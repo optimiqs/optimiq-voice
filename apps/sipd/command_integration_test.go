@@ -352,9 +352,11 @@ func TestTheSIPACLWatchDeliversAnEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SIPACLKVKey: %v", err)
 	}
+	itTrunk := "trunk-a"
 	entry, err := json.Marshal(acl.Record{
-		ID: "entry-1", OrganizationID: itOrg, Network: "203.0.113.0/24",
-		Action: "allow", Scope: acl.ScopeTrunk, Priority: 100, TrunkID: "trunk-a", Enabled: true,
+		OrgID: itOrg, Network: "203.0.113.0/24",
+		Action: contract.SIPACLEntryActionAllow, Scope: acl.ScopeTrunk,
+		Priority: 100, TrunkID: &itTrunk, Enabled: true,
 	})
 	if err != nil {
 		t.Fatalf("encoding the entry: %v", err)

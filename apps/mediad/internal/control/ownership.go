@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -75,15 +74,21 @@ func (s *Server) routeRequest(conn *nats.Conn, subject string, data []byte, hand
 	defer cancel()
 	owner, keys, err := s.requestOwner(ctx, subject, request)
 	if err != nil {
-		return s.routingFailure(request, err)
+		// A KV failure, which really is this node's problem. Kept as `internal`.
+		return s.routingFailure(request, ReasonInternal, err)
 	}
 	if owner != "" && owner != s.instanceID {
 		if addressed {
-			return s.routingFailure(request, errors.New("addressed media owner no longer owns the resource"))
+			return s.routingFailure(request, ReasonWrongNode,
+				errors.New("addressed media owner no longer owns the resource"))
 		}
 		reply, err := conn.RequestWithContext(ctx, mediaInstanceSubject(subject, owner), data)
 		if err != nil {
-			return s.routingFailure(request, errors.New("owning media instance is unavailable"))
+			// `wrong_instance`, not `internal`: the session is alive on a NAMED neighbour, and that is
+			// the code the engine branches on to address it there. `internal` invited a retry on this
+			// node that would fail identically.
+			return s.routingFailure(request, ReasonWrongNode,
+				errors.New("owning media instance is unavailable"))
 		}
 		return reply.Data
 	}
@@ -122,6 +127,17 @@ func (s *Server) requestOwner(ctx context.Context, subject string, request resou
 	}
 	for _, id := range request.sessions() {
 		key := directory.OwnerKey("session", id)
+		if s.ownsLocally(key, id) {
+			// Answered from memory. Ownership is immutable once claimed, so a key this instance has
+			// already claimed FOR A SESSION IT STILL HAS is a broker round trip with a known answer
+			// — and this runs on `bridge-sessions` and `start-playback`, which have a 500 ms budget
+			// that two or three of those round trips were eating into.
+			keys = append(keys, key)
+			if err := setOwner(s.instanceID); err != nil {
+				return "", nil, err
+			}
+			continue
+		}
 		found, err := store.Get(ctx, key)
 		if err != nil {
 			return "", nil, err
@@ -186,10 +202,30 @@ func (s *Server) requestOwner(ctx context.Context, subject string, request resou
 	return owner, keys, nil
 }
 
-func (s *Server) routingFailure(request resourceRequest, err error) []byte {
+// owns reports whether this instance has already claimed key for a session it still holds.
+//
+// BOTH halves are load-bearing. The tracked map alone goes stale — it is pruned once a minute — and
+// answering from it for a session that has since been released would route the command here to be
+// refused as unknown rather than to the instance that has it. The live-session check alone is not
+// enough either: a session can be live here without this instance having won the claim.
+func (s *Server) ownsLocally(key, sessionID string) bool {
+	if sessionID == "" {
+		return false
+	}
+	s.ownership.mu.Lock()
+	_, tracked := s.ownership.tracked[key][sessionID]
+	s.ownership.mu.Unlock()
+	if !tracked {
+		return false
+	}
+	_, _, live := s.sessions.SessionTenancy(sessionID)
+	return live
+}
+
+func (s *Server) routingFailure(request resourceRequest, reason string, err error) []byte {
 	// Match every media response's identity fields; callers retain their normal refusal parsing.
 	return encode(s.log, map[string]any{
-		"ok": false, "reason": ReasonInternal, "error": fmt.Sprint(err), "instanceId": s.instanceID,
+		"ok": false, "reason": reason, "error": fmt.Sprint(err), "instanceId": s.instanceID,
 		"sessionId": request.SessionID, "sessionIds": append([]string{}, request.SessionIDs...), "bridgeId": request.BridgeID,
 		"released": false, "stopped": false, "unbridged": false, "untapped": false,
 		"playbackRef": request.PlaybackRef, "recordingRef": request.RecordingRef, "tapId": request.TapID,
@@ -228,7 +264,7 @@ func (s *Server) RenewOwnership(ctx context.Context) {
 				updateCtx, cancel := context.WithTimeout(ctx, directory.Timeout)
 				err := s.ownership.store.Refresh(updateCtx, key, s.instanceID)
 				cancel()
-				if err != nil && !strings.Contains(err.Error(), "context canceled") {
+				if err != nil && !errors.Is(err, context.Canceled) {
 					s.log.Warn("cannot renew media ownership", "error", err)
 				}
 			}

@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -352,6 +353,19 @@ func TestTransportConfigurationIsValidated(t *testing.T) {
 			want: "one socket cannot serve two transports",
 		},
 		{
+			// The collision is between sockets of the same family. With UDP off, TCP owns
+			// SIPD_LISTEN_ADDR on its own and a WS listener on the same address is the exact
+			// "one binds, the other fails in a goroutine nobody watches" failure.
+			name: "TCP and WS on one address with UDP disabled",
+			env: map[string]string{
+				"SIPD_UDP":            "false",
+				"SIPD_TCP":            "true",
+				"SIPD_WS":             "true",
+				"SIPD_WS_LISTEN_ADDR": "0.0.0.0:5060",
+			},
+			want: "one socket cannot serve two transports",
+		},
+		{
 			name: "a session interval below the RFC 4028 floor",
 			env:  map[string]string{"SIPD_SESSION_TIMERS": "true", "SIPD_MIN_SE": "30"},
 			want: "at least 90 seconds",
@@ -417,5 +431,29 @@ func TestSecureTransportsLoadWhenFullyConfigured(t *testing.T) {
 	}
 	if cfg.TrunkACL != "203.0.113.0/24=trunk-telnyx" {
 		t.Errorf("TrunkACL = %q", cfg.TrunkACL)
+	}
+}
+
+// UDP and TCP are different sockets, so they legitimately share SIPD_LISTEN_ADDR. The family key
+// must not turn that into a boot failure.
+func TestUDPAndTCPMayShareOneAddress(t *testing.T) {
+	cfg, err := config.Load(env(minimal(map[string]string{
+		"SIPD_UDP": "true",
+		"SIPD_TCP": "true",
+	})))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.EnableUDP || !cfg.EnableTCP {
+		t.Fatal("both transports must be enabled")
+	}
+}
+
+// Load's failure must carry ErrInvalid, or the sentinel is a documented capability that does not
+// exist.
+func TestLoadFailuresWrapErrInvalid(t *testing.T) {
+	_, err := config.Load(env(minimal(map[string]string{"SIPD_MAX_CONTACTS": "0"})))
+	if !errors.Is(err, config.ErrInvalid) {
+		t.Fatalf("err = %v, want it to wrap config.ErrInvalid", err)
 	}
 }

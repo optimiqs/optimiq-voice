@@ -438,3 +438,25 @@ func TestSessionEndedSendsQualityEvenWhenTheEndpointSentNoRTCP(t *testing.T) {
 		t.Errorf("reportsReceived = %d, want 0", quality.ReportsReceived)
 	}
 }
+
+func TestWaitFlushesTheEventsAShutdownHandedOff(t *testing.T) {
+	// `main` used to return from Drain straight into the NATS connection's own drain, and every
+	// publish still in flight died with the process — losing the `session.ended` for exactly the
+	// calls a drain ends, which is the one event the engine cannot reconstruct from anywhere else.
+	announcer, publisher, _ := newAnnouncer(t)
+
+	for index := 0; index < 32; index++ {
+		ended := summary()
+		ended.SessionID = testSession + string(rune('a'+index%26))
+		announcer.SessionEnded(ended, rtp.EndReasonDrained)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if !announcer.Wait(ctx) {
+		t.Fatal("Wait gave up on publishes that had not finished")
+	}
+	if got := len(publisher.EndedEvents()); got != 32 {
+		t.Errorf("published %d session.ended events after Wait, want 32", got)
+	}
+}

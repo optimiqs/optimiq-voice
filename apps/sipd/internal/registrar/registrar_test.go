@@ -181,6 +181,13 @@ func (h *harness) register(headers ...string) *sip.Response {
 
 func (h *harness) answerChallenge(res *sip.Response) string {
 	h.t.Helper()
+	return h.answerChallengeCount(res, 1)
+}
+
+// answerChallengeCount answers with an explicit nonce count, for the tests that reuse one nonce
+// across requests — the registrar's replay guard refuses a repeated count.
+func (h *harness) answerChallengeCount(res *sip.Response, count int) string {
+	h.t.Helper()
 	header := res.GetHeader("WWW-Authenticate")
 	if header == nil {
 		h.t.Fatal("401 carried no WWW-Authenticate header")
@@ -194,7 +201,7 @@ func (h *harness) answerChallenge(res *sip.Response) string {
 		URI:      "sip:" + testRealm,
 		Username: testUser,
 		Password: testPass,
-		Count:    1,
+		Count:    count,
 		Cnonce:   "0a4f113b",
 	})
 	if err != nil {
@@ -393,15 +400,29 @@ func TestStaleRegisterCannotOverwriteOrRemoveCurrentContact(t *testing.T) {
 	h := newHarness(t, nil)
 	contact := contactHeader("sip:1001@203.0.113.9:5060", "expires=300")
 	challenge := h.send(h.newRegister("", contact))
-	req := h.newRegister(h.answerChallenge(challenge), contact)
+	req := h.newRegister(h.answerChallengeCount(challenge, 1), contact)
 	if res := h.send(req); res.StatusCode != 200 {
 		t.Fatalf("REGISTER = %d", res.StatusCode)
 	}
-	if res := h.send(req.Clone()); res.StatusCode != 500 {
+	// A byte-identical replay never reaches the binding at all: the nonce count has been used, so
+	// the digest layer re-challenges. See the replay note in auth.go.
+	if res := h.send(req.Clone()); res.StatusCode != 401 {
+		t.Fatalf("replayed REGISTER = %d, want a fresh challenge", res.StatusCode)
+	}
+	// A genuinely re-authenticated but OUT OF ORDER REGISTER — fresh nonce count, stale CSeq — is
+	// what the binding's own guard has to catch.
+	reauthorize := func(count int) *sip.Request {
+		stale := req.Clone()
+		stale.RemoveHeader("Authorization")
+		stale.AppendHeader(sip.NewHeader("Authorization", h.answerChallengeCount(challenge, count)))
+		return stale
+	}
+	if res := h.send(reauthorize(2)); res.StatusCode != 500 {
 		t.Fatalf("stale REGISTER = %d", res.StatusCode)
 	}
-	req.Contact().Params.Add("expires", "0")
-	if res := h.send(req); res.StatusCode != 500 {
+	removal := reauthorize(3)
+	removal.Contact().Params.Add("expires", "0")
+	if res := h.send(removal); res.StatusCode != 500 {
 		t.Fatalf("stale removal = %d", res.StatusCode)
 	}
 	if _, found := h.binding(); !found {
@@ -658,10 +679,15 @@ func TestSweeperExpiresLapsedBindings(t *testing.T) {
 		t.Fatalf("tracked %d bindings, want 1", h.registrar.TrackedBindings())
 	}
 
-	// Still inside the granted interval: nothing may expire yet.
+	// Still inside the granted interval: nothing may expire yet, and — because the hint carries the
+	// exact deadline — nothing may cost a KV round trip either.
 	h.now = h.now.Add(59 * time.Second)
+	updates := h.store.Updates()
 	if swept := h.registrar.Sweep(context.Background()); swept != 0 {
 		t.Fatalf("swept %d bindings before the deadline", swept)
+	}
+	if spent := h.store.Updates() - updates; spent != 0 {
+		t.Errorf("a sweep before the deadline spent %d KV round trips, want none", spent)
 	}
 
 	h.now = h.now.Add(2 * time.Second)
@@ -938,5 +964,33 @@ func TestNewRejectsInconsistentOptions(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "challenges for") {
 		t.Errorf("error = %v, want it to name the realm mismatch", err)
+	}
+}
+
+// The attack the nonce count exists to stop: the digest covers the method, the request URI and the
+// nonce, and NOT the Contact. An observer who captures one REGISTER on an unencrypted transport
+// used to be able to resend the identical Authorization header in a REGISTER carrying their own
+// contact, and inbound calls for the victim would fork to them.
+func TestAReplayedAuthorizationCannotBindAnAttackersContact(t *testing.T) {
+	h := newHarness(t, nil)
+	victim := contactHeader("sip:1001@203.0.113.9:5060", "expires=300")
+	challenge := h.send(h.newRegister("", victim))
+	authorization := h.answerChallengeCount(challenge, 1)
+	if res := h.send(h.newRegister(authorization, victim)); res.StatusCode != 200 {
+		t.Fatalf("the genuine REGISTER = %d", res.StatusCode)
+	}
+
+	attacker := h.newRegister(authorization, contactHeader("sip:1001@198.51.100.4:5060", "expires=300"))
+	if res := h.send(attacker); res.StatusCode != 401 {
+		t.Fatalf("replayed credentials with a different contact = %d, want 401", res.StatusCode)
+	}
+	binding, found := h.binding()
+	if !found {
+		t.Fatal("the victim's binding disappeared")
+	}
+	for _, contact := range binding.Contacts {
+		if strings.Contains(contact.URI, "198.51.100.4") {
+			t.Fatalf("the attacker's contact was bound: %+v", binding.Contacts)
+		}
 	}
 }

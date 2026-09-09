@@ -268,6 +268,34 @@ func TestHoldStartsAndUnholdStopsTheMusicLoop(t *testing.T) {
 	if summary := playback.Summary(); summary.Kind != rtp.PlaybackMusicOnHold {
 		t.Errorf("the hold loop is labelled %q, want moh", summary.Kind)
 	}
+	// And the index entry goes with it. Hold used to write the index by hand with no watcher behind
+	// it, so `m.playbacks` grew one permanent entry per hold and a `stop-playback` for a recycled
+	// reference resolved to a session that had ended long before.
+	waitFor(t, "the hold loop to leave the playback index", func() bool {
+		_, ok := rig.manager.PlaybackSessionOf("moh-1")
+		return !ok
+	})
+}
+
+func TestAHoldWhoseMusicCannotStartIndexesNothing(t *testing.T) {
+	// The index write used to happen whether or not the music started, because Session.Hold swallows
+	// that failure by design — leaving a reference pointing at a session that is playing nothing.
+	rig := newBridgeRig(t, 62480, 62499)
+	if err := rig.manager.Bridge("bridge-1", rig.aID, rig.bID); err != nil {
+		t.Fatalf("Bridge: %v", err)
+	}
+	// Deliberately NOT latched: there is nowhere to send, so the playback cannot begin.
+
+	if err := rig.manager.Hold(rig.aID, rtp.HoldOptions{
+		MusicRef:      "moh-ghost",
+		MusicFrames:   frames(2, 0x20),
+		MusicEncoding: audio.EncodingULaw,
+	}); err != nil {
+		t.Fatalf("Hold: %v", err)
+	}
+	if owner, ok := rig.manager.PlaybackSessionOf("moh-ghost"); ok {
+		t.Errorf("a hold with no music indexed %q anyway", owner)
+	}
 }
 
 func TestHoldStandsEvenWhenItsMusicCannotStart(t *testing.T) {

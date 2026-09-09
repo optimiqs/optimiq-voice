@@ -24,6 +24,7 @@ package profile
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/emiago/sipgo/sip"
@@ -271,7 +272,7 @@ func NewSet(profiles ...Profile) (*Set, error) {
 	var problems []string
 	names := make(map[string]bool, len(profiles))
 
-	for index, candidate := range profiles {
+	for _, candidate := range profiles {
 		if err := candidate.Validate(); err != nil {
 			problems = append(problems, err.Error())
 			continue
@@ -289,7 +290,7 @@ func NewSet(profiles ...Profile) (*Set, error) {
 					profiles[existing].Name, candidate.Name, key))
 				continue
 			}
-			set.byListener[key] = index
+			set.byListener[key] = len(set.profiles)
 		}
 		set.profiles = append(set.profiles, candidate)
 	}
@@ -333,9 +334,11 @@ func (s *Set) ByName(name string) (Profile, bool) {
 //     selector that cannot be influenced by the sender, so it is first and it is authoritative.
 //  2. The transport, when exactly one profile serves it. A deployment with carriers on TLS and
 //     devices on UDP is resolved here without any address matching at all.
-//  3. The SOURCE address against each external profile's ACL. This is a fallback for a deployment
-//     that shares one socket, and it is last precisely because it is the only step where the
-//     sender's own address participates in choosing the policy applied to it.
+//  3. The SOURCE address against each external profile's ACL — including an external profile with
+//     no listeners of its own, which is the documented default: it shares the main sockets and is
+//     selected by source address alone. This is a fallback for a deployment that shares one socket,
+//     and it is last precisely because it is the only step where the sender's own address
+//     participates in choosing the policy applied to it.
 //
 // Nothing matching is ErrNoProfile, and the caller answers 403. There is no default profile.
 func (s *Set) For(req *sip.Request) (Profile, error) {
@@ -359,19 +362,37 @@ func (s *Set) For(req *sip.Request) (Profile, error) {
 			}
 		}
 	}
-	if len(matches) == 1 {
+	// An external profile with NO listeners of its own shares whatever sockets the process serves
+	// and is selected by source address alone — the documented default when
+	// SIPD_EXTERNAL_LISTEN_ADDR is empty. It never appears in `matches`, so the transport step
+	// would otherwise see a single transport-serving profile (the internal one) and answer every
+	// carrier INVITE with a digest challenge no carrier can answer. When such a profile exists the
+	// transport step cannot resolve on its own and the source step has to run first.
+	shared := false
+	for _, candidate := range s.profiles {
+		if candidate.Kind == KindExternal && len(candidate.Listeners) == 0 {
+			shared = true
+			break
+		}
+	}
+	if !shared && len(matches) == 1 {
 		return s.profiles[matches[0]], nil
 	}
 
 	source := req.Source()
-	for _, index := range matches {
-		candidate := s.profiles[index]
+	for index, candidate := range s.profiles {
 		if candidate.Kind != KindExternal {
+			continue
+		}
+		if len(candidate.Listeners) > 0 && !slices.Contains(matches, index) {
 			continue
 		}
 		if _, allowed := candidate.ACL.Match(source); allowed {
 			return candidate, nil
 		}
+	}
+	if len(matches) == 1 {
+		return s.profiles[matches[0]], nil
 	}
 	// A source that no external ACL claims falls to the single internal profile serving this
 	// transport, if there is exactly one — where it will be challenged for a digest it does not

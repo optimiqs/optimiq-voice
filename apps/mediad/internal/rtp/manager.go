@@ -728,8 +728,22 @@ func (m *Manager) StartPlayback(sessionID string, opts PlaybackOptions) error {
 		return err
 	}
 
+	m.trackPlayback(sessionID, session, opts.Ref, playback)
+
+	m.log.Info("playback started",
+		"sessionId", sessionID, "playbackRef", opts.Ref, "frames", len(opts.Frames))
+	return nil
+}
+
+// trackPlayback indexes a running playback by reference and watches it to the end.
+//
+// Every playback the instance starts goes through here, hold music included: the index is what
+// makes `stop-playback` able to find a loop by reference, and the watcher is what stops the index
+// from growing one stale entry per prompt — a reference that outlived its session would resolve a
+// later stop against whatever session had since taken its place.
+func (m *Manager) trackPlayback(sessionID string, session *Session, ref string, playback *Playback) {
 	m.mu.Lock()
-	m.playbacks[opts.Ref] = sessionID
+	m.playbacks[ref] = sessionID
 	m.mu.Unlock()
 
 	m.running.Add(1)
@@ -740,9 +754,9 @@ func (m *Manager) StartPlayback(sessionID string, opts PlaybackOptions) error {
 		m.mu.Lock()
 		// Only if it is still OURS: a superseding playback with the same reference would otherwise
 		// have its index entry deleted by the one it replaced.
-		if owner, ok := m.playbacks[opts.Ref]; ok && owner == sessionID &&
+		if owner, ok := m.playbacks[ref]; ok && owner == sessionID &&
 			session.ActivePlayback() == nil {
-			delete(m.playbacks, opts.Ref)
+			delete(m.playbacks, ref)
 		}
 		m.mu.Unlock()
 
@@ -756,10 +770,6 @@ func (m *Manager) StartPlayback(sessionID string, opts PlaybackOptions) error {
 			m.lifecycle.PlaybackFinished(session.Summary(), summary)
 		}
 	}()
-
-	m.log.Info("playback started",
-		"sessionId", sessionID, "playbackRef", opts.Ref, "frames", len(opts.Frames))
-	return nil
 }
 
 // StopPlayback interrupts a playback by reference and reports the session it was on.
@@ -1037,14 +1047,18 @@ func (m *Manager) ReapIdle() int {
 	m.mu.Lock()
 	var stale []expiry
 	for id, session := range m.sessions {
-		if session.held.Load() || session.mutedIn.Load() || session.mutedOut.Load() || now.UnixMilli() < session.rtpGraceUntil.Load() {
-			continue
-		}
 		idle := session.Idle(now)
 		heardSomething := session.Stats().LastPacketUnixMs != 0
+		// Held, muted and just-resumed sessions are EXPECTED to be silent, so they are exempt from
+		// the RTP timeout — but only from that one. The backstop below is not a media-failure check
+		// and the gates say nothing about it: a leg that has never received a single packet is a
+		// leak whatever its direction, and a ringing leg is answered `inactive`, so exempting the
+		// gated ones leaked a port pair permanently on the commonest abandoned call setup there is.
+		gatedSilence := session.held.Load() || session.mutedIn.Load() || session.mutedOut.Load() ||
+			now.UnixMilli() < session.rtpGraceUntil.Load()
 
 		switch {
-		case heardSomething && m.rtpTimeout > 0 && idle > m.rtpTimeout:
+		case heardSomething && !gatedSilence && m.rtpTimeout > 0 && idle > m.rtpTimeout:
 			stale = append(stale, expiry{session, EndReasonRTPTimeout, idle})
 		case !heardSomething && m.idleAfter > 0 && idle > m.idleAfter:
 			stale = append(stale, expiry{session, EndReasonIdleReaped, idle})
@@ -1151,9 +1165,7 @@ func (m *Manager) Drain(ctx context.Context) error {
 	if len(live) > 0 {
 		m.log.Warn("draining live sessions; media on these calls stops now", "count", len(live))
 	}
-	for _, session := range live {
-		m.closeAndAnnounce(session, EndReasonDrained)
-	}
+	m.closeAllAndAnnounce(ctx, live)
 
 	stopped := make(chan struct{})
 	go func() {
@@ -1166,5 +1178,70 @@ func (m *Manager) Drain(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("rtp: draining %d sessions: %w", len(live), ctx.Err())
+	}
+}
+
+// drainCloseWorkers bounds how many sessions a drain closes at once. See closeAllAndAnnounce.
+const drainCloseWorkers = 16
+
+// closeAllAndAnnounce closes a drained instance's sessions, in parallel and under the drain's
+// deadline.
+//
+// Serially was wrong twice over: closeAndAnnounce waits up to recordingFinaliseTimeout for each
+// recorder, so a box with fifty live recordings on a wedged mount spent minutes here — and it did
+// so in a loop nothing could interrupt, which is exactly the deadline MEDIAD_SHUTDOWN_TIMEOUT
+// exists to impose. A small pool rather than one goroutine per session because the work is a
+// filesystem flush, not something that gets faster with a thousand of them in flight.
+//
+// When the deadline lands mid-drain the remaining sessions still get their sockets closed, without
+// the announce: a port handed back late is better than a port the exiting process never released,
+// and there is no time left to wait on the events anyway.
+func (m *Manager) closeAllAndAnnounce(ctx context.Context, live []*Session) {
+	if len(live) == 0 {
+		return
+	}
+	workers := drainCloseWorkers
+	if len(live) < workers {
+		workers = len(live)
+	}
+
+	work := make(chan *Session)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for session := range work {
+				m.closeAndAnnounce(session, EndReasonDrained)
+			}
+		}()
+	}
+
+	go func() {
+		defer close(work)
+		for index, session := range live {
+			select {
+			case work <- session:
+			case <-ctx.Done():
+				m.log.Warn("the drain deadline landed mid-close; closing the rest without announcing",
+					"remaining", len(live)-index)
+				for _, remaining := range live[index:] {
+					if err := remaining.Close(); err != nil {
+						m.log.Warn("closing a session", "sessionId", remaining.ID, "error", err)
+					}
+				}
+				return
+			}
+		}
+	}()
+
+	closed := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-ctx.Done():
 	}
 }

@@ -237,6 +237,28 @@ type Conference struct {
 	stopOnce sync.Once
 	stop     chan struct{}
 	done     chan struct{}
+
+	// total, mixed, out and pending belong to the mix loop and nothing else touches them. Reused
+	// across ticks for the same reason Member.contribution is: a room that allocated four buffers
+	// fifty times a second was the one loop in this service with a hard 20 ms deadline paying for
+	// steady GC pressure it did not need.
+	total   []int32
+	mixed   []int32
+	out     []int16
+	pending []mixFrame
+}
+
+// mixFrame is one member's finished frame, waiting to be written OUTSIDE the room lock.
+//
+// The writes used to happen inline, under c.mu, and each one is a marshal plus a WriteToUDP — or a
+// Pion SRTP write taking its own locks for a WebRTC leg. At eight members and fifty ticks a second
+// that is four hundred syscalls a second holding the mutex that every join, leave and Members()
+// waits on, several of which are called with Manager.mu held: one slow socket stalled the whole
+// room and could block a Release behind the global session map.
+type mixFrame struct {
+	session *Session
+	payload []byte
+	marker  bool
 }
 
 // Members lists the session ids in the room, in join order.
@@ -415,13 +437,13 @@ func (c *Conference) run() {
 // per existing participant.
 func (c *Conference) mixOnce() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	if len(c.order) == 0 {
+		c.mu.Unlock()
 		return
 	}
 
-	total := make([]int32, audio.FrameSamples)
+	total := c.scratchTotal()
 	for _, id := range c.order {
 		member := c.members[id]
 		gain := member.gainRx.Load()
@@ -445,8 +467,8 @@ func (c *Conference) mixOnce() {
 		}
 	}
 
-	mixed := make([]int32, audio.FrameSamples)
-	out := make([]int16, audio.FrameSamples)
+	mixed, out := c.mixed, c.out
+	c.pending = c.pending[:0]
 	for _, id := range c.order {
 		member := c.members[id]
 
@@ -487,8 +509,33 @@ func (c *Conference) mixOnce() {
 
 		marker := !member.marked
 		member.marked = true
-		member.session.sendMixFrame(member.encoder.EncodeFrame(out), marker)
+		// EncodeFrame's output is the one buffer here that is NOT reused: it outlives the lock and
+		// each member's is written separately, so they cannot share one.
+		c.pending = append(c.pending, mixFrame{
+			session: member.session,
+			payload: member.encoder.EncodeFrame(out),
+			marker:  marker,
+		})
 	}
+	pending := c.pending
+	c.mu.Unlock()
+
+	for _, frame := range pending {
+		frame.session.sendMixFrame(frame.payload, frame.marker)
+	}
+}
+
+// scratchTotal hands back the room's zeroed accumulator, allocating it on the first tick.
+func (c *Conference) scratchTotal() []int32 {
+	if c.total == nil {
+		c.total = make([]int32, audio.FrameSamples)
+		c.mixed = make([]int32, audio.FrameSamples)
+		c.out = make([]int16, audio.FrameSamples)
+	}
+	for index := range c.total {
+		c.total[index] = 0
+	}
+	return c.total
 }
 
 // addRestrictedLocked adds the contributions of members whose audience is enumerated.

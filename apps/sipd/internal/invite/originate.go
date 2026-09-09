@@ -532,8 +532,9 @@ func (h *Handler) createOutboundLeg(
 	}
 
 	session := dialog.NewSession(created, dialog.SessionOptions{
-		Handler: &executor{handler: h, state: state},
-		Logger:  h.log.With("legId", created.LegID),
+		Handler:  &executor{handler: h, state: state},
+		OnUpdate: h.dialogs.Touch,
+		Logger:   h.log.With("legId", created.LegID),
 	})
 	if err := h.dialogs.Insert(created); err != nil {
 		session.Close()

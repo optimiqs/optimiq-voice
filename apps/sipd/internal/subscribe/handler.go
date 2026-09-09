@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/emiago/sipgo"
@@ -243,6 +244,17 @@ type Handler struct {
 	// Wait can drain them at shutdown rather than leaving a phone with an accepted subscription it
 	// was never told the state of.
 	notifications sync.WaitGroup
+	// slots bounds how many NOTIFY client transactions this handler holds open at once.
+	//
+	// Without it, one goroutine per watcher per change: a queue extension with two hundred BLF
+	// watchers and a few state changes a second is low thousands of concurrent client transactions,
+	// each holding a transaction-layer slot for the full notify timeout, and the INVITE path shares
+	// that client. A saturated fan-out DROPS rather than queues, because RFC 4235 versioning
+	// already makes a skipped intermediate notification safe — the next one carries the newer
+	// version and the watcher keeps that.
+	slots chan struct{}
+	// dropped counts notifications shed by a saturated fan-out, so the shedding is visible.
+	dropped atomic.Int64
 }
 
 // New validates the options and builds a Handler.
@@ -288,6 +300,7 @@ func New(opts Options) (*Handler, error) {
 		now:           opts.Now,
 		newTag:        opts.NewTag,
 		table:         NewTable(),
+		slots:         make(chan struct{}, notifyConcurrency),
 	}
 	if handler.notifier == nil {
 		handler.notifier = DiscardNotifier{}
@@ -663,6 +676,12 @@ func (h *Handler) deliver(
 	}
 }
 
+// notifyConcurrency is how many NOTIFY client transactions may be in flight at once, both for the
+// change fan-out and for the shutdown deactivation sweep. Thirty-two is well above the rate any
+// real deployment changes state at and well below the point at which the shared SIP client's
+// transaction layer starts starving the INVITE path.
+const notifyConcurrency = 32
+
 // dispatch sends one NOTIFY OFF the caller's goroutine.
 //
 // The fan-out cannot be sequential. A NOTIFY is a client transaction, so an unreachable phone holds
@@ -682,9 +701,21 @@ func (h *Handler) dispatch(
 	contentType string,
 	state SubscriptionState,
 ) {
+	select {
+	case h.slots <- struct{}{}:
+	default:
+		// Shed, and say so. The watcher is not left stale: the next change for this subscription
+		// carries a higher version and RFC 4235 §3.3 has the watcher keep that one.
+		if dropped := h.dropped.Add(1); dropped%100 == 1 {
+			h.log.Warn("shedding notifications: the fan-out is saturated",
+				"resource", subscription.Resource, "dropped", dropped, "limit", notifyConcurrency)
+		}
+		return
+	}
 	h.notifications.Add(1)
 	go func() {
 		defer h.notifications.Done()
+		defer func() { <-h.slots }()
 		ctx, cancel := context.WithTimeout(h.baseCtx, h.notifyTimeout)
 		defer cancel()
 		h.deliver(ctx, subscription, body, contentType, state, h.log)
@@ -886,18 +917,48 @@ func (h *Handler) Sweep(context.Context) int {
 // of every lamp this instance was serving.
 func (h *Handler) Shutdown(ctx context.Context) int {
 	drained := h.table.Drain()
-	// Sent inline rather than through dispatch, and with the caller's context: this runs AFTER the
-	// base context is cancelled, so a dispatched notification would be abandoned before it left the
-	// process — which is the one case where a lost notification costs a fleet-wide lamp freeze
-	// rather than one stale key.
+	// Sent on the caller's context rather than through dispatch: this runs AFTER the base context
+	// is cancelled, so a dispatched notification would be abandoned before it left the process —
+	// which is the one case where a lost notification costs a fleet-wide lamp freeze rather than one
+	// stale key.
+	//
+	// Bounded-parallel rather than sequential. Notify blocks until its client transaction settles,
+	// so one unplugged handset holds the loop for a whole non-INVITE timeout while the WHOLE loop
+	// shares a single shutdown deadline — an instance with a few dead phones would deactivate the
+	// first handful and let every other lamp in the fleet freeze until SIPD_SUBSCRIBE_MAX_EXPIRES,
+	// which is the outage `deactivated` exists to prevent.
+	workers := min(notifyConcurrency, len(drained))
+	queue := make(chan *Subscription)
+	var group sync.WaitGroup
+	for range workers {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for subscription := range queue {
+				req := BuildNotify(subscription, nil, contentTypeFor(subscription.Event),
+					StateTerminatedDeactivated, h.contact, h.server)
+				if err := h.notifier.Notify(ctx, req); err != nil {
+					h.log.Warn("cannot deactivate a subscription on shutdown",
+						"resource", subscription.Resource, "error", err)
+				}
+			}
+		}()
+	}
 	for _, subscription := range drained {
-		req := BuildNotify(subscription, nil, contentTypeFor(subscription.Event),
-			StateTerminatedDeactivated, h.contact, h.server)
-		if err := h.notifier.Notify(ctx, req); err != nil {
-			h.log.Warn("cannot deactivate a subscription on shutdown",
-				"resource", subscription.Resource, "error", err)
+		select {
+		case queue <- subscription:
+		case <-ctx.Done():
+			// The shutdown deadline passed. Stop feeding rather than blocking on a worker that is
+			// itself waiting on a transaction nobody will answer.
+			close(queue)
+			group.Wait()
+			h.log.Warn("the shutdown deadline passed before every subscription was deactivated",
+				"subscriptions", len(drained))
+			return len(drained)
 		}
 	}
+	close(queue)
+	group.Wait()
 	if len(drained) > 0 {
 		h.log.Info("deactivated subscriptions on shutdown", "count", len(drained))
 	}

@@ -234,6 +234,26 @@ func TestStartRecordingDerivesTheEnginesOwnObjectKey(t *testing.T) {
 	}
 }
 
+func TestStartRecordingRefusesATenancyThatEscapesTheRecordingsRoot(t *testing.T) {
+	// The allocate boundary refuses these tokens, so this asserts the SECOND guard: the call site
+	// that actually turns org and call into a path. `filepath.Join` cleans `../` rather than
+	// refusing it, so an unchecked token here writes a WAV — and creates the directories for it —
+	// anywhere this process can write.
+	rig := newRig(t)
+	allocateSession(t, rig)
+	rig.sessions.forceTenancy(testSession, "../../../etc", testCall)
+
+	response := decodeStartRecording(t, rig.server.HandleStartRecording(mustJSON(t,
+		contract.MediaStartRecordingRequest{SessionID: testSession, RecordingRef: "rec-1"})))
+
+	if response.Ok {
+		t.Fatalf("start-recording accepted a traversing org id: %+v", response)
+	}
+	if calls := rig.sessions.recordingCalls(); len(calls) != 0 {
+		t.Fatalf("the packet path was asked to write %q", calls[0].opts.Path)
+	}
+}
+
 func TestStartRecordingCarriesTheReceiveDirectionAndTheLimits(t *testing.T) {
 	rig := newRig(t)
 	allocateSession(t, rig)
@@ -291,6 +311,14 @@ func TestStartRecordingRefusesWhatItCannotDoRatherThanDroppingIt(t *testing.T) {
 			name:     "a container mediad does not write",
 			mutate:   func(rq *contract.MediaStartRecordingRequest) { rq.Format = "gsm" },
 			contains: "WAV",
+		},
+		{
+			// Anything but `receive` or `both` used to behave as `receive`, so a typo produced HALF a
+			// recording and reported it as a success.
+			name:     "a direction that is not one",
+			mutate:   func(rq *contract.MediaStartRecordingRequest) { rq.Direction = "transmit" },
+			contains: "recording direction",
+			reason:   "bad_request",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

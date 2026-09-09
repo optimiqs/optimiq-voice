@@ -247,14 +247,11 @@ func run() error {
 	// nothing to do with either of them.
 	trunkDirectory := trunk.NewDirectory(log)
 	if cfg.EnableInvite {
-		// The status publisher is the JetStream one whenever there is a broker, which by this point
-		// there always is — the process refuses to start without one. LogPublisher survives for the
-		// no-broker development case and is chosen by the same condition, so a deployment either
-		// publishes or says loudly that it cannot and never silently drops a carrier outage.
+		// There is always a broker by this point — nats.Connect above either returned a connection or
+		// the process exited — so the publisher is always the JetStream one. trunk.LogPublisher
+		// stays for the tests and for a future explicit no-broker mode; it is not reachable from a
+		// nil check that can never be true.
 		var statusPublisher trunk.Publisher = trunk.NewJetStreamPublisher(js, config.EventSource)
-		if conn == nil {
-			statusPublisher = trunk.LogPublisher{Log: log}
-		}
 
 		registrarClient, err := trunk.NewClientRegistrar(sipClient, trunk.RegistrarOptions{
 			Contact:   contactURI(cfg),
@@ -698,9 +695,19 @@ type inviteDeps struct {
 func newInviteHandler(deps inviteDeps) (*invite.Handler, error) {
 	cfg, log := deps.cfg, deps.log
 
-	profiles, aclWatcher, err := buildProfiles(deps.ctx, cfg, deps.conn, log)
+	profiles, aclWatcher, aclReady, err := buildProfiles(deps.ctx, cfg, deps.conn, log)
 	if err != nil {
 		return nil, err
+	}
+	// The ACL is a security boundary and buildProfiles STARTS the watch rather than finishing it, so
+	// this is where "opened before the INVITE surface" becomes "loaded before it". The wait is short
+	// and bounded: an empty ACL fails closed, so the cost of giving up is a carrier refused for a
+	// moment, and the cost of waiting for ever would be a SIP edge that never serves REGISTER
+	// because a bucket the control plane has not created yet.
+	aclLoaded := waitForACL(deps.ctx, aclReady, aclReadyTimeout)
+	if !aclLoaded {
+		log.Warn("the sip-acl replay has not landed; carrier INVITEs are refused until it does",
+			"bucket", contract.SIPACLKV.Name, "waited", aclReadyTimeout)
 	}
 	requester, err := invite.NewClientRequester(deps.client)
 	if err != nil {
@@ -761,6 +768,7 @@ func newInviteHandler(deps inviteDeps) (*invite.Handler, error) {
 		"admissionTimeout", port.Timeout(),
 		"eventRoot", contract.SubjectRootSIPDialog,
 		"aclEntries", aclWatcher.Len(),
+		"aclLoaded", aclLoaded,
 		"trunks", deps.trunks.Len(),
 		"sessionTimers", cfg.EnableSessionTimers)
 	return handler, nil
@@ -777,12 +785,35 @@ func newInviteHandler(deps inviteDeps) (*invite.Handler, error) {
 // refuses every carrier — `Match` has no default allow and there is no constructor that could give
 // it one — so building it early costs nothing and saves a restart the first time a tenant adds a
 // trunk.
+// aclReadyTimeout is how long boot waits for the sip-acl initial replay before serving INVITEs
+// anyway. Long enough for a broker round trip and a replay of a realistic ACL, short enough that a
+// missing bucket does not hold up REGISTER, which has nothing to do with this boundary.
+const aclReadyTimeout = 3 * time.Second
+
+// waitForACL blocks until the initial replay lands, the deadline passes or the process is shutting
+// down, and reports whether the ACL is loaded.
+func waitForACL(ctx context.Context, ready <-chan struct{}, timeout time.Duration) bool {
+	if ready == nil {
+		return false
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-ready:
+		return true
+	case <-timer.C:
+		return false
+	case <-ctx.Done():
+		return false
+	}
+}
+
 func buildProfiles(
 	ctx context.Context,
 	cfg config.Config,
 	conn *nats.Conn,
 	log *slog.Logger,
-) (*profile.Set, *acl.Watcher, error) {
+) (*profile.Set, *acl.Watcher, <-chan struct{}, error) {
 	listeners := make([]profile.Listener, 0, 5)
 	if cfg.EnableUDP {
 		listeners = append(listeners, profile.Listener{Network: "udp", Addr: cfg.ListenAddr})
@@ -808,20 +839,25 @@ func buildProfiles(
 
 	overrides, err := parseTrunkACL(cfg.TrunkACL)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	carrierACL := profile.NewWatchedACL(overrides)
 	watcher, err := acl.NewWatcher(carrierACL, overrides, log)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
+
+	// ready closes once the bucket's initial replay has landed, however many attach attempts that
+	// took. It is the signal boot waits on before it starts answering INVITEs.
+	ready := make(chan struct{})
+	var readyOnce sync.Once
 
 	watchConfigured := false
 	if conn != nil {
 		js, err := jetstream.New(conn)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		watchConfigured = true
 		watchWhenAvailable(ctx, log, contract.SIPACLKV.Name, time.Second, func() error {
@@ -829,15 +865,28 @@ func buildProfiles(
 			if err != nil {
 				return err
 			}
-			_, err = acl.Watch(ctx, bucket, watcher)
-			return err
+			replayed, err := acl.Watch(ctx, bucket, watcher)
+			if err != nil {
+				return err
+			}
+			go func() {
+				select {
+				case <-replayed:
+					readyOnce.Do(func() { close(ready) })
+				case <-ctx.Done():
+				}
+			}()
+			return nil
 		})
 	}
 
 	internal := profile.Internal("internal", listeners...)
 	if !watchConfigured && len(overrides) == 0 {
+		// No bucket and no overrides: there is no external profile and therefore nothing to wait
+		// for.
+		readyOnce.Do(func() { close(ready) })
 		set, err := profile.NewSet(internal)
-		return set, watcher, err
+		return set, watcher, ready, err
 	}
 	// Keep the dynamic ACL attached while the control plane creates its bucket.
 	// An empty ACL refuses carrier traffic until the initial replay succeeds.
@@ -853,7 +902,7 @@ func buildProfiles(
 		}
 	}
 	set, err := profile.NewSet(internal, external)
-	return set, watcher, err
+	return set, watcher, ready, err
 }
 
 // parseTrunkACL reads `cidr[=trunkId]` entries separated by commas.

@@ -50,13 +50,33 @@ const (
 type recordingNotifier struct {
 	mu   sync.Mutex
 	sent []*sip.Request
+	// gate and entered let a test hold every Notify open at once, which is how "the fan-out is
+	// parallel" is asserted rather than assumed: a sequential loop never fills `entered`.
+	gate    chan struct{}
+	entered chan struct{}
 }
 
 func (n *recordingNotifier) Notify(_ context.Context, req *sip.Request) error {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	n.sent = append(n.sent, req)
+	gate, entered := n.gate, n.entered
+	n.mu.Unlock()
+	if gate != nil {
+		entered <- struct{}{}
+		<-gate
+	}
 	return nil
+}
+
+// hold makes the next `count` notifications block until the returned release is called, and
+// returns a channel that receives once per notification that has started.
+func (n *recordingNotifier) hold(count int) (started <-chan struct{}, release func()) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.gate = make(chan struct{})
+	n.entered = make(chan struct{}, count)
+	gate := n.gate
+	return n.entered, func() { close(gate) }
 }
 
 func (n *recordingNotifier) all() []*sip.Request {
@@ -722,6 +742,51 @@ func TestShutdownTellsEverySubscriberToComeBack(t *testing.T) {
 	}
 	if h.handler.Subscriptions() != 0 {
 		t.Error("the table survived a shutdown")
+	}
+}
+
+// One unplugged handset must not hold the shutdown deadline hostage. Notify blocks until its client
+// transaction settles, so a sequential loop deactivates the first few and lets every other lamp in
+// the fleet freeze for the rest of SIPD_SUBSCRIBE_MAX_EXPIRES.
+func TestShutdownDeactivatesInParallel(t *testing.T) {
+	h := newHarness(t, harnessOptions{})
+
+	const subscribers = 4
+	for index := range subscribers {
+		if res := h.subscribe(subscribeOptions{callID: "watcher-" + strconv.Itoa(index)}); res.StatusCode != 200 {
+			t.Fatalf("SUBSCRIBE %d = %d", index, res.StatusCode)
+		}
+	}
+	if h.handler.Subscriptions() != subscribers {
+		t.Fatalf("subscriptions = %d, want %d", h.handler.Subscriptions(), subscribers)
+	}
+	h.notifier.reset()
+
+	started, release := h.notifier.hold(subscribers)
+	done := make(chan int, 1)
+	go func() { done <- h.handler.Shutdown(context.Background()) }()
+
+	// Every deactivation must be in flight at once. A sequential loop delivers one and then waits
+	// for the release that this test only sends after all four have arrived — so it would time out.
+	for range subscribers {
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the shutdown deactivations are not running in parallel")
+		}
+	}
+	release()
+
+	select {
+	case deactivated := <-done:
+		if deactivated != subscribers {
+			t.Fatalf("deactivated %d subscriptions, want %d", deactivated, subscribers)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown did not return")
+	}
+	if sent := h.notifier.all(); len(sent) != subscribers {
+		t.Fatalf("shutdown produced %d notifications, want %d", len(sent), subscribers)
 	}
 }
 

@@ -8,9 +8,12 @@
 //
 //	RUN_SIPD_INTEGRATION=1 go test -tags integration -v -timeout 5m ./...
 //
-// Requirements: a working `docker` (or a Docker-compatible CLI) on PATH. The test starts one
-// throwaway `nats:2.11 -js` container on a random port and removes it on the way out, including
-// after a panic or a failed assertion.
+// Requirements: a broker the test can start. Either a working `docker` (or a Docker-compatible CLI)
+// on PATH — one throwaway `nats:2.11 -js` container on a random port, removed on the way out
+// including after a panic or a failed assertion — or a local `nats-server` binary named by
+// NATS_SERVER_BIN, which is spawned directly on a free port with a per-test JetStream store. The
+// binary path exists because a machine without a container runtime is otherwise unable to run any
+// of this, and the suites assert on broker BEHAVIOUR rather than on how it was started.
 //
 // Why raw UDP rather than a sipgo client: the point of an integration test is to prove that bytes
 // on a wire produce a binding in a bucket. Building the REGISTER by hand and parsing the response
@@ -63,16 +66,129 @@ const (
 func requireIntegration(t *testing.T) {
 	t.Helper()
 	if os.Getenv("RUN_SIPD_INTEGRATION") != "1" {
-		t.Skip("set RUN_SIPD_INTEGRATION=1 to run the sipd integration suite (needs docker)")
+		t.Skip("set RUN_SIPD_INTEGRATION=1 to run the sipd integration suite (needs docker or NATS_SERVER_BIN)")
+	}
+	if natsServerBinary() != "" {
+		return
 	}
 	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker is not on PATH")
+		t.Skip("neither NATS_SERVER_BIN nor docker is available")
 	}
+}
+
+// natsServerBinary is the local broker binary, when one was named. Preferred over docker when set.
+func natsServerBinary() string {
+	binary := strings.TrimSpace(os.Getenv("NATS_SERVER_BIN"))
+	if binary == "" {
+		return ""
+	}
+	if _, err := exec.LookPath(binary); err != nil {
+		return ""
+	}
+	return binary
+}
+
+// freePort asks the kernel for a port and hands back the number.
+//
+// The listener is closed before the broker binds it, so this is a race in principle. In practice
+// nothing else on a test host is racing for an ephemeral port, and the alternative — a fixed port —
+// makes two concurrent packages collide every time rather than never.
+func freePort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserving a port for nats-server: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatalf("releasing the reserved port: %v", err)
+	}
+	return port
+}
+
+// startLocalNATSWithConfig spawns the named binary against config/nats.conf.
+//
+// The config pins `port: 4222`, `http_port: 8222` and `store_dir: "/data"`, none of which a test on
+// a developer machine has. The two ports are overridden by command-line flag, which wins over the
+// file; `store_dir` cannot be, because a `-sd` alongside a `jetstream` block that sets it is a
+// "Duplicate 'store_dir' configuration" the server refuses to start on. So the file is copied with
+// that ONE line rewritten and nothing else — every account, user and permission under test is the
+// deployed one, which is the whole point of running against this file rather than a fixture.
+func startLocalNATSWithConfig(t *testing.T, binary, configPath string, environment []string) string {
+	t.Helper()
+	source, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("reading config/nats.conf: %v", err)
+	}
+	store := filepath.Join(t.TempDir(), "jetstream")
+	rewritten := strings.Replace(string(source), `store_dir: "/data"`, `store_dir: "`+store+`"`, 1)
+	if rewritten == string(source) {
+		t.Fatalf(`config/nats.conf no longer contains store_dir: "/data"; this helper needs updating`)
+	}
+	localConfig := filepath.Join(t.TempDir(), "nats.conf")
+	if err := os.WriteFile(localConfig, []byte(rewritten), 0o600); err != nil {
+		t.Fatalf("writing the local copy of nats.conf: %v", err)
+	}
+
+	port := freePort(t)
+	cmd := exec.Command(binary,
+		"-c", localConfig,
+		"-a", "127.0.0.1", "-p", strconv.Itoa(port),
+		"-m", strconv.Itoa(freePort(t)),
+	)
+	cmd.Env = environment
+	var output strings.Builder
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting %s with the platform config: %v", binary, err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+		if t.Failed() {
+			t.Logf("nats-server output:\n%s", output.String())
+		}
+	})
+	return "nats://127.0.0.1:" + strconv.Itoa(port)
+}
+
+// startLocalNATS spawns the named binary and kills it on the way out.
+func startLocalNATS(t *testing.T, binary string, extra ...string) string {
+	t.Helper()
+	port := freePort(t)
+	args := append([]string{
+		"-a", "127.0.0.1", "-p", strconv.Itoa(port),
+		"-js", "-sd", t.TempDir(),
+	}, extra...)
+	cmd := exec.Command(binary, args...)
+	var output strings.Builder
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting %s: %v", binary, err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+		if t.Failed() {
+			t.Logf("nats-server output:\n%s", output.String())
+		}
+	})
+	return "nats://127.0.0.1:" + strconv.Itoa(port)
 }
 
 // startNATS runs a throwaway JetStream server and returns its client URL.
 func startNATS(t *testing.T) string {
 	t.Helper()
+
+	if binary := natsServerBinary(); binary != "" {
+		return waitForJetStream(t, startLocalNATS(t, binary))
+	}
 
 	out, err := exec.Command("docker", "run", "-d", "--rm",
 		"-p", "127.0.0.1::4222", natsImage, "-js").CombinedOutput()
@@ -108,6 +224,12 @@ func startNATS(t *testing.T) string {
 	}
 	url := "nats://" + mapped
 
+	return waitForJetStream(t, url)
+}
+
+// waitForJetStream blocks until the broker answers an AccountInfo, or fails the test.
+func waitForJetStream(t *testing.T, url string) string {
+	t.Helper()
 	// JetStream needs a moment to come up; poll rather than sleep a magic number.
 	deadline := time.Now().Add(60 * time.Second)
 	for {
@@ -356,6 +478,10 @@ type sipClient struct {
 	user   string
 	aor    string
 	callID string
+	// nonceCount is the RFC 2617 `nc`, incremented on every answer this client computes. The
+	// registrar's replay guard accepts a nonce count exactly once per nonce, so a client that
+	// re-sends a previous Authorization header verbatim — as a phone never does — is refused.
+	nonceCount int
 }
 
 func dialSIP(t *testing.T, addr string) *sipClient {
@@ -459,9 +585,10 @@ func (c *sipClient) authenticateAs(res *sip.Response, username, password string)
 	if err != nil {
 		c.t.Fatalf("parsing the challenge: %v", err)
 	}
+	c.nonceCount++
 	answer, err := digest.Digest(challenge, digest.Options{
 		Method: "REGISTER", URI: "sip:" + itRealm,
-		Username: username, Password: password, Count: 1, Cnonce: "0a4f113b",
+		Username: username, Password: password, Count: c.nonceCount, Cnonce: "0a4f113b",
 	})
 	if err != nil {
 		c.t.Fatalf("computing the digest: %v", err)
@@ -483,9 +610,10 @@ func (c *sipClient) answerFor(res *sip.Response, method, uri string) string {
 	if err != nil {
 		c.t.Fatalf("parsing the challenge: %v", err)
 	}
+	c.nonceCount++
 	answer, err := digest.Digest(challenge, digest.Options{
 		Method: method, URI: uri,
-		Username: c.user, Password: itPass, Count: 1, Cnonce: "0a4f113b",
+		Username: c.user, Password: itPass, Count: c.nonceCount, Cnonce: "0a4f113b",
 	})
 	if err != nil {
 		c.t.Fatalf("computing the digest: %v", err)
@@ -686,8 +814,10 @@ func TestDeregisterRemovesTheBinding(t *testing.T) {
 		t.Fatalf("first event = %q", subjectEvent.Type)
 	}
 
-	// Expires: 0 — a phone being powered off, or a user logging out.
-	if res := client.register(authorization, ";expires=0"); res.StatusCode != 200 {
+	// Expires: 0 — a phone being powered off, or a user logging out. Answered afresh, because the
+	// registrar's nonce-count guard accepts each nc once: re-sending the header that registered the
+	// binding is a replay, and a phone increments instead.
+	if res := client.register(client.authenticate(challenge), ";expires=0"); res.StatusCode != 200 {
 		t.Fatalf("de-register = %d %s", res.StatusCode, res.Reason)
 	}
 
@@ -1012,14 +1142,9 @@ func startNATSWithPlatformConfig(t *testing.T) string {
 		t.Fatalf("config/nats.conf is not readable: %v", err)
 	}
 
-	args := []string{
-		"run", "-d", "--rm",
-		"-p", "127.0.0.1::4222",
-		"-v", configPath + ":/etc/nats/nats.conf:ro",
-	}
 	// Every `$NAME` in the file must resolve or the broker refuses to start — which is itself the
-	// behaviour the config's header promises, and is why all ten are passed.
-	for _, pair := range [][2]string{
+	// behaviour the config's header promises, and is why all twelve are passed.
+	credentials := [][2]string{
 		{"NATS_USER", "operator-it"},
 		{"NATS_PASS", itNATSPass},
 		{"NATS_API_USER", "api-it"},
@@ -1032,7 +1157,22 @@ func startNATSWithPlatformConfig(t *testing.T) string {
 		{"NATS_SIPD_PASS", itNATSPass},
 		{"NATS_SYS_USER", "sys-it"},
 		{"NATS_SYS_PASS", itNATSPass},
-	} {
+	}
+
+	if binary := natsServerBinary(); binary != "" {
+		environment := os.Environ()
+		for _, pair := range credentials {
+			environment = append(environment, pair[0]+"="+pair[1])
+		}
+		return waitForSipdLogin(t, startLocalNATSWithConfig(t, binary, configPath, environment))
+	}
+
+	args := []string{
+		"run", "-d", "--rm",
+		"-p", "127.0.0.1::4222",
+		"-v", configPath + ":/etc/nats/nats.conf:ro",
+	}
+	for _, pair := range credentials {
 		args = append(args, "-e", pair[0]+"="+pair[1])
 	}
 	args = append(args, natsImage, "-c", "/etc/nats/nats.conf")
@@ -1053,8 +1193,12 @@ func startNATSWithPlatformConfig(t *testing.T) string {
 		t.Fatalf("docker port: %v\n%s", err, port)
 	}
 	mapped := strings.TrimSpace(strings.Split(strings.TrimSpace(string(port)), "\n")[0])
-	url := "nats://" + mapped
+	return waitForSipdLogin(t, "nats://"+mapped)
+}
 
+// waitForSipdLogin blocks until the broker accepts the sipd account's credentials.
+func waitForSipdLogin(t *testing.T, url string) string {
+	t.Helper()
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		conn, err := nats.Connect(url, nats.UserInfo(itSipdUser, itNATSPass), nats.CustomInboxPrefix("_INBOX.sipd"))

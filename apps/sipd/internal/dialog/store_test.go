@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -293,4 +294,77 @@ func TestIdentityKeysAreInjectionProof(t *testing.T) {
 	if (Identity{SIPCallID: "a", LocalTag: "b"}).Established() {
 		t.Error("a triple with no remote tag is not established")
 	}
+}
+
+// The reaper's heartbeat runs on its own goroutine and a *Dialog is owned by its session's, so
+// Claims must never read a live dialog. Before the store cached rendered claims it did exactly
+// that, and `state`, `OrgID` and `CallID` were read while the owner was writing them — an actual
+// data race, and a torn claim is what the reaper's CDR of last resort is built from.
+func TestClaimsDoNotRaceWithTheOwningGoroutine(t *testing.T) {
+	store := NewStore(StoreOptions{InstanceID: "sipd-test", Now: func() time.Time { return testClock }})
+	sessions := make([]*Session, 0, 8)
+	for index := range 8 {
+		leg := "leg-" + string(rune('a'+index))
+		created, err := New(Options{
+			LegID:    leg,
+			Identity: Identity{SIPCallID: leg + "-call", LocalTag: "l", RemoteTag: "r"},
+			Now:      func() time.Time { return testClock },
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		if err := store.Insert(created); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+		sessions = append(sessions, NewSession(created, SessionOptions{OnUpdate: store.Touch}))
+	}
+	t.Cleanup(func() {
+		for _, session := range sessions {
+			session.Close()
+		}
+	})
+
+	stop := make(chan struct{})
+	var work sync.WaitGroup
+	// The owners mutate exactly the fields a claim is rendered from, through their own mailbox.
+	for index, session := range sessions {
+		work.Add(1)
+		go func() {
+			defer work.Done()
+			for round := 0; ; round++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = session.Inspect(context.Background(), func(d *Dialog) {
+					d.OrgID = "org-" + string(rune('a'+index))
+					d.CallID = "call-" + string(rune('a'+round%26))
+				})
+				_, _ = session.Apply(context.Background(), Input{Trigger: TriggerLocalTrying})
+			}
+		}()
+	}
+	// And the sweep reads them, the way the reaper does.
+	work.Add(1)
+	go func() {
+		defer work.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			for _, claim := range store.Claims() {
+				if claim.LegID == "" {
+					t.Error("a claim was rendered with no leg id")
+					return
+				}
+			}
+		}
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	work.Wait()
 }

@@ -256,7 +256,13 @@ func (e *G722Encoder) Reset() {
 // step, and inventing a companion for it would put a sample the caller never supplied into the
 // stream and leave the two sides one sample apart for the rest of the call.
 func (e *G722Encoder) Encode(samples []int16) []byte {
-	out := make([]byte, 0, len(samples)/2)
+	return e.encodeInto(make([]byte, 0, len(samples)/2), samples)
+}
+
+// encodeInto is Encode writing into a caller-supplied buffer, for the packet path. See
+// Resampler8to16.resampleInto.
+func (e *G722Encoder) encodeInto(dst []byte, samples []int16) []byte {
+	out := dst[:0]
 	for index := 0; index+1 < len(samples); index += 2 {
 		copy(e.x[:22], e.x[2:24])
 		e.x[22] = int32(samples[index])
@@ -370,7 +376,12 @@ func (d *G722Decoder) Reset() {
 
 // Decode converts octets to 16 kHz samples, two samples per octet.
 func (d *G722Decoder) Decode(payload []byte) []int16 {
-	out := make([]int16, 0, len(payload)*2)
+	return d.decodeInto(make([]int16, 0, len(payload)*2), payload)
+}
+
+// decodeInto is Decode writing into a caller-supplied buffer. See Resampler8to16.resampleInto.
+func (d *G722Decoder) decodeInto(dst []int16, payload []byte) []int16 {
+	out := dst[:0]
 	for _, octet := range payload {
 		low := d.decodeLow(int32(octet) & 0x3F)
 		high := d.decodeHigh((int32(octet) >> 6) & 0x03)

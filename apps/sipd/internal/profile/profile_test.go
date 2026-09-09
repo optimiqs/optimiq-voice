@@ -331,3 +331,40 @@ func TestListenerClassification(t *testing.T) {
 		})
 	}
 }
+
+// The DEFAULT configuration: SIPD_EXTERNAL_LISTEN_ADDR is empty, so the external profile has no
+// listener of its own, shares the main socket and is selected by source address alone. Before this
+// was handled the transport step saw exactly one transport-serving profile — the internal one — and
+// every carrier INVITE was answered 401 with a digest challenge no carrier can answer.
+func TestSetForSelectsAListenerlessExternalProfileBySource(t *testing.T) {
+	acl := NewACL([]Entry{mustEntry(t, "203.0.113.0/24", ActionAllow, 0, "trunk-telnyx")})
+	internal := Internal("internal", Listener{Network: "udp", Addr: "0.0.0.0:5060"})
+	external := External("external", acl)
+
+	set, err := NewSet(internal, external)
+	if err != nil {
+		t.Fatalf("NewSet: %v", err)
+	}
+
+	got, err := set.For(request(t, "UDP", "203.0.113.9:5060", ""))
+	if err != nil || got.Name != "external" {
+		t.Fatalf("a carrier INVITE resolved to %q / %v, want the external profile", got.Name, err)
+	}
+	if got.Context != ContextUntrusted {
+		t.Errorf("context = %q, want the untrusted one", got.Context)
+	}
+
+	// The local address still wins: traffic that arrived on the internal socket is internal, even
+	// from an address the carrier ACL allows.
+	got, err = set.For(request(t, "UDP", "203.0.113.9:5060", "0.0.0.0:5060"))
+	if err != nil || got.Name != "internal" {
+		t.Fatalf("For = %q / %v, want the internal profile", got.Name, err)
+	}
+
+	// And a stranger the ACL does not claim still falls to the internal profile, where it is
+	// challenged rather than refused.
+	got, err = set.For(request(t, "UDP", "8.8.8.8:5060", ""))
+	if err != nil || got.Name != "internal" {
+		t.Fatalf("For = %q / %v, want the internal profile", got.Name, err)
+	}
+}

@@ -95,6 +95,9 @@ type JitterStats struct {
 	// Overflowed counts packets discarded because the buffer was already full at its ceiling —
 	// a sender running fast, or a mixer tick that stalled.
 	Overflowed uint64
+	// Resynced counts the times playout JUMPED to the oldest buffered frame because the sequence it
+	// was walking towards was too far away to walk to. See resyncLocked.
+	Resynced uint64
 	// DepthFrames is the current target depth.
 	DepthFrames int
 	// MaxDepthFrames is the deepest the buffer ever had to go.
@@ -231,6 +234,8 @@ func (j *JitterBuffer) Pop() ([]byte, bool) {
 			// catch up to their new packets.
 			j.primed = false
 			j.started = false
+		} else {
+			j.resyncLocked()
 		}
 		return nil, false
 	}
@@ -241,6 +246,32 @@ func (j *JitterBuffer) Pop() ([]byte, bool) {
 	j.stats.Popped++
 	j.comfortTickLocked()
 	return frame, true
+}
+
+// resyncLocked jumps playout to the oldest buffered frame when the gap to it is too wide to walk.
+//
+// The escape hatch above only fires when the buffer is EMPTY, and after a sequence discontinuity —
+// a re-INVITE that restarts the stream, an endpoint that jumps — it never is: the new packets keep
+// arriving and are eventually discarded as Overflowed while `next` steps towards them one frame per
+// 20 ms tick. A gap of a thousand sequence numbers was twenty seconds of silence for that member,
+// heard by everybody in the room. Anything within the buffer's own ceiling is still walked, because
+// that is ordinary loss and stepping through it is what keeps the stream on its clock.
+func (j *JitterBuffer) resyncLocked() {
+	nearest, distance := uint16(0), 0
+	first := true
+	for sequence := range j.pending {
+		// Push refuses anything older than `next`, so every buffered sequence is ahead of it and the
+		// unsigned difference is the real distance, wrap included.
+		gap := int(sequence - j.next)
+		if first || gap < distance {
+			nearest, distance, first = sequence, gap, false
+		}
+	}
+	if first || distance <= jitterMaxFrames*2 {
+		return
+	}
+	j.next = nearest
+	j.stats.Resynced++
 }
 
 // Depth is how many frames are waiting. Exported for the diagnostics and for the suite.

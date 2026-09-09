@@ -274,6 +274,33 @@ func TestReapIdleClosesSessionsWithNoTraffic(t *testing.T) {
 	}
 }
 
+func TestReapIdleCollectsARingingLegThatNeverHeardAnything(t *testing.T) {
+	// A leg that is ringing is answered `inactive`, so the allocate sets BOTH mute gates — and the
+	// reaper used to skip every gated session unconditionally, which meant an engine that crashed
+	// between the allocate and the release leaked that port pair for the life of the process. The
+	// gates say "silence is expected here"; they do not say "this was never a session at all".
+	now := time.Now()
+	manager := newManager(t, 55940, 55959, 30*time.Second, func() time.Time { return now })
+
+	if _, err := manager.Allocate(rtp.AllocateOptions{
+		SessionID: "ringing", OrgID: testOrg, CallID: testCall,
+		AudioPayloadType: rtp.PayloadTypePCMU, Inactive: true, MuteIn: true, MuteOut: true,
+	}); err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	now = now.Add(20 * time.Second)
+	if reaped := manager.ReapIdle(); reaped != 0 {
+		t.Errorf("reaped %d sessions before the idle deadline", reaped)
+	}
+	now = now.Add(20 * time.Second)
+	if reaped := manager.ReapIdle(); reaped != 1 {
+		t.Fatalf("reaped %d abandoned ringing legs, want 1: the port pair is leaked otherwise", reaped)
+	}
+	if manager.Len() != 0 {
+		t.Errorf("Len() = %d after reaping, want 0", manager.Len())
+	}
+}
+
 func TestReapIdleIsDisabledByAZeroTimeout(t *testing.T) {
 	now := time.Now()
 	manager := newManager(t, 56000, 56019, 0, func() time.Time { return now })
@@ -381,6 +408,42 @@ func TestDrainClosesEverythingAndRefusesNewAllocations(t *testing.T) {
 	if err := manager.Drain(ctx); err != nil {
 		t.Errorf("the second Drain returned %v", err)
 	}
+}
+
+func TestDrainReleasesEveryPortEvenPastItsDeadline(t *testing.T) {
+	// The close loop used to be serial AND unable to see the drain context, so a box whose recorders
+	// were finalising onto a wedged mount spent five seconds per session in a loop nothing could
+	// interrupt — well past MEDIAD_SHUTDOWN_TIMEOUT, which exists to bound exactly this. Whatever
+	// the deadline does, no socket may be left open behind it.
+	allocator, err := rtp.NewAllocator(loopback, 56340, 56379)
+	if err != nil {
+		t.Fatalf("NewAllocator: %v", err)
+	}
+	manager, err := rtp.NewManager(rtp.ManagerOptions{
+		Allocator:  allocator,
+		PublicAddr: publicAddr,
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	for _, id := range []string{"a", "b", "c", "d", "e"} {
+		if _, err := manager.Allocate(rtp.AllocateOptions{
+			SessionID: id, OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU,
+		}); err != nil {
+			t.Fatalf("Allocate %q: %v", id, err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the deadline has already landed when the drain starts
+	if err := manager.Drain(ctx); err == nil {
+		t.Error("Drain past its deadline reported success")
+	}
+	if manager.Len() != 0 {
+		t.Errorf("Len() = %d after a drain, want 0", manager.Len())
+	}
+	waitFor(t, "every port pair to come back", func() bool { return allocator.InUse() == 0 })
 }
 
 func netipMustParseStatic(raw string) netip.Addr {

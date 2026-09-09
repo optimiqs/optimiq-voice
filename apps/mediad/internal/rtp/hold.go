@@ -269,12 +269,16 @@ func (m *Manager) Hold(sessionID string, opts HoldOptions) error {
 	if err := session.Hold(opts); err != nil {
 		return err
 	}
-	if opts.MusicRef != "" {
-		// Indexed like any other playback, so `stop-playback` can find the hold loop by reference —
-		// which is what makes `stopMusicOnHold` on a held leg reachable at all.
-		m.mu.Lock()
-		m.playbacks[opts.MusicRef] = sessionID
-		m.mu.Unlock()
+	// Indexed and WATCHED like any other playback, so `stop-playback` can find the hold loop by
+	// reference — which is what makes `stopMusicOnHold` on a held leg reachable at all — and so the
+	// entry goes away when the loop does. Read back from the session rather than assumed from the
+	// options, because a hold whose music failed to start stands without any playback at all
+	// (Session.Hold, which swallows that error by design) and indexing one would leave a reference
+	// pointing at a session that is playing nothing.
+	if session.HoldMusicRef() == opts.MusicRef && opts.MusicRef != "" {
+		if playback := session.ActivePlayback(); playback != nil && playback.Ref() == opts.MusicRef {
+			m.trackPlayback(sessionID, session, opts.MusicRef, playback)
+		}
 	}
 	return nil
 }

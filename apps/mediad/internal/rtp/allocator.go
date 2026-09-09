@@ -118,15 +118,34 @@ func (a *Allocator) InUse() int {
 // A port that cannot be bound — held by Asterisk during the cutover, or by anything else on the
 // host — is skipped, not fatal. Only a full pass over the range with nothing bindable is
 // ErrPortsExhausted.
+//
+// # Why the bind happens outside the lock
+//
+// The reservation is what needs the mutex; the two ListenUDP calls do not. Holding it across them
+// meant that on a near-full range one allocate did up to Capacity()×2 failing syscalls while every
+// other call setup on the instance queued behind it — which is precisely the range shape the
+// Asterisk cutover produces, since the two services are documented as running side by side. The
+// port is marked in-use before the bind and unmarked if it fails, so no two callers can be binding
+// the same port at once and a lost bind costs one skipped port rather than a leaked one.
 func (a *Allocator) Allocate() (*PortPair, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
 	for attempt := 0; attempt < a.Capacity(); attempt++ {
+		a.mu.Lock()
+		if len(a.inUse) == a.Capacity() {
+			// Every pair is ours already. Walking the range to rediscover that would be Capacity()
+			// map lookups for an answer we have in one.
+			err := fmt.Errorf("%w: %d/%d pairs allocated from %d-%d",
+				ErrPortsExhausted, len(a.inUse), a.Capacity(), a.low, a.high)
+			a.mu.Unlock()
+			return nil, err
+		}
 		port := a.cursor
 		a.advanceLocked()
-
-		if _, taken := a.inUse[port]; taken {
+		_, taken := a.inUse[port]
+		if !taken {
+			a.inUse[port] = struct{}{}
+		}
+		a.mu.Unlock()
+		if taken {
 			continue
 		}
 
@@ -134,10 +153,12 @@ func (a *Allocator) Allocate() (*PortPair, error) {
 		if err != nil {
 			// Someone outside this process holds the port. Skipping is the whole reason Allocate
 			// binds rather than counts.
+			a.mu.Lock()
+			delete(a.inUse, port)
+			a.mu.Unlock()
 			continue
 		}
 
-		a.inUse[port] = struct{}{}
 		return &PortPair{
 			Port: port,
 			RTP:  rtpConn,
@@ -149,6 +170,8 @@ func (a *Allocator) Allocate() (*PortPair, error) {
 			},
 		}, nil
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	return nil, fmt.Errorf("%w: %d/%d pairs allocated from %d-%d",
 		ErrPortsExhausted, len(a.inUse), a.Capacity(), a.low, a.high)
 }

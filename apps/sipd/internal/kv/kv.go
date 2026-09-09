@@ -349,6 +349,9 @@ type MemoryStore struct {
 	revision uint64
 	mu       sync.RWMutex
 	bindings map[string]Binding
+	// updates counts Update calls, so a test can assert that a sweep did not spend a round trip on
+	// a binding that is nowhere near its deadline.
+	updates int
 }
 
 var _ Store = (*MemoryStore)(nil)
@@ -365,6 +368,7 @@ func (s *MemoryStore) Update(_ context.Context, orgID, aorHash string, change fu
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.updates++
 	var previous *Binding
 	if value, found := s.bindings[key]; found {
 		previous = &value
@@ -384,6 +388,13 @@ func (s *MemoryStore) Update(_ context.Context, orgID, aorHash string, change fu
 		s.bindings[key] = *next
 	}
 	return previous, next, nil
+}
+
+// Updates reports how many Update calls this store has served.
+func (s *MemoryStore) Updates() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.updates
 }
 
 // Put implements Store.

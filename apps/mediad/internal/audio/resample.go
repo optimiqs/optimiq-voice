@@ -82,7 +82,16 @@ type Resampler8to16 struct {
 
 // Resample converts 8 kHz samples to 16 kHz.
 func (r *Resampler8to16) Resample(in []int16) []int16 {
-	out := make([]int16, 0, len(in)*2)
+	return r.resampleInto(make([]int16, 0, len(in)*2), in)
+}
+
+// resampleInto is Resample writing into a caller-supplied buffer, for the packet path.
+//
+// The transcoder and the mixer run this fifty times a second per leg, and a fresh output slice each
+// time is one of the allocations rung 7's bridge pays for with nothing to show. `dst` is expected
+// zero-length with capacity; it is appended to and returned, so an undersized one still works.
+func (r *Resampler8to16) resampleInto(dst, in []int16) []int16 {
+	out := dst[:0]
 	for _, sample := range in {
 		// Zero-stuffing: one input sample followed by one zero doubles the rate and puts a mirror
 		// image of the signal above 4 kHz, which the kernel below then removes. The factor of two
@@ -107,7 +116,12 @@ type Resampler16to8 struct {
 
 // Resample converts 16 kHz samples to 8 kHz.
 func (r *Resampler16to8) Resample(in []int16) []int16 {
-	out := make([]int16, 0, (len(in)+1)/2)
+	return r.resampleInto(make([]int16, 0, (len(in)+1)/2), in)
+}
+
+// resampleInto is Resample writing into a caller-supplied buffer. See Resampler8to16.resampleInto.
+func (r *Resampler16to8) resampleInto(dst, in []int16) []int16 {
+	out := dst[:0]
 	for _, sample := range in {
 		copy(r.history[:resampleTaps-1], r.history[1:])
 		r.history[resampleTaps-1] = float64(sample)

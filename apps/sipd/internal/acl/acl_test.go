@@ -3,19 +3,25 @@ package acl
 import (
 	"testing"
 
+	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
+
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/profile"
 )
 
 func record(network, action string, priority int, trunkID string) Record {
+	var trunk *string
+	if trunkID != "" {
+		trunk = &trunkID
+	}
 	return Record{
-		ID:      network,
+		OrgID:   "org-test",
 		Network: network,
-		Action:  action,
+		Action:  contract.SIPACLEntryAction(action),
 		Scope:   ScopeTrunk,
 		// Priority is the COLUMN's, "lower first". The inversion into the evaluator's "higher wins"
 		// is this package's job and is exactly what these tests are checking.
 		Priority: priority,
-		TrunkID:  trunkID,
+		TrunkID:  trunk,
 		Enabled:  true,
 	}
 }
@@ -92,10 +98,14 @@ func TestTheMostSpecificPrefixWinsAtEqualPriority(t *testing.T) {
 // let an office reach the provisioning endpoint must not also let it send unauthenticated INVITEs.
 func TestOnlyTheTrunkScopeGovernsINVITEAdmission(t *testing.T) {
 	acl, watcher := newTestWatcher(t, nil)
-	for _, scope := range []string{"registration", "provisioning", "api"} {
+	for _, scope := range []contract.SIPACLEntryScope{
+		contract.SIPACLEntryScopeRegistration,
+		contract.SIPACLEntryScopeProvisioning,
+		contract.SIPACLEntryScopeAPI,
+	} {
 		entry := record("203.0.113.0/24", "allow", 100, "trunk-a")
 		entry.Scope = scope
-		watcher.Put(scope, entry)
+		watcher.Put(string(scope), entry)
 	}
 
 	if acl.Len() != 0 {
@@ -201,5 +211,42 @@ func TestAMatchedAllowCarriesItsTrunkAttribution(t *testing.T) {
 	}
 	if entry.TrunkID != "018f-telnyx" {
 		t.Fatalf("trunkId = %q, want 018f-telnyx", entry.TrunkID)
+	}
+}
+
+// The initial replay arrives as one update per key, so recompiling per key makes loading N entries
+// N recompilations of N entries — quadratic prefix parsing and sorting before the boundary is
+// usable, which is the window in which every carrier is refused.
+func TestSuspendDefersRecompilationUntilResume(t *testing.T) {
+	acl, watcher := newTestWatcher(t, nil)
+
+	watcher.Suspend()
+	for _, network := range []string{"203.0.113.0/24", "198.51.100.0/24", "192.0.2.0/24"} {
+		watcher.Put(network, record(network, "allow", 100, "trunk-a"))
+	}
+	if watcher.Len() != 3 {
+		t.Fatalf("the watcher holds %d records, want 3", watcher.Len())
+	}
+	// Suspended means the ACL is untouched, which is EMPTY rather than half-applied — the safe
+	// direction on this boundary and what it already does before a replay starts.
+	if acl.Len() != 0 {
+		t.Fatalf("the ACL compiled %d entries while suspended", acl.Len())
+	}
+	if _, allowed := acl.Match("203.0.113.7:5060"); allowed {
+		t.Fatal("a suspended watcher admitted traffic")
+	}
+
+	watcher.Resume()
+	if acl.Len() != 3 {
+		t.Fatalf("the ACL compiled %d entries after Resume, want 3", acl.Len())
+	}
+	if _, allowed := acl.Match("203.0.113.7:5060"); !allowed {
+		t.Fatal("the replayed entries never applied")
+	}
+
+	// After the replay, each update recompiles on its own again.
+	watcher.Remove("203.0.113.0/24")
+	if _, allowed := acl.Match("203.0.113.7:5060"); allowed {
+		t.Fatal("a withdrawn entry still admits after a resume")
 	}
 }

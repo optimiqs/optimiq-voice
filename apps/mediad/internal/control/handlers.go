@@ -54,6 +54,9 @@ func (s *Server) HandleAllocateSession(data []byte) []byte {
 		return s.refuseAllocate(request.SessionID, ReasonBadRequest,
 			"orgId is required: it is the subject token this session's lifecycle events are published under")
 	}
+	if message := tenancyRefusal(request.OrgID, request.CallID); message != "" {
+		return s.refuseAllocate(request.SessionID, ReasonBadRequest, message)
+	}
 	if request.SDPOffer == "" {
 		return s.refuseAllocate(request.SessionID, ReasonBadRequest, "sdpOffer is required")
 	}
@@ -255,6 +258,9 @@ func (s *Server) HandleCreateOffer(data []byte) []byte {
 	case request.OrgID == "":
 		return s.refuseCreateOffer(request.SessionID, ReasonBadRequest,
 			"orgId is required: it is the subject token this session's lifecycle events are published under")
+	}
+	if message := tenancyRefusal(request.OrgID, request.CallID); message != "" {
+		return s.refuseCreateOffer(request.SessionID, ReasonBadRequest, message)
 	}
 	if request.Transport != nil && string(*request.Transport) == "webrtc" {
 		return s.createWebRTCOffer(request)
@@ -1135,17 +1141,26 @@ func (s *Server) HandleStartRecording(data []byte) []byte {
 			fmt.Sprintf("no session %s on this instance", request.SessionID))
 	}
 	orgID, callID, _ := s.sessions.SessionTenancy(request.SessionID)
-	if orgID == "" || callID == "" {
-		// Unreachable through the control surface, which refuses an allocate without either. Checked
-		// anyway, because the failure it prevents is a file at `//<ref>.wav` — a path that exists,
-		// is written to, and joins to no object key any consumer will ever look for.
+	if tenancyRefusal(orgID, callID) != "" {
+		// Unreachable through the control surface, which holds both tokens to the same rule at
+		// allocate. Checked again here because this is the call site that turns them into a path:
+		// an empty one gives a file at `//<ref>.wav` that joins to no object key any consumer will
+		// look for, and a dot-segment one writes outside the recordings root altogether.
 		return s.refuseRecording(request.SessionID, request.RecordingRef, ReasonInternal,
-			"this session carries no org or call, so no object key can be derived for it")
+			"this session carries no usable org or call, so no object key can be derived for it")
 	}
 
 	direction := rtp.RecordingDirection(request.Direction)
-	if request.Direction == "" {
+	switch direction {
+	case "":
 		direction = rtp.RecordBoth
+	case rtp.RecordReceive, rtp.RecordBoth:
+	default:
+		// Anything else used to behave as `receive`, so a typo produced HALF a recording reported as
+		// a success. Every other enum on this surface is parsed and refused; this one now is too.
+		return s.refuseRecording(request.SessionID, request.RecordingRef, ReasonBadRequest,
+			fmt.Sprintf("direction %q is not a recording direction: it is %q, %q or absent",
+				request.Direction, rtp.RecordReceive, rtp.RecordBoth))
 	}
 	objectKey := recordingObjectKey(orgID, callID, request.RecordingRef)
 
@@ -1298,6 +1313,22 @@ func recordingObjectKey(orgID, callID, ref string) string {
 // recordingExtension is the only container mediad writes. See the format refusal above.
 const recordingExtension = ".wav"
 
+// tenancyRefusal names the first of org and call that cannot be part of a path, or "" when both
+// can. Both tokens become DIRECTORIES under the recordings root (see recordingObjectKey), so they
+// are held to the same rule as the reference that becomes the filename: `filepath.Join` cleans
+// `../` rather than rejecting it, so an unchecked token escapes the root entirely.
+func tenancyRefusal(orgID, callID string) string {
+	switch {
+	case !isSafeRefToken(orgID):
+		return "orgId must be one token of [A-Za-z0-9._-] with no path separators: it names the " +
+			"top directory a recording for this session lands under"
+	case !isSafeRefToken(callID):
+		return "callId must be one token of [A-Za-z0-9._-] with no path separators: it names a " +
+			"directory a recording for this session lands under"
+	}
+	return ""
+}
+
 // isSafeRefToken reports whether a reference can be part of a filename without escaping its
 // directory. Deliberately narrower than the subject-token rule: a dot is allowed, because
 // references are UUIDs today and could reasonably carry one, but `..` and every separator are not.
@@ -1323,15 +1354,6 @@ func millis(value *int) time.Duration {
 		return 0
 	}
 	return time.Duration(*value) * time.Millisecond
-}
-
-// codecOf names a G.711 payload type. Anything else cannot reach here — a session is only ever
-// created with a type ParseOffer resolved — so PCMU is the unreachable default rather than a guess.
-func codecOf(payloadType uint8) sdp.Codec {
-	if payloadType == rtp.PayloadTypePCMA {
-		return sdp.CodecPCMA
-	}
-	return sdp.CodecPCMU
 }
 
 func derefString(value *string) string {

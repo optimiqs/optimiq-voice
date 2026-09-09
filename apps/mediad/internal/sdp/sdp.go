@@ -418,7 +418,7 @@ type Answer struct {
 //	v=0                     RFC 4566 requires it and there is no other version.
 //	o=- <id> <ver> IN IP4 … The origin's address is the PUBLIC one: some far ends key on it.
 //	s=-                     No session name. `-` is the RFC's own "not applicable".
-//	c=IN IP4 <public>       Where to send RTP.
+//	c=IN IP4 <public>       Where to send RTP. IP6 when the public address is one — see addrType.
 //	t=0 0                   Unbounded — a call has no scheduled start or stop.
 //	m=audio <port> RTP/AVP … ONE codec, plus telephone-event when it was offered. Answering with a
 //	                        list would be answering with a question.
@@ -442,10 +442,10 @@ func BuildAnswer(answer Answer) string {
 
 	var body strings.Builder
 	body.WriteString("v=0\r\n")
-	fmt.Fprintf(&body, "o=- %d %d IN IP4 %s\r\n",
-		answer.SessionID, answer.SessionVersion, answer.Address)
+	fmt.Fprintf(&body, "o=- %d %d IN %s %s\r\n",
+		answer.SessionID, answer.SessionVersion, addrType(answer.Address), addrLiteral(answer.Address))
 	body.WriteString("s=-\r\n")
-	fmt.Fprintf(&body, "c=IN IP4 %s\r\n", answer.Address)
+	fmt.Fprintf(&body, "c=IN %s %s\r\n", addrType(answer.Address), addrLiteral(answer.Address))
 	body.WriteString("t=0 0\r\n")
 	fmt.Fprintf(&body, "m=audio %d RTP/AVP %s\r\n", port, formats)
 	if answer.Codec == CodecOpus {
@@ -525,10 +525,10 @@ func BuildOffer(offer OfferParams) string {
 
 	var body strings.Builder
 	body.WriteString("v=0\r\n")
-	fmt.Fprintf(&body, "o=- %d %d IN IP4 %s\r\n",
-		offer.SessionID, offer.SessionVersion, offer.Address)
+	fmt.Fprintf(&body, "o=- %d %d IN %s %s\r\n",
+		offer.SessionID, offer.SessionVersion, addrType(offer.Address), addrLiteral(offer.Address))
 	body.WriteString("s=-\r\n")
-	fmt.Fprintf(&body, "c=IN IP4 %s\r\n", offer.Address)
+	fmt.Fprintf(&body, "c=IN %s %s\r\n", addrType(offer.Address), addrLiteral(offer.Address))
 	body.WriteString("t=0 0\r\n")
 	fmt.Fprintf(&body, "m=audio %d RTP/AVP %s\r\n", offer.Port, strings.Join(formats, " "))
 	// One rtpmap per audio codec, spelled out even for the static types: an endpoint that reads
@@ -584,4 +584,24 @@ func ParseDirection(raw string) (Direction, error) {
 	default:
 		return "", fmt.Errorf("sdp: unknown media direction %q", raw)
 	}
+}
+
+// addrType names an address's SDP addrtype.
+//
+// Hard-coded `IP4` was a latent 100%-call-failure bug rather than a simplification: config.Load
+// accepts any IP for MEDIAD_PUBLIC_IP, only the WebRTC path insists on v4, and an IPv6 address
+// emitted under an `IN IP4` addrtype is malformed SDP that every conformant far end rejects one hop
+// away — with no complaint at boot. An IPv4-mapped v6 address is still IP4: what goes on the wire
+// is its dotted form.
+func addrType(address netip.Addr) string {
+	if address.Is6() && !address.Is4In6() {
+		return "IP6"
+	}
+	return "IP4"
+}
+
+// addrLiteral is the address as it belongs on an SDP line: a v4-mapped v6 address in its dotted
+// form, so `IN IP4 ::ffff:203.0.113.10` — an addrtype and a literal that disagree — cannot happen.
+func addrLiteral(address netip.Addr) string {
+	return address.Unmap().String()
 }

@@ -17,8 +17,15 @@
 //
 // # The evaluation rule, stated once
 //
-// Lowest `priority` first, ties broken by the most specific prefix, first match wins — and an
-// address matching NOTHING is REFUSED. The last clause is the whole boundary: there is no default
+// MOST SPECIFIC PREFIX first — a /32 beats a /24 whatever their priorities — then priority (lowest
+// `sip_acl_entry.priority` first, which is what the inversion below makes "higher wins"
+// downstream), then deny before allow at equal specificity and priority; first match wins. And an
+// address matching NOTHING is REFUSED.
+//
+// Specificity outranking priority is worth stating plainly, because the other reading changes
+// answers: `deny 203.0.113.0/24 priority 1` plus `allow 203.0.113.7/32 priority 100` ALLOWS
+// 203.0.113.7. The evaluator is profile.ACL.store and it is the authority; this sentence describes
+// it rather than the other way round. The last clause is the whole boundary: there is no default
 // allow anywhere in this package or in internal/profile, and there is no constructor that could
 // introduce one.
 //
@@ -50,67 +57,47 @@ import (
 // apart IS the anti-toll-fraud boundary, in the column's own words. An entry written to let an
 // office's address reach the provisioning endpoint must not also let it send unauthenticated
 // INVITEs, and the only thing standing between those two is this filter.
-const ScopeTrunk = "trunk"
+const ScopeTrunk = contract.SIPACLEntryScopeTrunk
 
 // Record is one entry as the `sip-acl` bucket holds it.
 //
-// # A hand-written mirror, and the gap that makes it one
-//
-// `contract.SIPACLKV` defines the bucket and `contract.SIPACLKVKey` defines the key transformation.
-// Neither packages/events nor packages/events-go defines the VALUE — there is no `sipAclEntrySchema`
-// beside `registrationBindingSchema` — so this struct is a hand-written mirror of the columns in
-// `packages/pbx-db/src/schema/security-schema.ts`, and the agreement between the writer in apps/api
-// and this reader is a convention rather than a contract. Recorded rather than hidden; the field
-// names are the column names verbatim so a mismatch is visible by eye.
-type Record struct {
-	ID             string `json:"id"`
-	OrganizationID string `json:"organizationId"`
-	Name           string `json:"name,omitempty"`
-	// Network is the CIDR, exactly as PostgreSQL's `cidr` type normalised it on the way in.
-	Network string `json:"network"`
-	Action  string `json:"action"`
-	Scope   string `json:"scope"`
-	// Priority is the column's, "lower first". See priorityOf for the inversion.
-	Priority int `json:"priority"`
-	// TrunkID attributes an allow to a carrier, which is what turns "this packet may enter" into
-	// "this packet is Telnyx" — the attribution an INVITE from an unauthenticated source needs before
-	// the engine can be asked whose call it is.
-	//
-	// Design §8.2 records that `sip_acl_entry` has no such column yet and that slice 3 needs either a
-	// `trunk_acl` child table or a `trunkId` column here. It is read optimistically: an entry without
-	// one still ADMITS the call, and the engine attributes it from the did-index as it does today.
-	TrunkID     string `json:"trunkId,omitempty"`
-	Description string `json:"description,omitempty"`
-	Enabled     bool   `json:"enabled"`
-}
+// It is the GENERATED contract type — packages/events' `sipAclEntrySchema`, emitted into
+// packages/events-go as `SIPACLEntry` — aliased so this package can keep calling it what the bucket
+// calls it. An alias and not a copy: the writer in apps/api projects the same schema, so the field
+// names here are the contract's rather than a convention this reader hopes still holds.
+type Record = contract.SIPACLEntry
 
-// Entry compiles the record into an evaluator entry, or reports why it cannot.
-func (r Record) Entry() (profile.Entry, error) {
-	action := profile.Action(strings.ToLower(strings.TrimSpace(r.Action)))
+// compile turns the record into an evaluator entry, or reports why it cannot.
+func compile(r Record) (profile.Entry, error) {
+	action := profile.Action(strings.ToLower(strings.TrimSpace(string(r.Action))))
 	if !action.Valid() {
 		return profile.Entry{}, fmt.Errorf("acl: %q is not a valid action", r.Action)
 	}
-	return profile.ParseEntry(r.Network, action, priorityOf(r.Priority), r.TrunkID, r.label())
+	return profile.ParseEntry(r.Network, action, priorityOf(r.Priority), deref(r.TrunkID), label(r))
 }
 
-func (r Record) label() string {
-	switch {
-	case r.Name != "":
-		return r.Name
-	case r.Description != "":
-		return r.Description
-	default:
-		return contract.SIPACLKV.Name
+// label names the entry in a log line and in profile.Entry.Label.
+func label(r Record) string {
+	if name := deref(r.Name); name != "" {
+		return name
 	}
+	return contract.SIPACLKV.Name
 }
 
-// Applies reports whether this entry governs unauthenticated INVITE admission.
+func deref(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+// applies reports whether this entry governs unauthenticated INVITE admission.
 //
 // Two conditions and both are refusals rather than filters: a DISABLED entry is one an operator
 // switched off, and an entry in another SCOPE governs a different surface entirely. Treating either
 // as an allow here is how an ACL written for the admin API becomes a carrier trunk.
-func (r Record) Applies() bool {
-	return r.Enabled && strings.ToLower(strings.TrimSpace(r.Scope)) == ScopeTrunk
+func applies(r Record) bool {
+	return r.Enabled && strings.ToLower(strings.TrimSpace(string(r.Scope))) == string(ScopeTrunk)
 }
 
 // priorityOf inverts the column's ordering into the evaluator's.
@@ -136,6 +123,10 @@ type Watcher struct {
 	// overrides are entries from configuration rather than from the bucket. They are recompiled
 	// alongside every update so a static entry is not lost the first time the bucket changes.
 	overrides []profile.Entry
+	// suspended defers recompilation while a batch of records is being applied, and deferred says
+	// one was skipped. See Suspend.
+	suspended bool
+	deferred  bool
 }
 
 // NewWatcher builds a watcher over an ACL.
@@ -168,21 +159,61 @@ func (w *Watcher) Len() int {
 	return len(w.records)
 }
 
+// Suspend defers recompilation until Resume, for a batch of records that arrives as many updates.
+//
+// The initial replay is that batch: WatchAll delivers every existing key one at a time, and
+// recompiling per key makes loading N entries N recompilations of N entries — O(N² log N) prefix
+// parses and sorts before the boundary is usable, which is the window in which carriers are refused.
+// The ACL is unchanged while suspended, so it stays EMPTY rather than half-applied, which on this
+// boundary is the safe direction and is what it already does before the replay starts.
+func (w *Watcher) Suspend() {
+	w.mu.Lock()
+	w.suspended = true
+	w.mu.Unlock()
+}
+
+// Resume ends a Suspend and recompiles once if anything changed in the meantime.
+func (w *Watcher) Resume() {
+	w.mu.Lock()
+	w.suspended = false
+	pending := w.deferred
+	w.deferred = false
+	w.mu.Unlock()
+	if pending {
+		w.recompile()
+	}
+}
+
 // Put installs or replaces one record and recompiles. Exported so a test and a watch update take
 // the same path.
 func (w *Watcher) Put(key string, record Record) {
 	w.mu.Lock()
 	w.records[key] = record
+	held := w.hold()
 	w.mu.Unlock()
-	w.recompile()
+	if !held {
+		w.recompile()
+	}
 }
 
 // Remove drops one record and recompiles.
 func (w *Watcher) Remove(key string) {
 	w.mu.Lock()
 	delete(w.records, key)
+	held := w.hold()
 	w.mu.Unlock()
-	w.recompile()
+	if !held {
+		w.recompile()
+	}
+}
+
+// hold records that a recompilation is owed and reports whether it was deferred. Called with the
+// lock held.
+func (w *Watcher) hold() bool {
+	if w.suspended {
+		w.deferred = true
+	}
+	return w.suspended
 }
 
 // recompile rebuilds the whole entry set and swaps it in.
@@ -210,10 +241,10 @@ func (w *Watcher) recompile() {
 	entries = append(entries, overrides...)
 	skipped := 0
 	for index, record := range records {
-		if !record.Applies() {
+		if !applies(record) {
 			continue
 		}
-		entry, err := record.Entry()
+		entry, err := compile(record)
 		if err != nil {
 			skipped++
 			w.log.Error("ignoring an unusable sip-acl entry", "key", keys[index], "error", err)
@@ -264,9 +295,14 @@ func Watch(ctx context.Context, bucket jetstream.KeyValue, watcher *Watcher) (<-
 		return nil, fmt.Errorf("acl: watching the %s bucket: %w", contract.SIPACLKV.Name, err)
 	}
 
+	// The replay is one batch, not N edits: recompiling per key would be quadratic in the number of
+	// entries and every carrier is refused until it finishes.
+	watcher.Suspend()
+
 	ready := make(chan struct{})
 	go func() {
 		defer func() { _ = updates.Stop() }()
+		defer watcher.Resume()
 		settled := false
 		closeReady := func() {
 			if !settled {
@@ -285,6 +321,7 @@ func Watch(ctx context.Context, bucket jetstream.KeyValue, watcher *Watcher) (<-
 					return
 				}
 				if entry == nil {
+					watcher.Resume()
 					watcher.log.Info("sip acl loaded",
 						"bucket", contract.SIPACLKV.Name,
 						"records", watcher.Len(),

@@ -40,6 +40,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -88,6 +89,9 @@ type Options struct {
 	// half of it or less — so a heartbeat has more than one chance to land through a broker blip
 	// before a neighbour declares this instance dead and reaps its live calls.
 	Interval time.Duration
+	// ReapInterval is how often the REAP half runs, which is deliberately not every sweep. Zero
+	// means twice the heartbeat interval. See Reaper.Sweep.
+	ReapInterval time.Duration
 	// Timeout bounds one sweep's I/O.
 	Timeout time.Duration
 	Logger  *slog.Logger
@@ -102,9 +106,12 @@ type Reaper struct {
 	events   sipevents.Publisher
 	instance string
 	interval time.Duration
-	timeout  time.Duration
-	log      *slog.Logger
-	now      func() time.Time
+	// reapInterval and nextReap gate the bucket listing. See Sweep.
+	reapInterval time.Duration
+	nextReap     time.Time
+	timeout      time.Duration
+	log          *slog.Logger
+	now          func() time.Time
 }
 
 // New validates the options and builds a Reaper.
@@ -122,14 +129,15 @@ func New(opts Options) (*Reaper, error) {
 			"bucket looks like somebody else's and this process would reap its own calls")
 	}
 	reaper := &Reaper{
-		store:    opts.Store,
-		dialogs:  opts.Dialogs,
-		events:   opts.Events,
-		instance: opts.InstanceID,
-		interval: opts.Interval,
-		timeout:  opts.Timeout,
-		log:      opts.Logger,
-		now:      opts.Now,
+		store:        opts.Store,
+		dialogs:      opts.Dialogs,
+		events:       opts.Events,
+		instance:     opts.InstanceID,
+		interval:     opts.Interval,
+		reapInterval: opts.ReapInterval,
+		timeout:      opts.Timeout,
+		log:          opts.Logger,
+		now:          opts.Now,
 	}
 	if reaper.interval <= 0 {
 		// Thirty seconds against the store's ninety-second default lease: three chances to land a
@@ -144,6 +152,9 @@ func New(opts Options) (*Reaper, error) {
 	}
 	if reaper.now == nil {
 		reaper.now = time.Now
+	}
+	if reaper.reapInterval <= 0 {
+		reaper.reapInterval = 2 * reaper.interval
 	}
 	return reaper, nil
 }
@@ -171,11 +182,31 @@ func (r *Reaper) Run(ctx context.Context) error {
 
 // Sweep runs one heartbeat-and-reap pass. It is exported so a test can drive it without a ticker,
 // and so a shutdown path can run one final pass.
+// # Why the reap half does not run on every sweep
+//
+// The heartbeat is O(this instance's dialogs) and is a write per live call, which is what the
+// interval is sized for. The reap is O(the WHOLE FLEET's dialogs) — `All` reads every claim in the
+// bucket — and every instance pays it, so the cost is instances × fleet-wide dialogs per interval
+// and it grows quadratically with cluster size. Ten instances holding five thousand calls between
+// them is fifty thousand KV Gets every interval, all but a handful discarded.
+//
+// So the listing runs on its own, longer interval, with a random phase so a fleet's reap sweeps do
+// not align. What it costs is latency on a CDR of last resort — a claim whose owner died is
+// published one reap interval later than it would have been — and that is the right thing to trade,
+// because the claim's own lease is what decides whether it is an orphan, not when we look.
 func (r *Reaper) Sweep(ctx context.Context) {
 	sweepCtx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
 	r.heartbeat(sweepCtx)
+	now := r.now()
+	if now.Before(r.nextReap) {
+		return
+	}
+	// Jittered so N instances that started together do not list the bucket in the same millisecond
+	// for ever after, which is the thundering herd the interval alone would leave in place.
+	jitter := time.Duration(rand.Int64N(int64(r.reapInterval) / 4))
+	r.nextReap = now.Add(r.reapInterval - r.reapInterval/8 + jitter)
 	r.reap(sweepCtx)
 }
 

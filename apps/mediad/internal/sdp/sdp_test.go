@@ -414,3 +414,28 @@ func TestParseDirection(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildersNameTheAddressTypeTheyActuallyEmit(t *testing.T) {
+	// `IN IP4` was hard-coded in both builders while config.Load accepts any IP for
+	// MEDIAD_PUBLIC_IP, so an IPv6-only deployment emitted an IPv6 address under an IPv4 addrtype —
+	// malformed SDP that fails one hop away rather than at boot.
+	v6 := netip.MustParseAddr("2001:db8::10")
+	answer := sdp.BuildAnswer(sdp.Answer{
+		SessionID: 1, SessionVersion: 1, Address: v6, Port: 30002,
+		Codec: sdp.CodecPCMU, Direction: sdp.DirectionSendRecv,
+	})
+	for _, line := range []string{"o=- 1 1 IN IP6 2001:db8::10", "c=IN IP6 2001:db8::10"} {
+		if !strings.Contains(answer, line+"\r\n") {
+			t.Errorf("the answer is missing %q\n---\n%s", line, answer)
+		}
+	}
+
+	// A v4-in-v6 address is still IP4: what goes on the wire is its dotted form.
+	mapped := sdp.BuildAnswer(sdp.Answer{
+		SessionID: 1, SessionVersion: 1, Address: netip.MustParseAddr("::ffff:203.0.113.10"),
+		Port: 30002, Codec: sdp.CodecPCMU, Direction: sdp.DirectionSendRecv,
+	})
+	if !strings.Contains(mapped, "c=IN IP4 203.0.113.10\r\n") {
+		t.Errorf("a v4-mapped address was not answered as IP4\n---\n%s", mapped)
+	}
+}

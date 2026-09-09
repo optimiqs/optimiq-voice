@@ -51,6 +51,14 @@ type Store struct {
 	// byEarly maps a Call-ID plus our own tag to a legId, for the window before the far end's tag
 	// is known. A UAC's CANCEL, its Timer B and its 100 all land in that window.
 	byEarly map[string]string
+	// claims is the rendered Claim per legId, kept as a VALUE under this lock.
+	//
+	// It exists because the heartbeat sweep runs on the reaper's goroutine and a *Dialog is owned
+	// by its session's. Rendering a claim off the dialog there would read `state`, `OrgID`,
+	// `CallID` and `Identity` while the owner is writing them — an actual data race, and a torn
+	// `state` is what the reaper's CDR-of-last-resort would then be built from. So the claim is
+	// rendered by the OWNER (Insert, Rebind, Touch) and the sweep only ever copies values out.
+	claims map[string]Claim
 
 	instanceID string
 	lease      time.Duration
@@ -75,6 +83,7 @@ func NewStore(opts StoreOptions) *Store {
 		byLeg:      make(map[string]*Dialog),
 		byIdentity: make(map[string]string),
 		byEarly:    make(map[string]string),
+		claims:     make(map[string]Claim),
 		instanceID: opts.InstanceID,
 		lease:      opts.Lease,
 		now:        opts.Now,
@@ -106,6 +115,7 @@ func (s *Store) Insert(dialog *Dialog) error {
 	}
 	s.byLeg[dialog.LegID] = dialog
 	s.index(dialog)
+	s.claims[dialog.LegID] = s.claimFor(dialog)
 	return nil
 }
 
@@ -134,7 +144,27 @@ func (s *Store) Rebind(legID string, identity Identity) error {
 	delete(s.byIdentity, dialog.Identity.Key())
 	dialog.Identity = identity
 	s.index(dialog)
+	s.claims[legID] = s.claimFor(dialog)
 	return nil
+}
+
+// Touch re-renders a dialog's cached claim.
+//
+// It MUST be called from the goroutine that owns the dialog — that is the whole point of it: the
+// read of the dialog's fields happens on the owner, and only the resulting value crosses the lock.
+// The session calls it after every task, and the INVITE handler calls it whenever it writes the
+// claim out to the bucket.
+func (s *Store) Touch(dialog *Dialog) {
+	if dialog == nil {
+		return
+	}
+	claim := s.claimFor(dialog)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, held := s.byLeg[dialog.LegID]; !held {
+		return
+	}
+	s.claims[dialog.LegID] = claim
 }
 
 // Get looks a dialog up by its leg id, which is the only key.
@@ -237,6 +267,7 @@ func (s *Store) Remove(legID string) {
 		return
 	}
 	delete(s.byLeg, legID)
+	delete(s.claims, legID)
 	delete(s.byIdentity, dialog.Identity.Key())
 	delete(s.byEarly, dialog.Identity.EarlyKey())
 }
@@ -305,8 +336,11 @@ func (c Claim) Expired(now time.Time) bool {
 	return now.UnixMilli() >= c.ExpiresAt
 }
 
-// ClaimFor renders the current claim for a dialog this instance holds.
-func (s *Store) ClaimFor(dialog *Dialog) Claim {
+// ClaimFor renders the current claim for a dialog this instance holds. It reads the dialog, so it
+// runs on the goroutine that owns it and never on the sweep's.
+func (s *Store) ClaimFor(dialog *Dialog) Claim { return s.claimFor(dialog) }
+
+func (s *Store) claimFor(dialog *Dialog) Claim {
 	now := s.now()
 	return Claim{
 		LegID:         dialog.LegID,
@@ -327,19 +361,21 @@ func (s *Store) ClaimFor(dialog *Dialog) Claim {
 	}
 }
 
-// Claims renders every live dialog's claim, for the heartbeat sweep.
+// Claims returns a copy of every live dialog's claim, for the heartbeat sweep.
+//
+// It copies VALUES the owning goroutines rendered rather than reading the dialogs themselves; see
+// the `claims` field. The lease deadline is stamped fresh here, because the heartbeat's job is to
+// extend it and the cached one is as old as the last state change.
 func (s *Store) Claims() []Claim {
+	expires := s.now().Add(s.lease).UnixMilli()
 	s.mu.RLock()
-	dialogs := make([]*Dialog, 0, len(s.byLeg))
-	for _, dialog := range s.byLeg {
-		dialogs = append(dialogs, dialog)
+	claims := make([]Claim, 0, len(s.claims))
+	for _, claim := range s.claims {
+		claim.ExpiresAt = expires
+		claims = append(claims, claim)
 	}
 	s.mu.RUnlock()
 
-	claims := make([]Claim, 0, len(dialogs))
-	for _, dialog := range dialogs {
-		claims = append(claims, s.ClaimFor(dialog))
-	}
 	sort.Slice(claims, func(i, j int) bool { return claims[i].LegID < claims[j].LegID })
 	return claims
 }

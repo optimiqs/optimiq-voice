@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/emiago/sipgo/sip"
@@ -32,13 +33,22 @@ import (
 //
 //	nonce = <expiryUnixHex> "." <random16Hex> "." <hmacSHA256(secret, expiry "." random)[:16]Hex>
 //
-// # What this does NOT do
+// # Replay, and why there is per-instance nonce-count state after all
 //
-// Nonce-count replay protection. Tracking nc per nonce is precisely the shared state the design
-// removes, and it buys little here: the nonce TTL is a minute, the transport should be TLS on any
-// untrusted network, and a replayed REGISTER re-binds the same contact for the same device. Real
-// mitigation for credential attacks is rate limiting plus the anti-fraud consumer on the
-// REGISTRATIONS stream, which is a control-plane concern (plan §5 T1), not a registrar one.
+// The digest covers the method, the request URI and the nonce. It does NOT cover the Contact. So a
+// replayed Authorization header is not "the same device re-binding the same contact": within the
+// nonce TTL an observer on an unencrypted transport can resend the identical credentials in a
+// REGISTER carrying THEIR contact, and inbound calls for the victim fork to the attacker. The
+// stale-CSeq guard in contacts.go does not catch it, because it only fires for the same contact URI.
+//
+// The fix is the RFC 2617 §3.2.1 nonce count: a nonce may be answered with a given nc exactly once,
+// and a legitimate re-REGISTER increments it. That is per-instance, best-effort state — an answer
+// load-balanced to an instance that has not seen the nonce is accepted on its first use there — so
+// it narrows the replay window rather than closing it, and TLS remains the real boundary on an
+// untrusted network. It costs one bounded map and it removes the trivial single-instance attack.
+//
+// Still NOT here: rate limiting and credential-stuffing detection, which are the anti-fraud
+// consumer's job on the REGISTRATIONS stream (plan §5 T1), not a registrar one.
 
 // Digest failure modes. The registrar maps these to SIP statuses; they are distinct types so the
 // mapping lives in one place and so tests can assert the reason, not the status.
@@ -59,6 +69,15 @@ var (
 	ErrBadResponse = errors.New("registrar: digest response mismatch")
 	// ErrMalformedAuthorization means the header could not be parsed.
 	ErrMalformedAuthorization = errors.New("registrar: malformed Authorization header")
+	// ErrNonceReplayed means this nonce has already been answered with that nonce count. It wraps
+	// ErrNonceStale so every caller re-challenges with stale=true: the honest device whose nc we
+	// have already seen retries silently against a fresh nonce, and the replayer has nothing to
+	// answer the new challenge with.
+	ErrNonceReplayed = errors.New("registrar: nonce count replayed")
+	// ErrQOPUnsupported means the answer used a quality-of-protection the challenge did not offer.
+	// The challenge always advertises qop="auth"; accepting the RFC 2069 form against it is a
+	// downgrade an attacker chooses, not a compatibility the device needs.
+	ErrQOPUnsupported = errors.New("registrar: unsupported qop")
 )
 
 // Authenticator mints and verifies digest challenges for one realm.
@@ -67,6 +86,9 @@ type Authenticator struct {
 	secret []byte
 	ttl    time.Duration
 	now    func() time.Time
+	// nonces is the replay guard, SHARED with every per-realm authenticator ForRequest derives, so
+	// a fleet of domains does not become a fleet of empty guards.
+	nonces *nonceGuard
 }
 
 // NewAuthenticator builds an authenticator. An empty secret is replaced by 32 random bytes, which
@@ -84,7 +106,9 @@ func NewAuthenticator(realm string, secret []byte, ttl time.Duration) (*Authenti
 			return nil, fmt.Errorf("registrar: generating a nonce secret: %w", err)
 		}
 	}
-	return &Authenticator{realm: realm, secret: secret, ttl: ttl, now: time.Now}, nil
+	authenticator := &Authenticator{realm: realm, secret: secret, ttl: ttl, now: time.Now}
+	authenticator.nonces = newNonceGuard(func() time.Time { return authenticator.now() })
+	return authenticator, nil
 }
 
 // Realm returns the realm this authenticator challenges for.
@@ -107,7 +131,7 @@ func (a *Authenticator) ForRequest(req *sip.Request) *Authenticator {
 	}
 	mac := hmac.New(sha256.New, a.secret)
 	mac.Write([]byte("sip-realm\x00" + realm))
-	return &Authenticator{realm: realm, secret: mac.Sum(nil), ttl: a.ttl, now: a.now}
+	return &Authenticator{realm: realm, secret: mac.Sum(nil), ttl: a.ttl, now: a.now, nonces: a.nonces}
 }
 
 // VerifyRequest binds the digest to the actual request URI as well as its method and realm.
@@ -224,6 +248,12 @@ func (a *Authenticator) Verify(method string, auth Authorization, ha1 string) er
 		// top-5 vendor catalogue; accepting them silently as MD5 would be worse than refusing.
 		return fmt.Errorf("%w: %s", ErrUnsupportedAlgorithm, auth.Algorithm)
 	}
+	// The challenge offers qop="auth" and nothing else, so anything else is a downgrade: RFC 2617
+	// §3.2.2 requires the client to use a qop the server offered, and the RFC 2069 form the legacy
+	// branch would compute carries no client nonce and no nonce count to replay-guard with.
+	if auth.QOP != "auth" {
+		return fmt.Errorf("%w: %q", ErrQOPUnsupported, auth.QOP)
+	}
 	if err := a.CheckNonce(auth.Nonce); err != nil {
 		return err
 	}
@@ -232,7 +262,77 @@ func (a *Authenticator) Verify(method string, auth Authorization, ha1 string) er
 	if subtle.ConstantTimeCompare([]byte(expected), []byte(auth.Response)) != 1 {
 		return ErrBadResponse
 	}
+	// Last, and only once the credentials are known good: a wrong password must not be able to burn
+	// a nonce count the honest device is about to use.
+	return a.nonces.accept(auth.Nonce, auth.NC, nonceExpiry(auth.Nonce))
+}
+
+// nonceGuard records the highest nonce count accepted for each live nonce.
+//
+// It is bounded and best-effort by construction: entries are dropped once their nonce cannot be
+// valid any more, and a guard that has filled up is emptied rather than grown, because a full guard
+// means somebody is minting nonces faster than they expire and the alternative is an attacker
+// choosing this process's memory ceiling.
+type nonceGuard struct {
+	mu   sync.Mutex
+	seen map[string]nonceUse
+	max  int
+	now  func() time.Time
+}
+
+type nonceUse struct {
+	nc      int
+	expires time.Time
+}
+
+func newNonceGuard(now func() time.Time) *nonceGuard {
+	return &nonceGuard{seen: make(map[string]nonceUse), max: 10000, now: now}
+}
+
+// accept records the nonce count and refuses one that is not strictly greater than the last.
+func (g *nonceGuard) accept(nonce string, nc int, expires time.Time) error {
+	if nc <= 0 {
+		// No nonce count at all is a header that cannot be replay-guarded, and the challenge asked
+		// for one. Treated as a replay so the device re-answers a fresh challenge properly.
+		return fmt.Errorf("%w: %w", ErrNonceStale, ErrNonceReplayed)
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if previous, seen := g.seen[nonce]; seen && nc <= previous.nc {
+		return fmt.Errorf("%w: %w", ErrNonceStale, ErrNonceReplayed)
+	}
+	if len(g.seen) >= g.max {
+		g.sweepLocked()
+	}
+	g.seen[nonce] = nonceUse{nc: nc, expires: expires}
 	return nil
+}
+
+// sweepLocked drops every nonce that has expired, and everything if that was not enough.
+func (g *nonceGuard) sweepLocked() {
+	now := g.now()
+	for nonce, use := range g.seen {
+		if !use.expires.After(now) {
+			delete(g.seen, nonce)
+		}
+	}
+	if len(g.seen) >= g.max {
+		g.seen = make(map[string]nonceUse)
+	}
+}
+
+// nonceExpiry reads the deadline out of a nonce this fleet minted. A nonce that does not parse
+// never reaches here, because CheckNonce runs first.
+func nonceExpiry(nonce string) time.Time {
+	head, _, found := strings.Cut(nonce, ".")
+	if !found {
+		return time.Time{}
+	}
+	seconds, err := strconv.ParseInt(head, 16, 64)
+	if err != nil {
+		return time.Time{}
+	}
+	return time.Unix(seconds, 0)
 }
 
 // digestResponse implements RFC 2617 §3.2.2.1, both the qop=auth and the legacy no-qop forms.

@@ -285,6 +285,12 @@ func run() error {
 	if err := manager.Drain(drainCtx); err != nil {
 		log.Warn("draining sessions timed out; exiting anyway", "error", err)
 	}
+	// The events the drain just produced are handed off, not sent. Returning here would run the
+	// deferred conn.Drain() and then exit under them, losing the `session.ended` for every call this
+	// instance was carrying — the one event the engine cannot reconstruct from anywhere else.
+	if !announcer.Wait(drainCtx) {
+		log.Warn("lifecycle events were still in flight at the shutdown deadline; some may be lost")
+	}
 
 	group.Wait()
 	log.Info("stopped")

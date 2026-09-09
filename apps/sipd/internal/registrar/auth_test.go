@@ -324,3 +324,106 @@ func TestNewAuthenticatorRejectsBadInput(t *testing.T) {
 		t.Errorf("generated secret is %d bytes, want 32", len(generated.secret))
 	}
 }
+
+func answerCount(t *testing.T, challenge string, method, uri, password string, count int) Authorization {
+	t.Helper()
+	parsed, err := digest.ParseChallenge(challenge)
+	if err != nil {
+		t.Fatalf("a real client cannot parse our challenge: %v", err)
+	}
+	credential, err := digest.Digest(parsed, digest.Options{
+		Method:   method,
+		URI:      uri,
+		Username: authUser,
+		Password: password,
+		Count:    count,
+		Cnonce:   "0a4f113b",
+	})
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	authorization, err := ParseAuthorization(credential.String())
+	if err != nil {
+		t.Fatalf("ParseAuthorization: %v", err)
+	}
+	return authorization
+}
+
+// The digest does not cover the Contact, so a replayed Authorization is not "the same device
+// re-binding the same contact" — it is whatever REGISTER the replayer wraps it in. The nonce count
+// is what makes one answer usable exactly once.
+func TestAnAnswerCannotBeUsedTwiceWithTheSameNonceCount(t *testing.T) {
+	authenticator := newTestAuthenticator(t, time.Minute)
+	challenge, err := authenticator.Challenge(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := answerCount(t, challenge, "REGISTER", "sip:"+authRealm, authPassword, 1)
+	if err := authenticator.Verify("REGISTER", first, ha1()); err != nil {
+		t.Fatalf("the first use must be accepted: %v", err)
+	}
+	if err := authenticator.Verify("REGISTER", first, ha1()); !errors.Is(err, ErrNonceReplayed) {
+		t.Fatalf("err = %v, want ErrNonceReplayed", err)
+	}
+	// It re-challenges with stale=true, so the honest device retries without prompting a human.
+	if err := authenticator.Verify("REGISTER", first, ha1()); !errors.Is(err, ErrNonceStale) {
+		t.Errorf("a replay must present as stale, not as a bad password: %v", err)
+	}
+	// The legitimate re-REGISTER — same nonce, next count — still works, which is the whole point
+	// of counting rather than burning the nonce outright.
+	next := answerCount(t, challenge, "REGISTER", "sip:"+authRealm, authPassword, 2)
+	if err := authenticator.Verify("REGISTER", next, ha1()); err != nil {
+		t.Fatalf("an incremented nonce count must be accepted: %v", err)
+	}
+	// And a count already passed cannot be reused, in either direction.
+	if err := authenticator.Verify("REGISTER", next, ha1()); !errors.Is(err, ErrNonceReplayed) {
+		t.Errorf("err = %v, want ErrNonceReplayed", err)
+	}
+}
+
+// A wrong password must not burn the nonce count the honest device is about to use, or an attacker
+// could lock a phone out of its own registration by guessing at it.
+func TestAFailedAnswerDoesNotConsumeTheNonceCount(t *testing.T) {
+	authenticator := newTestAuthenticator(t, time.Minute)
+	challenge, err := authenticator.Challenge(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := answerCount(t, challenge, "REGISTER", "sip:"+authRealm, "wrong", 1)
+	if err := authenticator.Verify("REGISTER", wrong, ha1()); !errors.Is(err, ErrBadResponse) {
+		t.Fatalf("err = %v, want ErrBadResponse", err)
+	}
+	good := answerCount(t, challenge, "REGISTER", "sip:"+authRealm, authPassword, 1)
+	if err := authenticator.Verify("REGISTER", good, ha1()); err != nil {
+		t.Fatalf("the genuine answer at the same count must still be accepted: %v", err)
+	}
+}
+
+// The challenge offers qop="auth" and only that. Falling back to the RFC 2069 form for an answer
+// that names no qop is a downgrade the CLIENT chooses, and it carries neither cnonce nor nonce
+// count — so it cannot be replay-guarded at all.
+func TestAQOPlessAnswerIsRefusedAgainstAQOPChallenge(t *testing.T) {
+	authenticator := newTestAuthenticator(t, time.Minute)
+	value, err := authenticator.Challenge(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	challenge, err := digest.ParseChallenge(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uri := "sip:" + authRealm
+	legacy := Authorization{
+		Username:  authUser,
+		Realm:     authRealm,
+		Nonce:     challenge.Nonce,
+		URI:       uri,
+		Algorithm: "MD5",
+		// The RFC 2069 response, which is arithmetically correct and must still be refused.
+		Response: md5hex(ha1() + ":" + challenge.Nonce + ":" + md5hex("REGISTER:"+uri)),
+	}
+	if err := authenticator.Verify("REGISTER", legacy, ha1()); !errors.Is(err, ErrQOPUnsupported) {
+		t.Fatalf("err = %v, want ErrQOPUnsupported", err)
+	}
+}

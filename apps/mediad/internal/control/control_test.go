@@ -545,6 +545,17 @@ func (s *stubSessions) TelephoneEventPayloadType(sessionID string) (uint8, bool)
 	return rtp.PayloadTypeTelephoneEvent, true
 }
 
+// forceTenancy makes a live session report an org and call the control surface would never have
+// accepted, so the recording path's own guard can be tested rather than assumed.
+func (s *stubSessions) forceTenancy(sessionID, orgID, callID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tenancy == nil {
+		s.tenancy = make(map[string][2]string)
+	}
+	s.tenancy[sessionID] = [2]string{orgID, callID}
+}
+
 func (s *stubSessions) SessionTenancy(sessionID string) (string, string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -841,6 +852,24 @@ func TestAllocateRefusals(t *testing.T) {
 			// would end silently and the engine would never learn why.
 			name:       "no org id",
 			mutate:     func(rq *contract.MediaAllocateSessionRequest) { rq.OrgID = "" },
+			wantReason: control.ReasonBadRequest,
+		},
+		{
+			// Both tenancy tokens become DIRECTORIES under the recordings root, so a dot-segment in
+			// either is a path traversal: filepath.Join cleans `../` rather than refusing it, and a
+			// recording started on this session would then be written outside the root entirely.
+			name:       "org id that escapes the recordings root",
+			mutate:     func(rq *contract.MediaAllocateSessionRequest) { rq.OrgID = "../../../etc" },
+			wantReason: control.ReasonBadRequest,
+		},
+		{
+			name:       "call id that escapes the recordings root",
+			mutate:     func(rq *contract.MediaAllocateSessionRequest) { rq.CallID = ".." },
+			wantReason: control.ReasonBadRequest,
+		},
+		{
+			name:       "call id with a path separator",
+			mutate:     func(rq *contract.MediaAllocateSessionRequest) { rq.CallID = "a/b" },
 			wantReason: control.ReasonBadRequest,
 		},
 		{

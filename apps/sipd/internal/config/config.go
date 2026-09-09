@@ -488,7 +488,7 @@ func Load(getenv Getenv) (Config, error) {
 	}
 
 	if len(problems) > 0 {
-		return Config{}, fmt.Errorf("sipd configuration is invalid:\n  - %s",
+		return Config{}, fmt.Errorf("%w:\n  - %s", ErrInvalid,
 			strings.Join(problems, "\n  - "))
 	}
 	return cfg, nil
@@ -499,31 +499,34 @@ func Load(getenv Getenv) (Config, error) {
 // It is a boot check rather than a runtime one because the runtime symptom is miserable: one
 // listener binds, the other fails, the error is logged by a goroutine nobody is watching, and half
 // the fleet's phones cannot reach the transport they were provisioned for.
+// The collision is between sockets of the same FAMILY, not between transports. UDP and TCP
+// legitimately share one address — different protocols, different sockets, which is why they have
+// one SIPD_LISTEN_ADDR between them — but TCP, TLS, WS and WSS all bind a stream socket and two of
+// them on one address is the failure this check exists for. Skipping TCP outright, as this used to,
+// meant `SIPD_UDP=false SIPD_TCP=true` with SIPD_WS_LISTEN_ADDR equal to SIPD_LISTEN_ADDR passed
+// validation and then produced exactly that failure.
 func duplicateListener(cfg Config) (string, bool) {
 	claimed := make(map[string]string, 5)
 	for _, listener := range [5]struct {
 		enabled bool
 		name    string
+		family  string
 		addr    string
 	}{
-		{cfg.EnableUDP, "SIPD_UDP", cfg.ListenAddr},
-		{cfg.EnableTCP, "SIPD_TCP", cfg.ListenAddr},
-		{cfg.EnableTLS, "SIPD_TLS", cfg.TLSListenAddr},
-		{cfg.EnableWS, "SIPD_WS", cfg.WSListenAddr},
-		{cfg.EnableWSS, "SIPD_WSS", cfg.WSSListenAddr},
+		{cfg.EnableUDP, "SIPD_UDP", "udp", cfg.ListenAddr},
+		{cfg.EnableTCP, "SIPD_TCP", "tcp", cfg.ListenAddr},
+		{cfg.EnableTLS, "SIPD_TLS", "tcp", cfg.TLSListenAddr},
+		{cfg.EnableWS, "SIPD_WS", "tcp", cfg.WSListenAddr},
+		{cfg.EnableWSS, "SIPD_WSS", "tcp", cfg.WSSListenAddr},
 	} {
 		if !listener.enabled {
 			continue
 		}
-		// UDP and TCP legitimately share one address: they are different sockets on different
-		// protocols, which is why they have one SIPD_LISTEN_ADDR between them.
-		if listener.name == "SIPD_TCP" {
-			continue
-		}
-		if previous, taken := claimed[listener.addr]; taken {
+		key := listener.family + "/" + listener.addr
+		if previous, taken := claimed[key]; taken {
 			return listener.addr + " (" + previous + " and " + listener.name + ")", true
 		}
-		claimed[listener.addr] = listener.name
+		claimed[key] = listener.name
 	}
 	return "", false
 }

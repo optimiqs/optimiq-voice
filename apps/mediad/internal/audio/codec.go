@@ -149,14 +149,32 @@ func NewFrameEncoder(format Format) (FrameEncoder, error) {
 }
 
 // g711FrameCodec is both halves for a companding law, which is stateless — the whole point of G.711.
-type g711FrameCodec struct{ encoding Encoding }
-
-func (c *g711FrameCodec) DecodeFrame(payload []byte) []int16 {
-	return padFrame(DecodeLinear(payload, c.encoding))
+//
+// The scratch buffers are not state, they are the absence of an allocation: a codec instance belongs
+// to exactly one direction of one bridge or one seat in one room, and both callers consume the
+// decoded frame before they call again, so one buffer per instance does what a sync.Pool would.
+type g711FrameCodec struct {
+	encoding Encoding
+	decoded  []int16
+	padded   []int16
 }
 
+func (c *g711FrameCodec) DecodeFrame(payload []byte) []int16 {
+	if c.decoded == nil {
+		c.decoded = make([]int16, FrameSamples)
+		c.padded = make([]int16, FrameSamples)
+	}
+	return padFrameInto(c.padded, decodeLinearInto(c.decoded, payload, c.encoding))
+}
+
+// EncodeFrame's OUTPUT is the one buffer here that is freshly allocated every time: it leaves for a
+// socket write the caller may still be holding when the next frame is encoded.
 func (c *g711FrameCodec) EncodeFrame(samples []int16) []byte {
-	return encodeLinear(padFrame(samples), c.encoding)
+	if c.padded == nil {
+		c.decoded = make([]int16, FrameSamples)
+		c.padded = make([]int16, FrameSamples)
+	}
+	return encodeLinear(padFrameInto(c.padded, samples), c.encoding)
 }
 
 func (c *g711FrameCodec) Reset() {}
@@ -165,10 +183,22 @@ func (c *g711FrameCodec) Reset() {}
 type g722FrameDecoder struct {
 	decoder *G722Decoder
 	down    Resampler16to8
+
+	// Scratch, for the same reason as g711FrameCodec's. See the note there.
+	wide   []int16
+	narrow []int16
+	padded []int16
 }
 
 func (d *g722FrameDecoder) DecodeFrame(payload []byte) []int16 {
-	return padFrame(d.down.Resample(d.decoder.Decode(payload)))
+	if d.padded == nil {
+		d.wide = make([]int16, 0, FrameSamples*2)
+		d.narrow = make([]int16, 0, FrameSamples)
+		d.padded = make([]int16, FrameSamples)
+	}
+	d.wide = d.decoder.decodeInto(d.wide, payload)
+	d.narrow = d.down.resampleInto(d.narrow, d.wide)
+	return padFrameInto(d.padded, d.narrow)
 }
 
 func (d *g722FrameDecoder) Reset() {
@@ -180,10 +210,20 @@ func (d *g722FrameDecoder) Reset() {
 type g722FrameEncoder struct {
 	encoder *G722Encoder
 	up      Resampler8to16
+
+	// Scratch for the two INTERMEDIATE steps only; the encoded octets are allocated fresh, because
+	// they leave for a socket. See g711FrameCodec.
+	padded []int16
+	wide   []int16
 }
 
 func (e *g722FrameEncoder) EncodeFrame(samples []int16) []byte {
-	return e.encoder.Encode(e.up.Resample(padFrame(samples)))
+	if e.padded == nil {
+		e.padded = make([]int16, FrameSamples)
+		e.wide = make([]int16, 0, FrameSamples*2)
+	}
+	e.wide = e.up.resampleInto(e.wide, padFrameInto(e.padded, samples))
+	return e.encoder.Encode(e.wide)
 }
 
 func (e *g722FrameEncoder) Reset() {
@@ -194,6 +234,24 @@ func (e *g722FrameEncoder) Reset() {
 // padFrame makes a slice exactly one frame long: truncating what is too long, and padding what is
 // too short with LINEAR silence, which really is zero (unlike a companded byte — see Encoding.Silence).
 func padFrame(samples []int16) []int16 {
+	return padFrameInto(nil, samples)
+}
+
+// padFrameInto is padFrame writing into a caller-supplied FrameSamples-long buffer. A short input is
+// copied and the tail zeroed; an exact or long one needs no buffer at all and is returned as a view,
+// exactly as padFrame does.
+func padFrameInto(dst, samples []int16) []int16 {
+	if len(samples) >= FrameSamples || len(dst) != FrameSamples {
+		return padFrameAlloc(samples)
+	}
+	copy(dst, samples)
+	for index := len(samples); index < FrameSamples; index++ {
+		dst[index] = 0
+	}
+	return dst
+}
+
+func padFrameAlloc(samples []int16) []int16 {
 	switch {
 	case len(samples) == FrameSamples:
 		return samples

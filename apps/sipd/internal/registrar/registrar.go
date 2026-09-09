@@ -407,10 +407,23 @@ func (r *Registrar) Run(ctx context.Context) error {
 
 // Sweep removes only contacts that are still expired at the atomic write, so a refresh on
 // another SIP server cannot be deleted by this server's stale deadline.
+//
+// # Only bindings this instance already believes have lapsed are visited
+//
+// The hint carries the exact deadline this instance granted, so the filter is free — and without it
+// every sweep spends one KV round trip per TRACKED binding rather than per EXPIRED one. At the
+// default five-second interval a fleet of five thousand phones is then a thousand no-op Gets a
+// second against the broker, per instance, for ever. The contract is unchanged: the CAS callback
+// below still re-checks, so a refresh that landed on another server between the filter and the
+// write is still not deleted.
 func (r *Registrar) Sweep(ctx context.Context) int {
+	now := r.now()
 	r.mu.Lock()
 	tracked := make([]kv.Binding, 0, len(r.tracked))
 	for _, binding := range r.tracked {
+		if !lapsed(binding, now) {
+			continue
+		}
 		tracked = append(tracked, binding)
 	}
 	r.mu.Unlock()
@@ -441,6 +454,21 @@ func (r *Registrar) Sweep(ctx context.Context) int {
 		}
 	}
 	return expired
+}
+
+// lapsed reports whether anything in a tracked binding is due to be removed. The per-contact
+// deadlines are the authority when there are contacts, because a binding whose own ExpiresAt is the
+// LONGEST-lived contact's would keep a lapsed second device bound until the first one went too.
+func lapsed(binding kv.Binding, now time.Time) bool {
+	if len(binding.Contacts) == 0 {
+		return binding.Expired(now)
+	}
+	for _, contact := range binding.Contacts {
+		if !now.Before(contact.ExpiresAt.Time) {
+			return true
+		}
+	}
+	return false
 }
 
 // Rehydrate adopts the bindings already in the bucket, so a restarted instance keeps expiring the

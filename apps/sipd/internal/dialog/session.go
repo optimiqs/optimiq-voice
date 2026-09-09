@@ -56,6 +56,7 @@ func (f EffectHandlerFunc) Handle(ctx context.Context, dialog *Dialog, effect Ef
 type Session struct {
 	dialog   *Dialog
 	handler  EffectHandler
+	onUpdate func(*Dialog)
 	log      *slog.Logger
 	mailbox  chan envelope
 	closed   chan struct{}
@@ -83,6 +84,10 @@ type SessionOptions struct {
 	// Depth is the mailbox size. It is small on purpose: a dialog with a hundred queued commands is
 	// a dialog whose effects are blocking on a socket, and the back-pressure is information.
 	Depth int
+	// OnUpdate is called after every task and its effects, ON THIS GOROUTINE. It is how the Store's
+	// cached claim stays current without the reaper's sweep ever reading a live dialog — see
+	// Store.Touch, which is the only implementation.
+	OnUpdate func(*Dialog)
 }
 
 // NewSession starts the owning goroutine. Close stops it.
@@ -92,11 +97,12 @@ func NewSession(dialog *Dialog, opts SessionOptions) *Session {
 		depth = 8
 	}
 	session := &Session{
-		dialog:  dialog,
-		handler: opts.Handler,
-		log:     opts.Logger,
-		mailbox: make(chan envelope, depth),
-		closed:  make(chan struct{}),
+		dialog:   dialog,
+		handler:  opts.Handler,
+		onUpdate: opts.OnUpdate,
+		log:      opts.Logger,
+		mailbox:  make(chan envelope, depth),
+		closed:   make(chan struct{}),
 	}
 	if session.log == nil {
 		session.log = slog.Default()
@@ -135,6 +141,9 @@ func (s *Session) run() {
 			// that answers the losing CANCEL's transaction, and dropping it would leave the far end
 			// retransmitting a CANCEL at a live call.
 			s.dispatch(message.ctx, outcome.Effects)
+			if s.onUpdate != nil {
+				s.onUpdate(s.dialog)
+			}
 			message.reply <- sessionResult{outcome: outcome, err: err}
 		}
 	}

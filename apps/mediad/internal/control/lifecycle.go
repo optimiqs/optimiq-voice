@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
@@ -39,7 +40,20 @@ type LifecycleAnnouncer struct {
 	dir        directory.Store
 	log        *slog.Logger
 	instanceID string
+
+	// inflight counts the publishes that have been handed off and not yet finished, so a shutdown
+	// can WAIT for them. Without it, `main` returned from Drain straight into `conn.Drain()` and the
+	// process exited under publishes that had not reached the broker — losing exactly the
+	// `session.ended` for every drained call, which is the one this service argues must be durable.
+	inflight sync.WaitGroup
+	// slots bounds how many of those are talking to the broker at once. A mass reap, or a leg
+	// producing digits at RFC 4733 rates, otherwise put hundreds of concurrent JetStream publishes
+	// on a broker that is quite possibly already the thing that has gone wrong.
+	slots chan struct{}
 }
+
+// lifecyclePublishConcurrency is how many lifecycle publishes may be in flight at once. See slots.
+const lifecyclePublishConcurrency = 8
 
 var _ rtp.Lifecycle = (*LifecycleAnnouncer)(nil)
 
@@ -54,7 +68,44 @@ func NewLifecycleAnnouncer(
 	if log == nil {
 		log = slog.Default()
 	}
-	return &LifecycleAnnouncer{publisher: publisher, dir: dir, log: log, instanceID: instanceID}
+	return &LifecycleAnnouncer{
+		publisher:  publisher,
+		dir:        dir,
+		log:        log,
+		instanceID: instanceID,
+		slots:      make(chan struct{}, lifecyclePublishConcurrency),
+	}
+}
+
+// publishAsync hands a publish to a goroutine, bounded by slots and tracked by inflight.
+//
+// The hand-off itself never blocks the caller, which is the whole point: this runs on the goroutine
+// tearing a session down, and a sick broker must not be able to stall a drain.
+func (a *LifecycleAnnouncer) publishAsync(do func(context.Context) error, eventType, sessionID string) {
+	a.inflight.Add(1)
+	go func() {
+		defer a.inflight.Done()
+		a.slots <- struct{}{}
+		defer func() { <-a.slots }()
+		a.publish(do, eventType, sessionID)
+	}()
+}
+
+// Wait blocks until every handed-off publish has finished or the context expires, and reports
+// whether they all finished. Called on shutdown, after the manager has drained and before the NATS
+// connection goes away.
+func (a *LifecycleAnnouncer) Wait(ctx context.Context) bool {
+	done := make(chan struct{})
+	go func() {
+		a.inflight.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // SessionEnded publishes `session.ended` and removes the directory entry.
@@ -95,7 +146,7 @@ func (a *LifecycleAnnouncer) SessionEnded(session rtp.SessionSummary, reason rtp
 		Quality:         &quality,
 	}
 
-	go a.publish(func(ctx context.Context) error {
+	a.publishAsync(func(ctx context.Context) error {
 		return a.publisher.SessionEnded(ctx, contract.Envelope[contract.MediaSessionEndedData]{
 			ID:      envelope.id,
 			At:      envelope.at,
@@ -160,7 +211,7 @@ func (a *LifecycleAnnouncer) RTPTimedOut(session rtp.SessionSummary, silentFor t
 		RemoteAddress:   stringPtr(session.RemoteAddr),
 	}
 
-	go a.publish(func(ctx context.Context) error {
+	a.publishAsync(func(ctx context.Context) error {
 		return a.publisher.SessionRTPTimeout(ctx,
 			contract.Envelope[contract.MediaSessionRTPTimeoutData]{
 				ID:      envelope.id,
@@ -217,7 +268,7 @@ func (a *LifecycleAnnouncer) PlaybackFinished(
 		Detail:      stringPtr(playback.Detail),
 	}
 
-	go a.publish(func(ctx context.Context) error {
+	a.publishAsync(func(ctx context.Context) error {
 		return a.publisher.PlaybackFinished(ctx,
 			contract.Envelope[contract.MediaPlaybackFinishedData]{
 				ID:      envelope.id,
@@ -278,7 +329,7 @@ func (a *LifecycleAnnouncer) RecordingFinished(
 		Detail:       stringPtr(recording.Detail),
 	}
 
-	go a.publish(func(ctx context.Context) error {
+	a.publishAsync(func(ctx context.Context) error {
 		return a.publisher.RecordingFinished(ctx,
 			contract.Envelope[contract.MediaRecordingFinishedData]{
 				ID:      envelope.id,
@@ -331,7 +382,7 @@ func (a *LifecycleAnnouncer) DtmfReceived(session rtp.SessionSummary, digit rtp.
 		DurationMs: digit.DurationMs,
 	}
 
-	go a.publish(func(ctx context.Context) error {
+	a.publishAsync(func(ctx context.Context) error {
 		return a.publisher.DtmfReceived(ctx, contract.Envelope[contract.MediaDtmfReceivedData]{
 			ID:      envelope.id,
 			At:      envelope.at,

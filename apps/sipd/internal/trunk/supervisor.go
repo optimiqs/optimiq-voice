@@ -190,13 +190,22 @@ func (s *Supervisor) start(ctx context.Context, config Config) (*gatewayRunner, 
 		config:  config,
 		inputs:  make(chan Input, 4),
 		cancel:  cancel,
+		log:     s.log,
 	}
 	s.wait.Add(1)
 	go func() {
 		defer s.wait.Done()
 		s.run(runnerCtx, runner)
 	}()
-	runner.post(Input{Trigger: TriggerStart})
+	// Jittered, not immediate. Backoff jitters RETRIES with the stated rationale that a carrier
+	// that is down is down for every one of our instances at once — and the first registration after
+	// a fleet restart or a directory replay is the same storm aimed at a carrier that is UP: N
+	// trunks x M instances all REGISTERing in the same millisecond.
+	//
+	// The spread is a fraction of the backoff's own initial interval, so it is measured in the same
+	// units as everything else here and stays well under a second by default.
+	delay := time.Duration(rand.Float64() * float64(s.backoff.Initial)) //nolint:gosec // de-synchronising registrations, not a secret
+	runner.arm(&runner.retry, delay, func() { runner.post(Input{Trigger: TriggerStart}) })
 	return runner, nil
 }
 
@@ -285,6 +294,7 @@ type gatewayRunner struct {
 	config  Config
 	inputs  chan Input
 	cancel  context.CancelFunc
+	log     *slog.Logger
 
 	mu      sync.Mutex
 	refresh *time.Timer
@@ -296,7 +306,12 @@ type gatewayRunner struct {
 //
 // Dropping rather than blocking, and it matters on exactly one path: a REGISTER whose response
 // arrives after the trunk was deleted has nowhere to go, and a blocking send would leak the
-// goroutine that is holding it.
+// goroutine that is holding it. That is the `stopped` check above, and it is the ONLY case dropping
+// is correct for. A RUNNING runner whose four-slot mailbox is momentarily full must not lose an
+// input: a TriggerAccepted dropped behind three timer ticks leaves the gateway in Registering and
+// reporting `degraded` for a trunk that is up, until its retry timer happens to fire. So the send is
+// bounded rather than non-blocking, and a send that really cannot land is logged with its trigger
+// instead of vanishing.
 func (r *gatewayRunner) post(in Input) {
 	r.mu.Lock()
 	stopped := r.stopped
@@ -306,7 +321,16 @@ func (r *gatewayRunner) post(in Input) {
 	}
 	select {
 	case r.inputs <- in:
+		return
 	default:
+	}
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	select {
+	case r.inputs <- in:
+	case <-timer.C:
+		r.log.Warn("dropping a trunk gateway input: the mailbox stayed full",
+			"trunkId", r.config.TrunkID, "trigger", in.Trigger.String())
 	}
 }
 

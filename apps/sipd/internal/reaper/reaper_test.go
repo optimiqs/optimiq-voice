@@ -27,6 +27,7 @@ type fakeClaims struct {
 	delErr  error
 	deleted []string
 	puts    []dialog.Claim
+	lists   int
 }
 
 func newFakeClaims(claims ...dialog.Claim) *fakeClaims {
@@ -62,6 +63,7 @@ func (f *fakeClaims) Delete(_ context.Context, legID string) error {
 func (f *fakeClaims) All(_ context.Context) ([]dialog.Claim, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lists++
 	if f.allErr != nil {
 		return nil, f.allErr
 	}
@@ -302,4 +304,46 @@ func (p *failingPublisher) Terminated(
 	_ contract.Envelope[contract.SIPDialogTerminatedData],
 ) error {
 	return p.err
+}
+
+// The reap half lists the WHOLE bucket, on every instance — cost O(instances × fleet dialogs) — so
+// it runs on its own longer interval while the heartbeat keeps ticking at the sweep rate.
+func TestTheReapListingDoesNotRunOnEverySweep(t *testing.T) {
+	now := testNow
+	store := newFakeClaims(claim("leg-dead", "sipd-gone", testNow.Add(-time.Minute)))
+	live := fakeLive{claims: []dialog.Claim{claim("leg-a", "sipd-alive", testNow.Add(90*time.Second))}}
+	reaper, err := New(Options{
+		Store:      store,
+		Dialogs:    live,
+		Events:     sipevents.NewRecordingPublisher(),
+		InstanceID: "sipd-alive",
+		Interval:   30 * time.Second,
+		Now:        func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// The first sweep reaps immediately: a restarted pod's neighbours may be holding claims that
+	// lapsed while it was down.
+	reaper.Sweep(context.Background())
+	if store.lists != 1 {
+		t.Fatalf("the first sweep listed %d times, want 1", store.lists)
+	}
+
+	now = now.Add(30 * time.Second)
+	reaper.Sweep(context.Background())
+	if store.lists != 1 {
+		t.Errorf("the next sweep listed the bucket again; the reap interval is not honoured")
+	}
+	if len(store.written()) != 2 {
+		t.Errorf("the heartbeat wrote %d claims over two sweeps, want one per sweep", len(store.written()))
+	}
+
+	// Past the reap interval — 2x the sweep interval by default, minus the jitter window.
+	now = now.Add(2 * time.Minute)
+	reaper.Sweep(context.Background())
+	if store.lists != 2 {
+		t.Errorf("listed %d times, want the reap to have run again", store.lists)
+	}
 }

@@ -202,8 +202,11 @@ func (h *harness) invite(challenge *digest.Challenge, extra ...string) *sip.Requ
 			URI:      req.Recipient.String(),
 			Username: testUser,
 			Password: testPass,
-			Count:    1,
-			Cnonce:   "0a4f113b",
+			// The nonce count must strictly increase for a nonce this harness reuses across
+			// requests, or the registrar's replay guard refuses the second one. cseq is already
+			// monotonic per request, so it doubles as the count.
+			Count:  h.cseq,
+			Cnonce: "0a4f113b",
 		})
 		if err != nil {
 			h.t.Fatalf("digest: %v", err)

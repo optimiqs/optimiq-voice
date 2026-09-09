@@ -13,6 +13,14 @@ type PacketTransport interface {
 	Close() error
 }
 
+// droppingTransport is implemented by a transport that can discard an inbound packet before the
+// session ever sees it — the WebRTC one, whose reader hands packets over a bounded channel. A
+// plain UDP socket cannot, which is why this is an optional interface rather than a method on
+// PacketTransport.
+type droppingTransport interface {
+	Dropped() (rtpDropped, rtcpDropped uint64)
+}
+
 var securePacketSource = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
 
 func (s *Session) readRTP(buf []byte) (int, *net.UDPAddr, error) {

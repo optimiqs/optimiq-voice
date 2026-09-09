@@ -216,7 +216,17 @@ func wavHeader(dataBytes uint32) []byte {
 // Exported because the recorder needs it and lives in internal/rtp: a recording is the reverse of a
 // playback, and the companding tables are here.
 func DecodeLinear(payload []byte, encoding Encoding) []int16 {
-	samples := make([]int16, len(payload))
+	return decodeLinearInto(make([]int16, len(payload)), payload, encoding)
+}
+
+// decodeLinearInto is DecodeLinear writing into a caller-supplied buffer, for the packet path.
+// `dst` is grown when it is too short, and sliced to the payload's length when it is longer.
+func decodeLinearInto(dst []int16, payload []byte, encoding Encoding) []int16 {
+	samples := dst
+	if cap(samples) < len(payload) {
+		samples = make([]int16, len(payload))
+	}
+	samples = samples[:len(payload)]
 	if encoding == EncodingALaw {
 		for index, encoded := range payload {
 			samples[index] = ALawToLinear(encoded)

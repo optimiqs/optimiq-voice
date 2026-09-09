@@ -271,3 +271,40 @@ func TestJitterBufferDropsDuplicatesSilently(t *testing.T) {
 		t.Errorf("Depth = %d after a duplicate, want 3", depth)
 	}
 }
+
+func TestJitterBufferResyncsAcrossALargeSequenceJump(t *testing.T) {
+	t.Parallel()
+
+	// A sender whose sequence jumps forward — a re-INVITE that restarts the stream, an endpoint bug —
+	// used to cost the room one tick of silence PER SKIPPED SEQUENCE, because playout only ever
+	// stepped forward by one and the "everything drained, re-prime" escape hatch never fired: the new
+	// packets kept the buffer non-empty while `next` walked towards them at 20 ms a frame. A jump of
+	// a thousand was twenty seconds of silence heard by everybody.
+	buffer := rtp.NewJitterBuffer(audio.SampleRate)
+	now := time.Now()
+
+	now = pushRun(buffer, 100, 6, now)
+	for index := 0; index < 6; index++ {
+		if _, ok := buffer.Pop(); !ok {
+			t.Fatalf("Pop %d before the jump played nothing", index)
+		}
+	}
+
+	jumped := uint16(5000)
+	pushRun(buffer, jumped, 6, now)
+	// One miss is the resync itself; the frame after it must be the far side of the jump rather than
+	// the next of a thousand empty slots.
+	if _, ok := buffer.Pop(); ok {
+		t.Fatal("the tick that resynced played a frame")
+	}
+	frame, ok := buffer.Pop()
+	if !ok {
+		t.Fatal("playout did not resync onto the new sequence; the member is silent until it walks there")
+	}
+	if want := byte(jumped); frame[0] != want {
+		t.Errorf("played frame %d, want %d, the first of the new run", frame[0], want)
+	}
+	if stats := buffer.Stats(); stats.Resynced != 1 {
+		t.Errorf("Resynced = %d, want 1", stats.Resynced)
+	}
+}

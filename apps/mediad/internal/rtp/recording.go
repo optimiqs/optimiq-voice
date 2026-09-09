@@ -411,7 +411,13 @@ func (r *Recording) finish(reason RecordingEndReason) {
 			// Surfaced rather than buried in a counter nobody reads: a recording with gaps in it is
 			// a recording somebody will play back and complain about, and this is the only place
 			// that can say the gaps were the writer falling behind rather than the network.
-			detail = "frames were dropped while a direction's queue was full"
+			if detail != "" {
+				// APPENDED, not replaced. A voicemail ended by `#` on a busy box used to report only
+				// the drops, and the fact that the caller pressed a key — which this is the one
+				// field carrying — was lost.
+				detail += "; "
+			}
+			detail += "frames were dropped while a direction's queue was full"
 			r.session.log.Warn("a recording dropped frames; the file has gaps in it",
 				"recordingRef", r.opts.Ref, "dropped", dropped)
 		}

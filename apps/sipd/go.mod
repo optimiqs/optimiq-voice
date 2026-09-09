@@ -3,11 +3,12 @@ module github.com/optimiqs/optimiq-voice/apps/sipd
 go 1.26
 
 require (
-	github.com/optimiqs/optimiq-voice/packages/runtime-go v0.0.0
 	github.com/emiago/sipgo v1.4.3
 	github.com/icholy/digest v1.1.0
 	github.com/nats-io/nats.go v1.52.0
 	github.com/optimiqs/optimiq-voice/packages/events-go v0.0.0
+	github.com/optimiqs/optimiq-voice/packages/runtime-go v0.0.0
+	golang.org/x/sync v0.16.0
 )
 
 require (
@@ -20,7 +21,6 @@ require (
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
 	golang.org/x/crypto v0.52.0 // indirect
-	golang.org/x/sync v0.16.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
 )
 

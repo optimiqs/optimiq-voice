@@ -11,6 +11,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
+	"golang.org/x/sync/singleflight"
 )
 
 // NATSStore resolves credentials over NATS request-reply against apps/api.
@@ -68,9 +69,18 @@ type NATSStore struct {
 
 	// now is swapped in tests so TTL behaviour is asserted without sleeping.
 	now func() time.Time
+	// rpc is the credential request. It is a field only so a test can assert the caching and
+	// collapsing behaviour without a broker; nothing but NewNATSStore ever sets it.
+	rpc func(ctx context.Context, realm, username string) (Credential, error)
 
 	mu    sync.Mutex
 	cache map[string]cacheEntry
+	// lastEvict is when the full expiry sweep last ran. See evictLocked.
+	lastEvict time.Time
+	// inflight collapses concurrent lookups for one account into one RPC. The cache collapses the
+	// STEADY rate; without this, a fleet restart or a TTL boundary sends one request per concurrent
+	// REGISTER at a control plane that is already the slowest link in the path.
+	inflight singleflight.Group
 }
 
 type cacheEntry struct {
@@ -143,6 +153,7 @@ func NewNATSStore(conn *nats.Conn, opts NATSOptions) (*NATSStore, error) {
 	if store.now == nil {
 		store.now = time.Now
 	}
+	store.rpc = store.request
 	return store, nil
 }
 
@@ -154,19 +165,38 @@ func (s *NATSStore) Lookup(ctx context.Context, realm, username string) (Credent
 		return entry.credential, entry.err
 	}
 
-	credential, err := s.request(ctx, realm, username)
-	switch {
-	case err == nil:
-		s.store(key, cacheEntry{credential: credential, expires: s.now().Add(s.positiveTTL)})
-		return credential, nil
-	case errors.Is(err, ErrNotFound), errors.Is(err, ErrDisabled):
-		// A definite "no" is cacheable; that is the whole point of the negative half.
-		s.store(key, cacheEntry{err: err, expires: s.now().Add(s.negativeTTL)})
-		return Credential{}, err
-	default:
-		// Transport failures are never cached: caching them would extend an outage past its cause.
+	// One RPC per account per burst. The waiters share the leader's answer, INCLUDING its refusal:
+	// a leader whose own context expired reports that to everybody, which is the same thing each of
+	// them would have discovered a moment later and is not cached either way.
+	//
+	// The cache is written INSIDE the flight, before the group entry is released. Writing it after
+	// Do returned would leave a window in which the leader has finished, the key is free again and
+	// the cache is still empty — so a caller arriving in it becomes a second leader and issues the
+	// duplicate request this exists to remove.
+	result, err, _ := s.inflight.Do(key, func() (any, error) {
+		// The leader re-reads the cache: a caller that queued behind a request which has since
+		// landed must not send a second one.
+		if entry, ok := s.cached(key); ok {
+			return entry.credential, entry.err
+		}
+		credential, err := s.rpc(ctx, realm, username)
+		switch {
+		case err == nil:
+			s.store(key, cacheEntry{credential: credential, expires: s.now().Add(s.positiveTTL)})
+		case errors.Is(err, ErrNotFound), errors.Is(err, ErrDisabled):
+			// A definite "no" is cacheable; that is the whole point of the negative half.
+			s.store(key, cacheEntry{err: err, expires: s.now().Add(s.negativeTTL)})
+		default:
+			// Transport failures are never cached: caching them would extend an outage past its
+			// cause.
+		}
+		return credential, err
+	})
+	credential, _ := result.(Credential)
+	if err != nil {
 		return Credential{}, err
 	}
+	return credential, nil
 }
 
 func (s *NATSStore) request(ctx context.Context, realm, username string) (Credential, error) {
@@ -277,21 +307,30 @@ func (s *NATSStore) store(key string, entry cacheEntry) {
 	s.cache[key] = entry
 }
 
-// evictLocked drops expired entries, and if that frees nothing, drops an arbitrary one.
+// evictLocked frees a slot, sweeping expired entries at most once per negative TTL.
 //
 // Not an LRU. An LRU's bookkeeping would be a second data structure protected by the same mutex on
 // the REGISTER path, and the cache is a load shedder rather than a correctness mechanism — an
 // eviction costs one extra request, which is exactly what the entry would have cost anyway once
 // its short TTL ran out. What matters is only that the map cannot grow without bound.
+//
+// The sweep is RATE LIMITED, and that is the load-bearing part. A full cache is exactly what the
+// negative half is designed to produce under a username scan, and sweeping on every miss would turn
+// each of a scanner's guesses into a walk of all ten thousand entries while holding the mutex that
+// serialises every REGISTER and every INVITE digest lookup in the process — the scanner setting the
+// pace. Between sweeps a single arbitrary entry goes, which is O(1) and costs one extra request.
 func (s *NATSStore) evictLocked() {
 	now := s.now()
-	for key, entry := range s.cache {
-		if !now.Before(entry.expires) {
-			delete(s.cache, key)
+	if now.Sub(s.lastEvict) >= s.negativeTTL {
+		s.lastEvict = now
+		for key, entry := range s.cache {
+			if !now.Before(entry.expires) {
+				delete(s.cache, key)
+			}
 		}
-	}
-	if len(s.cache) < s.maxEntries {
-		return
+		if len(s.cache) < s.maxEntries {
+			return
+		}
 	}
 	for key := range s.cache {
 		delete(s.cache, key)

@@ -1,7 +1,13 @@
 package credentials
 
 import (
+	"context"
 	"errors"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -255,5 +261,102 @@ func TestNewNATSStoreDefaultsToTheContract(t *testing.T) {
 	}
 	if store.timeout != 500*time.Millisecond {
 		t.Errorf("timeout = %s, want the contract's 500ms REGISTER-path deadline", store.timeout)
+	}
+}
+
+// A cold cache must not stampede the control plane. The positive cache collapses the STEADY rate;
+// without single-flight a fleet restart or a TTL boundary sends one RPC per concurrent REGISTER.
+func TestConcurrentLookupsForOneAccountIssueOneRequest(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	release := make(chan struct{})
+	var requests atomic.Int64
+	store := &NATSStore{
+		cache:       map[string]cacheEntry{},
+		maxEntries:  16,
+		positiveTTL: 30 * time.Second,
+		negativeTTL: 10 * time.Second,
+		now:         func() time.Time { return now },
+	}
+	store.rpc = func(context.Context, string, string) (Credential, error) {
+		requests.Add(1)
+		// Held open so every caller is genuinely concurrent rather than merely serialised behind a
+		// cache that filled after the first one returned.
+		<-release
+		return Credential{OrgID: "org", Username: "1001", Realm: "acme.example.com", HA1: strings.Repeat("a", 32)}, nil
+	}
+
+	const callers = 32
+	var group sync.WaitGroup
+	errs := make(chan error, callers)
+	for range callers {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			credential, err := store.Lookup(context.Background(), "acme.example.com", "1001")
+			if err != nil {
+				errs <- err
+				return
+			}
+			if credential.OrgID != "org" {
+				errs <- errors.New("a waiter got the wrong credential")
+			}
+		}()
+	}
+	// Give the callers time to pile up behind the leader before it answers.
+	for requests.Load() == 0 {
+		runtime.Gosched()
+	}
+	close(release)
+	group.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("Lookup: %v", err)
+	}
+
+	if got := requests.Load(); got != 1 {
+		t.Errorf("%d concurrent lookups issued %d requests, want 1", callers, got)
+	}
+	if store.Len() != 1 {
+		t.Errorf("cache holds %d entries, want the one answer", store.Len())
+	}
+}
+
+// The eviction sweep is rate limited, because a full cache is exactly what a username scan
+// produces: sweeping on every miss would make each of the scanner's guesses a full map walk under
+// the mutex that serialises every REGISTER in the process.
+func TestCacheEvictionSweepIsRateLimited(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	store := &NATSStore{
+		cache:       map[string]cacheEntry{},
+		maxEntries:  8,
+		positiveTTL: time.Minute,
+		negativeTTL: 10 * time.Second,
+		now:         func() time.Time { return now },
+	}
+	fill := func(count int, prefix string, expires time.Time) {
+		for i := range count {
+			store.store(lookupKey("acme.example.com", prefix+strconv.Itoa(i)), cacheEntry{err: ErrNotFound, expires: expires})
+		}
+	}
+
+	fill(8, "a", now.Add(5*time.Second))
+	if store.Len() != 8 {
+		t.Fatalf("cache holds %d entries, want 8", store.Len())
+	}
+
+	// Everything has lapsed and no sweep has ever run: this one sweeps.
+	now = now.Add(6 * time.Second)
+	fill(1, "b", now.Add(5*time.Second))
+	if store.Len() != 1 {
+		t.Fatalf("the first eviction holds %d entries, want the sweep to have cleared the lapsed 8", store.Len())
+	}
+
+	fill(7, "c", now.Add(5*time.Second))
+	now = now.Add(6 * time.Second)
+	// Everything has lapsed again, but the last sweep was 6s ago and the negative TTL is 10s: a
+	// single arbitrary entry goes instead of a full walk, so the ceiling holds without the scan.
+	fill(1, "d", now.Add(5*time.Second))
+	if store.Len() != 8 {
+		t.Errorf("cache holds %d entries, want the ceiling of 8 held by a single-entry eviction", store.Len())
 	}
 }

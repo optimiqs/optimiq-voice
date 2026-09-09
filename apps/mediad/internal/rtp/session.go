@@ -142,6 +142,14 @@ type Stats struct {
 	SuppressedByHold uint64
 	// SuppressedByMute counts frames dropped in either direction by an explicit mute. Rung 5.
 	SuppressedByMute uint64
+	// TransportDroppedRTP and TransportDroppedRTCP count packets a secure transport discarded before
+	// this session saw them, because the buffer between its reader and Session.Run was full. Always
+	// zero for a plain UDP leg, which has no such buffer.
+	//
+	// They belong here with the other drop counters for the same reason: every way audio can go
+	// missing on this leg should be explicable from one struct.
+	TransportDroppedRTP  uint64
+	TransportDroppedRTCP uint64
 	// Transcoded counts frames that were decoded and re-encoded on the way to this leg, because the
 	// two ends of the bridge negotiated different codecs. Rung 7.
 	//
@@ -480,8 +488,14 @@ func (s *Session) Mode() Mode { return s.mode }
 // Stats copies the counters out.
 func (s *Session) Stats() Stats {
 	s.statsMu.Lock()
-	defer s.statsMu.Unlock()
-	return s.stats
+	stats := s.stats
+	s.statsMu.Unlock()
+	if dropper, ok := s.transport.(droppingTransport); ok {
+		// Read through rather than mirrored into the session's own counters: the drop happens on the
+		// transport's reader goroutine, which has no session to count against.
+		stats.TransportDroppedRTP, stats.TransportDroppedRTCP = dropper.Dropped()
+	}
+	return stats
 }
 
 // Remote is the learned far end, or nil before the first packet.

@@ -539,10 +539,11 @@ func (h *Handler) handleInitialInvite(req *sip.Request, tx sip.ServerTransaction
 		return
 	}
 
+	// intent.ReplacesLegID carries the replaced leg into createLeg, which sets it on the legState
+	// BEFORE the leg is published and before tx.OnCancel is installed. Assigning it here instead
+	// would write a legState field from the request goroutine while a CANCEL that arrived in that
+	// window is already reading it on the session's.
 	session, state, err := h.createLeg(req, tx, owner, intent, negotiation.Timer, log)
-	if err == nil {
-		state.replacesLegID = replacedLegID
-	}
 	if err != nil {
 		log.Error("cannot create the dialog", "error", err)
 		h.respond(tx, req, statusServerError, "Server Internal Error")
@@ -620,9 +621,10 @@ func (h *Handler) createLeg(
 	created.SetTimer(timer)
 
 	state := &legState{
-		invite:   req,
-		inviteTx: tx,
-		profile:  owner,
+		invite:        req,
+		inviteTx:      tx,
+		profile:       owner,
+		replacesLegID: intent.ReplacesLegID,
 	}
 	if to := req.To(); to != nil {
 		state.local = to.Address
@@ -632,8 +634,9 @@ func (h *Handler) createLeg(
 	}
 
 	session := dialog.NewSession(created, dialog.SessionOptions{
-		Handler: &executor{handler: h, state: state},
-		Logger:  log,
+		Handler:  &executor{handler: h, state: state},
+		OnUpdate: h.dialogs.Touch,
+		Logger:   log,
 	})
 	if err := h.dialogs.Insert(created); err != nil {
 		session.Close()
@@ -1016,9 +1019,13 @@ func (h *Handler) writeClaim(d *dialog.Dialog) {
 	if h.claims == nil {
 		return
 	}
+	// Rendered here, on the dialog's own goroutine, and cached for the heartbeat sweep in the same
+	// breath — the sweep must never read a live dialog itself.
+	claim := h.dialogs.ClaimFor(d)
+	h.dialogs.Touch(d)
 	ctx, cancel := context.WithTimeout(h.baseCtx, 3*time.Second)
 	defer cancel()
-	if err := h.claims.Put(ctx, h.dialogs.ClaimFor(d)); err != nil {
+	if err := h.claims.Put(ctx, claim); err != nil {
 		// A claim that cannot be written costs reaping, not the call. Failing the INVITE here would
 		// drop a working call because a bucket was full.
 		h.log.Warn("cannot write the dialog claim", "legId", d.LegID, "error", err)

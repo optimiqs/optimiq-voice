@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	mediasdp "github.com/optimiqs/optimiq-voice/apps/mediad/internal/sdp"
@@ -68,6 +69,18 @@ type Transport struct {
 	closeOnce, connectOnce sync.Once
 	signalMu               sync.Mutex
 	lastOffer, lastAnswer  string
+
+	// droppedRTP and droppedRTCP count packets discarded because the buffer to the media pipeline
+	// was full. Counted rather than silent for exactly the reason every other drop on this path is
+	// (see rtp.Stats): a stalled Session.Run fills 128 packets in under three seconds and the audio
+	// goes with it, and "the browser leg was choppy" is unanswerable without a number.
+	droppedRTP  atomic.Uint64
+	droppedRTCP atomic.Uint64
+}
+
+// Dropped is how many inbound RTP and RTCP packets this transport discarded for want of buffer.
+func (t *Transport) Dropped() (rtpDropped, rtcpDropped uint64) {
+	return t.droppedRTP.Load(), t.droppedRTCP.Load()
 }
 
 func (f *Factory) New(id string) (*Transport, error) {
@@ -100,6 +113,7 @@ func (f *Factory) New(id string) (*Transport, error) {
 			case <-t.done:
 				return
 			default:
+				t.droppedRTP.Add(1)
 			}
 		}
 	})
@@ -130,6 +144,7 @@ func (t *Transport) readReports(read func([]byte) (int, error)) {
 		case <-t.done:
 			return
 		default:
+			t.droppedRTCP.Add(1)
 		}
 	}
 }
