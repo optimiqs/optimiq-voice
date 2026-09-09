@@ -9,14 +9,14 @@ import { canAccessPage } from "~/lib/page-permissions";
 import { roleLabel } from "~/lib/permissions";
 import { routes } from "~/lib/routes";
 import { NAV_SECTIONS } from "./_components/nav-config";
-import { useAppSession, useAnyPermission } from "./_context/session-context";
 import { useLiveStatus } from "./_context/live-context";
-import { LiveIndicator } from "./queues/_components/agent-console";
+import { useAppSession, useAnyPermission } from "./_context/session-context";
 import {
 	useLiveActiveCalls,
 	useLiveAgentStates,
 	useLiveRegistrations,
 } from "./_hooks/use-live-queries";
+import { LiveIndicator } from "./queues/_components/agent-console";
 
 /**
  * The landing surface: what is happening on this tenant's phone system, right now.
@@ -189,10 +189,7 @@ function LiveTile({
 			<CardBody className="flex flex-col gap-1">
 				<div className="flex items-baseline justify-between gap-2">
 					<p className="text-sm font-medium text-muted-foreground">{label}</p>
-					<Link
-						href={href}
-						className="text-xs text-primary underline-offset-4 hover:underline"
-					>
+					<Link href={href} className="text-xs text-primary underline-offset-4 hover:underline">
 						Open
 					</Link>
 				</div>

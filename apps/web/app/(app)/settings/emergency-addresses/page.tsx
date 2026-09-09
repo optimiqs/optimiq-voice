@@ -85,8 +85,8 @@ export default function EmergencyAddressesPage() {
 					<CardTitle>These addresses are not validated</CardTitle>
 					<CardDescription>
 						An address becomes a dispatchable location only once the upstream carrier has validated
-						it against the authoritative 911 database. This platform has no carrier E911
-						integration yet, so every address below is stored and shown as{" "}
+						it against the authoritative 911 database. This platform has no carrier E911 integration
+						yet, so every address below is stored and shown as{" "}
 						<strong className="font-medium text-foreground">Not validated</strong> — recording one
 						here does not make a number compliant. Fill in the floor, suite or room whenever there
 						is one: that detail, not the street address, is what RAY BAUM&apos;S Act actually

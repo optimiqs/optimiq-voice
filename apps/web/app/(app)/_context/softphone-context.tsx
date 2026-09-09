@@ -192,27 +192,50 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
 			? "This deployment has no browser SIP transport (sipd WSS) configured yet."
 			: null;
 
-	const value: SoftphoneContextValue = {
-		available: resolved !== null,
-		unavailableReason,
-		isLoading: credentialsQuery.isPending && organizationId.length > 0,
-		extension: credentialsQuery.data?.extension ?? null,
-		credentials: resolved,
-		state,
-		webrtcSupported: resolved?.webrtcSupported ?? false,
-		mediaNote:
-			resolved?.mediaNote ??
-			"The media plane's WebRTC leg (DTLS-SRTP in mediad) is the remaining piece; calls signal but carry no audio yet.",
-		connect,
-		disconnect: teardown,
-		dial,
-		answer,
-		hangup,
-		toggleHold,
-		toggleMute,
-		sendDtmf,
-		dismissEndedCall,
-	};
+	// Memoised for the reason `live-context` is: every `useSoftphone()` consumer re-renders when this
+	// object's identity changes, and the provider re-renders on every SIP event dispatched into the
+	// reducer. The callbacks below are already stable, so only the reducer state, the resolved
+	// credentials and the query flags actually move.
+	const value = useMemo<SoftphoneContextValue>(
+		() => ({
+			available: resolved !== null,
+			unavailableReason,
+			isLoading: credentialsQuery.isPending && organizationId.length > 0,
+			extension: credentialsQuery.data?.extension ?? null,
+			credentials: resolved,
+			state,
+			webrtcSupported: resolved?.webrtcSupported ?? false,
+			mediaNote:
+				resolved?.mediaNote ??
+				"The media plane's WebRTC leg (DTLS-SRTP in mediad) is the remaining piece; calls signal but carry no audio yet.",
+			connect,
+			disconnect: teardown,
+			dial,
+			answer,
+			hangup,
+			toggleHold,
+			toggleMute,
+			sendDtmf,
+			dismissEndedCall,
+		}),
+		[
+			resolved,
+			unavailableReason,
+			credentialsQuery.isPending,
+			credentialsQuery.data,
+			organizationId,
+			state,
+			connect,
+			teardown,
+			dial,
+			answer,
+			hangup,
+			toggleHold,
+			toggleMute,
+			sendDtmf,
+			dismissEndedCall,
+		],
+	);
 
 	return (
 		<SoftphoneContext.Provider value={value}>

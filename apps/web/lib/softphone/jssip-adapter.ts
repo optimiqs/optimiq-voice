@@ -2,6 +2,7 @@
 
 import { UA, WebSocketInterface } from "jssip";
 import type { CallPeer, SoftphoneEvent } from "./call-state";
+import type { ResolvedSoftphoneCredentials } from "./contracts";
 import type { SipUserAgent, SipUserAgentOptions } from "./sip-adapter";
 import type { EndEvent, RTCSession } from "jssip/lib/RTCSession";
 import type { RTCSessionEvent, UnRegisteredEvent } from "jssip/lib/UA";
@@ -20,6 +21,8 @@ function peerFrom(session: RTCSession): CallPeer {
 class JsSipUserAgent implements SipUserAgent {
 	private readonly ua: UA;
 	private readonly options: SipUserAgentOptions;
+	/** The credentials the UA is currently registered with. Rotated by {@link peerConfiguration}. */
+	private credentials: ResolvedSoftphoneCredentials;
 	private session: RTCSession | null = null;
 	private stopped = false;
 	private starting = false;
@@ -29,6 +32,7 @@ class JsSipUserAgent implements SipUserAgent {
 	constructor(options: SipUserAgentOptions) {
 		this.options = options;
 		const { credentials } = options;
+		this.credentials = credentials;
 
 		const socket = new WebSocketInterface(credentials.wssUrl);
 		this.ua = new UA({
@@ -216,6 +220,11 @@ class JsSipUserAgent implements SipUserAgent {
 				session.answer({ mediaConstraints: AUDIO_ONLY, pcConfig });
 			} catch {
 				if (this.session === session && !session.isEnded()) {
+					// Say why. A bare 480 declines the call with nothing on screen to explain it.
+					this.emit({
+						type: "CALL_ENDED",
+						reason: "The call could not be answered. Reconnect the softphone and try again.",
+					});
 					session.terminate({ status_code: 480 });
 				}
 			} finally {
@@ -224,15 +233,34 @@ class JsSipUserAgent implements SipUserAgent {
 		})();
 	}
 
+	/**
+	 * The relay configuration for the next media connection, from freshly fetched credentials.
+	 *
+	 * Only a changed `sipUri` is fatal: that means a different account — an org switch, or the
+	 * extension reassigned — and placing a call as somebody else is worse than not placing one. A
+	 * changed PASSWORD is the ordinary case this refresh exists for (an admin regenerating the SIP
+	 * secret), so it re-registers with the new secret and the call goes ahead. Refusing it used to
+	 * leave a softphone that showed "Registered" and silently declined every call.
+	 */
 	private async peerConfiguration(): Promise<RTCConfiguration> {
-		const original = this.options.credentials;
+		const original = this.credentials;
 		const credentials = (await this.options.refreshCredentials?.()) ?? original;
+		if (!credentials.webrtcSupported) {
+			throw new Error("Browser audio is disabled for this account");
+		}
+		if (credentials.sipUri !== original.sipUri) {
+			throw new Error("The calling account changed");
+		}
 		if (
-			!credentials.webrtcSupported ||
-			credentials.sipUri !== original.sipUri ||
-			credentials.password !== original.password
+			credentials.password !== original.password ||
+			credentials.authorizationUser !== original.authorizationUser
 		) {
-			throw new Error("The calling account changed or browser audio is disabled");
+			this.credentials = credentials;
+			this.ua.set("authorization_user", credentials.authorizationUser);
+			this.ua.set("password", credentials.password);
+			// A REGISTER with the new secret, not a restart: the socket and any session on it stay up,
+			// and the next in-dialog challenge is answered with the credentials the server now holds.
+			this.ua.register();
 		}
 		return { iceServers: [...(credentials.iceServers ?? [])] };
 	}

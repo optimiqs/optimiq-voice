@@ -1,7 +1,7 @@
 import { getSessionCookie } from "better-auth/cookies";
 import { NextResponse, type NextRequest } from "next/server";
 import { SESSION_COOKIE_PREFIX } from "~/lib/auth-constants";
-import { isPublicRoute, routes, signInWithRedirect } from "~/lib/routes";
+import { isPublicRoute, routes, safeRedirectTarget, signInWithRedirect } from "~/lib/routes";
 
 /**
  * An OPTIMISTIC redirect, and nothing more.
@@ -26,9 +26,12 @@ export function proxy(request: NextRequest) {
 	const hasSessionCookie = getSessionCookie(request, { cookiePrefix: SESSION_COOKIE_PREFIX });
 
 	if (isPublicRoute(pathname)) {
-		// Someone already signed in has no business on the sign-in page.
+		// Someone already signed in has no business on the sign-in page. They keep their
+		// destination, though: an invitation link bounces through `/sign-in?redirectTo=…`, and
+		// sending them to the overview instead would lose the invitation id with it.
 		if (hasSessionCookie && (pathname === routes.signIn || pathname === routes.signUp)) {
-			return NextResponse.redirect(new URL(routes.overview, request.url));
+			const target = safeRedirectTarget(request.nextUrl.searchParams.get("redirectTo"));
+			return NextResponse.redirect(new URL(target, request.url));
 		}
 		return NextResponse.next();
 	}

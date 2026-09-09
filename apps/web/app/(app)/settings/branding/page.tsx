@@ -1,7 +1,8 @@
 "use client";
 
 import { useForm, useStore } from "@tanstack/react-form";
-import { useEffect } from "react";
+import { useTheme } from "next-themes";
+import { useEffect, type CSSProperties } from "react";
 import { Button } from "~/components/ui/button";
 import {
 	Card,
@@ -20,7 +21,7 @@ import {
 	EMPTY_BRANDING_FORM,
 	formToBrandingPatch,
 } from "~/lib/branding/schemas";
-import { brandThemeCss, isHexColor } from "~/lib/branding/theme";
+import { deriveBrandRoles, isHexColor } from "~/lib/branding/theme";
 import { RequirePermission } from "../../_components/require-permission";
 import { useBranding, useSaveBranding } from "../../_hooks/use-branding-queries";
 import { SettingsNav } from "../_components/settings-nav";
@@ -31,12 +32,13 @@ import { SettingsNav } from "../_components/settings-nav";
  * Matches the notifications/routing settings pattern exactly — `@tanstack/react-form` with a Zod
  * validator, values seeded from an effect once the read resolves, one card, save gated by
  * `settings.write` with a read-only fallback. What it adds is a LIVE preview: the same
- * `brandThemeCss` the app uses is scoped to a preview box so an administrator sees the actual
- * primary/accent the app will render before they save.
+ * `deriveBrandRoles` the app's theme layer uses, applied as custom properties on a preview box so
+ * an administrator sees the actual primary/accent the app will render before they save.
  */
 export default function BrandingSettingsPage() {
 	const branding = useBranding();
 	const save = useSaveBranding();
+	const { resolvedTheme } = useTheme();
 
 	const form = useForm({
 		defaultValues: EMPTY_BRANDING_FORM,
@@ -57,11 +59,12 @@ export default function BrandingSettingsPage() {
 	// Live preview: read the current field values and derive the theme they would apply.
 	const values = useStore(form.store, (state) => state.values);
 	const primaryValid = values.primaryColor === "" || isHexColor(values.primaryColor);
-	// Scope BOTH blocks to the preview box so typing a colour never bleeds the half-typed theme onto
-	// the live app — `.dark` especially would otherwise override the whole shell.
-	const scopedPreviewCss = brandThemeCss(formToBrandingPatch(values))
-		.replace(/:root/gu, "[data-brand-preview]")
-		.replace(/\.dark /gu, ".dark [data-brand-preview]");
+	// The roles go on the preview box itself as custom properties. Scoping is then STRUCTURAL — the
+	// half-typed theme cannot bleed onto the live app because it never leaves this element — rather
+	// than a rewrite of another module's stylesheet text, which breaks the moment that module emits
+	// a selector the rewrite does not know about.
+	const roles = deriveBrandRoles(formToBrandingPatch(values));
+	const previewVars = resolvedTheme === "dark" ? roles.dark : roles.light;
 
 	return (
 		<>
@@ -209,19 +212,15 @@ export default function BrandingSettingsPage() {
 							</form>
 						</Card>
 
-						{/* Live preview — the real theme layer, scoped to this box. */}
+						{/* Live preview — the real theme roles, applied to this box and nowhere else. */}
 						<Card className="h-fit">
 							<CardHeader>
 								<CardTitle>Preview</CardTitle>
 								<CardDescription>The colours as the app will render them.</CardDescription>
 							</CardHeader>
 							<CardBody>
-								{/* eslint-disable-next-line react/no-danger */}
-								{scopedPreviewCss ? (
-									<style dangerouslySetInnerHTML={{ __html: scopedPreviewCss }} />
-								) : null}
 								<div
-									data-brand-preview=""
+									style={previewVars as CSSProperties}
 									className="flex flex-col gap-3 rounded-panel border border-border bg-surface p-4"
 								>
 									<span className="text-sm font-medium text-foreground">

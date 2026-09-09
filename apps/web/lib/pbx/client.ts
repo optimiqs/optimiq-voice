@@ -804,7 +804,10 @@ export const PBX_CHILDREN = {
 export function pbxListSearchParams(query: PbxListQuery): string {
 	const params = new URLSearchParams();
 	params.set("page", String(Math.max(1, query.page ?? 1)));
-	params.set("limit", String(Math.min(MAX_PAGE_LIMIT, query.limit ?? DEFAULT_PAGE_LIMIT)));
+	params.set(
+		"limit",
+		String(Math.min(MAX_PAGE_LIMIT, Math.max(1, query.limit ?? DEFAULT_PAGE_LIMIT))),
+	);
 	if (query.search) {
 		params.set("search", query.search);
 	}
@@ -839,7 +842,7 @@ export async function getPbx<TRow>(
 	resource: PbxResourceDescriptor<TRow>,
 	id: string,
 ): Promise<TRow> {
-	const { data } = await apiFetch<ItemEnvelope<TRow>>(`${resource.path}/${id}`);
+	const { data } = await apiFetch<ItemEnvelope<TRow>>(`${resource.path}/${encodeURIComponent(id)}`);
 	return data;
 }
 
@@ -863,7 +866,7 @@ export async function updatePbx<TRow>(
 	id: string,
 	values: Record<string, unknown>,
 ): Promise<MutationEnvelope<TRow>> {
-	return await apiFetch<MutationEnvelope<TRow>>(`${resource.path}/${id}`, {
+	return await apiFetch<MutationEnvelope<TRow>>(`${resource.path}/${encodeURIComponent(id)}`, {
 		method: "PATCH",
 		body: JSON.stringify(values),
 	});
@@ -873,9 +876,12 @@ export async function deletePbx<TRow>(
 	resource: PbxResourceDescriptor<TRow>,
 	id: string,
 ): Promise<MutationEnvelope<{ readonly id: string }>> {
-	return await apiFetch<MutationEnvelope<{ readonly id: string }>>(`${resource.path}/${id}`, {
-		method: "DELETE",
-	});
+	return await apiFetch<MutationEnvelope<{ readonly id: string }>>(
+		`${resource.path}/${encodeURIComponent(id)}`,
+		{
+			method: "DELETE",
+		},
+	);
 }
 
 export async function listPbxChildren<TRow>(
@@ -883,7 +889,7 @@ export async function listPbxChildren<TRow>(
 	parentId: string,
 ): Promise<readonly TRow[]> {
 	const { data } = await apiFetch<{ data: readonly TRow[] }>(
-		`${child.parentPath}/${parentId}/${child.segment}`,
+		`${child.parentPath}/${encodeURIComponent(parentId)}/${child.segment}`,
 	);
 	return data;
 }
@@ -894,7 +900,7 @@ export async function createPbxChild<TRow>(
 	values: Record<string, unknown>,
 ): Promise<MutationEnvelope<TRow>> {
 	return await apiFetch<MutationEnvelope<TRow>>(
-		`${child.parentPath}/${parentId}/${child.segment}`,
+		`${child.parentPath}/${encodeURIComponent(parentId)}/${child.segment}`,
 		{ method: "POST", body: JSON.stringify(values) },
 	);
 }
@@ -906,7 +912,7 @@ export async function updatePbxChild<TRow>(
 	values: Record<string, unknown>,
 ): Promise<MutationEnvelope<TRow>> {
 	return await apiFetch<MutationEnvelope<TRow>>(
-		`${child.parentPath}/${parentId}/${child.segment}/${id}`,
+		`${child.parentPath}/${encodeURIComponent(parentId)}/${child.segment}/${encodeURIComponent(id)}`,
 		{ method: "PATCH", body: JSON.stringify(values) },
 	);
 }
@@ -917,7 +923,7 @@ export async function deletePbxChild<TRow>(
 	id: string,
 ): Promise<MutationEnvelope<{ readonly id: string }>> {
 	return await apiFetch<MutationEnvelope<{ readonly id: string }>>(
-		`${child.parentPath}/${parentId}/${child.segment}/${id}`,
+		`${child.parentPath}/${encodeURIComponent(parentId)}/${child.segment}/${encodeURIComponent(id)}`,
 		{ method: "DELETE" },
 	);
 }
@@ -939,7 +945,7 @@ export async function reorderPbxChildren<TRow>(
 	ids: readonly string[],
 ): Promise<MutationEnvelope<readonly TRow[]>> {
 	return await apiFetch<MutationEnvelope<readonly TRow[]>>(
-		`${child.parentPath}/${parentId}/${child.segment}/reorder`,
+		`${child.parentPath}/${encodeURIComponent(parentId)}/${child.segment}/reorder`,
 		{ method: "PUT", body: JSON.stringify({ ids }) },
 	);
 }
@@ -964,10 +970,13 @@ export async function toggleCallFlow(
 	callFlowId: string,
 	mode: CallFlowMode,
 ): Promise<MutationEnvelope<CallFlowRow>> {
-	return await apiFetch<MutationEnvelope<CallFlowRow>>(`/call-flows/${callFlowId}/toggle`, {
-		method: "POST",
-		body: JSON.stringify({ mode }),
-	});
+	return await apiFetch<MutationEnvelope<CallFlowRow>>(
+		`/call-flows/${encodeURIComponent(callFlowId)}/toggle`,
+		{
+			method: "POST",
+			body: JSON.stringify({ mode }),
+		},
+	);
 }
 
 /**
@@ -988,7 +997,7 @@ export async function setTimeConditionOverride(
 	override: TimeConditionOverride,
 ): Promise<MutationEnvelope<TimeConditionRow>> {
 	return await apiFetch<MutationEnvelope<TimeConditionRow>>(
-		`/call-flows/time-conditions/${timeConditionId}/override`,
+		`/call-flows/time-conditions/${encodeURIComponent(timeConditionId)}/override`,
 		{ method: "POST", body: JSON.stringify({ override }) },
 	);
 }
@@ -1008,7 +1017,7 @@ export async function setPinSetEntryPin(
 	pin: string,
 ): Promise<MutationEnvelope<PinSetEntryRow>> {
 	return await apiFetch<MutationEnvelope<PinSetEntryRow>>(
-		`/pin-sets/${pinSetId}/entries/${entryId}/pin`,
+		`/pin-sets/${encodeURIComponent(pinSetId)}/entries/${encodeURIComponent(entryId)}/pin`,
 		{ method: "PUT", body: JSON.stringify({ pin }) },
 	);
 }
@@ -1108,19 +1117,25 @@ export async function setVoicemailPin(
 	boxId: string,
 	pin: string,
 ): Promise<MutationEnvelope<VoicemailPinState>> {
-	return await apiFetch<MutationEnvelope<VoicemailPinState>>(`/voicemail-boxes/${boxId}/pin`, {
-		method: "POST",
-		body: JSON.stringify({ pin }),
-	});
+	return await apiFetch<MutationEnvelope<VoicemailPinState>>(
+		`/voicemail-boxes/${encodeURIComponent(boxId)}/pin`,
+		{
+			method: "POST",
+			body: JSON.stringify({ pin }),
+		},
+	);
 }
 
 /** Clears it. The mailbox falls back to authenticating by the calling extension. */
 export async function clearVoicemailPin(
 	boxId: string,
 ): Promise<MutationEnvelope<VoicemailPinState>> {
-	return await apiFetch<MutationEnvelope<VoicemailPinState>>(`/voicemail-boxes/${boxId}/pin`, {
-		method: "DELETE",
-	});
+	return await apiFetch<MutationEnvelope<VoicemailPinState>>(
+		`/voicemail-boxes/${encodeURIComponent(boxId)}/pin`,
+		{
+			method: "DELETE",
+		},
+	);
 }
 
 export interface VoicemailMessageQuery {
@@ -1141,7 +1156,7 @@ export async function listVoicemailMessages(
 	params.set("page", String(query.page ?? 1));
 	params.set("limit", String(query.limit ?? DEFAULT_PAGE_LIMIT));
 	return await apiFetch<VoicemailMessagePage>(
-		`/voicemail-boxes/${boxId}/messages?${params.toString()}`,
+		`/voicemail-boxes/${encodeURIComponent(boxId)}/messages?${params.toString()}`,
 	);
 }
 
@@ -1157,10 +1172,13 @@ export async function setVoicemailMessageRead(
 	messageId: string,
 	read: boolean,
 ): Promise<VoicemailMessageResult> {
-	return await apiFetch<VoicemailMessageResult>(`/voicemail-boxes/${boxId}/messages/${messageId}`, {
-		method: "PATCH",
-		body: JSON.stringify({ read }),
-	});
+	return await apiFetch<VoicemailMessageResult>(
+		`/voicemail-boxes/${encodeURIComponent(boxId)}/messages/${encodeURIComponent(messageId)}`,
+		{
+			method: "PATCH",
+			body: JSON.stringify({ read }),
+		},
+	);
 }
 
 /**
@@ -1177,7 +1195,7 @@ export async function deleteVoicemailMessage(
 ): Promise<VoicemailMessageDeletion> {
 	const suffix = purge ? "?purge=true" : "";
 	return await apiFetch<VoicemailMessageDeletion>(
-		`/voicemail-boxes/${boxId}/messages/${messageId}${suffix}`,
+		`/voicemail-boxes/${encodeURIComponent(boxId)}/messages/${encodeURIComponent(messageId)}${suffix}`,
 		{ method: "DELETE" },
 	);
 }
@@ -1194,7 +1212,7 @@ export async function mintVoicemailPlaybackUrl(
 	messageId: string,
 ): Promise<VoicemailPlaybackLink> {
 	const { data } = await apiFetch<ItemEnvelope<VoicemailPlaybackLink>>(
-		`/voicemail-boxes/${boxId}/messages/${messageId}/play-url`,
+		`/voicemail-boxes/${encodeURIComponent(boxId)}/messages/${encodeURIComponent(messageId)}/play-url`,
 		{ method: "POST", body: JSON.stringify({}) },
 	);
 	return data;
@@ -1208,7 +1226,7 @@ export async function mintVoicemailPlaybackUrl(
 export type ConferencePinRole = "participant" | "moderator";
 
 function conferencePinPath(conferenceId: string, role: ConferencePinRole): string {
-	return `/conferences/${conferenceId}/${role === "moderator" ? "moderator-pin" : "pin"}`;
+	return `/conferences/${encodeURIComponent(conferenceId)}/${role === "moderator" ? "moderator-pin" : "pin"}`;
 }
 
 /**
@@ -1322,12 +1340,12 @@ export function conferenceModerationPath(
 	memberRef?: string,
 ): string {
 	if (action === "lock" || action === "unlock") {
-		return `/conferences/${conferenceId}/${action}`;
+		return `/conferences/${encodeURIComponent(conferenceId)}/${action}`;
 	}
 	// Percent-encoded because the server documents the leg id as an OPAQUE token it does not
 	// validate the shape of. It is a UUID on this platform today, and encoding it costs nothing to
 	// stop being true.
-	return `/conferences/${conferenceId}/participants/${encodeURIComponent(memberRef ?? "")}/${action}`;
+	return `/conferences/${encodeURIComponent(conferenceId)}/participants/${encodeURIComponent(memberRef ?? "")}/${action}`;
 }
 
 /**
@@ -1463,7 +1481,7 @@ export async function updatePrompt(
 	promptId: string,
 	values: { readonly name?: string; readonly language?: string },
 ): Promise<MutationEnvelope<PromptRow>> {
-	return await apiFetch<MutationEnvelope<PromptRow>>(`/prompts/${promptId}`, {
+	return await apiFetch<MutationEnvelope<PromptRow>>(`/prompts/${encodeURIComponent(promptId)}`, {
 		method: "PATCH",
 		body: JSON.stringify(values),
 	});
@@ -1471,15 +1489,18 @@ export async function updatePrompt(
 
 /** Deletes a prompt and its stored object. Refused with a 409 while anything still plays it. */
 export async function deletePrompt(promptId: string): Promise<MutationEnvelope<{ id: string }>> {
-	return await apiFetch<MutationEnvelope<{ id: string }>>(`/prompts/${promptId}`, {
-		method: "DELETE",
-	});
+	return await apiFetch<MutationEnvelope<{ id: string }>>(
+		`/prompts/${encodeURIComponent(promptId)}`,
+		{
+			method: "DELETE",
+		},
+	);
 }
 
 /** The audio files under one hold-music class. Not paginated — the API does not paginate it. */
 export async function listMohFiles(mohClassId: string): Promise<readonly PromptRow[]> {
 	const { data } = await apiFetch<{ data: readonly PromptRow[] }>(
-		`/moh-classes/${mohClassId}/files`,
+		`/moh-classes/${encodeURIComponent(mohClassId)}/files`,
 	);
 	return data;
 }
@@ -1490,7 +1511,7 @@ export async function uploadMohFile(
 	fields: { readonly name?: string } = {},
 ): Promise<MutationEnvelope<PromptRow>> {
 	return await apiUpload<MutationEnvelope<PromptRow>>(
-		`/moh-classes/${mohClassId}/files`,
+		`/moh-classes/${encodeURIComponent(mohClassId)}/files`,
 		file,
 		fields,
 	);
@@ -1501,7 +1522,7 @@ export async function deleteMohFile(
 	fileId: string,
 ): Promise<MutationEnvelope<{ id: string }>> {
 	return await apiFetch<MutationEnvelope<{ id: string }>>(
-		`/moh-classes/${mohClassId}/files/${fileId}`,
+		`/moh-classes/${encodeURIComponent(mohClassId)}/files/${encodeURIComponent(fileId)}`,
 		{ method: "DELETE" },
 	);
 }
@@ -1516,7 +1537,7 @@ export async function deleteMohFile(
  */
 export async function mintPromptPlaybackUrl(promptId: string): Promise<MediaPlaybackLink> {
 	const { data } = await apiFetch<ItemEnvelope<MediaPlaybackLink>>(
-		`/prompts/${promptId}/play-url`,
+		`/prompts/${encodeURIComponent(promptId)}/play-url`,
 		{ method: "POST", body: JSON.stringify({}) },
 	);
 	return data;
@@ -1530,7 +1551,7 @@ export async function listVoicemailGreetings(
 	boxId: string,
 ): Promise<readonly VoicemailGreetingRow[]> {
 	const { data } = await apiFetch<{ data: readonly VoicemailGreetingRow[] }>(
-		`/voicemail-boxes/${boxId}/greetings`,
+		`/voicemail-boxes/${encodeURIComponent(boxId)}/greetings`,
 	);
 	return data;
 }
@@ -1553,7 +1574,7 @@ export async function uploadVoicemailGreeting(
 	} = {},
 ): Promise<MutationEnvelope<VoicemailGreetingRow>> {
 	return await apiUpload<MutationEnvelope<VoicemailGreetingRow>>(
-		`/voicemail-boxes/${boxId}/greetings`,
+		`/voicemail-boxes/${encodeURIComponent(boxId)}/greetings`,
 		file,
 		{
 			...(fields.kind === undefined ? {} : { kind: fields.kind }),
@@ -1577,7 +1598,7 @@ export async function setVoicemailGreetingActive(
 	active: boolean,
 ): Promise<MutationEnvelope<VoicemailGreetingRow>> {
 	return await apiFetch<MutationEnvelope<VoicemailGreetingRow>>(
-		`/voicemail-boxes/${boxId}/greetings/${greetingId}/${active ? "activate" : "deactivate"}`,
+		`/voicemail-boxes/${encodeURIComponent(boxId)}/greetings/${encodeURIComponent(greetingId)}/${active ? "activate" : "deactivate"}`,
 		{ method: "POST", body: JSON.stringify({}) },
 	);
 }
@@ -1587,7 +1608,7 @@ export async function deleteVoicemailGreeting(
 	greetingId: string,
 ): Promise<MutationEnvelope<{ id: string }>> {
 	return await apiFetch<MutationEnvelope<{ id: string }>>(
-		`/voicemail-boxes/${boxId}/greetings/${greetingId}`,
+		`/voicemail-boxes/${encodeURIComponent(boxId)}/greetings/${encodeURIComponent(greetingId)}`,
 		{ method: "DELETE" },
 	);
 }
@@ -1597,7 +1618,7 @@ export async function mintGreetingPlaybackUrl(
 	greetingId: string,
 ): Promise<MediaPlaybackLink> {
 	const { data } = await apiFetch<ItemEnvelope<MediaPlaybackLink>>(
-		`/voicemail-boxes/${boxId}/greetings/${greetingId}/play-url`,
+		`/voicemail-boxes/${encodeURIComponent(boxId)}/greetings/${encodeURIComponent(greetingId)}/play-url`,
 		{ method: "POST", body: JSON.stringify({}) },
 	);
 	return data;

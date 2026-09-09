@@ -41,16 +41,12 @@ export interface AgentSessionResult {
 
 /** The seat the acting user occupies, or `null`. Not an error: most members are not agents. */
 export async function fetchMyAgentSession(): Promise<AgentSessionView | null> {
-	const { data } = await apiFetch<{ data: AgentSessionView | null }>(
-		"/queue-agents/session/me",
-	);
+	const { data } = await apiFetch<{ data: AgentSessionView | null }>("/queue-agents/session/me");
 	return data;
 }
 
 export async function fetchAgentSession(agentId: string): Promise<AgentSessionView> {
-	const { data } = await apiFetch<{ data: AgentSessionView }>(
-		`/queue-agents/${agentId}/session`,
-	);
+	const { data } = await apiFetch<{ data: AgentSessionView }>(`/queue-agents/${agentId}/session`);
 	return data;
 }
 

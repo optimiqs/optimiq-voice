@@ -22,7 +22,7 @@ import {
 	usePbxChildReorder,
 	usePbxChildren,
 	usePbxItem,
-	usePbxList,
+	usePbxRoster,
 } from "../../_hooks/use-pbx-queries";
 import { PagingGroupDialog } from "./paging-group-dialog";
 import { PagingGroupMemberDialog } from "./paging-group-member-dialog";
@@ -55,8 +55,8 @@ export function PagingGroupDetail({ groupId }: { groupId: string }) {
 	const removeMember = usePbxChildDelete(PBX_CHILDREN.pagingGroupMembers, "paging-groups", groupId);
 	const reorder = usePbxChildReorder(PBX_CHILDREN.pagingGroupMembers, "paging-groups", groupId);
 
-	/** Members carry an extension id; the table has to say a number. Capped at the API's page size. */
-	const extensions = usePbxList(PBX_RESOURCES.extensions, { page: 1, limit: 100 });
+	/** Members carry an extension id; the table has to say a number. */
+	const extensions = usePbxRoster(PBX_RESOURCES.extensions);
 	const extensionsById = new Map(extensions.rows.map((row: ExtensionRow) => [row.id, row]));
 
 	const canWrite = usePermission(PBX_RESOURCES.pagingGroups.permissions.write);
@@ -211,7 +211,7 @@ export function PagingGroupDetail({ groupId }: { groupId: string }) {
 								<Badge tone="neutral">extension</Badge>
 							) : (
 								<span className="text-xs text-muted-foreground">
-									Not in the first {extensions.rows.length}
+									{extensions.complete ? "Not found" : `Not in the first ${extensions.rows.length}`}
 								</span>
 							),
 					},

@@ -77,7 +77,9 @@ export function DirectoryDialog({
 	const initial = directory
 		? readDestination(directory as unknown as Record<string, unknown>, "timeout")
 		: EMPTY_DESTINATION;
-	const [timeout, setTimeout] = useState<DestinationValue>(initial);
+	// Named `timeoutDestination`, not `timeout` — a local called `setTimeout` shadows the global one,
+	// so the next timer added to this dialog would silently be a destination setter.
+	const [timeoutDestination, setTimeoutDestination] = useState<DestinationValue>(initial);
 	const [localErrors, setLocalErrors] = useState<Readonly<Record<string, string>>>({});
 
 	const form = useForm({
@@ -87,7 +89,7 @@ export function DirectoryDialog({
 			const parsed = dialByNameDirectoryFormSchema.parse(value);
 			server.clear();
 
-			const problem = validateDestinationValue(timeout, { required: false });
+			const problem = validateDestinationValue(timeoutDestination, { required: false });
 			if (problem) {
 				setLocalErrors({
 					[`timeoutDestination${problem.field.charAt(0).toUpperCase()}${problem.field.slice(1)}`]:
@@ -97,7 +99,7 @@ export function DirectoryDialog({
 			}
 			setLocalErrors({});
 
-			const body = { ...parsed, ...writeDestination(timeout, "timeout") };
+			const body = { ...parsed, ...writeDestination(timeoutDestination, "timeout") };
 			try {
 				if (directory === null) {
 					await create.mutateAsync(body);
@@ -122,7 +124,7 @@ export function DirectoryDialog({
 					server.clear();
 					mutation.reset();
 					setLocalErrors({});
-					setTimeout(initial);
+					setTimeoutDestination(initial);
 					form.reset();
 				}
 				onOpenChange(next);
@@ -238,9 +240,9 @@ export function DirectoryDialog({
 				prefix="timeout"
 				label="When the caller gives up"
 				description="Taken when they time out or run out of attempts. Usually a receptionist or a ring group. Leave it empty to release the call, which is rarely what anyone means."
-				value={timeout}
+				value={timeoutDestination}
 				onChange={(next) => {
-					setTimeout(next);
+					setTimeoutDestination(next);
 					setLocalErrors({});
 				}}
 				disabled={mutation.isPending}

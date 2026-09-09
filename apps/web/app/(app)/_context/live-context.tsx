@@ -1,6 +1,15 @@
 "use client";
 
-import { createContext, use, useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+	createContext,
+	use,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+	type ReactNode,
+} from "react";
 import { LiveClient, type LiveStatus, type LiveTopicHandlers } from "~/lib/live/client";
 import { topicKind, type LiveTopic } from "~/lib/live/protocol";
 
@@ -26,6 +35,8 @@ interface LiveContextValue {
 	readonly client: LiveClient | null;
 	readonly status: LiveStatus;
 	readonly allowedTopicKinds: readonly string[];
+	/** Whether the server has said what this session may watch yet. */
+	readonly welcomed: boolean;
 }
 
 const LiveContext = createContext<LiveContextValue | null>(null);
@@ -38,6 +49,7 @@ export function LiveProvider({ children }: { children: ReactNode }) {
 	);
 	const [status, setStatus] = useState<LiveStatus>("closed");
 	const [allowedTopicKinds, setAllowedTopicKinds] = useState<readonly string[]>([]);
+	const [welcomed, setWelcomed] = useState(false);
 
 	useEffect(() => {
 		if (client === null) {
@@ -47,7 +59,10 @@ export function LiveProvider({ children }: { children: ReactNode }) {
 		// `welcome` arrives a round trip AFTER the socket opens, so it needs its own notification:
 		// reading the allowed kinds on the status change would read them before the server had said
 		// anything, and there is no second status change to prompt a re-read.
-		const detachWelcome = client.onWelcome(setAllowedTopicKinds);
+		const detachWelcome = client.onWelcome((kinds) => {
+			setAllowedTopicKinds(kinds);
+			setWelcomed(true);
+		});
 		return () => {
 			detachStatus();
 			detachWelcome();
@@ -56,8 +71,8 @@ export function LiveProvider({ children }: { children: ReactNode }) {
 	}, [client]);
 
 	const value = useMemo(
-		() => ({ client, status, allowedTopicKinds }),
-		[client, status, allowedTopicKinds],
+		() => ({ client, status, allowedTopicKinds, welcomed }),
+		[client, status, allowedTopicKinds, welcomed],
 	);
 
 	return <LiveContext value={value}>{children}</LiveContext>;
@@ -91,16 +106,22 @@ export function useLiveTopic(
 	handlers: LiveTopicHandlers,
 	options: { readonly enabled?: boolean } = {},
 ): void {
-	const { client, allowedTopicKinds } = useLiveContext();
-	const [handlerBox] = useState(() => ({ current: handlers }));
-	handlerBox.current = handlers;
+	const { client, allowedTopicKinds, welcomed } = useLiveContext();
+	// The latest-ref pattern, written as a layout effect rather than an assignment in the render
+	// body: a render that is discarded would otherwise have already overwritten the box, and a tree
+	// resumed afterwards would dispatch into an abandoned render's handlers.
+	const handlerBox = useRef(handlers);
+	useLayoutEffect(() => {
+		handlerBox.current = handlers;
+	});
 
 	const enabled = options.enabled !== false && topic !== null;
-	// The welcome frame lists what this session may watch. Checking it here means a component
-	// that renders before permissions are known does not send a subscribe that will be denied —
-	// and once the frame arrives, the effect re-runs and the lease is taken.
-	const permitted =
-		topic === null || allowedTopicKinds.length === 0 || allowedTopicKinds.includes(topicKind(topic));
+	// The welcome frame lists what this session may watch, so nothing subscribes until it lands:
+	// a component that renders before permissions are known does not send a subscribe that will be
+	// denied, and once the frame arrives the effect re-runs and the lease is taken. Gating on the
+	// FLAG rather than on an empty list matters — a session legitimately allowed nothing would
+	// otherwise be treated as allowed everything.
+	const permitted = topic === null || (welcomed && allowedTopicKinds.includes(topicKind(topic)));
 
 	useEffect(() => {
 		if (client === null || topic === null || !enabled || !permitted) {

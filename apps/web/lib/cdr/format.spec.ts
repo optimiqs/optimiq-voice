@@ -148,15 +148,14 @@ describe("buildCallTree", () => {
 		expect(flattenCallTree(buildCallTree(legs))).toHaveLength(1);
 	});
 
-	it("survives a cycle between two legs", () => {
-		const legs = [
-			leg({ id: "x", originatingLegId: "y" }),
-			leg({ id: "y", originatingLegId: "x" }),
-		];
+	it("survives a cycle between two legs, and still shows both", () => {
+		const legs = [leg({ id: "x", originatingLegId: "y" }), leg({ id: "y", originatingLegId: "x" })];
 
 		// Unreachable in real data (a leg is originated before it can originate), but a corrupted
-		// row must not hang the browser.
-		expect(flattenCallTree(buildCallTree(legs)).length).toBeLessThanOrEqual(2);
+		// row must not hang the browser — nor silently vanish from a screen whose job is every leg
+		// of one call. Neither leg is a root, so both would otherwise be dropped.
+		const flat = flattenCallTree(buildCallTree(legs));
+		expect(flat.map((node) => node.leg.id).sort()).toEqual(["x", "y"]);
 	});
 });
 

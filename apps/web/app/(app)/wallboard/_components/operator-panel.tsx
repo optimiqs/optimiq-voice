@@ -27,7 +27,7 @@ import { routes } from "~/lib/routes";
 import { usePermission } from "../../_context/session-context";
 import { useQueueStats } from "../../_hooks/use-cdr-queries";
 import { useLiveAgentStates, useLiveQueue } from "../../_hooks/use-live-queries";
-import { usePbxChildren, usePbxItem, usePbxList } from "../../_hooks/use-pbx-queries";
+import { usePbxChildren, usePbxItem, usePbxRoster } from "../../_hooks/use-pbx-queries";
 import { AgentSessionControls, LiveIndicator } from "../../queues/_components/agent-console";
 import { AgentStatusBadge } from "../../queues/_components/queue-shared";
 import { ServiceLevelBadge, WallTile } from "./wallboard-shared";
@@ -63,7 +63,7 @@ import type { QueueAgentRow, QueueAgentStatus, QueueRow, QueueTierRow } from "~/
 export function OperatorPanel({ queueId }: { queueId: string }) {
 	const queue = usePbxItem<QueueRow>(PBX_RESOURCES.queues, queueId);
 	const tiers = usePbxChildren<QueueTierRow>(PBX_CHILDREN.queueTiers, "queues", queueId);
-	const agents = usePbxList<QueueAgentRow>(PBX_RESOURCES.queueAgents, { page: 1, limit: 100 });
+	const agents = usePbxRoster<QueueAgentRow>(PBX_RESOURCES.queueAgents);
 
 	const live = useLiveQueue(queueId);
 	const agentStates = useLiveAgentStates();

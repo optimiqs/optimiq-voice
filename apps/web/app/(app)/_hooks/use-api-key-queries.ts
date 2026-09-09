@@ -12,10 +12,15 @@ import { queryKeys } from "~/lib/query-keys";
  * the tenant rather than to whoever happened to create it — a departing administrator does not
  * take the integrations with them.
  *
- * `organizationId` is therefore passed EXPLICITLY on every call, and its absence is not a
- * harmless default: `/api-key/list` without it returns the caller's USER-owned keys instead of
- * the organization's (`@better-auth/api-key` dist/index.mjs:1277), so the page would look
- * permanently empty while keys existed. `/api-key/create` without it rejects with a 400.
+ * `organizationId` is therefore passed EXPLICITLY on every call that TAKES one, and its absence
+ * there is not a harmless default: `/api-key/list` without it returns the caller's USER-owned keys
+ * instead of the organization's (`@better-auth/api-key` dist/index.mjs:1277), so the page would
+ * look permanently empty while keys existed. `/api-key/create` without it rejects with a 400.
+ *
+ * `/api-key/delete` is the exception, and deliberately so: its body schema is `{ configId?, keyId }`
+ * only. It loads the key by id and derives the reference from the ROW, then checks the caller's
+ * `apiKey.delete` permission on that organization — so the scope is the key's own, not one the
+ * client could get wrong. The hook still takes `organizationId` for the invalidation.
  */
 
 export interface ApiKeySummary {

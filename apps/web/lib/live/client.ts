@@ -88,11 +88,21 @@ interface Lease {
 export class LiveClient {
 	private socket: LiveSocket | undefined;
 	private readonly leases = new Map<LiveTopic, Set<Lease>>();
+	/**
+	 * The last snapshot each topic received on the CURRENT connection.
+	 *
+	 * A second component leasing an already-open topic used to re-subscribe for a snapshot of its
+	 * own, but the server's answer is fanned out to every lease on the topic — so N tiles on one
+	 * topic meant N subscribes, N whole-bucket snapshots and N² full rebuilds on one page load.
+	 * Replaying the held snapshot reaches the new lease only, and costs the server nothing.
+	 */
+	private readonly snapshots = new Map<LiveTopic, LiveSnapshotEvent>();
 	private readonly statusListeners = new Set<(status: LiveStatus) => void>();
 	private readonly welcomeListeners = new Set<(topics: readonly string[]) => void>();
 	private readonly options: LiveClientOptions;
 	private attempt = 0;
 	private retryHandle: number | undefined;
+	private watchdogHandle: number | undefined;
 	private stopped = false;
 	private statusValue: LiveStatus = "closed";
 	private allowedKinds: readonly string[] = [];
@@ -147,11 +157,15 @@ export class LiveClient {
 			this.sendSubscribe([topic]);
 		} else {
 			existing.add(lease);
-			// A late joiner has no snapshot of its own, so it is told to re-subscribe: the server
-			// answers a repeated subscribe with a fresh snapshot rather than refusing it, precisely so
-			// a second component mounting onto an open topic starts with state instead of waiting for
-			// the next thing to change.
-			this.sendSubscribe([topic]);
+			// A late joiner has no snapshot of its own. If this connection has already been given one
+			// for the topic, replay it — that reaches THIS lease and no other. Only when there is
+			// none is the server asked, whose answer every lease on the topic would receive.
+			const held = this.snapshots.get(topic);
+			if (held === undefined) {
+				this.sendSubscribe([topic]);
+			} else {
+				lease.handlers.onSnapshot?.(held);
+			}
 		}
 		this.connect();
 
@@ -170,6 +184,7 @@ export class LiveClient {
 				return;
 			}
 			this.leases.delete(topic);
+			this.snapshots.delete(topic);
 			this.send({ op: "unsubscribe", topics: [topic] });
 			if (this.leases.size === 0) {
 				// Nothing on screen wants live state any more. Holding the socket open would keep a
@@ -195,6 +210,7 @@ export class LiveClient {
 			this.setStatus("open");
 			// The whole topic set, not the ones added since: a reconnect is a new server-side
 			// connection that knows nothing about this client.
+			this.armWatchdog();
 			const topics = [...this.leases.keys()];
 			if (topics.length > 0) {
 				this.send({ op: "subscribe", topics });
@@ -202,6 +218,7 @@ export class LiveClient {
 		};
 
 		socket.onmessage = (event) => {
+			this.armWatchdog();
 			if (typeof event.data !== "string") {
 				return;
 			}
@@ -213,6 +230,10 @@ export class LiveClient {
 
 		socket.onclose = (event) => {
 			this.socket = undefined;
+			this.clearWatchdog();
+			// A snapshot held across a reconnect describes the gap, not the present. The re-subscribe
+			// on the next `onopen` replaces it; until then a new lease must wait for the server.
+			this.snapshots.clear();
 			if (this.stopped) {
 				this.setStatus("closed");
 				return;
@@ -243,6 +264,8 @@ export class LiveClient {
 	}
 
 	private disconnect(): void {
+		this.clearWatchdog();
+		this.snapshots.clear();
 		if (this.retryHandle !== undefined) {
 			(this.options.clearTimeoutFn ?? defaultClearTimeout)(this.retryHandle);
 			this.retryHandle = undefined;
@@ -251,6 +274,32 @@ export class LiveClient {
 		this.socket = undefined;
 		socket?.close();
 		this.setStatus("closed");
+	}
+
+	/**
+	 * Restarts the liveness timer. Armed on open and reset by every frame.
+	 *
+	 * The server pings every {@link LIVE_DEFAULT_HEARTBEAT_MS}, so silence for twice that means the
+	 * socket is half-open — a slept laptop, a proxy idle timeout, a pod killed without a FIN — and
+	 * `onclose` will never fire on its own. Closing it here puts the existing reconnect path back in
+	 * charge; the alternative is a wallboard that goes on claiming to be live over frozen data.
+	 */
+	private armWatchdog(): void {
+		this.clearWatchdog();
+		if (this.stopped) {
+			return;
+		}
+		this.watchdogHandle = (this.options.setTimeoutFn ?? defaultSetTimeout)(() => {
+			this.watchdogHandle = undefined;
+			this.socket?.close();
+		}, 2 * LIVE_DEFAULT_HEARTBEAT_MS);
+	}
+
+	private clearWatchdog(): void {
+		if (this.watchdogHandle !== undefined) {
+			(this.options.clearTimeoutFn ?? defaultClearTimeout)(this.watchdogHandle);
+			this.watchdogHandle = undefined;
+		}
 	}
 
 	private scheduleReconnect(): void {
@@ -295,13 +344,12 @@ export class LiveClient {
 				}
 				return;
 			case "snapshot": {
-				const holders = this.leases.get(frame.topic as LiveTopic);
+				const topic = frame.topic as LiveTopic;
+				const snapshot: LiveSnapshotEvent = { topic, rows: frame.data, at: frame.at };
+				this.snapshots.set(topic, snapshot);
+				const holders = this.leases.get(topic);
 				for (const lease of holders ?? []) {
-					lease.handlers.onSnapshot?.({
-						topic: frame.topic as LiveTopic,
-						rows: frame.data,
-						at: frame.at,
-					});
+					lease.handlers.onSnapshot?.(snapshot);
 				}
 				return;
 			}

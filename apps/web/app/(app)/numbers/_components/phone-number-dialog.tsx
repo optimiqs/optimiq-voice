@@ -108,9 +108,7 @@ export function PhoneNumberDialog({
 				enabled: parsed.enabled,
 				// `optionalText` has already turned a blank selection into `null`, which is what "no
 				// location assigned" means on the wire. Omitted entirely without the narrower grant.
-				...(canAssignEmergencyAddress
-					? { emergencyAddressId: parsed.emergencyAddressId }
-					: {}),
+				...(canAssignEmergencyAddress ? { emergencyAddressId: parsed.emergencyAddressId } : {}),
 				...writeDestination(destination, ""),
 			};
 

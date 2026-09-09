@@ -19,6 +19,7 @@ import {
 	getPbx,
 	listPbx,
 	listPbxChildren,
+	MAX_PAGE_LIMIT,
 	PBX_RESOURCES,
 	reorderPbxChildren,
 	setPinSetEntryPin,
@@ -103,6 +104,62 @@ export function usePbxList<TRow>(
 		rows: result.data?.data ?? [],
 		total: result.data?.total ?? 0,
 		totalPages: result.data?.totalPages ?? 0,
+	};
+}
+
+/**
+ * The WHOLE list, for a lookup map rather than a table.
+ *
+ * Half a dozen screens hold an id and have to render a name — a queue tier's agent, a paging
+ * group's member, a shared line's appearance. Those built a `Map` from `{ page: 1, limit: 100 }`,
+ * which is the API's maximum page and not the API's maximum list: on a 150-extension tenant the
+ * rows past the hundredth rendered as a truncated UUID, with nothing on screen to say why.
+ *
+ * So this pages through instead. It is deliberately NOT what a table uses — a table pages because
+ * the user is reading it, and this exists because nobody is: the answer is a map, and a map that is
+ * missing entries is wrong rather than short. `MAX_ROSTER_PAGES` is the seatbelt: a roster past
+ * that size is a screen that needs a different design, and the map is honestly marked `complete:
+ * false` rather than silently truncated again.
+ *
+ * Filed under the same `pbxList` key prefix, so every mutation's resource-wide invalidation sweeps
+ * it exactly as it sweeps the paged reads.
+ */
+const MAX_ROSTER_PAGES = 20;
+
+export interface PbxRosterResult<TRow> {
+	readonly query: UseQueryResult<readonly TRow[]>;
+	readonly rows: readonly TRow[];
+	/** False when the list ran past `MAX_ROSTER_PAGES` and the map is missing rows. */
+	readonly complete: boolean;
+}
+
+export function usePbxRoster<TRow>(
+	resource: PbxResourceDescriptor<TRow>,
+	options: { readonly enabled?: boolean } = {},
+): PbxRosterResult<TRow> {
+	const organizationId = useOrganizationId();
+	const result = useQuery({
+		queryKey: queryKeys.pbxList(organizationId, resource.key, { purpose: "roster" }),
+		queryFn: async () => {
+			const rows: TRow[] = [];
+			let page = 1;
+			for (;;) {
+				const envelope = await listPbx(resource, { page, limit: MAX_PAGE_LIMIT });
+				rows.push(...envelope.data);
+				if (page >= envelope.totalPages || page >= MAX_ROSTER_PAGES) {
+					break;
+				}
+				page += 1;
+			}
+			return rows as readonly TRow[];
+		},
+		enabled: organizationId.length > 0 && options.enabled !== false,
+	});
+
+	return {
+		query: result,
+		rows: result.data ?? [],
+		complete: (result.data?.length ?? 0) < MAX_ROSTER_PAGES * MAX_PAGE_LIMIT,
 	};
 }
 

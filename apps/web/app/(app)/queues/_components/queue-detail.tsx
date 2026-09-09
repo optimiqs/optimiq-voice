@@ -32,7 +32,7 @@ import {
 	usePbxChildDelete,
 	usePbxChildren,
 	usePbxItem,
-	usePbxList,
+	usePbxRoster,
 } from "../../_hooks/use-pbx-queries";
 import { AgentSessionControls, LiveIndicator } from "./agent-console";
 import { QueueDialog } from "./queue-dialog";
@@ -79,8 +79,8 @@ export function QueueDetail({ queueId }: { queueId: string }) {
 	const tiers = usePbxChildren(PBX_CHILDREN.queueTiers, "queues", queueId);
 	const removeTier = usePbxChildDelete(PBX_CHILDREN.queueTiers, "queues", queueId);
 
-	/** Tiers carry an agent id; the table has to say a name. Capped at the API's own page size. */
-	const agents = usePbxList(PBX_RESOURCES.queueAgents, { page: 1, limit: 100 });
+	/** Tiers carry an agent id; the table has to say a name. */
+	const agents = usePbxRoster(PBX_RESOURCES.queueAgents);
 	const agentsById = new Map(agents.rows.map((row: QueueAgentRow) => [row.id, row]));
 
 	const canWrite = usePermission(PBX_RESOURCES.queues.permissions.write);

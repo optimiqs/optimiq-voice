@@ -15,7 +15,7 @@ import { Button } from "~/components/ui/button";
 import { MenuItem } from "~/components/ui/menu";
 import { DEFAULT_PAGE_LIMIT, PBX_RESOURCES } from "~/lib/pbx/client";
 import { usePermission } from "../../_context/session-context";
-import { usePbxDelete, usePbxList } from "../../_hooks/use-pbx-queries";
+import { usePbxDelete, usePbxList, usePbxRoster } from "../../_hooks/use-pbx-queries";
 import { QueueAgentDialog } from "./queue-agent-dialog";
 import { AgentStatusBadge } from "./queue-shared";
 import { QueueTierDialog } from "./queue-tier-dialog";
@@ -41,7 +41,7 @@ export function QueueAgentsPanel() {
 	const canManage = usePermission(resource.permissions.write);
 
 	/** Only to name the extension an agent answers on; the row stores an id. */
-	const extensions = usePbxList(PBX_RESOURCES.extensions, { page: 1, limit: 100 });
+	const extensions = usePbxRoster(PBX_RESOURCES.extensions);
 	const extensionNames = new Map(
 		extensions.rows.map((row: ExtensionRow) => [row.id, PBX_RESOURCES.extensions.displayName(row)]),
 	);

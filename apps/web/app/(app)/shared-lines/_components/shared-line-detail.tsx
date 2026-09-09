@@ -22,7 +22,7 @@ import {
 	usePbxChildReorder,
 	usePbxChildren,
 	usePbxItem,
-	usePbxList,
+	usePbxRoster,
 } from "../../_hooks/use-pbx-queries";
 import { SharedLineAppearanceDialog } from "./shared-line-appearance-dialog";
 import { SharedLineDialog } from "./shared-line-dialog";
@@ -66,8 +66,8 @@ export function SharedLineDetail({ lineId }: { lineId: string }) {
 	);
 	const reorder = usePbxChildReorder(PBX_CHILDREN.sharedLineAppearances, "shared-lines", lineId);
 
-	/** Appearances carry an extension id; the table has to say a number. Capped at the API's page size. */
-	const extensions = usePbxList(PBX_RESOURCES.extensions, { page: 1, limit: 100 });
+	/** Appearances carry an extension id; the table has to say a number. */
+	const extensions = usePbxRoster(PBX_RESOURCES.extensions);
 	const extensionsById = new Map(extensions.rows.map((row: ExtensionRow) => [row.id, row]));
 
 	const canWrite = usePermission(PBX_RESOURCES.sharedLines.permissions.write);
@@ -229,7 +229,7 @@ export function SharedLineDetail({ lineId }: { lineId: string }) {
 								<Badge tone="neutral">extension</Badge>
 							) : (
 								<span className="text-xs text-muted-foreground">
-									Not in the first {extensions.rows.length}
+									{extensions.complete ? "Not found" : `Not in the first ${extensions.rows.length}`}
 								</span>
 							),
 					},

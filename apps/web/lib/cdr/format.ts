@@ -22,7 +22,9 @@ export function formatDuration(millis: number): string {
 	const minutes = Math.floor((total % 3600) / 60);
 	const seconds = total % 60;
 	const pad = (value: number): string => String(value).padStart(2, "0");
-	return hours > 0 ? `${String(hours)}:${pad(minutes)}:${pad(seconds)}` : `${pad(minutes)}:${pad(seconds)}`;
+	return hours > 0
+		? `${String(hours)}:${pad(minutes)}:${pad(seconds)}`
+		: `${pad(minutes)}:${pad(seconds)}`;
 }
 
 /**
@@ -192,7 +194,16 @@ export function buildCallTree(legs: readonly CallLegRow[]): readonly CallLegNode
 		return { leg, children: kids, depth };
 	};
 
-	return roots.filter((leg) => !visited.has(leg.id)).map((leg) => build(leg, 0));
+	const trees = roots.map((leg) => build(leg, 0));
+	// Anything still unvisited sits in a parent cycle (a transfer loop, or a bad
+	// `originating_leg_id`) and so never became a root. It is shown as its own root rather than
+	// dropped: a call detail whose stated job is every leg of one call must not silently lose one.
+	for (const leg of legs) {
+		if (!visited.has(leg.id)) {
+			trees.push(build(leg, 0));
+		}
+	}
+	return trees;
 }
 
 /** The tree flattened back to rows, in the order it should be drawn. */

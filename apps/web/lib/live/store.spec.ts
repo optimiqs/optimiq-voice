@@ -164,6 +164,37 @@ describe("applyUpdate", () => {
 		).toBe(seeded);
 	});
 
+	/**
+	 * The case the same-object rule exists for: sipd republishes a registration on every REGISTER
+	 * refresh, so a 300-phone table would rebuild its whole Map several times a second for a screen
+	 * on which nothing changed.
+	 */
+	it("returns the same state when a put republishes an identical row", () => {
+		expect(
+			applyUpdate(
+				seeded,
+				{ topic: "registrations", kind: "put", at: "t2", key: "org.aaaa", data: registration() },
+				parseRegistration,
+			),
+		).toBe(seeded);
+	});
+
+	it("still applies a put that changes a field", () => {
+		const next = applyUpdate(
+			seeded,
+			{
+				topic: "registrations",
+				kind: "put",
+				at: "t2",
+				key: "org.aaaa",
+				data: registration({ expiresAt: "2026-08-06T09:10:00.000Z" }),
+			},
+			parseRegistration,
+		);
+		expect(next).not.toBe(seeded);
+		expect(next.rows.get("org.aaaa")?.expiresAt).toBe("2026-08-06T09:10:00.000Z");
+	});
+
 	it("ignores a stream event, which has no key to file it under", () => {
 		expect(
 			applyUpdate(
@@ -794,6 +825,63 @@ describe("applyConferenceUpdate", () => {
 		// The ROOM survives its last known member leaving: the claim still says people are in it,
 		// and this tab simply cannot name them.
 		expect(state.rooms.has(CONF)).toBe(true);
+	});
+
+	/**
+	 * A contribution lease rolling forward is not news: the count is unchanged and both the old and
+	 * the new expiry are still ahead of now. Re-rendering would re-sort every room and every
+	 * participant list once per engine instance per heartbeat.
+	 */
+	it("returns the same state when a claim only rolls its lease forward", () => {
+		expect(
+			applyConferenceUpdate(seeded, {
+				topic: "conferences",
+				kind: "put",
+				at: "t2",
+				key: `${ORG}.${CONF}`,
+				data: claim({
+					contributions: {
+						"engine-a": {
+							memberCount: 2,
+							moderatorPresent: false,
+							expiresAt: CONF_NOW + 120_000,
+						},
+					},
+				}),
+			}),
+		).toBe(seeded);
+	});
+
+	/** The lease still matters when it has LAPSED: `conferenceMemberCount` stops counting it. */
+	it("applies a claim whose contribution has expired", () => {
+		const next = applyConferenceUpdate(seeded, {
+			topic: "conferences",
+			kind: "put",
+			at: "t2",
+			key: `${ORG}.${CONF}`,
+			data: claim({
+				contributions: {
+					"engine-a": { memberCount: 2, moderatorPresent: false, expiresAt: 1 },
+				},
+			}),
+		});
+		expect(next).not.toBe(seeded);
+	});
+
+	it("applies a claim whose member count moved", () => {
+		const next = applyConferenceUpdate(seeded, {
+			topic: "conferences",
+			kind: "put",
+			at: "t2",
+			key: `${ORG}.${CONF}`,
+			data: claim({
+				contributions: {
+					"engine-a": { memberCount: 3, moderatorPresent: false, expiresAt: CONF_NOW + 60_000 },
+				},
+			}),
+		});
+		expect(next).not.toBe(seeded);
+		expect(next.rooms.get(CONF)?.contributions["engine-a"]?.memberCount).toBe(3);
 	});
 
 	it("applies a lock transition to a room it holds, in both directions", () => {

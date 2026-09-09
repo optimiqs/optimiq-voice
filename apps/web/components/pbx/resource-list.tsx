@@ -1,7 +1,7 @@
 "use client";
 
 import { parseAsInteger, parseAsString, parseAsStringLiteral, useQueryState } from "nuqs";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useId, useMemo } from "react";
 import { cn } from "~/lib/cn";
 import { DEFAULT_PAGE_LIMIT, type PbxListQuery } from "~/lib/pbx/client";
 import { Badge } from "../ui/badge";
@@ -18,6 +18,7 @@ import {
 	TableHeader,
 	TableRow,
 } from "../ui/table";
+import { useDebounced } from "./use-debounced";
 import type { ReactNode } from "react";
 
 /**
@@ -98,25 +99,6 @@ export function useListQueryState(prefix = ""): {
 			void setPage(value);
 		},
 	};
-}
-
-/**
- * Delays the value the QUERY uses, never the value the input shows.
- *
- * Debouncing the input itself would make typing feel laggy; debouncing only what reaches the
- * network keeps the field instant and still costs one request per pause.
- */
-function useDebounced<T>(value: T, delayMs: number): T {
-	const [settled, setSettled] = useState(value);
-	const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-
-	useEffect(() => {
-		clearTimeout(timer.current);
-		timer.current = setTimeout(() => setSettled(value), delayMs);
-		return () => clearTimeout(timer.current);
-	}, [value, delayMs]);
-
-	return settled;
 }
 
 export interface ListToolbarProps {

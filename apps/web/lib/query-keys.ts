@@ -206,9 +206,13 @@ export const queryKeys = {
 	cdr: (organizationId: string) => ["organizations", organizationId, "cdr"] as const,
 	cdrList: (organizationId: string, query: Readonly<Record<string, unknown>>) =>
 		["organizations", organizationId, "cdr", "legs", query] as const,
-	/** One call's legs, keyed by call id — what an expanded row reads. */
-	cdrCall: (organizationId: string, callId: string) =>
-		["organizations", organizationId, "cdr", "call", callId] as const,
+	/**
+	 * One call's legs, keyed by call id AND the window it was asked over — what an expanded row
+	 * reads. The server bounds this lookup by `from`/`to`, so two windows are two answers and must
+	 * not share an entry; the `cdrCall` prefix still matches for invalidation.
+	 */
+	cdrCall: (organizationId: string, callId: string, query: Readonly<Record<string, unknown>>) =>
+		["organizations", organizationId, "cdr", "call", callId, query] as const,
 	/**
 	 * Queue service level over a window.
 	 *

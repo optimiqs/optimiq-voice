@@ -62,11 +62,7 @@ export function useAgentSessionAction(): AgentSessionMutation {
 	const organizationId = useActiveOrganization()?.id ?? "";
 
 	const mutation = useMutation({
-		mutationFn: async (input: {
-			agentId: string;
-			action: AgentSessionAction;
-			reason?: string;
-		}) =>
+		mutationFn: async (input: { agentId: string; action: AgentSessionAction; reason?: string }) =>
 			await applyAgentSessionAction(
 				input.agentId,
 				input.action,

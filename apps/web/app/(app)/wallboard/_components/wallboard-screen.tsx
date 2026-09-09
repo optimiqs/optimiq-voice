@@ -24,7 +24,7 @@ import { PBX_RESOURCES } from "~/lib/pbx/client";
 import { routes } from "~/lib/routes";
 import { useQueueStats } from "../../_hooks/use-cdr-queries";
 import { useLiveAgentStates } from "../../_hooks/use-live-queries";
-import { usePbxList } from "../../_hooks/use-pbx-queries";
+import { usePbxRoster } from "../../_hooks/use-pbx-queries";
 import {
 	RANGE_PRESET_LABELS,
 	RANGE_PRESETS,
@@ -60,7 +60,7 @@ import type { QueueRow } from "~/lib/pbx/contracts";
  * is sometimes the incident somebody opened this page about.
  */
 export function WallboardScreen() {
-	const queues = usePbxList<QueueRow>(PBX_RESOURCES.queues, { page: 1, limit: 100 });
+	const queues = usePbxRoster<QueueRow>(PBX_RESOURCES.queues);
 	const agentStates = useLiveAgentStates();
 	const range = useTimeRangeState();
 

@@ -79,6 +79,10 @@ export function applyUpdate<TValue>(
 	if (parsed === undefined) {
 		return state;
 	}
+	const previous = state.rows.get(event.key);
+	if (previous !== undefined && state.loaded && sameLiveValue(previous, parsed)) {
+		return state;
+	}
 	const rows = new Map(state.rows);
 	rows.set(event.key, parsed);
 	// `loaded` becomes true even without a snapshot: an update proves the topic is live, and a
@@ -795,6 +799,10 @@ function applyClaimFrame(state: LiveConferenceState, event: LiveUpdateEvent): Li
 	if (parsed === undefined) {
 		return state;
 	}
+	const previous = state.rooms.get(parsed.conferenceId);
+	if (previous !== undefined && state.loaded && sameConferenceClaim(previous, parsed, Date.now())) {
+		return state;
+	}
 	const rooms = new Map(state.rooms);
 	rooms.set(parsed.conferenceId, parsed);
 	// `loaded` becomes true without a snapshot, the rule `applyUpdate` follows: a deployment where
@@ -860,6 +868,42 @@ function sameParticipant(a: LiveConferenceParticipant, b: LiveConferenceParticip
 		a.roomNumber === b.roomNumber &&
 		a.joinedAt === b.joinedAt
 	);
+}
+
+/**
+ * Whether a republished claim says anything the panel would draw differently.
+ *
+ * The lease is the subtle part: {@link conferenceMemberCount} drops a contribution whose
+ * `expiresAt` has passed, so a moved expiry is only irrelevant while BOTH the old and the new one
+ * are still in the future. Once either side has lapsed the count can change, and the frame has to
+ * go through.
+ */
+function sameConferenceClaim(a: LiveConferenceRoom, b: LiveConferenceRoom, now: number): boolean {
+	if (
+		a.orgId !== b.orgId ||
+		a.bridgeId !== b.bridgeId ||
+		a.claimedAt !== b.claimedAt ||
+		(a.locked ?? false) !== (b.locked ?? false) ||
+		a.lockedByUserId !== b.lockedByUserId ||
+		a.lockedAtMs !== b.lockedAtMs
+	) {
+		return false;
+	}
+	const instanceIds = Object.keys(a.contributions);
+	if (instanceIds.length !== Object.keys(b.contributions).length) {
+		return false;
+	}
+	return instanceIds.every((instanceId) => {
+		const left = a.contributions[instanceId];
+		const right = b.contributions[instanceId];
+		return (
+			left !== undefined &&
+			right !== undefined &&
+			left.memberCount === right.memberCount &&
+			left.moderatorPresent === right.moderatorPresent &&
+			(left.expiresAt === right.expiresAt || (now < left.expiresAt && now < right.expiresAt))
+		);
+	});
 }
 
 /**
@@ -975,4 +1019,34 @@ function compareParticipants(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
+}
+
+/**
+ * Structural equality for a parsed KV value.
+ *
+ * A deep compare rather than a shallow one because the shapes are nested (`LiveChannel.profile`,
+ * `LiveChannel.flags`) and a shallow compare would report every republished row as changed —
+ * exactly the render churn {@link applyUpdate} exists to avoid. Bounded by the row, and every value
+ * came out of `JSON.parse`, so there are no cycles and no prototypes to worry about.
+ */
+function sameLiveValue(a: unknown, b: unknown): boolean {
+	if (a === b) {
+		return true;
+	}
+	if (Array.isArray(a) || Array.isArray(b)) {
+		if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+			return false;
+		}
+		return a.every((item, index) => sameLiveValue(item, b[index]));
+	}
+	if (!isRecord(a) || !isRecord(b)) {
+		return false;
+	}
+	const keys = Object.keys(a);
+	if (keys.length !== Object.keys(b).length) {
+		return false;
+	}
+	return keys.every(
+		(key) => Object.hasOwn(b, key) && sameLiveValue(a[key], (b as Record<string, unknown>)[key]),
+	);
 }

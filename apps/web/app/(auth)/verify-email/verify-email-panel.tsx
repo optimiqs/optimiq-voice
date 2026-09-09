@@ -6,7 +6,7 @@ import { useState } from "react";
 import { Button } from "~/components/ui/button";
 import { toast } from "~/components/ui/toast";
 import { authErrorMessage, sendVerificationEmail } from "~/lib/auth-client";
-import { routes } from "~/lib/routes";
+import { routes, safeRedirectTarget } from "~/lib/routes";
 import { AuthCard } from "../_components/auth-card";
 
 /**
@@ -22,6 +22,9 @@ import { AuthCard } from "../_components/auth-card";
 export function VerifyEmailPanel() {
 	const searchParams = useSearchParams();
 	const email = searchParams.get("email") ?? "";
+	// Where verification lands. Sign-up forwards the invitation path here so the link in the email
+	// finishes the journey the invitation started rather than dropping the recipient on the shell.
+	const redirectTo = safeRedirectTarget(searchParams.get("redirectTo"));
 	const [pending, setPending] = useState(false);
 	const [resent, setResent] = useState(false);
 
@@ -31,7 +34,7 @@ export function VerifyEmailPanel() {
 		}
 		setPending(true);
 		try {
-			const result = await sendVerificationEmail({ email, callbackURL: routes.overview });
+			const result = await sendVerificationEmail({ email, callbackURL: redirectTo });
 			if (result.error) {
 				toast.error(authErrorMessage(result.error));
 				return;

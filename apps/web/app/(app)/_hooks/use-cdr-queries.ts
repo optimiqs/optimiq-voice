@@ -118,7 +118,10 @@ export function useCdrCall(
 ): UseQueryResult<CallDetail> {
 	const organizationId = useOrganizationId();
 	return useQuery({
-		queryKey: queryKeys.cdrCall(organizationId, callId ?? ""),
+		queryKey: queryKeys.cdrCall(organizationId, callId ?? "", {
+			from: range.from ?? null,
+			to: range.to ?? null,
+		}),
 		queryFn: () => getCall(callId as string, range),
 		enabled: organizationId.length > 0 && Boolean(callId),
 	});

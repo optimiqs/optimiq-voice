@@ -37,6 +37,15 @@ describe("pbxListSearchParams", () => {
 
 		expect(params.get("search")).toBe("a&b=c d");
 	});
+
+	/**
+	 * `page` has always had a floor; `limit` did not, so a hand-edited or bookmarked URL carrying
+	 * `limit=0` reached the server and came back a 400 the list renders as a generic failure.
+	 */
+	it("floors the limit as well as capping it", () => {
+		expect(new URLSearchParams(pbxListSearchParams({ page: 1, limit: 0 })).get("limit")).toBe("1");
+		expect(new URLSearchParams(pbxListSearchParams({ page: 1, limit: -5 })).get("limit")).toBe("1");
+	});
 });
 
 /**

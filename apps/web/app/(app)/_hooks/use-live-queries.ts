@@ -1,7 +1,7 @@
 "use client";
 
 import { useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { queueTopic } from "~/lib/live/protocol";
 import {
 	applyConferenceSnapshot,
@@ -99,8 +99,32 @@ export function useLiveRegistrations(): LiveRegistrationsResult {
 	const permitted = usePermission("extensions.read");
 	const state = useKvTopic("registrations", parseRegistration, { enabled: permitted });
 
+	/**
+	 * The clock liveness is judged against.
+	 *
+	 * `isRegistrationLive` compares `expiresAt` to now, and a binding lapses with nothing arriving
+	 * on the socket — a phone that is unplugged never sends a de-REGISTER. Without a tick the count
+	 * freezes at whatever the last frame said and keeps counting a device that is gone.
+	 *
+	 * Thirty seconds, not one: registration intervals are minutes-scale and this drives a headline
+	 * number, not a per-second wait timer. It does not run with nothing to expire.
+	 */
+	const [tick, setTick] = useState(() => Date.now());
+	const pending = state.rows.size;
+	useEffect(() => {
+		if (!permitted || pending === 0) {
+			return;
+		}
+		const handle = setInterval(() => {
+			setTick(Date.now());
+		}, 30_000);
+		return () => {
+			clearInterval(handle);
+		};
+	}, [permitted, pending]);
+
 	return useMemo(() => {
-		const now = Date.now();
+		const now = tick;
 		const rows = [...state.rows.values()];
 		const byExtensionId = new Map<string, LiveRegistration>();
 		for (const row of rows) {
@@ -115,7 +139,7 @@ export function useLiveRegistrations(): LiveRegistrationsResult {
 			permitted,
 			byExtensionId,
 		};
-	}, [state, permitted]);
+	}, [state, permitted, tick]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -185,24 +209,32 @@ export function useLiveAgentStates(): LiveAgentStatesResult {
 		setState(applySnapshot(event, parseAgentState));
 	}, []);
 
-	const onUpdate = useCallback(
-		(event: LiveUpdateEvent) => {
-			setState((previous) => {
-				const next = applyUpdate(previous, event, parseAgentState);
-				if (next !== previous && organizationId.length > 0) {
-					// Fired outside the state update on the next tick would be tidier, but the
-					// invalidation is idempotent and TanStack batches it — and doing it here keeps the
-					// "a transition happened" condition in one place rather than in a second effect
-					// watching a derived value.
-					void queryClient.invalidateQueries({
-						queryKey: queryKeys.pbxResource(organizationId, PBX_RESOURCES.queueAgents.key),
-					});
-				}
-				return next;
-			});
-		},
-		[organizationId, queryClient],
-	);
+	const onUpdate = useCallback((event: LiveUpdateEvent) => {
+		setState((previous) => applyUpdate(previous, event, parseAgentState));
+	}, []);
+
+	/**
+	 * The invalidation runs on the COMMITTED state, not inside the updater.
+	 *
+	 * A `setState` updater must be a pure function of `previous` — React may run it twice for one
+	 * dispatch, or for a render it then throws away — and a cache invalidation is a real
+	 * `GET /queue-agents`. `applyUpdate` returns the same object when nothing changed, so keying the
+	 * effect on the state identity fires exactly once per transition that actually landed. The
+	 * first commit is the snapshot, which the list query already covers.
+	 */
+	const settled = useRef(false);
+	useEffect(() => {
+		if (!settled.current) {
+			settled.current = true;
+			return;
+		}
+		if (organizationId.length === 0) {
+			return;
+		}
+		void queryClient.invalidateQueries({
+			queryKey: queryKeys.pbxResource(organizationId, PBX_RESOURCES.queueAgents.key),
+		});
+	}, [state, organizationId, queryClient]);
 
 	useLiveTopic("agent-state", { onSnapshot, onUpdate }, { enabled: permitted });
 

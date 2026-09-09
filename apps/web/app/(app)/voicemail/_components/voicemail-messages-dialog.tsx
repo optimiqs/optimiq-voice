@@ -34,11 +34,7 @@ import {
 	useVoicemailMessages,
 	useVoicemailPlaybackUrl,
 } from "../../_hooks/use-voicemail-queries";
-import type {
-	VoicemailBoxRow,
-	VoicemailFolder,
-	VoicemailMessageRow,
-} from "~/lib/pbx/contracts";
+import type { VoicemailBoxRow, VoicemailFolder, VoicemailMessageRow } from "~/lib/pbx/contracts";
 
 /**
  * The contents of one mailbox.
@@ -66,13 +62,15 @@ import type {
  * per row sitting in the DOM, most of them never played, all of them expiring in minutes.
  */
 
-const FOLDER_TABS: readonly { readonly value: VoicemailFolder | "inbox"; readonly label: string }[] =
-	[
-		{ value: "inbox", label: "Inbox" },
-		{ value: "new", label: "Unread" },
-		{ value: "saved", label: "Read" },
-		{ value: "deleted", label: "Trash" },
-	];
+const FOLDER_TABS: readonly {
+	readonly value: VoicemailFolder | "inbox";
+	readonly label: string;
+}[] = [
+	{ value: "inbox", label: "Inbox" },
+	{ value: "new", label: "Unread" },
+	{ value: "saved", label: "Read" },
+	{ value: "deleted", label: "Trash" },
+];
 
 export function VoicemailMessagesDialog({
 	open,
@@ -86,9 +84,13 @@ export function VoicemailMessagesDialog({
 	const [folder, setFolder] = useState<VoicemailFolder | "inbox">("inbox");
 	const [page, setPage] = useState(1);
 
-	const canWrite = usePermission("voicemail.write");
-	const canDelete = usePermission("voicemail.delete");
-	const canListen = usePermission("voicemail.listen");
+	// Every route behind this dialog — list, PATCH folder, DELETE, play-url — accepts the `.own`
+	// scope, because a mailbox owner acts on their own messages. Asking for the `.own` grant is
+	// therefore what matches the API: `hasPermission` treats the unscoped grant as covering it, so
+	// a supervisor holding `voicemail.write` still passes.
+	const canWrite = usePermission("voicemail.write.own");
+	const canDelete = usePermission("voicemail.delete.own");
+	const canListen = usePermission("voicemail.listen.own");
 
 	const list = useVoicemailMessages(open && box !== null ? box.id : undefined, {
 		...(folder === "inbox" ? {} : { folder }),
@@ -119,9 +121,7 @@ export function VoicemailMessagesDialog({
 		>
 			<DialogContent className="flex max-h-[calc(100dvh-3rem)] w-[min(52rem,calc(100vw-2rem))] flex-col">
 				<DialogHeader>
-					<DialogTitle>
-						{box === null ? "Messages" : `Mailbox ${box.mailboxNumber}`}
-					</DialogTitle>
+					<DialogTitle>{box === null ? "Messages" : `Mailbox ${box.mailboxNumber}`}</DialogTitle>
 					<DialogDescription>
 						{newCount} unread · {savedCount} read. Playback links are signed and expire within
 						minutes, so they are never shareable by accident.
@@ -281,7 +281,9 @@ function MessagesTable({
 								{formatBytes(row.sizeBytes ?? 0)}
 							</TableCell>
 							<TableCell>
-								<Badge tone={row.folder === "deleted" ? "neutral" : row.read ? "neutral" : "accent"}>
+								<Badge
+									tone={row.folder === "deleted" ? "neutral" : row.read ? "neutral" : "accent"}
+								>
 									{row.folder === "deleted" ? "Deleted" : row.read ? "Read" : "Unread"}
 								</Badge>
 							</TableCell>

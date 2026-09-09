@@ -16,6 +16,35 @@
  */
 const apiOrigin = (process.env.API_PROXY_ORIGIN ?? "http://127.0.0.1:50051").replace(/\/+$/u, "");
 
+/**
+ * The content policy, REPORT-ONLY on purpose.
+ *
+ * Two of the sources cannot be pinned from this repository: the softphone's WSS listener is
+ * whatever `transport.wssUrl` the API reports for the deployment (`lib/softphone/credentials.ts`),
+ * and a recording's `play-url` is a signed object-store URL whose host belongs to whatever bucket
+ * the deployment configured. Enforcing a policy that guesses at either would break audio in
+ * production with a console message nobody reads, so this reports first: run a deployment, read
+ * the violations, then narrow `connect-src`/`media-src` to the real hosts and rename the header to
+ * `Content-Security-Policy`.
+ *
+ * `style-src 'unsafe-inline'` is required today by the brand theme's inline `<style>`
+ * (`components/ui/brand-theme-style.tsx`); a nonce is the follow-up. `frame-ancestors` supersedes
+ * the `X-Frame-Options` above, which stays for browsers that predate it.
+ */
+const contentSecurityPolicy = [
+	"default-src 'self'",
+	"base-uri 'self'",
+	"object-src 'none'",
+	"frame-ancestors 'none'",
+	"form-action 'self'",
+	"script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+	"style-src 'self' 'unsafe-inline'",
+	"img-src 'self' data: blob: https:",
+	"font-src 'self' data:",
+	"media-src 'self' blob: https:",
+	"connect-src 'self' blob: https: wss:",
+].join("; ");
+
 /** @type {import("next").NextConfig} */
 const nextConfig = {
 	reactStrictMode: true,
@@ -45,6 +74,11 @@ const nextConfig = {
 					{ key: "X-Content-Type-Options", value: "nosniff" },
 					{ key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
 					{ key: "X-Frame-Options", value: "DENY" },
+					{
+						key: "Strict-Transport-Security",
+						value: "max-age=63072000; includeSubDomains",
+					},
+					{ key: "Content-Security-Policy-Report-Only", value: contentSecurityPolicy },
 				],
 			},
 		];
