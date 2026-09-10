@@ -58,7 +58,8 @@ type AllocateOptions struct {
 	Format audio.Format
 	// TelephoneEventPayloadType is the RFC 4733 type the answer settled on, or 0 for none.
 	TelephoneEventPayloadType uint8
-	// Inactive puts the session in ModeInactive — a leg that is ringing but not yet talking.
+	// Inactive raises both direction gates at bind time — a leg that is ringing but not yet talking.
+	// The gates are the source of truth; Session.Mode is derived from them.
 	Inactive bool
 	// MuteIn and MuteOut are the media-plane half of a non-sendrecv answer direction. They arrive on
 	// the allocate so the gate is up before the first packet after a renegotiation.
@@ -141,6 +142,9 @@ type Manager struct {
 	// dtmfMaxDigit bounds one detected digit on every session it creates.
 	dtmfMaxDigit time.Duration
 
+	// negotiating owns the SDP/crypto exchange state per session id. Its lock is taken OUTSIDE mu.
+	negotiating negotiations
+
 	mu       sync.Mutex
 	sessions map[string]*Session
 	// bridges maps a caller-assigned bridge id to the two sessions relaying under it. The peer
@@ -155,7 +159,18 @@ type Manager struct {
 	// collapsing the two would put a jitter buffer and a codec round trip on every two-party call.
 	conferences map[string]*Conference
 	// taps maps a tap id to the room it joined, because `untap-session` carries a tap id only.
-	taps   map[string]tapRecord
+	taps map[string]tapRecord
+
+	// The reverse indexes. Membership and removal are asked on nearly every command, and answering
+	// them by scanning bridges, rooms and taps made one call's control path cost grow with every
+	// unrelated call on the box. Each is written only where its forward map is written, under m.mu.
+	bridgeBySession     map[string]string
+	conferenceBySession map[string]string
+	// tapsBySession and tapsByConference serve the two tap removals that carry no tap id: a
+	// supervisor's own session leaving, and a room being destroyed under it.
+	tapsBySession    map[string]map[string]struct{}
+	tapsByConference map[string]map[string]struct{}
+
 	closed bool
 
 	// running tracks each session's read goroutine so Drain can wait for the packet path to stop
@@ -215,6 +230,11 @@ func NewManager(opts ManagerOptions) (*Manager, error) {
 		recordings:     make(map[string]string),
 		conferences:    make(map[string]*Conference),
 		taps:           make(map[string]tapRecord),
+
+		bridgeBySession:     make(map[string]string),
+		conferenceBySession: make(map[string]string),
+		tapsBySession:       make(map[string]map[string]struct{}),
+		tapsByConference:    make(map[string]map[string]struct{}),
 	}
 	if manager.rtpTimeout <= 0 {
 		manager.rtpTimeout = opts.IdleAfter
@@ -312,6 +332,8 @@ func (m *Manager) Allocate(opts AllocateOptions) (Descriptor, error) {
 	}
 	m.sessions[sessionID] = session
 	m.mu.Unlock()
+	// A session id bound afresh must not inherit the negotiation of the call before it.
+	m.negotiating.forget(sessionID)
 
 	m.running.Add(1)
 	go func() {
@@ -341,6 +363,9 @@ func (m *Manager) Allocate(opts AllocateOptions) (Descriptor, error) {
 
 // ApplyDirection re-points a live session's suppression gates after a renegotiation. Idempotent: it
 // SETS both flags rather than toggling them.
+//
+// The gates are the ONLY record of the negotiated direction, so a session allocated `inactive`
+// resumes relaying here without a second mode transition to keep in step. See Session.Mode.
 //
 // It does NOT touch the HOLD flag — a renegotiation answering `sendrecv` must not take a held
 // caller off hold.
@@ -394,36 +419,24 @@ func (m *Manager) SeedRemote(sessionID string, addr netip.AddrPort) error {
 	return nil
 }
 
-// SettleSRTP attaches the SDES context a B-leg's answer keyed, on a session create-offer bound
-// before the far end's key was known. Idempotent; an unknown id is ErrUnknownSession.
-func (m *Manager) SettleSRTP(sessionID string, ctx *SRTPContext) error {
-	session, err := m.liveSession(sessionID)
-	if err != nil {
-		return err
-	}
-	session.SettleSRTP(ctx)
-	return nil
-}
-
 // Release tears a session down, reporting whether there was one to tear down so a retried release
 // can answer false rather than error.
 func (m *Manager) Release(sessionID string) bool {
 	m.mu.Lock()
 	session, ok := m.sessions[sessionID]
-	var leftConference string
+	var emptied *Conference
 	if ok {
 		delete(m.sessions, sessionID)
 		// Releasing one half of a bridge tears the relay down; the other leg stays ALIVE and simply
 		// stops having a peer.
 		m.unbridgeSessionLocked(sessionID)
-		// The room survives; what must not survive is a seat pointing at a closed socket.
-		leftConference, _ = m.leaveConferenceLocked(sessionID)
+		// The room survives unless this was its last seat; what must not survive either way is a
+		// seat pointing at a closed socket.
+		_, emptied, _ = m.leaveConferenceLocked(sessionID)
 	}
 	m.mu.Unlock()
 
-	if leftConference != "" {
-		m.destroyConferenceIfEmpty(leftConference)
-	}
+	m.stopEmptied(emptied)
 
 	if !ok {
 		return false
@@ -455,6 +468,8 @@ func (m *Manager) closeAndAnnounce(session *Session, reason EndReason) {
 	if m.lifecycle != nil {
 		m.lifecycle.SessionEnded(summary, reason)
 	}
+	// The negotiation dies with the session it belongs to; every end path passes through here.
+	m.negotiating.forget(session.ID)
 }
 
 // awaitRecording waits for a recorder to finalise its file, then announces it. Bounded, so a drain
@@ -508,7 +523,9 @@ func (m *Manager) announceRecording(session SessionSummary, recording *Recording
 // the OTHER's socket, with no decode, mix or jitter buffer.
 //
 // Idempotent, and re-pointable: bridging the same pair again succeeds, and bridging a session that
-// is already in another bridge MOVES it, which is what an attended transfer needs.
+// is already in another bridge MOVES it, which is what an attended transfer needs. Re-using a bridge
+// id for a DIFFERENT pair moves the id too — the pair it named is disconnected, not left relaying
+// with nothing able to address it.
 func (m *Manager) Bridge(bridgeID string, first, second string) error {
 	switch {
 	case bridgeID == "":
@@ -518,6 +535,15 @@ func (m *Manager) Bridge(bridgeID string, first, second string) error {
 	case first == second:
 		return errors.New("rtp: cannot bridge a session to itself")
 	}
+
+	// Registered before the unlock defer so it runs after it: Stop closes a channel the mix loop
+	// selects on, and that loop takes the room lock.
+	var emptied []*Conference
+	defer func() {
+		for _, conference := range emptied {
+			m.stopEmptied(conference)
+		}
+	}()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -541,17 +567,27 @@ func (m *Manager) Bridge(bridgeID string, first, second string) error {
 		return err
 	}
 
-	// Detach both first, so a re-bridge cannot leave a stale pointer pushing audio at a party that
-	// is no longer in the conversation.
+	// Detach three things first, so a re-bridge cannot leave a stale pointer pushing audio at a
+	// party that is no longer in the conversation: whatever this ID was bound to, and whatever each
+	// incoming session was in. The first is not implied by the second — re-using an id for a
+	// different pair would otherwise leave the old pair relaying with nothing indexing them.
+	if previous, bound := m.bridges[bridgeID]; bound {
+		m.detachLocked(bridgeID, previous)
+	}
 	m.unbridgeSessionLocked(first)
 	m.unbridgeSessionLocked(second)
-	m.leaveConferenceLocked(first)
-	m.leaveConferenceLocked(second)
+	for _, id := range []string{first, second} {
+		if _, left, ok := m.leaveConferenceLocked(id); ok && left != nil {
+			emptied = append(emptied, left)
+		}
+	}
 
 	transcoders.install(a, b)
 	a.SetPeer(b)
 	b.SetPeer(a)
 	m.bridges[bridgeID] = [2]string{first, second}
+	m.bridgeBySession[first] = bridgeID
+	m.bridgeBySession[second] = bridgeID
 
 	m.log.Info("sessions bridged", "bridgeId", bridgeID, "sessionIds", []string{first, second})
 	return nil
@@ -573,17 +609,19 @@ func (m *Manager) Unbridge(bridgeID string) ([]string, bool) {
 
 // unbridgeSessionLocked removes whatever bridge a session is in. Caller holds m.mu.
 func (m *Manager) unbridgeSessionLocked(sessionID string) {
-	for bridgeID, pair := range m.bridges {
-		if pair[0] == sessionID || pair[1] == sessionID {
-			m.detachLocked(bridgeID, pair)
-			return
-		}
+	bridgeID, ok := m.bridgeBySession[sessionID]
+	if !ok {
+		return
 	}
+	m.detachLocked(bridgeID, m.bridges[bridgeID])
 }
 
 // detachLocked clears both peer pointers and forgets the bridge. Caller holds m.mu.
 func (m *Manager) detachLocked(bridgeID string, pair [2]string) {
 	for _, id := range pair {
+		if bound, ok := m.bridgeBySession[id]; ok && bound == bridgeID {
+			delete(m.bridgeBySession, id)
+		}
 		if session, ok := m.sessions[id]; ok {
 			session.SetPeer(nil)
 			// The translation goes with the bridge: leaving it installed would carry stale codec
@@ -830,12 +868,8 @@ func (m *Manager) PlaybackSessionOf(ref string) (string, bool) {
 func (m *Manager) BridgeOf(sessionID string) (string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for bridgeID, pair := range m.bridges {
-		if pair[0] == sessionID || pair[1] == sessionID {
-			return bridgeID, true
-		}
-	}
-	return "", false
+	bridgeID, ok := m.bridgeBySession[sessionID]
+	return bridgeID, ok
 }
 
 // Get returns a live session by id.
@@ -910,6 +944,7 @@ func (m *Manager) ReapIdle() int {
 
 	m.mu.Lock()
 	var stale []expiry
+	var emptied []*Conference
 	for id, session := range m.sessions {
 		idle := session.Idle(now)
 		heardSomething := session.lastPacket.Load() != 0
@@ -937,9 +972,15 @@ func (m *Manager) ReapIdle() int {
 		}
 		delete(m.sessions, id)
 		m.unbridgeSessionLocked(id)
-		m.leaveConferenceLocked(id)
+		if _, left, ok := m.leaveConferenceLocked(id); ok && left != nil {
+			emptied = append(emptied, left)
+		}
 	}
 	m.mu.Unlock()
+
+	for _, conference := range emptied {
+		m.stopEmptied(conference)
+	}
 
 	for _, entry := range stale {
 		if entry.reason == EndReasonRTPTimeout {
@@ -1008,12 +1049,16 @@ func (m *Manager) Drain(ctx context.Context) error {
 		delete(m.sessions, id)
 	}
 	m.bridges = make(map[string][2]string)
+	m.bridgeBySession = make(map[string]string)
+	m.conferenceBySession = make(map[string]string)
 	rooms := make([]*Conference, 0, len(m.conferences))
 	for id, conference := range m.conferences {
 		rooms = append(rooms, conference)
 		delete(m.conferences, id)
 	}
 	m.taps = make(map[string]tapRecord)
+	m.tapsBySession = make(map[string]map[string]struct{})
+	m.tapsByConference = make(map[string]map[string]struct{})
 	m.mu.Unlock()
 
 	// The mix loops stop BEFORE the sessions close, so no tick can find a member whose socket has

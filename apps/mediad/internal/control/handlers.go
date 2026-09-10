@@ -79,80 +79,98 @@ func (s *Server) HandleAllocateSession(data []byte) []byte {
 		return s.refuseAllocate(request.SessionID, reason, offerErr.Error())
 	}
 
-	answerCrypto, secure, err := s.negotiateSDES(offer.Crypto)
-	if err != nil {
-		// Before any port is bound, so a refused offer still costs no capacity.
-		return s.refuseAllocate(request.SessionID, ReasonNotSupported, err.Error())
-	}
-
 	answerDirection := sdp.AnswerDirection(offer.Direction, requested)
 	muteIn, muteOut := directionToMutes(answerDirection)
 
-	descriptor, err := s.sessions.Allocate(rtp.AllocateOptions{
-		SRTP:                      secure,
-		SessionID:                 request.SessionID,
-		OrgID:                     request.OrgID,
-		CallID:                    request.CallID,
-		LegID:                     derefString(request.LegID),
-		AudioPayloadType:          offer.AudioPayloadType,
-		Format:                    offer.Codec.Format(),
-		TelephoneEventPayloadType: offer.TelephoneEventPayloadType,
-		Inactive:                  answerDirection == sdp.DirectionInactive,
-		MuteIn:                    muteIn,
-		MuteOut:                   muteOut,
-	})
+	// The answer and the SRTP context it advertises are committed to the session together, under a
+	// lock private to this session id. An identical allocate therefore replays the first answer
+	// rather than drawing a second key the packet path is not encrypting with (RFC 4568 §6.1).
+	var (
+		refusal    []byte
+		descriptor rtp.Descriptor
+	)
+	negotiation, err := s.sessions.Negotiate(request.SessionID, negotiationRequest(data),
+		func(_ rtp.Negotiation, replay bool) (*rtp.Negotiation, *rtp.SRTPContext, error) {
+			var (
+				answerCrypto sdp.Crypto
+				secure       *rtp.SRTPContext
+			)
+			if !replay {
+				var err error
+				if answerCrypto, secure, err = s.negotiateSDES(offer.Crypto); err != nil {
+					// Before any port is bound, so a refused offer still costs no capacity.
+					refusal = s.refuseAllocate(request.SessionID, ReasonNotSupported, err.Error())
+					return nil, nil, errRefusedInExchange
+				}
+			}
+
+			allocated, err := s.sessions.Allocate(rtp.AllocateOptions{
+				SRTP:                      secure,
+				SessionID:                 request.SessionID,
+				OrgID:                     request.OrgID,
+				CallID:                    request.CallID,
+				LegID:                     derefString(request.LegID),
+				AudioPayloadType:          offer.AudioPayloadType,
+				Format:                    offer.Codec.Format(),
+				TelephoneEventPayloadType: offer.TelephoneEventPayloadType,
+				Inactive:                  answerDirection == sdp.DirectionInactive,
+				MuteIn:                    muteIn,
+				MuteOut:                   muteOut,
+			})
+			if err != nil {
+				reason := ReasonInternal
+				switch {
+				case errors.Is(err, rtp.ErrPortsExhausted):
+					reason = ReasonCapacity
+				case errors.Is(err, rtp.ErrClosed):
+					reason = ReasonShuttingDown
+				}
+				// WARN rather than ERROR: capacity and shutdown are operational states, and a deploy
+				// would otherwise page on every drain.
+				s.log.Warn("refusing an allocate",
+					"sessionId", request.SessionID, "callId", request.CallID,
+					"reason", reason, "error", err)
+				refusal = s.refuseAllocate(request.SessionID, reason, err.Error())
+				return nil, nil, errRefusedInExchange
+			}
+			descriptor = allocated
+
+			// A repeat allocate for a live session is a retry when the direction is unchanged and a
+			// re-negotiation when it differs. Allocate itself stays idempotent: no second port, no
+			// mode change; the direction gates are the record of the direction either way.
+			if err := s.sessions.ApplyDirection(request.SessionID, muteIn, muteOut); err != nil {
+				s.log.Warn("could not apply a renegotiated direction",
+					"sessionId", request.SessionID, "direction", answerDirection, "error", err)
+			}
+			// Advisory, and never fatal: it only matters for a leg that must be sent to before it speaks.
+			if err := s.sessions.SeedRemote(request.SessionID, offer.RemoteAddress); err != nil {
+				s.log.Debug("could not seed the far end from the offer",
+					"sessionId", request.SessionID, "error", err)
+			}
+			if replay {
+				return nil, nil, nil
+			}
+
+			body, err := s.renderAnswer(allocated, offer, answerCrypto, answerDirection)
+			if err != nil {
+				s.log.Error("cannot render an answer for a negotiated session",
+					"sessionId", request.SessionID, "error", err)
+				// The port pair is already held; releasing it keeps a rendering failure from leaking
+				// capacity.
+				s.sessions.Release(request.SessionID)
+				refusal = s.refuseAllocate(request.SessionID, ReasonInternal, err.Error())
+				return nil, nil, errRefusedInExchange
+			}
+			return &rtp.Negotiation{SDP: body, Local: answerCrypto}, secure, nil
+		})
+	if refusal != nil {
+		return refusal
+	}
 	if err != nil {
-		reason := ReasonInternal
-		switch {
-		case errors.Is(err, rtp.ErrPortsExhausted):
-			reason = ReasonCapacity
-		case errors.Is(err, rtp.ErrClosed):
-			reason = ReasonShuttingDown
-		}
-		// WARN rather than ERROR: capacity and shutdown are operational states, and a deploy would
-		// otherwise page on every drain.
-		s.log.Warn("refusing an allocate",
-			"sessionId", request.SessionID, "callId", request.CallID,
-			"reason", reason, "error", err)
-		return s.refuseAllocate(request.SessionID, reason, err.Error())
-	}
-
-	// A repeat allocate for a live session is a retry when the direction is unchanged and a
-	// re-negotiation when it differs. Allocate itself stays idempotent: no second port, no mode change.
-	if err := s.sessions.ApplyDirection(request.SessionID, muteIn, muteOut); err != nil {
-		s.log.Warn("could not apply a renegotiated direction",
-			"sessionId", request.SessionID, "direction", answerDirection, "error", err)
-	}
-	// Advisory, and never fatal: it only matters for a leg that must be sent to before it speaks.
-	if err := s.sessions.SeedRemote(request.SessionID, offer.RemoteAddress); err != nil {
-		s.log.Debug("could not seed the far end from the offer",
-			"sessionId", request.SessionID, "error", err)
-	}
-
-	sessionID, sessionVersion := sdpSessionIDs(descriptor.RTPPort)
-	negotiated := sdp.CodecForFormat(descriptor.Format)
-	toAnswer := sdp.Answer{
-		SessionID:                 sessionID,
-		SessionVersion:            sessionVersion,
-		Address:                   s.publicAddr,
-		Port:                      descriptor.RTPPort,
-		Codec:                     negotiated,
-		AudioPayloadType:          descriptor.AudioPayloadType,
-		TelephoneEventPayloadType: descriptor.TelephoneEventPayloadType,
-		OpusFmtp:                  offer.OpusFmtp,
-		Direction:                 answerDirection,
-		Crypto:                    answerCrypto,
-	}
-	if err := toAnswer.Validate(); err != nil {
-		// A dynamic codec that reached here without its payload type would render under PT 0, which
-		// the far end reads as PCMU: a call with audio that is noise. Refuse instead.
-		s.log.Error("cannot render an answer for a negotiated session",
-			"sessionId", request.SessionID, "codec", negotiated, "error", err)
-		// The port pair is already held; releasing it keeps a rendering failure from leaking capacity.
-		s.sessions.Release(request.SessionID)
 		return s.refuseAllocate(request.SessionID, ReasonInternal, err.Error())
 	}
-	answer := sdp.BuildAnswer(toAnswer)
+	answer := negotiation.SDP
+	negotiated := sdp.CodecForFormat(descriptor.Format)
 
 	s.recordSession(request, descriptor)
 
@@ -173,6 +191,37 @@ func (s *Server) HandleAllocateSession(data []byte) []byte {
 	}
 	return encode(s.log, response)
 }
+
+// renderAnswer builds the SDP answer for a freshly negotiated session.
+func (s *Server) renderAnswer(
+	descriptor rtp.Descriptor,
+	offer sdp.Offer,
+	crypto sdp.Crypto,
+	direction sdp.Direction,
+) (string, error) {
+	sessionID, sessionVersion := sdpSessionIDs(descriptor.RTPPort)
+	toAnswer := sdp.Answer{
+		SessionID:                 sessionID,
+		SessionVersion:            sessionVersion,
+		Address:                   s.publicAddr,
+		Port:                      descriptor.RTPPort,
+		Codec:                     sdp.CodecForFormat(descriptor.Format),
+		AudioPayloadType:          descriptor.AudioPayloadType,
+		TelephoneEventPayloadType: descriptor.TelephoneEventPayloadType,
+		OpusFmtp:                  offer.OpusFmtp,
+		Direction:                 direction,
+		Crypto:                    crypto,
+	}
+	if err := toAnswer.Validate(); err != nil {
+		// A dynamic codec that reached here without its payload type would render under PT 0, which
+		// the far end reads as PCMU: a call with audio that is noise. Refuse instead.
+		return "", err
+	}
+	return sdp.BuildAnswer(toAnswer), nil
+}
+
+// errRefusedInExchange ends a negotiation whose refusal the handler has already rendered.
+var errRefusedInExchange = errors.New("control: the negotiation was refused")
 
 // recordSession writes the directory entry, and does NOT fail the allocate when it cannot.
 //
@@ -263,55 +312,85 @@ func (s *Server) HandleCreateOffer(data []byte) []byte {
 	}
 	muteIn, muteOut := directionToMutes(direction)
 
-	offerCrypto, err := s.offerSDES()
+	// As on allocate: the offer body and the local key it advertises are committed together, so a
+	// retried create-offer replays the first offer rather than replacing the key the callee is about
+	// to answer.
+	var (
+		refusal    []byte
+		descriptor rtp.Descriptor
+	)
+	negotiation, err := s.sessions.Negotiate(request.SessionID, negotiationRequest(data),
+		func(_ rtp.Negotiation, replay bool) (*rtp.Negotiation, *rtp.SRTPContext, error) {
+			var offerCrypto sdp.Crypto
+			if !replay {
+				var err error
+				if offerCrypto, err = s.offerSDES(); err != nil {
+					refusal = s.refuseCreateOffer(request.SessionID, ReasonInternal, err.Error())
+					return nil, nil, errRefusedInExchange
+				}
+			}
+
+			allocated, err := s.sessions.Allocate(rtp.AllocateOptions{
+				SessionID: request.SessionID,
+				OrgID:     request.OrgID,
+				CallID:    request.CallID,
+				LegID:     derefString(request.LegID),
+				// The DEFAULT codec, not the negotiated one: the callee has not answered yet, so the
+				// session starts on PCMU with telephone-event 101 and accept-answer settles the real
+				// choice.
+				AudioPayloadType:          rtp.PayloadTypePCMU,
+				Format:                    audio.FormatULaw,
+				TelephoneEventPayloadType: rtp.PayloadTypeTelephoneEvent,
+				Inactive:                  direction == sdp.DirectionInactive,
+				MuteIn:                    muteIn,
+				MuteOut:                   muteOut,
+			})
+			if err != nil {
+				reason := ReasonInternal
+				switch {
+				case errors.Is(err, rtp.ErrPortsExhausted):
+					reason = ReasonCapacity
+				case errors.Is(err, rtp.ErrClosed):
+					reason = ReasonShuttingDown
+				}
+				s.log.Warn("refusing a create-offer",
+					"sessionId", request.SessionID, "callId", request.CallID,
+					"reason", reason, "error", err)
+				refusal = s.refuseCreateOffer(request.SessionID, reason, err.Error())
+				return nil, nil, errRefusedInExchange
+			}
+			descriptor = allocated
+			if replay {
+				return nil, nil, nil
+			}
+
+			sessionID, sessionVersion := sdpSessionIDs(allocated.RTPPort)
+			body := sdp.BuildOffer(sdp.OfferParams{
+				SessionID:                 sessionID,
+				SessionVersion:            sessionVersion,
+				Address:                   s.publicAddr,
+				Port:                      allocated.RTPPort,
+				Codecs:                    offeredCodecs,
+				TelephoneEventPayloadType: allocated.TelephoneEventPayloadType,
+				Direction:                 direction,
+				Crypto:                    offerCrypto,
+			})
+			// The callee's key arrives on accept-answer; until then the socket carries plaintext,
+			// which is safe because a leg with no answer has no far end to send to. Pending ties that
+			// answer to THIS generation's local key.
+			return &rtp.Negotiation{
+				SDP:     body,
+				Local:   offerCrypto,
+				Pending: offerCrypto.IsSet(),
+			}, nil, nil
+		})
+	if refusal != nil {
+		return refusal
+	}
 	if err != nil {
 		return s.refuseCreateOffer(request.SessionID, ReasonInternal, err.Error())
 	}
-
-	descriptor, err := s.sessions.Allocate(rtp.AllocateOptions{
-		SessionID: request.SessionID,
-		OrgID:     request.OrgID,
-		CallID:    request.CallID,
-		LegID:     derefString(request.LegID),
-		// The DEFAULT codec, not the negotiated one: the callee has not answered yet, so the session starts
-		// on PCMU with telephone-event 101 and accept-answer settles the real choice.
-		AudioPayloadType:          rtp.PayloadTypePCMU,
-		Format:                    audio.FormatULaw,
-		TelephoneEventPayloadType: rtp.PayloadTypeTelephoneEvent,
-		Inactive:                  direction == sdp.DirectionInactive,
-		MuteIn:                    muteIn,
-		MuteOut:                   muteOut,
-	})
-	if err != nil {
-		reason := ReasonInternal
-		switch {
-		case errors.Is(err, rtp.ErrPortsExhausted):
-			reason = ReasonCapacity
-		case errors.Is(err, rtp.ErrClosed):
-			reason = ReasonShuttingDown
-		}
-		s.log.Warn("refusing a create-offer",
-			"sessionId", request.SessionID, "callId", request.CallID,
-			"reason", reason, "error", err)
-		return s.refuseCreateOffer(request.SessionID, reason, err.Error())
-	}
-
-	sessionID, sessionVersion := sdpSessionIDs(descriptor.RTPPort)
-	offer := sdp.BuildOffer(sdp.OfferParams{
-		SessionID:                 sessionID,
-		SessionVersion:            sessionVersion,
-		Address:                   s.publicAddr,
-		Port:                      descriptor.RTPPort,
-		Codecs:                    offeredCodecs,
-		TelephoneEventPayloadType: descriptor.TelephoneEventPayloadType,
-		Direction:                 direction,
-		Crypto:                    offerCrypto,
-	})
-	if offerCrypto.IsSet() {
-		// The callee's key arrives on accept-answer; until then the socket carries plaintext, which
-		// is safe because a leg with no answer has no far end to send to.
-		s.pendingSRTP.Store(request.SessionID, offerCrypto)
-	}
+	offer := negotiation.SDP
 
 	s.recordSessionEntry(request.OrgID, request.CallID, derefString(request.LegID), descriptor)
 
@@ -688,8 +767,6 @@ func (s *Server) HandleReleaseSession(data []byte) []byte {
 	}
 
 	released := s.sessions.Release(request.SessionID)
-	// A B-leg released before its answer arrived would otherwise leave its local key behind forever.
-	s.pendingSRTP.Delete(request.SessionID)
 
 	// The delete runs whether or not there was a live session. A release for a session this instance
 	// does not hold is the shape of a retry that landed on the wrong node after a failover, and leaving
@@ -868,7 +945,7 @@ func playbackKindOf(description string) rtp.PlaybackKind {
 //	sendrecv   both ways flow. The ordinary call.
 //	sendonly   we send and do not receive, so what ARRIVES on this leg goes nowhere. mute(in).
 //	recvonly   we receive and do not send, so the peer's audio is not written out. mute(out).
-//	inactive   neither. Both gates up, and the session is additionally put in ModeInactive.
+//	inactive   neither. Both gates up, which is what the session's mode is then derived from.
 //
 // Which PARTY hears music is the engine's decision and arrives as a separate `start-playback` of a
 // `moh:` reference: "the held caller hears the queue's music" and "the holding agent hears nothing"

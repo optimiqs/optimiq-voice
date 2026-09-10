@@ -31,6 +31,10 @@ type Mode string
 const (
 	// ModeInactive receives, counts and discards. The safe default: a session in an unrecognised
 	// mode must not accidentally source audio.
+	//
+	// A session ALLOCATED inactive holds this mode only while both direction gates are still up:
+	// the negotiated direction lives in those gates and nowhere else, so a renegotiation to
+	// sendrecv, sendonly or recvonly resumes relay. See Session.Mode.
 	ModeInactive Mode = "inactive"
 
 	// ModeRelay forwards received payloads to a peer session, and is what a bridged leg is in. A
@@ -364,20 +368,6 @@ func NewSession(opts Options) (*Session, error) {
 	return session, nil
 }
 
-// settleCodec re-points this session's negotiated codec, audio payload type and telephone-event
-// type: the packet path's half of `accept-answer`.
-//
-// The three fields are written together so the packet path sees either the pre-answer default or
-// the settled codec, never a torn mixture. It MUST run before the leg is bridged, so no live relay
-// has its codec changed underneath it.
-// SettleSRTP attaches the SDES context a B-leg's answer settled on. Idempotent per session: the
-// first context wins, so a retried accept-answer cannot rekey a stream mid-call.
-func (s *Session) SettleSRTP(ctx *SRTPContext) {
-	if ctx != nil {
-		s.srtp.CompareAndSwap(nil, ctx)
-	}
-}
-
 func (s *Session) settleCodec(format audio.Format, audioPT, telephoneEventPT uint8) {
 	s.format.Store(uint32(format))
 	s.audioPayloadType.Store(uint32(audioPT))
@@ -420,8 +410,17 @@ func randomSSRC() (uint32, error) {
 // LocalPort is the even RTP port this session listens on.
 func (s *Session) LocalPort() int { return s.ports.Port }
 
-// Mode reports what the session does with received audio.
-func (s *Session) Mode() Mode { return s.mode }
+// Mode reports what the session does with received audio NOW.
+//
+// An allocated-inactive session answers ModeRelay once a renegotiation has taken either direction
+// gate down, because RFC 3264 `inactive` IS both gates up: keeping a second, creation-time copy of
+// the direction is how a successful sendrecv renegotiation ended up still discarding audio.
+func (s *Session) Mode() Mode {
+	if s.mode == ModeInactive && !(s.mutedIn.Load() && s.mutedOut.Load()) {
+		return ModeRelay
+	}
+	return s.mode
+}
 
 // Stats copies the counters out.
 func (s *Session) Stats() Stats {
@@ -558,7 +557,7 @@ func (s *Session) handlePacket(raw []byte, from *net.UDPAddr) {
 		return
 	}
 
-	switch s.mode {
+	switch s.Mode() {
 	case ModeEcho:
 		s.echo(&packet, from)
 	case ModeRelay:
@@ -624,8 +623,9 @@ func (s *Session) Peer() *Session {
 //     own and a re-bridge does not jump the sequence space.
 //   - Timestamp is KEPT: a relay does not resample, so the sampling instant is still true.
 //   - Marker is KEPT: on a telephone-event payload it is the start-of-digit flag.
-//   - Payload type is TRANSLATED for telephone-event only — its type is dynamic and the two legs
-//     routinely land on different numbers, while the payload format is identical.
+//   - Payload type is TRANSLATED to the outgoing leg's own negotiated type, for audio as much as for
+//     telephone-event: both are dynamic for some codecs, so the two legs routinely land on different
+//     numbers while the payload format is identical.
 func (s *Session) relay(packet *pionrtp.Packet) {
 	peer := s.Peer()
 	if peer == nil {
@@ -689,9 +689,11 @@ func (s *Session) forward(packet *pionrtp.Packet, sourceTelephoneEventPT uint8) 
 				return
 			}
 			payload = translated
-			payloadType = s.AudioPayloadType()
 			s.count(func(st *Stats) { st.Transcoded++ })
 		}
+		// Whether or not it was translated, the audio leaves under THIS leg's negotiated type. Two
+		// legs on the same dynamic codec routinely answered with different numbers.
+		payloadType = s.AudioPayloadType()
 	}
 
 	// The marker survives the relay and is FORCED on the first packet after a prompt ends, when the

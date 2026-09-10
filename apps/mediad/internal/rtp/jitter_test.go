@@ -290,3 +290,58 @@ func TestJitterBufferResyncsAcrossALargeSequenceJump(t *testing.T) {
 		t.Errorf("Resynced = %d, want 1", stats.Resynced)
 	}
 }
+
+func TestJitterBufferDoesNotCountInOrderArrivalsAsReordered(t *testing.T) {
+	buffer := rtp.NewJitterBuffer(audio.SampleRate)
+	pushRun(buffer, 1, 4, time.Now())
+
+	if reordered := buffer.Stats().Reordered; reordered != 0 {
+		t.Errorf("Reordered = %d for four strictly sequential arrivals, want 0", reordered)
+	}
+}
+
+func TestJitterBufferCountsOnlyArrivalsBehindASequenceAlreadySeen(t *testing.T) {
+	buffer := rtp.NewJitterBuffer(audio.SampleRate)
+	at := time.Now()
+	for _, sequence := range []uint16{1, 2, 4, 3, 5} {
+		buffer.Push(sequence, uint32(sequence)*audio.FrameTimestampStep, jitterFrame(sequence), at)
+		at = at.Add(audio.FrameDurationMs * time.Millisecond)
+	}
+
+	if reordered := buffer.Stats().Reordered; reordered != 1 {
+		t.Errorf("Reordered = %d, want the single arrival that came in behind 4", reordered)
+	}
+}
+
+func TestJitterBufferAppliesADeepenedTargetToLivePlayout(t *testing.T) {
+	buffer := rtp.NewJitterBuffer(audio.SampleRate)
+	at := pushRun(buffer, 1, 6, time.Now())
+
+	// Play two frames so the buffer is running rather than priming.
+	for range 2 {
+		if _, ok := buffer.Pop(); !ok {
+			t.Fatal("a primed buffer with six frames must play")
+		}
+	}
+	before := buffer.Target()
+
+	// A packet that arrived after its slot: the depth was wrong, not the network.
+	buffer.Push(1, audio.FrameTimestampStep, jitterFrame(1), at)
+	if after := buffer.Target(); after != before+1 {
+		t.Fatalf("Target() = %d after a late arrival, want %d", after, before+1)
+	}
+
+	depth := buffer.Depth()
+	if _, ok := buffer.Pop(); ok {
+		t.Fatal("the deepened target did not reach playout; the tick played straight through")
+	}
+	if got := buffer.Depth(); got != depth {
+		t.Errorf("Depth() = %d after the held tick, want the frame kept at %d", got, depth)
+	}
+	if stats := buffer.Stats(); stats.Stretched != 1 || stats.Lost != 0 {
+		t.Errorf("stats = %+v, want one stretched tick and no loss", stats)
+	}
+	if _, ok := buffer.Pop(); !ok {
+		t.Error("playout did not resume on the tick after the stretch")
+	}
+}

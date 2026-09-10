@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"maps"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -67,16 +66,49 @@ func (r resourceRequest) sessions() []string {
 	return ids
 }
 
-// orderingKey names the resources a request touches, so the command runner keeps one session's
-// commands in arrival order while letting different sessions run at once. A request naming nothing
-// falls back to the empty key, which is one shared FIFO chain.
+// orderingKey names the CONVERSATION a request touches, so the command runner keeps commands on one
+// call in arrival order while letting different calls run at once.
+//
+// The key is one representative id — the lowest a request names — not the whole set. Joining the set
+// gave `{a,b}` and `{a}` different keys, so `bridge(a,b)` and `release(a)` chained on nothing and ran
+// together; a request naming a superset of another's sessions must land on the same chain as it.
+// Ordering, not safety: every Manager operation is atomic under its own lock, and reordering two
+// commands on unrelated calls is indistinguishable from them arriving in the other order.
+//
+// A request naming no session falls back to the resource it names; see Server.orderingKeyFor, which
+// resolves that back to the session holding it.
 func (r resourceRequest) orderingKey() string {
 	ids := r.sessions()
 	if len(ids) == 0 {
 		return r.resourceKey()
 	}
-	slices.Sort(ids)
-	return strings.Join(slices.Compact(ids), "\x00")
+	return slices.Min(ids)
+}
+
+// orderingKeyFor is orderingKey with the router's own resource index consulted, so a command that
+// carries only a reference — `stop-playback`, `stop-recording`, `unbridge`, `untap` — chains behind
+// the command that started it rather than running beside it under a key of its own.
+//
+// The index is what routeRequest already records on every successful command: the sessions seen
+// under a resource key. A reference this instance has never served falls back to the resource key,
+// which is still stable for repeats of that same reference.
+func (s *Server) orderingKeyFor(request resourceRequest) string {
+	key := request.orderingKey()
+	if s.ownership == nil || len(request.sessions()) > 0 || key == "" {
+		return key
+	}
+	s.ownership.mu.Lock()
+	defer s.ownership.mu.Unlock()
+	owner := ""
+	for id := range s.ownership.tracked[key] {
+		if owner == "" || id < owner {
+			owner = id
+		}
+	}
+	if owner == "" {
+		return key
+	}
+	return owner
 }
 
 func (r resourceRequest) resourceKey() string {

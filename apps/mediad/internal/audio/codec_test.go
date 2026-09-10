@@ -175,3 +175,42 @@ func TestEncodingMapsBothWays(t *testing.T) {
 		})
 	}
 }
+
+func TestDecodeAndEncodeKeepTheSampleCountTheyWereGiven(t *testing.T) {
+	t.Parallel()
+
+	// 10, 20, 30 and 60 ms at 8 kHz. DecodeFrame/EncodeFrame are the fixed 20 ms views; Decode and
+	// Encode are the ones the relay path uses, and they must not invent or discard media time.
+	for _, format := range []audio.Format{audio.FormatULaw, audio.FormatALaw, audio.FormatG722} {
+		decoder, err := audio.NewFrameDecoder(format)
+		if err != nil {
+			t.Fatalf("NewFrameDecoder(%s): %v", format, err)
+		}
+		encoder, err := audio.NewFrameEncoder(format)
+		if err != nil {
+			t.Fatalf("NewFrameEncoder(%s): %v", format, err)
+		}
+		for _, samples := range []int{80, 160, 240, 480} {
+			payload := make([]byte, samples)
+			for index := range payload {
+				payload[index] = 0x7f
+			}
+			if decoded := decoder.Decode(payload); len(decoded) != samples {
+				t.Errorf("%s Decode(%d bytes) = %d samples, want %d",
+					format, samples, len(decoded), samples)
+			}
+			if frame := decoder.DecodeFrame(payload); len(frame) != audio.FrameSamples {
+				t.Errorf("%s DecodeFrame(%d bytes) = %d samples, want one frame",
+					format, samples, len(frame))
+			}
+			if encoded := encoder.Encode(make([]int16, samples)); len(encoded) != samples {
+				t.Errorf("%s Encode(%d samples) = %d bytes, want %d",
+					format, samples, len(encoded), samples)
+			}
+			if frame := encoder.EncodeFrame(make([]int16, samples)); len(frame) != audio.FrameSamples {
+				t.Errorf("%s EncodeFrame(%d samples) = %d bytes, want one frame",
+					format, samples, len(frame))
+			}
+		}
+	}
+}

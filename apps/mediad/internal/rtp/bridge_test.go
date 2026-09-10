@@ -62,10 +62,24 @@ func (p *phone) send(t *testing.T, packet pionrtp.Packet) {
 	}
 }
 
+// sendRaw puts arbitrary bytes on the wire, for what an open UDP port really receives.
+func (p *phone) sendRaw(t *testing.T, payload []byte) {
+	t.Helper()
+	if _, err := p.conn.WriteToUDP(payload, p.session); err != nil {
+		t.Fatalf("sending to the session: %v", err)
+	}
+}
+
 // receive waits for one packet, or reports that none arrived.
 func (p *phone) receive(t *testing.T) (pionrtp.Packet, bool) {
 	t.Helper()
-	if err := p.conn.SetReadDeadline(time.Now().Add(bridgeReadTimeout)); err != nil {
+	return p.receiveWithin(t, bridgeReadTimeout)
+}
+
+// receiveWithin is receive on a caller's deadline, for asserting that nothing arrives.
+func (p *phone) receiveWithin(t *testing.T, within time.Duration) (pionrtp.Packet, bool) {
+	t.Helper()
+	if err := p.conn.SetReadDeadline(time.Now().Add(within)); err != nil {
 		t.Fatalf("setting a read deadline: %v", err)
 	}
 	buf := make([]byte, 1500)
@@ -142,21 +156,32 @@ func newBridgeRigWithTypes(
 
 // latch makes both sessions learn their far ends, a precondition for any forwarding. One packet
 // each side, exactly as a real call starts.
+//
+// Waiting on Remote() alone is NOT enough to say the latch packet is spent: handlePacket latches
+// first and decides whether to relay last, so a bridge established inside that window relays the
+// latch frame, and the first thing the far end hears is 0xff at timestamp 0 instead of the audio
+// under test. A session reads its socket on ONE goroutine, so a second packet counted is proof the
+// first is finished with. The barrier is deliberately unparseable rather than audio: it is refused
+// before it could reach a peer, and it moves a counter (Malformed) no rig here reads, so the
+// arrival counts the recording rigs wait on still mean "the frame I just spoke".
 func (r *bridgeRig) latch(t *testing.T) {
 	t.Helper()
-	r.aPhone.send(t, pionrtp.Packet{
-		Header:  pionrtp.Header{Version: 2, PayloadType: rtp.PayloadTypePCMU, SSRC: 111},
-		Payload: []byte{0xff},
-	})
-	r.bPhone.send(t, pionrtp.Packet{
-		Header:  pionrtp.Header{Version: 2, PayloadType: rtp.PayloadTypePCMU, SSRC: 222},
-		Payload: []byte{0xff},
-	})
-	// Both packets arrive before the bridge exists, so neither is forwarded.
-	waitFor(t, "both sessions latched onto their far ends", func() bool {
+	for _, leg := range []struct {
+		phone *phone
+		ssrc  uint32
+	}{{r.aPhone, 111}, {r.bPhone, 222}} {
+		leg.phone.send(t, pionrtp.Packet{
+			Header:  pionrtp.Header{Version: 2, PayloadType: rtp.PayloadTypePCMU, SSRC: leg.ssrc},
+			Payload: []byte{0xff},
+		})
+		leg.phone.sendRaw(t, []byte("not rtp"))
+	}
+	waitFor(t, "both sessions latched onto their far ends and spent the latch packet", func() bool {
 		a, aOK := r.manager.Get(r.aID)
 		b, bOK := r.manager.Get(r.bID)
-		return aOK && bOK && a.Remote() != nil && b.Remote() != nil
+		return aOK && bOK &&
+			a.Remote() != nil && b.Remote() != nil &&
+			a.Stats().Malformed >= 1 && b.Stats().Malformed >= 1
 	})
 }
 
@@ -166,6 +191,19 @@ func TestBridgeRelaysAudioBothWays(t *testing.T) {
 
 	if err := rig.manager.Bridge("bridge-1", rig.aID, rig.bID); err != nil {
 		t.Fatalf("Bridge: %v", err)
+	}
+
+	// Nothing that arrived before the bridge existed may cross it. This is the assertion the suite
+	// was missing: a relayed latch frame is a well-formed packet on the right leg, so every header
+	// check below passed on it and only the payload comparison noticed.
+	for _, leg := range []struct {
+		name  string
+		phone *phone
+	}{{"A", rig.aPhone}, {"B", rig.bPhone}} {
+		if stray, heard := leg.phone.receiveWithin(t, 50*time.Millisecond); heard {
+			t.Fatalf("leg %s heard %v before any bridged audio was sent: a pre-bridge packet was relayed",
+				leg.name, stray.Payload)
+		}
 	}
 
 	// A → B.

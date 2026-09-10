@@ -45,13 +45,20 @@ type JitterStats struct {
 	// Late counts packets that arrived after their slot had been played out. Its ratio to Lost says
 	// whether the buffer is too shallow or the network is genuinely dropping packets.
 	Late uint64
-	// Reordered counts packets that arrived out of sequence and were still played in order.
+	// Reordered counts packets that arrived BEHIND a sequence already seen and were still played in
+	// order. Measured against arrival order, not against the playout cursor: a packet ahead of the
+	// cursor is the ordinary case, not a reordering.
 	Reordered uint64
 	// Overflowed counts packets discarded because the buffer was already full at its ceiling —
 	// a sender running fast, or a mixer tick that stalled.
 	Overflowed uint64
 	// Resynced counts the times playout jumped to the oldest buffered frame. See resyncLocked.
 	Resynced uint64
+	// Stretched counts playout ticks held back to grow the buffer to a deepened target, and Shrunk
+	// counts frames skipped to give depth back. Together they are how a target change reaches live
+	// playout rather than only a later re-prime.
+	Stretched uint64
+	Shrunk    uint64
 	// DepthFrames is the current target depth.
 	DepthFrames int
 	// MaxDepthFrames is the deepest the buffer ever had to go.
@@ -73,6 +80,16 @@ type JitterBuffer struct {
 	primed bool
 	// started is false until the first Pop actually delivered something.
 	started bool
+
+	// highest is the highest sequence yet PUSHED, tracked separately from the playout cursor so
+	// arrival order and playout order cannot be confused. Valid once seen is true.
+	highest uint16
+	seen    bool
+
+	// grow and shrink are the frames playout still owes the target: a deepened target holds a tick
+	// back, a released one skips a frame. Both are bounded by the depth bounds.
+	grow   int
+	shrink int
 
 	// free is the frame free list: buffers Recycle handed back after the mixer decoded them. Bounded
 	// by the same ceiling as pending, so a stalled room cannot grow it.
@@ -136,7 +153,9 @@ func (j *JitterBuffer) Push(sequence uint16, timestamp uint32, payload []byte, a
 		}
 	}
 
-	if sequence != j.next {
+	if !j.seen || sequenceAfterOrEqual(sequence, j.highest) {
+		j.highest, j.seen = sequence, true
+	} else {
 		j.stats.Reordered++
 	}
 	frame := j.takeFrameLocked(len(payload))
@@ -167,10 +186,17 @@ func (j *JitterBuffer) Recycle(frame []byte) {
 		return
 	}
 	j.mu.Lock()
+	j.recycleLocked(frame)
+	j.mu.Unlock()
+}
+
+func (j *JitterBuffer) recycleLocked(frame []byte) {
+	if cap(frame) == 0 {
+		return
+	}
 	if len(j.free) < jitterMaxFrames*2 {
 		j.free = append(j.free, frame[:cap(frame)])
 	}
-	j.mu.Unlock()
 }
 
 // Pop takes the next frame for the mixer's tick. A false means silence for this participant on this
@@ -181,6 +207,23 @@ func (j *JitterBuffer) Pop() ([]byte, bool) {
 
 	if !j.primed {
 		// Still filling: not an underrun, so not counted as loss.
+		return nil, false
+	}
+
+	if j.shrink > 0 && len(j.pending) > j.target {
+		// Giving depth back: one frame is skipped so playout catches up to the shallower target.
+		j.shrink--
+		if frame, buffered := j.pending[j.next]; buffered {
+			delete(j.pending, j.next)
+			j.recycleLocked(frame)
+		}
+		j.next++
+		j.stats.Shrunk++
+	} else if j.grow > 0 && len(j.pending) > 0 {
+		// Taking depth: this tick is silence, which is what puts the extra frame between arrival and
+		// playout. Not an underrun, so not counted as loss.
+		j.grow--
+		j.stats.Stretched++
 		return nil, false
 	}
 
@@ -253,21 +296,32 @@ func (j *JitterBuffer) Stats() JitterStats {
 	return stats
 }
 
-// adaptOnLossLocked deepens the buffer immediately, by one frame: a single lost packet is not
-// evidence of a worse network, and jumping to the ceiling would cost 200 ms over one hiccup.
-func (j *JitterBuffer) adaptOnLossLocked() {
+// deepenLocked adds one frame of target depth: a single lost packet is not evidence of a worse
+// network, and jumping to the ceiling would cost 200 ms over one hiccup.
+//
+// applyToPlayout asks for the extra frame to be taken from live playout, by holding one tick back.
+func (j *JitterBuffer) deepenLocked(applyToPlayout bool) {
 	j.comfort = 0
-	if j.target < jitterMaxFrames {
-		j.target++
-		if j.target > j.stats.MaxDepthFrames {
-			j.stats.MaxDepthFrames = j.target
-		}
+	if j.target >= jitterMaxFrames {
+		return
+	}
+	j.target++
+	if j.target > j.stats.MaxDepthFrames {
+		j.stats.MaxDepthFrames = j.target
+	}
+	if applyToPlayout && j.started {
+		j.grow++
 	}
 }
 
+// adaptOnLossLocked deepens the buffer after an underrun. The missed tick IS the extra frame of
+// delay, so playout owes nothing further.
+func (j *JitterBuffer) adaptOnLossLocked() { j.deepenLocked(false) }
+
 // adaptOnLateLocked deepens the buffer when a packet arrived after its slot — the signal that the
-// depth was wrong rather than that the network dropped something.
-func (j *JitterBuffer) adaptOnLateLocked() { j.adaptOnLossLocked() }
+// depth was wrong rather than that the network dropped something. Playout was not interrupted, so
+// the extra frame has to be taken from it.
+func (j *JitterBuffer) adaptOnLateLocked() { j.deepenLocked(true) }
 
 // comfortTickLocked counts a tick that needed no help, and gives a frame back after enough of them.
 // The estimator sets the floor rather than driving the depth directly: a depth that tracked the
@@ -290,6 +344,9 @@ func (j *JitterBuffer) comfortTickLocked() {
 	}
 	if j.target > floor {
 		j.target--
+		if j.started {
+			j.shrink++
+		}
 	}
 }
 

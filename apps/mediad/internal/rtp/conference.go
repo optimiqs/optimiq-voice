@@ -64,12 +64,8 @@ func (m *Manager) ConferenceOf(sessionID string) (string, bool) {
 }
 
 func (m *Manager) conferenceOfLocked(sessionID string) (string, bool) {
-	for id, conference := range m.conferences {
-		if _, ok := conference.Member(sessionID); ok {
-			return id, true
-		}
-	}
-	return "", false
+	conferenceID, ok := m.conferenceBySession[sessionID]
+	return conferenceID, ok
 }
 
 // JoinConference seats a session in a room, creating the room if it is the first one there.
@@ -95,31 +91,49 @@ func (m *Manager) JoinConference(conferenceID, sessionID string, opts JoinOption
 		m.mu.Unlock()
 		return fmt.Errorf("%w: %s", ErrUnknownSession, sessionID)
 	}
+	m.mu.Unlock()
+
+	// Prepared BEFORE anything is torn down, and outside the manager lock: building the codec pair
+	// is the one step of a join that can refuse, and holding the map's mutex across every join would
+	// serialise call setup behind conference setup. A refusal here leaves the conversation the leg
+	// is already in exactly as it was.
+	member, err := newMember(session, opts)
+	if err != nil {
+		return err
+	}
+
+	// Registered before the unlock defer so it runs after it. See Manager.Bridge.
+	var emptied *Conference
+	defer func() { m.stopEmptied(emptied) }()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.closed {
+		return ErrClosed
+	}
+	// Re-checked against the pointer, not just the id: the session could have been released and its
+	// id reallocated while the codecs were built, and seating the old one would mix a closed socket.
+	if current, live := m.sessions[sessionID]; !live || current != session {
+		return fmt.Errorf("%w: %s", ErrUnknownSession, sessionID)
+	}
+
 	// A session is in exactly one conversation; being in a bridge and a room at once would deliver
 	// every frame twice under one SSRC. It does NOT leave the room it is about to join: re-joining
 	// the same room is a re-point, and a leave/join would drop the jitter buffer and reset the codec
 	// mid-sentence.
 	m.unbridgeSessionLocked(sessionID)
-	if current, ok := m.conferenceOfLocked(sessionID); ok && current != conferenceID {
-		m.leaveConferenceLocked(sessionID)
+	if current, ok := m.conferenceBySession[sessionID]; ok && current != conferenceID {
+		_, emptied, _ = m.leaveConferenceLocked(sessionID)
 	}
 
 	conference, existed := m.conferences[conferenceID]
 	if !existed {
 		conference = m.newConferenceLocked(conferenceID)
 	}
-	m.mu.Unlock()
-
-	// join runs outside the manager lock: it builds a codec pair, and holding the map's mutex across
-	// every join would serialise call setup behind conference setup.
-	if _, err := conference.join(session, opts); err != nil {
-		// A room created for this join and unable to take it is torn down rather than left running
-		// an empty mix loop nobody will destroy.
-		if !existed {
-			m.destroyConferenceIfEmpty(conferenceID)
-		}
-		return err
-	}
+	// Infallible, so the commit needs no unwind: everything that could refuse already has.
+	conference.seat(member)
+	m.conferenceBySession[sessionID] = conferenceID
 
 	m.log.Info("session joined a conference",
 		"conferenceId", conferenceID, "sessionId", sessionID,
@@ -153,31 +167,62 @@ func (m *Manager) newConferenceLocked(conferenceID string) *Conference {
 // than as a failure — the same shape `Unbridge` uses for the same reason.
 func (m *Manager) LeaveConference(sessionID string) (string, bool) {
 	m.mu.Lock()
-	conferenceID, ok := m.leaveConferenceLocked(sessionID)
+	conferenceID, emptied, ok := m.leaveConferenceLocked(sessionID)
 	m.mu.Unlock()
 
+	m.stopEmptied(emptied)
 	if !ok {
 		return "", false
 	}
-	m.destroyConferenceIfEmpty(conferenceID)
 	return conferenceID, true
 }
 
-// leaveConferenceLocked removes a session from its room. Caller holds m.mu.
-func (m *Manager) leaveConferenceLocked(sessionID string) (string, bool) {
-	for id, conference := range m.conferences {
-		if conference.leave(sessionID) {
-			// Any tap whose own session just left goes with it: a record outliving its session is a
-			// supervisor the engine believes is still listening.
-			for tapID, record := range m.taps {
-				if record.tapSessionID == sessionID {
-					delete(m.taps, tapID)
-				}
-			}
-			return id, true
-		}
+// leaveConferenceLocked is the ONE departure path: every caller — leave, release, re-bridge, join
+// elsewhere and idle reaping — goes through it, so no exit can skip the empty-room cleanup that a
+// room's implicit creation makes mandatory. Caller holds m.mu.
+//
+// A room the departure emptied is unindexed here and RETURNED rather than stopped, because stopping
+// it wakes the mix loop, which takes the room lock. The caller passes it to stopEmptied after
+// releasing m.mu.
+func (m *Manager) leaveConferenceLocked(sessionID string) (string, *Conference, bool) {
+	conferenceID, ok := m.conferenceBySession[sessionID]
+	if !ok {
+		return "", nil, false
 	}
-	return "", false
+	delete(m.conferenceBySession, sessionID)
+	conference := m.conferences[conferenceID]
+	if conference == nil {
+		return conferenceID, nil, true
+	}
+	conference.leave(sessionID)
+	// Any tap whose own session just left goes with it: a record outliving its session is a
+	// supervisor the engine believes is still listening.
+	m.forgetTapsOfSessionLocked(sessionID)
+
+	if conference.Len() > 0 {
+		return conferenceID, nil, true
+	}
+	m.removeConferenceLocked(conferenceID)
+	return conferenceID, conference, true
+}
+
+// removeConferenceLocked unindexes a room and the taps attached to it. Caller holds m.mu.
+func (m *Manager) removeConferenceLocked(conferenceID string) {
+	delete(m.conferences, conferenceID)
+	for tapID := range m.tapsByConference[conferenceID] {
+		m.forgetTapLocked(tapID)
+	}
+	delete(m.tapsByConference, conferenceID)
+}
+
+// stopEmptied ends a room whose last member has left. Rooms are implicit — created by the first
+// join — so the last departure must stop them or their mix loop ticks for the life of the process.
+func (m *Manager) stopEmptied(conference *Conference) {
+	if conference == nil {
+		return
+	}
+	conference.Stop()
+	m.log.Info("conference emptied and destroyed", "conferenceId", conference.ID)
 }
 
 // DestroyConference ends a room and returns everybody in it to having no conversation.
@@ -191,18 +236,14 @@ func (m *Manager) DestroyConference(conferenceID string) ([]string, bool) {
 		m.mu.Unlock()
 		return nil, false
 	}
-	delete(m.conferences, conferenceID)
-	for tapID, record := range m.taps {
-		if record.conferenceID == conferenceID {
-			delete(m.taps, tapID)
-		}
+	m.removeConferenceLocked(conferenceID)
+	members := conference.Members()
+	for _, sessionID := range members {
+		delete(m.conferenceBySession, sessionID)
+		conference.leave(sessionID)
 	}
 	m.mu.Unlock()
 
-	members := conference.Members()
-	for _, sessionID := range members {
-		conference.leave(sessionID)
-	}
 	conference.Stop()
 
 	m.log.Info("conference destroyed", "conferenceId", conferenceID, "members", len(members))
@@ -223,6 +264,44 @@ func (m *Manager) destroyConferenceIfEmpty(conferenceID string) {
 
 	conference.Stop()
 	m.log.Info("conference emptied and destroyed", "conferenceId", conferenceID)
+}
+
+// rememberTapLocked indexes a tap forwards and backwards. Caller holds m.mu.
+func (m *Manager) rememberTapLocked(tapID string, record tapRecord) {
+	m.taps[tapID] = record
+	add := func(index map[string]map[string]struct{}, key string) {
+		if index[key] == nil {
+			index[key] = make(map[string]struct{})
+		}
+		index[key][tapID] = struct{}{}
+	}
+	add(m.tapsBySession, record.tapSessionID)
+	add(m.tapsByConference, record.conferenceID)
+}
+
+// forgetTapLocked removes a tap from all three indexes. Caller holds m.mu.
+func (m *Manager) forgetTapLocked(tapID string) {
+	record, ok := m.taps[tapID]
+	if !ok {
+		return
+	}
+	delete(m.taps, tapID)
+	drop := func(index map[string]map[string]struct{}, key string) {
+		delete(index[key], tapID)
+		if len(index[key]) == 0 {
+			delete(index, key)
+		}
+	}
+	drop(m.tapsBySession, record.tapSessionID)
+	drop(m.tapsByConference, record.conferenceID)
+}
+
+// forgetTapsOfSessionLocked drops every tap run BY a session. Caller holds m.mu.
+func (m *Manager) forgetTapsOfSessionLocked(sessionID string) {
+	for tapID := range m.tapsBySession[sessionID] {
+		m.forgetTapLocked(tapID)
+	}
+	delete(m.tapsBySession, sessionID)
 }
 
 // tapRecord is what Untap needs to take a tap down.
@@ -271,12 +350,12 @@ func (m *Manager) Tap(opts TapOptions) (TapResult, error) {
 	}
 
 	m.mu.Lock()
-	m.taps[opts.TapID] = tapRecord{
+	m.rememberTapLocked(opts.TapID, tapRecord{
 		conferenceID: conferenceID,
 		tapSessionID: opts.TapSessionID,
 		mode:         opts.Mode,
 		startedAt:    m.now(),
-	}
+	})
 	conference := m.conferences[conferenceID]
 	m.mu.Unlock()
 
@@ -302,7 +381,7 @@ func (m *Manager) Untap(tapID string) (string, bool) {
 	m.mu.Lock()
 	record, ok := m.taps[tapID]
 	if ok {
-		delete(m.taps, tapID)
+		m.forgetTapLocked(tapID)
 	}
 	m.mu.Unlock()
 

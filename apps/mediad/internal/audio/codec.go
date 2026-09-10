@@ -5,9 +5,12 @@ import (
 	"fmt"
 )
 
-// The linear bus is 8 kHz: a FrameDecoder always answers FrameSamples samples of 8 kHz linear PCM
-// whatever the codec's own sample rate is, and a FrameEncoder always takes them, so the mixer and
-// recorder never branch on a codec.
+// The linear bus is 8 kHz: whatever the codec's own sample rate is, it is decoded to and encoded
+// from 8 kHz linear PCM, so the mixer and recorder never branch on a codec.
+//
+// Decoding and packetisation are separate. Decode/Encode preserve the media time they were given —
+// a 30 ms packet decodes to 240 samples — and DecodeFrame/EncodeFrame are the fixed 20 ms views a
+// consumer on a frame clock (the mixer) wants.
 
 // Format is a payload format mediad can put on the wire.
 type Format uint8
@@ -88,9 +91,13 @@ var ErrNotTranscodable = errors.New("audio: this build cannot decode or encode t
 // Stateful by contract (G.722's predictor, the resampler's filter history): use one decoder per
 // inbound stream, for the life of that stream.
 type FrameDecoder interface {
+	// Decode answers the samples the payload actually carries, so 10, 20, 30 and 60 ms
+	// packetisations all survive: an SDP ptime is a preference, not permission to truncate
+	// (RFC 3264 §6.1).
+	Decode(payload []byte) []int16
 	// DecodeFrame answers exactly FrameSamples samples; a short, long or corrupt payload is still
-	// padded to a full frame, because a short frame at a mixer on a clock is a gap in everyone's
-	// audio rather than in one participant's.
+	// padded or truncated to a full frame, because a short frame at a mixer on a clock is a gap in
+	// everyone's audio rather than in one participant's.
 	DecodeFrame(payload []byte) []int16
 	// Reset returns the decoder to its start state, for a stream that has restarted.
 	Reset()
@@ -98,9 +105,13 @@ type FrameDecoder interface {
 
 // FrameEncoder turns 20 ms of 8 kHz linear PCM into one payload. Stateful; see FrameDecoder.
 type FrameEncoder interface {
-	// EncodeFrame answers this instance's OWN buffer, valid only until the next EncodeFrame on the
-	// same encoder; a caller that keeps the bytes must copy them. One encoder belongs to one
-	// direction of one bridge or one seat in one room, so there is no second consumer to race.
+	// Encode answers the payload for exactly the samples it was given, preserving their media time.
+	// The buffer is this instance's own; see EncodeFrame for the lifetime.
+	Encode(samples []int16) []byte
+	// EncodeFrame answers this instance's OWN buffer, valid only until the next Encode or
+	// EncodeFrame on the same encoder; a caller that keeps the bytes must copy them. One encoder
+	// belongs to one direction of one bridge or one seat in one room, so there is no second
+	// consumer to race.
 	EncodeFrame(samples []int16) []byte
 	Reset()
 }
@@ -142,23 +153,33 @@ type g711FrameCodec struct {
 	encoded  []byte
 }
 
-func (c *g711FrameCodec) DecodeFrame(payload []byte) []int16 {
+func (c *g711FrameCodec) Decode(payload []byte) []int16 {
 	if c.decoded == nil {
 		c.decoded = make([]int16, FrameSamples)
+	}
+	c.decoded = decodeLinearInto(c.decoded, payload, c.encoding)
+	return c.decoded
+}
+
+func (c *g711FrameCodec) DecodeFrame(payload []byte) []int16 {
+	if c.padded == nil {
 		c.padded = make([]int16, FrameSamples)
 	}
-	return padFrameInto(c.padded, decodeLinearInto(c.decoded, payload, c.encoding))
+	return padFrameInto(c.padded, c.Decode(payload))
 }
 
 // EncodeFrame reuses this instance's output buffer; see the FrameEncoder contract for the lifetime
 // that makes that safe.
+func (c *g711FrameCodec) Encode(samples []int16) []byte {
+	c.encoded = encodeLinearInto(c.encoded, samples, c.encoding)
+	return c.encoded
+}
+
 func (c *g711FrameCodec) EncodeFrame(samples []int16) []byte {
 	if c.padded == nil {
-		c.decoded = make([]int16, FrameSamples)
 		c.padded = make([]int16, FrameSamples)
-		c.encoded = make([]byte, FrameSamples)
 	}
-	return encodeLinearInto(c.encoded, padFrameInto(c.padded, samples), c.encoding)
+	return c.Encode(padFrameInto(c.padded, samples))
 }
 
 func (c *g711FrameCodec) Reset() {}
@@ -173,15 +194,21 @@ type g722FrameDecoder struct {
 	padded []int16
 }
 
-func (d *g722FrameDecoder) DecodeFrame(payload []byte) []int16 {
-	if d.padded == nil {
+func (d *g722FrameDecoder) Decode(payload []byte) []int16 {
+	if d.wide == nil {
 		d.wide = make([]int16, 0, FrameSamples*2)
 		d.narrow = make([]int16, 0, FrameSamples)
-		d.padded = make([]int16, FrameSamples)
 	}
 	d.wide = d.decoder.decodeInto(d.wide, payload)
 	d.narrow = d.down.resampleInto(d.narrow, d.wide)
-	return padFrameInto(d.padded, d.narrow)
+	return d.narrow
+}
+
+func (d *g722FrameDecoder) DecodeFrame(payload []byte) []int16 {
+	if d.padded == nil {
+		d.padded = make([]int16, FrameSamples)
+	}
+	return padFrameInto(d.padded, d.Decode(payload))
 }
 
 func (d *g722FrameDecoder) Reset() {
@@ -200,15 +227,21 @@ type g722FrameEncoder struct {
 	encoded []byte
 }
 
-func (e *g722FrameEncoder) EncodeFrame(samples []int16) []byte {
-	if e.padded == nil {
-		e.padded = make([]int16, FrameSamples)
+func (e *g722FrameEncoder) Encode(samples []int16) []byte {
+	if e.wide == nil {
 		e.wide = make([]int16, 0, FrameSamples*2)
 		e.encoded = make([]byte, 0, FrameSamples)
 	}
-	e.wide = e.up.resampleInto(e.wide, padFrameInto(e.padded, samples))
+	e.wide = e.up.resampleInto(e.wide, samples)
 	e.encoded = e.encoder.encodeInto(e.encoded, e.wide)
 	return e.encoded
+}
+
+func (e *g722FrameEncoder) EncodeFrame(samples []int16) []byte {
+	if e.padded == nil {
+		e.padded = make([]int16, FrameSamples)
+	}
+	return e.Encode(padFrameInto(e.padded, samples))
 }
 
 func (e *g722FrameEncoder) Reset() {

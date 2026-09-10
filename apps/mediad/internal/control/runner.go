@@ -1,11 +1,24 @@
 package control
 
-import "sync"
+import (
+	"context"
+	"time"
 
-// maxConcurrentCommands is the ceiling on media commands executing at once. It bounds the goroutines
-// a burst can put in flight; past it a request waits its turn instead of being refused, because a
-// media command that arrives during a call storm is one the engine is still waiting for.
-const maxConcurrentCommands = 256
+	"github.com/optimiqs/optimiq-voice/packages/runtime-go/keyed"
+)
+
+// The command runner's capacity. maxConcurrentCommands bounds the handlers executing at once;
+// maxPendingCommands and maxPendingPerResource bound what is WAITING, which is the part a call
+// storm grows. Past them an allocate is refused with `capacity` rather than queued behind work the
+// engine has already timed out on.
+const (
+	maxConcurrentCommands = 256
+	maxPendingCommands    = 4096
+	maxPendingPerResource = 256
+	// commandEnqueueTimeout is how long a command may wait for a slot. It is the engine's own RPC
+	// budget: past it the requester is gone, so the handler answers `capacity` and does no work.
+	commandEnqueueTimeout = 2 * time.Second
+)
 
 // keyedRunner runs a request off the NATS dispatcher goroutine while keeping requests that name the
 // same resources in the order they arrived.
@@ -13,52 +26,50 @@ const maxConcurrentCommands = 256
 // A NATS subscription dispatches its subject on ONE goroutine, so answering inline serialised every
 // allocate, create-offer and hold on that subject behind the KV round trips of the one in front.
 // Submit hands the work over and returns, so the dispatcher goes straight back to reading the socket.
-type keyedRunner struct {
-	mu      sync.Mutex
-	pending map[string][]func()
-	slots   chan struct{}
-}
+type keyedRunner struct{ exec *keyed.Executor }
 
 func newKeyedRunner(maxConcurrent int) *keyedRunner {
-	return &keyedRunner{
-		pending: make(map[string][]func()),
-		slots:   make(chan struct{}, maxConcurrent),
+	exec, err := keyed.New(keyed.Options{
+		MaxConcurrent:    maxConcurrent,
+		MaxPending:       maxPendingCommands,
+		MaxPendingPerKey: maxPendingPerResource,
+		EnqueueTimeout:   commandEnqueueTimeout,
+	})
+	if err != nil {
+		// Only a non-positive limit reaches this, which would be a constant edited to zero.
+		panic("control: " + err.Error())
 	}
+	return &keyedRunner{exec: exec}
 }
 
 // Submit queues task under key and never blocks. Tasks sharing a key run one at a time, oldest
 // first; tasks under different keys run concurrently, bounded by the runner's slots.
-func (r *keyedRunner) Submit(key string, task func()) {
-	r.mu.Lock()
-	queue, draining := r.pending[key]
-	r.pending[key] = append(queue, task)
-	r.mu.Unlock()
-	if draining {
-		return
-	}
-	go r.drain(key)
+//
+// It returns keyed.ErrOverloaded or keyed.ErrClosed instead of queueing without limit; the caller
+// must answer its requester in that case. A task that waited past commandEnqueueTimeout still runs,
+// with an expired context, so it can refuse rather than act on a command nobody awaits.
+func (r *keyedRunner) Submit(key string, task func()) error {
+	return r.SubmitKeys([]string{key}, task)
 }
 
-func (r *keyedRunner) drain(key string) {
-	for {
-		r.mu.Lock()
-		queue := r.pending[key]
-		if len(queue) == 0 {
-			delete(r.pending, key)
-			r.mu.Unlock()
+// SubmitKeys is Submit for a command that touches SEVERAL resources. The task runs only once it is
+// first in line for every one of them, so a bridge of {a,b} and a bridge of {b,c} cannot overlap
+// even though neither set contains the other.
+func (r *keyedRunner) SubmitKeys(keys []string, task func()) error {
+	return r.exec.Submit(keys, func(ctx context.Context) {
+		if ctx.Err() != nil {
 			return
 		}
-		task := queue[0]
-		queue[0] = nil
-		r.pending[key] = queue[1:]
-		r.mu.Unlock()
-
-		r.run(task)
-	}
+		task()
+	})
 }
 
-func (r *keyedRunner) run(task func()) {
-	r.slots <- struct{}{}
-	defer func() { <-r.slots }()
-	task()
+// SubmitContext is SubmitKeys for a caller that answers the expired case itself; ctx is already
+// expired when the task waited too long for a slot.
+func (r *keyedRunner) SubmitContext(keys []string, task func(ctx context.Context)) error {
+	return r.exec.Submit(keys, task)
 }
+
+// Drain stops accepting commands and waits for the ones already accepted, reporting whether they
+// all finished. Called after the subscriptions are gone and before the sessions are torn down.
+func (r *keyedRunner) Drain(ctx context.Context) bool { return r.exec.Shutdown(ctx) }

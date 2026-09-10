@@ -26,6 +26,7 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/directory"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 	secure "github.com/optimiqs/optimiq-voice/apps/mediad/internal/webrtc"
+	"github.com/optimiqs/optimiq-voice/packages/runtime-go/keyed"
 )
 
 // The v1 command subjects. Local names over contract values, so a rename in the Zod source is a
@@ -101,9 +102,13 @@ type Sessions interface {
 	// a leg can be sent to before it has spoken (early media). Advisory — the first packet still
 	// latches over it.
 	SeedRemote(sessionID string, addr netip.AddrPort) error
-	// SettleSRTP attaches the SDES context a callee's answer keyed onto a live B-leg, which
-	// create-offer bound before the far end's key existed. An unknown id is rtp.ErrUnknownSession.
-	SettleSRTP(sessionID string, ctx *rtp.SRTPContext) error
+	// Negotiate runs one offer/answer exchange for a session id under a lock private to it, so an
+	// identical retry replays the committed SDP instead of drawing key material the packet path is
+	// not using. See rtp.Manager.Negotiate for the contract the exchange function must honour.
+	Negotiate(
+		sessionID, request string,
+		exchange func(prior rtp.Negotiation, replay bool) (*rtp.Negotiation, *rtp.SRTPContext, error),
+	) (rtp.Negotiation, error)
 
 	// Tap joins a supervisor to a conversation on asymmetric terms; Untap takes it down.
 	Tap(opts rtp.TapOptions) (rtp.TapResult, error)
@@ -136,10 +141,7 @@ type Server struct {
 	instanceID     string
 	publicAddr     netip.Addr
 	srtpPolicy     config.SRTPPolicy
-	// pendingSRTP holds the local key of a leg create-offer keyed, until accept-answer supplies the
-	// callee's. Keyed by session id; entries are removed on settle and on release.
-	pendingSRTP sync.Map
-	ownership   *ownershipRouter
+	ownership      *ownershipRouter
 	// commands runs handlers off the subscription dispatcher, ordered per resource. See keyedRunner.
 	commands *keyedRunner
 }
@@ -269,12 +271,40 @@ func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscrip
 			if json.Unmarshal(data, &request) != nil {
 				request = resourceRequest{}
 			}
-			s.commands.Submit(request.orderingKey(), func() {
-				reply := s.routeRequest(conn, subject, data, request, handle, addressed)
+			respondWith := func(reply []byte) {
 				if err := msg.Respond(reply); err != nil {
 					s.log.Error("cannot reply", "subject", subject, "error", err)
 				}
+			}
+			// Every session the request names, not one representative: a bridge of {a,b} and a
+			// bridge of {b,c} overlap in one leg and must not run at once. A request that names no
+			// session falls back to the resource key its reference resolves to.
+			keys := request.sessions()
+			if len(keys) == 0 {
+				keys = []string{s.orderingKeyFor(request)}
+			}
+			err := s.commands.SubmitContext(keys, func(ctx context.Context) {
+				if ctx.Err() != nil {
+					// The command waited longer for a slot than its requester waited for an answer.
+					// Answering is still worth it — it turns the caller's timeout into a retry
+					// decision — but doing the work is not.
+					s.log.Warn("refusing a command that waited past its enqueue deadline",
+						"subject", subject, "sessionId", request.SessionID)
+					respondWith(s.refuseOverloaded(request, ReasonCapacity,
+						"this instance is saturated: the command waited past its deadline"))
+					return
+				}
+				respondWith(s.routeRequest(conn, subject, data, request, handle, addressed))
 			})
+			if err != nil {
+				reason, message := ReasonCapacity, "this instance is at its pending-command limit"
+				if errors.Is(err, keyed.ErrClosed) {
+					reason, message = ReasonShuttingDown, "this instance is draining"
+				}
+				s.log.Warn("refusing a command at admission",
+					"subject", subject, "sessionId", request.SessionID, "reason", reason)
+				respondWith(s.refuseOverloaded(request, reason, message))
+			}
 		}
 
 		var (
@@ -305,6 +335,31 @@ func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscrip
 	}
 	return subscriptions, nil
 }
+
+// refuseOverloaded answers a command that never reached its handler, because the runner refused it
+// at admission or its enqueue deadline passed first.
+//
+// One shape for every subject: each command response in the contract carries these five fields, and
+// a caller reading `ok:false` with a `reason` does not need the rest.
+func (s *Server) refuseOverloaded(request resourceRequest, reason, message string) []byte {
+	return encode(s.log, struct {
+		Ok         bool   `json:"ok"`
+		SessionID  string `json:"sessionId,omitempty"`
+		InstanceID string `json:"instanceId"`
+		Reason     string `json:"reason"`
+		Error      string `json:"error"`
+	}{
+		SessionID:  request.SessionID,
+		InstanceID: s.instanceID,
+		Reason:     reason,
+		Error:      message,
+	})
+}
+
+// DrainCommands stops accepting commands and waits for the accepted ones, reporting whether they
+// all finished. Called after the subscriptions are dropped and before the sessions are torn down: a
+// handler still running would otherwise act on a session the drain has already closed.
+func (s *Server) DrainCommands(ctx context.Context) bool { return s.commands.Drain(ctx) }
 
 // encode marshals a reply. A reply that cannot be marshalled is a programming error, but the caller
 // is mid-call, so it degrades to a hand-written refusal rather than to a timeout.

@@ -89,12 +89,15 @@ type stubSessions struct {
 	// descriptor's port so a create-offer→accept-answer flow can assert on a stable value.
 	settles     []settleCall
 	srtpSettles []string
-	settleErr   error
-	settlePort  int
-	tapErr      error
-	taps        []rtp.TapOptions
-	untaps      []string
-	tapped      map[string]string
+	// The negotiation state rtp.Manager keeps per session id, and the lock the exchange runs under.
+	negotiations map[string]rtp.Negotiation
+	negotiateMu  sync.Mutex
+	settleErr    error
+	settlePort   int
+	tapErr       error
+	taps         []rtp.TapOptions
+	untaps       []string
+	tapped       map[string]string
 
 	// `muted` is a pair of flags per session because a mute is ADDITIVE and a stub that replaced them
 	// would let a handler bug pass: the handler reads the state back because it cannot derive it.
@@ -394,15 +397,42 @@ func (s *stubSessions) seeds() []seedCall {
 	return slices.Clone(s.seededRemotes)
 }
 
-func (s *stubSessions) SettleSRTP(sessionID string, ctx *rtp.SRTPContext) error {
+// Negotiate mirrors rtp.Manager.Negotiate: one exchange at a time per session id, replaying the
+// committed result for an identical request. Its own mutex, because the exchange calls Allocate.
+func (s *stubSessions) Negotiate(
+	sessionID, request string,
+	exchange func(prior rtp.Negotiation, replay bool) (*rtp.Negotiation, *rtp.SRTPContext, error),
+) (rtp.Negotiation, error) {
+	s.negotiateMu.Lock()
+	defer s.negotiateMu.Unlock()
+
+	s.mu.Lock()
+	prior := s.negotiations[sessionID]
+	s.mu.Unlock()
+
+	committed, secure, err := exchange(prior, prior.Committed() && prior.Request == request)
+	if err != nil {
+		return rtp.Negotiation{}, err
+	}
+	if committed == nil {
+		return prior, nil
+	}
+	next := *committed
+	if next.Request == "" {
+		next.Request = request
+	}
+	next.Generation = prior.Generation + 1
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.srtpSettles = append(s.srtpSettles, sessionID)
-	if !s.live[sessionID] {
-		return fmt.Errorf("%w: %s", rtp.ErrUnknownSession, sessionID)
+	if secure != nil {
+		s.srtpSettles = append(s.srtpSettles, sessionID)
 	}
-	_ = ctx
-	return nil
+	if s.negotiations == nil {
+		s.negotiations = map[string]rtp.Negotiation{}
+	}
+	s.negotiations[sessionID] = next
+	return next, nil
 }
 
 func (s *stubSessions) SettleAnswer(

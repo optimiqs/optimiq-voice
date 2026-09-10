@@ -104,18 +104,19 @@ func TestTheRunnerBoundsConcurrencyWithoutLosingWork(t *testing.T) {
 	}
 }
 
-// The ordering key is what makes the guarantee above per-session: every id a request names, in a
-// canonical order, so a bridge and a hold on the same pair chain rather than race.
-func TestTheOrderingKeyNamesEveryResourceARequestTouches(t *testing.T) {
+// The ordering key is what makes the guarantee above per-conversation: one representative of the
+// ids a request names, so a bridge and a release that overlap in one leg chain rather than race.
+func TestTheOrderingKeyNamesTheConversationARequestTouches(t *testing.T) {
 	for _, row := range []struct {
 		name    string
 		request resourceRequest
 		want    string
 	}{
 		{"one session", resourceRequest{SessionID: "b"}, "b"},
-		{"canonical order", resourceRequest{SessionIDs: []string{"b", "a"}}, "a\x00b"},
-		{"same pair either way round", resourceRequest{SessionIDs: []string{"a", "b"}}, "a\x00b"},
+		{"canonical order", resourceRequest{SessionIDs: []string{"b", "a"}}, "a"},
+		{"same pair either way round", resourceRequest{SessionIDs: []string{"a", "b"}}, "a"},
 		{"a repeated id collapses", resourceRequest{SessionID: "a", SessionIDs: []string{"a"}}, "a"},
+		{"a subset shares the pair's chain", resourceRequest{SessionID: "a"}, "a"},
 		{"no session falls back to the resource", resourceRequest{BridgeID: "br"}, directory.OwnerKey("bridge", "br")},
 		{"nothing named", resourceRequest{}, ""},
 	} {

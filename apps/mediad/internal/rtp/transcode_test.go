@@ -235,3 +235,32 @@ func mustSession(t *testing.T, rig *bridgeRig, id string) *rtp.Session {
 	}
 	return session
 }
+
+func TestTranscoderPreservesTheSendersPacketisation(t *testing.T) {
+	// 10, 20, 30 and 60 ms at 8 kHz. An SDP ptime is a preference, not permission to truncate
+	// (RFC 3264 §6.1).
+	for _, samples := range []int{80, 160, 240, 480} {
+		payload := make([]byte, samples)
+		for index := range payload {
+			payload[index] = 0x7f
+		}
+		for _, pair := range [][2]audio.Format{
+			{audio.FormatULaw, audio.FormatALaw},
+			{audio.FormatULaw, audio.FormatG722},
+			{audio.FormatG722, audio.FormatULaw},
+		} {
+			coder, err := rtp.NewTranscoder(pair[0], pair[1])
+			if err != nil {
+				t.Fatalf("NewTranscoder(%s, %s): %v", pair[0], pair[1], err)
+			}
+			translated, ok := coder.Translate(payload)
+			if !ok {
+				t.Fatalf("%s to %s refused a %d-sample payload", pair[0], pair[1], samples)
+			}
+			if len(translated) != samples {
+				t.Errorf("%s to %s turned %d samples into %d; media time must survive the translation",
+					pair[0], pair[1], samples, len(translated))
+			}
+		}
+	}
+}

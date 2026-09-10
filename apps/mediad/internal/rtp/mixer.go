@@ -37,6 +37,11 @@ var ErrConferenceCodec = errors.New("rtp: this codec cannot be mixed")
 // integer arithmetic end to end; eight fractional bits is about 0.03 dB near unity.
 const unityGain int32 = 256
 
+// maxPacketSamples is 60 ms on the mix bus: the longest packetisation RFC 3551 §4.1 expects an
+// endpoint to send, and so the largest remainder one tick can leave behind. Only a sizing hint —
+// a longer arrival still decodes correctly, it just regrows the member's sample queue once.
+const maxPacketSamples = audio.FrameSamples * 3
+
 // Side names one half of a two-party conversation. A SIDE is a party in a conversation, where a
 // DIRECTION is a property of one channel.
 type Side string
@@ -131,6 +136,11 @@ type Member struct {
 	// contribution is this member's decoded, gained frame for the tick in progress. Owned by the
 	// mixer goroutine alone and reused across ticks.
 	contribution []int32
+	// pending is the media time this member has had decoded but not yet mixed, in linear samples on
+	// the mix bus. Arrivals are queued as SAMPLES rather than as packets, so one tick consumes
+	// exactly 20 ms of media time however the sender packetised it. Owned by the mixer goroutine
+	// alone, and bounded by one packet's worth of remainder — see takeContribution.
+	pending []int16
 	// marked is false until this member's first mixed frame has gone out; that frame carries the
 	// marker bit, since the stream switches to the mixer's clock exactly once.
 	marked bool
@@ -160,6 +170,51 @@ func (m *Member) Gain() (rx, tx int32) { return m.gainRx.Load(), m.gainTx.Load()
 // JitterStats is this member's buffer's counters.
 func (m *Member) JitterStats() JitterStats { return m.jitter.Stats() }
 
+// takeContribution decodes enough of this member's arrivals to cover one 20 ms tick and writes the
+// gained samples into `contribution`. Run on the mixer goroutine, once per member per tick.
+//
+// A tick consumes exactly FrameSamples of MEDIA time, not one packet: a 30 ms arrival leaves 10 ms
+// behind for the next tick and a 10 ms arrival has its successor pulled in beside it, so 10, 20, 30
+// and 60 ms members share one room without drifting against each other. The pending remainder is
+// therefore always shorter than one packet, and the codec sees every sample exactly once and in
+// order, which is what keeps a stateful decoder and the outbound timestamp continuous.
+//
+// A tick the buffer cannot cover is padded with silence rather than stalled — the room is on a
+// clock, and a short frame would be a gap in everybody's audio rather than in this member's.
+func (m *Member) takeContribution() {
+	for len(m.pending) < audio.FrameSamples {
+		frame, ok := m.jitter.Pop()
+		if !ok {
+			break
+		}
+		m.pending = append(m.pending, m.decoder.Decode(frame)...)
+		// Decode copies into the decoder's own scratch, so the frame is dead here and can go back to
+		// the buffer. See JitterBuffer.Recycle.
+		m.jitter.Recycle(frame)
+	}
+
+	if len(m.pending) == 0 {
+		clear(m.contribution)
+		return
+	}
+
+	gain := m.gainRx.Load()
+	for index := range audio.FrameSamples {
+		var sample int16
+		if index < len(m.pending) {
+			sample = m.pending[index]
+		}
+		m.contribution[index] = int32(sample) * gain / unityGain
+	}
+
+	if len(m.pending) <= audio.FrameSamples {
+		m.pending = m.pending[:0]
+		return
+	}
+	// Shifts down within the same backing array; the remainder is bounded, so this never grows it.
+	m.pending = append(m.pending[:0], m.pending[audio.FrameSamples:]...)
+}
+
 // receive hands one arrived packet to this member's jitter buffer. Telephone-event packets are NOT
 // buffered — decoding one writes noise into the mix — and are relayed instead; see forwardEvent.
 func (m *Member) receive(packet *pionrtp.Packet, now time.Time) {
@@ -184,6 +239,11 @@ type Conference struct {
 	members map[string]*Member
 	// order is the members in join order, so the mix — and its saturation behaviour — is deterministic.
 	order []string
+	// restricted is the sub-list of order whose speakTo is enumerated rather than everybody: the
+	// only members NOT in the unclamped total, and so the only ones an unrestricted listener has to
+	// be offered explicitly. Empty in every plain conference, which is what keeps that mix O(NF)
+	// instead of adding a scan of the room per listener. Rebuilt on every seating change.
+	restricted []string
 
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -233,10 +293,9 @@ func (c *Conference) Done() <-chan struct{} { return c.done }
 // Stop ends the mix loop. Idempotent.
 func (c *Conference) Stop() { c.stopOnce.Do(func() { close(c.stop) }) }
 
-// join seats a session. Caller holds nothing; the conference takes its own lock.
-func (c *Conference) join(session *Session, opts JoinOptions) (*Member, error) {
-	// The codecs are built before the lock and before anything is mutated: this is the one step that
-	// can refuse, and a refusal after seating would leave a member contributing nothing.
+// newMember prepares a seat without taking it. Nothing is mutated, so a caller can build the member
+// before deciding to move a session, and a refusal costs the session nothing.
+func newMember(session *Session, opts JoinOptions) (*Member, error) {
 	format := session.Format()
 	decoder, err := audio.NewFrameDecoder(format)
 	if err != nil {
@@ -250,7 +309,6 @@ func (c *Conference) join(session *Session, opts JoinOptions) (*Member, error) {
 	}
 
 	member := &Member{
-		conference:   c,
 		session:      session,
 		jitter:       NewJitterBuffer(session.clockRate()),
 		decoder:      decoder,
@@ -259,28 +317,53 @@ func (c *Conference) join(session *Session, opts JoinOptions) (*Member, error) {
 		speakTo:      opts.SpeakTo,
 		tapID:        opts.TapID,
 		contribution: make([]int32, audio.FrameSamples),
+		// One tick's worth plus the largest remainder a supported packetisation can leave (60 ms),
+		// so the sample queue is allocated once and never regrown.
+		pending: make([]int16, 0, audio.FrameSamples+maxPacketSamples),
 	}
 	member.SetGain(opts.GainRx, opts.GainTx)
+	return member, nil
+}
+
+// seat installs a prepared member, or re-points the seat this session already has, and reports the
+// seat that is now live. Infallible by construction — newMember has already done everything that can
+// refuse — so a caller may commit it under the manager lock with no unwind path.
+func (c *Conference) seat(prepared *Member) *Member {
+	prepared.conference = c
+	session := prepared.session
 
 	c.mu.Lock()
-	if existing, ok := c.members[session.ID]; ok {
+	if existing, taken := c.members[session.ID]; taken {
 		// Re-joining re-points an existing seat (a supervisor escalating whisper to barge); reseating
 		// would drop the jitter buffer and reset the codec mid-sentence.
-		existing.hear, existing.speakTo = opts.Hear, opts.SpeakTo
-		existing.SetGain(opts.GainRx, opts.GainTx)
+		existing.hear, existing.speakTo = prepared.hear, prepared.speakTo
+		rx, tx := prepared.Gain()
+		existing.SetGain(rx, tx)
+		c.refreshRestrictedLocked()
 		c.mu.Unlock()
-		return existing, nil
+		return existing
 	}
-	c.members[session.ID] = member
+	c.members[session.ID] = prepared
 	c.order = append(c.order, session.ID)
+	c.refreshRestrictedLocked()
 	c.mu.Unlock()
 
 	// A session in a conference has no peer: the mix replaces the relay. Leaving the pointer would
 	// put a leg in a bridge and a room at once, delivering every frame twice under one SSRC.
 	session.SetPeer(nil)
 	session.transcode.Store(nil)
-	session.mixMember.Store(member)
-	return member, nil
+	session.mixMember.Store(prepared)
+	return prepared
+}
+
+// refreshRestrictedLocked rebuilds the restricted-speaker list from the seating. Caller holds c.mu.
+func (c *Conference) refreshRestrictedLocked() {
+	c.restricted = c.restricted[:0]
+	for _, id := range c.order {
+		if member := c.members[id]; member != nil && !member.speakTo.All() {
+			c.restricted = append(c.restricted, id)
+		}
+	}
 }
 
 // leave takes a session out of the room, reporting whether it was in it.
@@ -295,6 +378,7 @@ func (c *Conference) leave(sessionID string) bool {
 				break
 			}
 		}
+		c.refreshRestrictedLocked()
 	}
 	c.mu.Unlock()
 
@@ -354,9 +438,10 @@ func (c *Conference) run() {
 
 // mixOnce produces and sends one frame of audio to every member:
 //
-//  1. Each member's next frame is popped, decoded, and scaled by their receive gain into an int32
-//     contribution. A member with nothing to play contributes SILENCE rather than being skipped,
-//     which is what keeps the mix on a clock.
+//  1. Each member has 20 ms of MEDIA time taken off their sample queue — refilled from as many
+//     arrivals as that costs, which is not one packet unless they send 20 ms ones — and scaled by
+//     their receive gain into an int32 contribution. A member with nothing to play contributes
+//     SILENCE rather than being skipped, which is what keeps the mix on a clock.
 //  2. Everybody whose audience is everybody is summed into one UNCLAMPED total.
 //  3. Each member's mix is that total minus their own contribution, plus any restricted-audience
 //     member who speaks to them.
@@ -372,20 +457,7 @@ func (c *Conference) mixOnce() {
 	total := c.scratchTotal()
 	for _, id := range c.order {
 		member := c.members[id]
-		gain := member.gainRx.Load()
-
-		frame, ok := member.jitter.Pop()
-		if !ok {
-			clear(member.contribution)
-			continue
-		}
-		samples := member.decoder.DecodeFrame(frame)
-		// DecodeFrame copies into the decoder's own scratch, so the frame is dead here and can go back
-		// to the buffer. See JitterBuffer.Recycle.
-		member.jitter.Recycle(frame)
-		for index := range audio.FrameSamples {
-			member.contribution[index] = int32(samples[index]) * gain / unityGain
-		}
+		member.takeContribution()
 
 		if member.speakTo.All() {
 			for index := range total {
@@ -407,8 +479,11 @@ func (c *Conference) mixOnce() {
 					mixed[index] -= member.contribution[index]
 				}
 			}
-			// A restricted-audience member is not in `total`, so add them explicitly.
-			c.addRestrictedLocked(mixed, member)
+			// A restricted-audience member is not in `total`, so add them explicitly. Skipped
+			// outright in the common room, where there are none.
+			if len(c.restricted) > 0 {
+				c.addRestrictedLocked(mixed, member)
+			}
 		} else {
 			clear(mixed)
 			for _, otherID := range c.order {
@@ -458,14 +533,15 @@ func (c *Conference) scratchTotal() []int32 {
 	return c.total
 }
 
-// addRestrictedLocked adds the contributions of members whose audience is enumerated.
+// addRestrictedLocked adds the contributions of members whose audience is enumerated. It walks the
+// restricted list, not the room, so the cost is the number of exceptional speakers rather than N.
 func (c *Conference) addRestrictedLocked(mixed []int32, to *Member) {
-	for _, otherID := range c.order {
+	for _, otherID := range c.restricted {
 		if otherID == to.session.ID {
 			continue
 		}
 		other := c.members[otherID]
-		if other.speakTo.All() || !other.speakTo.includes(to.session.ID) {
+		if other == nil || !other.speakTo.includes(to.session.ID) {
 			continue
 		}
 		if !to.hear.includes(otherID) {

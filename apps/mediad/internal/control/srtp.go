@@ -1,6 +1,8 @@
 package control
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/config"
@@ -69,23 +71,38 @@ func (s *Server) offerSDES() (sdp.Crypto, error) {
 	return sdp.GenerateKeyMaterial()
 }
 
+// negotiationRequest identifies a command for retry detection: the exact bytes the caller sent. A
+// retry is byte-identical, so it replays the committed answer; a renegotiation differs somewhere —
+// a new direction, a new offer, a rekey — and draws a new generation.
+func negotiationRequest(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
 // settleOfferedSDES completes a B-leg keyed by offerSDES once the callee's answer supplies the
-// remote key. The local key is held between the two commands in pendingSRTP.
+// remote key.
+//
+// The answer settles the PENDING generation — the one create-offer committed — so an answer that
+// arrives after a newer offer has been made cannot key the session with a retired local key.
 func (s *Server) settleOfferedSDES(sessionID string, answered sdp.Crypto) error {
-	value, ok := s.pendingSRTP.LoadAndDelete(sessionID)
-	if !ok {
-		return nil
-	}
-	local, _ := value.(sdp.Crypto)
-	if !answered.IsSet() {
-		return errSRTPRequired
-	}
-	context, err := rtp.NewSRTPContext(rtp.SRTPKeys{
-		LocalKeyMaterial:  local.KeyMaterial,
-		RemoteKeyMaterial: answered.KeyMaterial,
-	})
-	if err != nil {
-		return err
-	}
-	return s.sessions.SettleSRTP(sessionID, context)
+	_, err := s.sessions.Negotiate(sessionID, "",
+		func(prior rtp.Negotiation, _ bool) (*rtp.Negotiation, *rtp.SRTPContext, error) {
+			if !prior.Pending {
+				return nil, nil, nil
+			}
+			if !answered.IsSet() {
+				return nil, nil, errSRTPRequired
+			}
+			context, err := rtp.NewSRTPContext(rtp.SRTPKeys{
+				LocalKeyMaterial:  prior.Local.KeyMaterial,
+				RemoteKeyMaterial: answered.KeyMaterial,
+			})
+			if err != nil {
+				return nil, nil, err
+			}
+			settled := prior
+			settled.Pending = false
+			return &settled, context, nil
+		})
+	return err
 }

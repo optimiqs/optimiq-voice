@@ -18,7 +18,9 @@ import (
 // erratum — so 20 ms is 160 ticks on both sides. Opus, whose clock rate really is 48000, cannot be
 // transcoded on this path: the timestamps would have to be rewritten.
 //
-// Frame sizes line up too: PCMU, PCMA and G.722 all produce 160 octets for 20 ms, so no
+// Translation preserves media time rather than assuming 20 ms: a 30 ms packet decodes to 240 samples
+// and re-encodes to a 30 ms payload, so the packetisation the sender chose survives and the
+// timestamps stay continuous. PCMU, PCMA and G.722 all carry one octet per 8 kHz sample, so no
 // repacketisation buffer is needed.
 
 // ErrCannotTranscode is returned when two legs disagree about a codec that cannot be translated.
@@ -69,14 +71,15 @@ func NewTranscoder(from, to audio.Format) (*Transcoder, error) {
 func (t *Transcoder) From() audio.Format { return t.from }
 func (t *Transcoder) To() audio.Format   { return t.to }
 
-// Translate converts one payload. The `false` is a payload that carried no audio at all.
+// Translate converts one payload, keeping its duration. The `false` is a payload that carried no
+// audio at all.
 func (t *Transcoder) Translate(payload []byte) ([]byte, bool) {
 	if len(payload) == 0 {
 		return nil, false
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.encoder.EncodeFrame(t.decoder.DecodeFrame(payload)), true
+	return t.encoder.Encode(t.decoder.Decode(payload)), true
 }
 
 // Reset restarts both codecs, for a stream that has restarted under the same bridge.

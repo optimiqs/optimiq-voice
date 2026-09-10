@@ -284,6 +284,11 @@ func run() error {
 
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancelDrain()
+	// Then the commands already accepted: a handler still running would otherwise act on a session
+	// the drain below has closed.
+	if !server.DrainCommands(drainCtx) {
+		log.Warn("commands were still running at the shutdown deadline")
+	}
 	if err := manager.Drain(drainCtx); err != nil {
 		log.Warn("draining sessions timed out; exiting anyway", "error", err)
 	}

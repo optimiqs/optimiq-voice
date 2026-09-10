@@ -118,16 +118,30 @@ type Recording struct {
 
 	// received and sent are the two direction queues. Buffered channels rather than slots, so a
 	// burst is absorbed rather than truncated — see recordingQueueFrames.
-	received chan []byte
-	sent     chan []byte
+	received chan capturedFrame
+	sent     chan capturedFrame
+
+	// pendingReceived, pendingSent and the two scratch frames belong to the recorder goroutine
+	// alone. Arrivals are queued by media time rather than by packet, so a sender using 10, 30 or
+	// 60 ms packetisation still produces a file whose duration is the call's duration.
+	pendingReceived []int16
+	pendingSent     []int16
+	frameReceived   []int16
+	frameSent       []int16
 
 	// dropped counts frames that arrived with the queue full, so a hole in the file is explicable.
 	dropped atomic.Int64
 
-	// paused is read on the recorder's own tick and written by `pause-recording`. While it is set
-	// the tick still runs and still writes a frame — silence — which is the whole difference from a
-	// stop: one file, and the audio after the gap still sits at the offset it happened at.
+	// paused is read on the capture path and on the recorder's own tick, and written by
+	// `pause-recording`. While it is set the tick still runs and still writes a frame — silence —
+	// which is the whole difference from a stop: one file, and the audio after the gap still sits at
+	// the offset it happened at.
 	paused atomic.Bool
+	// epoch changes on every pause and every resume, and is stamped on each frame AT CAPTURE. It is
+	// what makes a pause a capture-time boundary rather than a drain race: audio captured in another
+	// epoch is dropped on consumption however far behind the queues are, so a backlog cannot survive
+	// the pause and be written after the resume.
+	epoch atomic.Uint64
 	// writtenMs is how much audio the file holds, in whole frames, published by the recorder for
 	// the command path to read. The WAVWriter is the recorder goroutine's alone, so a pause that
 	// asked IT for the offset would be a data race.
@@ -184,6 +198,9 @@ func (r *Recording) SetPaused(paused bool) bool {
 		return paused
 	}
 	at := int(r.writtenMs.Load())
+	// Bumped BEFORE the flag, so a capture that reads the old epoch and then loses the race to the
+	// flag is still dropped on consumption.
+	r.epoch.Add(1)
 	if paused {
 		r.pauseStartMs = at
 	} else if r.pauseStartMs >= 0 {
@@ -204,6 +221,7 @@ func (r *Recording) closePauses(durationMs int) []RecordingPause {
 	if r.pauseStartMs >= 0 {
 		r.pauses = append(r.pauses, RecordingPause{StartMs: r.pauseStartMs, EndMs: durationMs})
 		r.pauseStartMs = -1
+		r.epoch.Add(1)
 		r.paused.Store(false)
 	}
 	return r.pauses
@@ -232,6 +250,12 @@ func (r *Recording) stopFor(reason RecordingEndReason) {
 	})
 }
 
+// capturedFrame is one queued payload and the pause epoch it was captured in. See Recording.epoch.
+type capturedFrame struct {
+	epoch   uint64
+	payload []byte
+}
+
 // Received queues one frame from the far end. Called on the session's read goroutine.
 //
 // The payload is copied because the read loop reuses one buffer per packet, so a queued slice would
@@ -246,14 +270,22 @@ func (r *Recording) Sent(payload []byte) {
 	r.enqueue(r.sent, payload)
 }
 
-func (r *Recording) enqueue(queue chan []byte, payload []byte) {
+func (r *Recording) enqueue(queue chan capturedFrame, payload []byte) {
 	if len(payload) == 0 {
+		return
+	}
+	// The epoch is read FIRST: a pause between the two reads leaves this frame stamped with an
+	// epoch the recorder will refuse, which is the safe way round.
+	epoch := r.epoch.Load()
+	if r.paused.Load() {
+		// The capture-time half of the pause boundary: audio spoken while paused never enters the
+		// file, whatever the queues do afterwards.
 		return
 	}
 	frame := make([]byte, len(payload))
 	copy(frame, payload)
 	select {
-	case queue <- frame:
+	case queue <- capturedFrame{epoch: epoch, payload: frame}:
 	default:
 		// Never blocking: this runs on the packet path, and a recorder stalled on a full disk must
 		// cost a hole in one file rather than back-pressure into a live call's read loop.
@@ -282,8 +314,8 @@ func (s *Session) StartRecording(opts RecordingOptions) (*Recording, error) {
 	recording := &Recording{
 		opts:     opts,
 		session:  s,
-		received: make(chan []byte, recordingQueueFrames),
-		sent:     make(chan []byte, recordingQueueFrames),
+		received: make(chan capturedFrame, recordingQueueFrames),
+		sent:     make(chan capturedFrame, recordingQueueFrames),
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
 
@@ -387,46 +419,80 @@ func (r *Recording) run() {
 	}
 }
 
-// mixOneFrame takes at most one frame from each direction and returns their sum. A direction with
+// mixOneFrame takes 20 ms of media time from each direction and returns their sum. A direction with
 // nothing waiting contributes silence rather than being skipped, or every word after a pause would
 // arrive early.
 func (r *Recording) mixOneFrame() []int16 {
 	mixed := make([]int16, audio.FrameSamples)
+	epoch := r.epoch.Load()
 
 	if r.paused.Load() {
-		// Still consuming one frame per direction, so the queues drain at the rate they fill: a
-		// pause that let them back up would replay the silenced audio the moment it lifted, which
-		// is precisely the card number the pause exists to keep out of the file.
-		r.discardOneFrame()
+		// The consumption half of the pause boundary. Everything queued belongs to an earlier
+		// epoch, so it is dropped rather than drained one frame per tick: a backlog that outlived
+		// the drain rate is precisely the card number the pause exists to keep out of the file.
+		r.discardStale()
 		return mixed
 	}
 
-	select {
-	case frame := <-r.received:
-		audio.MixInto(mixed, audio.DecodeLinear(frame, r.opts.Encoding))
-	default:
+	if frame := r.takeFrame(r.received, &r.pendingReceived, &r.frameReceived, epoch); frame != nil {
+		audio.MixInto(mixed, frame)
 	}
-
 	if r.opts.Direction == RecordBoth {
-		select {
-		case frame := <-r.sent:
-			audio.MixInto(mixed, audio.DecodeLinear(frame, r.opts.Encoding))
-		default:
+		if frame := r.takeFrame(r.sent, &r.pendingSent, &r.frameSent, epoch); frame != nil {
+			audio.MixInto(mixed, frame)
 		}
 	}
 	return mixed
 }
 
-// discardOneFrame drops at most one frame from each direction the recording captures.
-func (r *Recording) discardOneFrame() {
-	select {
-	case <-r.received:
-	default:
-	}
-	if r.opts.Direction == RecordBoth {
+// takeFrame assembles one 20 ms frame for a direction out of the media time queued for it, however
+// the sender packetised it. Nil is a direction that had nothing at all for this tick.
+//
+// Frames stamped with another epoch are dropped: see Recording.epoch.
+func (r *Recording) takeFrame(
+	queue chan capturedFrame,
+	pending, scratch *[]int16,
+	epoch uint64,
+) []int16 {
+	for len(*pending) < audio.FrameSamples {
 		select {
-		case <-r.sent:
+		case captured := <-queue:
+			if captured.epoch != epoch {
+				continue
+			}
+			*pending = append(*pending, audio.DecodeLinear(captured.payload, r.opts.Encoding)...)
 		default:
+			if len(*pending) == 0 {
+				return nil
+			}
+			// A packetisation that does not divide 20 ms leaves a remainder at the tail of the
+			// stream; the rest of this frame is silence rather than a stall.
+			*pending = append(*pending, make([]int16, audio.FrameSamples-len(*pending))...)
+		}
+	}
+	if len(*scratch) != audio.FrameSamples {
+		*scratch = make([]int16, audio.FrameSamples)
+	}
+	copy(*scratch, *pending)
+	*pending = append((*pending)[:0], (*pending)[audio.FrameSamples:]...)
+	return *scratch
+}
+
+// discardStale drops everything queued for a paused recording, from both the queues and the media
+// time already assembled out of them. Nothing captured in the current epoch can be waiting: enqueue
+// refuses while paused, so every queued frame is from the other side of the boundary.
+func (r *Recording) discardStale() {
+	r.pendingReceived = r.pendingReceived[:0]
+	r.pendingSent = r.pendingSent[:0]
+	for _, queue := range [2]chan capturedFrame{r.received, r.sent} {
+		for {
+			select {
+			case <-queue:
+			default:
+			}
+			if len(queue) == 0 {
+				break
+			}
 		}
 	}
 }

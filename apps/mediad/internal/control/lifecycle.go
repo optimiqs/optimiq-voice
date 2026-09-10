@@ -3,7 +3,6 @@ package control
 import (
 	"context"
 	"log/slog"
-	"sync"
 	"time"
 
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
@@ -11,6 +10,7 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/directory"
 	mediaevents "github.com/optimiqs/optimiq-voice/apps/mediad/internal/events"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
+	"github.com/optimiqs/optimiq-voice/packages/runtime-go/ackpub"
 )
 
 // LifecycleAnnouncer is the TELL half of the media contract: it turns the packet path's session
@@ -21,26 +21,33 @@ import (
 // nobody waiting, so the announcement path can take a two-second publish deadline.
 //
 // Publishing is asynchronous because rtp.Manager calls this from the goroutine tearing a session
-// down; an inline round trip would let a sick broker stall a drain. Ordering still holds:
-// `session.rtp-timeout` is published before the `session.ended` that follows it, both carry the
-// session id, and JetStream's per-subject ordering does the rest.
+// down; an inline round trip would let a sick broker stall a drain. Order is preserved per SESSION
+// rather than per goroutine (see ackpub): `recording.finished` reaches the broker before the
+// `session.ended` that follows it, and two DTMF digits reach it in the order they were pressed.
 type LifecycleAnnouncer struct {
 	publisher  mediaevents.Publisher
 	dir        directory.Store
 	log        *slog.Logger
 	instanceID string
 
-	// inflight counts the publishes that have been handed off and not yet finished, so a shutdown
-	// can WAIT for them; otherwise the process exits under publishes that never reached the broker,
-	// losing the `session.ended` for every drained call.
-	inflight sync.WaitGroup
-	// slots bounds how many are talking to the broker at once. A mass reap otherwise puts hundreds
-	// of concurrent JetStream publishes on a broker that is quite possibly already unwell.
-	slots chan struct{}
+	// events orders and retries the publishes. It is what a shutdown waits on: otherwise the process
+	// exits under publishes that never reached the broker, losing the `session.ended` for every
+	// drained call.
+	events *ackpub.Publisher
 }
 
-// lifecyclePublishConcurrency is how many lifecycle publishes may be in flight at once. See slots.
-const lifecyclePublishConcurrency = 8
+// The publisher's capacity. Concurrency bounds how many publishes talk to the broker at once — a
+// mass reap otherwise puts hundreds of concurrent JetStream publishes on a broker that is quite
+// possibly already unwell — and the pending limits bound what waits behind them.
+const (
+	lifecyclePublishConcurrency = 8
+	lifecyclePendingEvents      = 4096
+	lifecyclePendingPerSession  = 64
+	// lifecyclePublishAttempts and lifecyclePublishBackoff apply to CRITICAL events only: the ones a
+	// consumer's workflow is blocked on. Telemetry is attempted once.
+	lifecyclePublishAttempts = 3
+	lifecyclePublishBackoff  = 200 * time.Millisecond
+)
 
 var _ rtp.Lifecycle = (*LifecycleAnnouncer)(nil)
 
@@ -55,44 +62,60 @@ func NewLifecycleAnnouncer(
 	if log == nil {
 		log = slog.Default()
 	}
+	events, err := ackpub.New(ackpub.Options{
+		MaxConcurrent:    lifecyclePublishConcurrency,
+		MaxPending:       lifecyclePendingEvents,
+		MaxPendingPerKey: lifecyclePendingPerSession,
+		Timeout:          mediaevents.PublishTimeout,
+		Attempts:         lifecyclePublishAttempts,
+		Backoff:          lifecyclePublishBackoff,
+		Logger:           log,
+	})
+	if err != nil {
+		// Only a non-positive limit reaches this, which would be a constant edited to zero.
+		panic("control: " + err.Error())
+	}
 	return &LifecycleAnnouncer{
 		publisher:  publisher,
 		dir:        dir,
 		log:        log,
 		instanceID: instanceID,
-		slots:      make(chan struct{}, lifecyclePublishConcurrency),
+		events:     events,
 	}
 }
 
-// publishAsync hands a publish to a goroutine, bounded by slots and tracked by inflight.
+// publishAsync hands a publish over, ordered behind this session's earlier events and bounded by
+// the publisher's capacity.
 //
 // The hand-off itself never blocks the caller, which is the whole point: this runs on the goroutine
-// tearing a session down, and a sick broker must not be able to stall a drain.
-func (a *LifecycleAnnouncer) publishAsync(do func(context.Context) error, eventType, sessionID string) {
-	a.inflight.Add(1)
-	go func() {
-		defer a.inflight.Done()
-		a.slots <- struct{}{}
-		defer func() { <-a.slots }()
-		a.publish(do, eventType, sessionID)
-	}()
+// tearing a session down, and a sick broker must not be able to stall a drain. eventID is the
+// envelope's own id and stays the same across a retry, so a re-delivered critical event lands in
+// JetStream's duplicate window rather than twice in the call's history.
+func (a *LifecycleAnnouncer) publishAsync(
+	do func(context.Context) error,
+	eventType, sessionID, eventID string,
+	critical bool,
+) {
+	err := a.events.Publish(ackpub.Event{
+		ID:       eventID,
+		Key:      sessionID,
+		Type:     eventType,
+		Critical: critical,
+		Publish:  do,
+	})
+	if err != nil {
+		a.log.Error("dropping a media lifecycle event at admission",
+			"type", eventType, "sessionId", sessionID, "eventId", eventID, "error", err)
+	}
 }
 
-// Wait blocks until every handed-off publish has finished or the context expires, and reports
-// whether they all finished. Called on shutdown, after the manager has drained and before the NATS
-// connection goes away.
+// Wait closes admission and blocks until every handed-off publish has finished or the context
+// expires, reporting whether they all finished. Called on shutdown, after the manager has drained
+// and before the NATS connection goes away — closing admission here is what stops a late announcer
+// from outrunning the drain.
 func (a *LifecycleAnnouncer) Wait(ctx context.Context) bool {
-	done := make(chan struct{})
-	go func() {
-		a.inflight.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return true
-	case <-ctx.Done():
-		return false
-	}
+	a.events.Close()
+	return a.events.Wait(ctx)
 }
 
 // SessionEnded publishes `session.ended` and removes the directory entry.
@@ -141,7 +164,7 @@ func (a *LifecycleAnnouncer) SessionEnded(session rtp.SessionSummary, reason rtp
 			Source:  mediaevents.Source,
 			Data:    data,
 		})
-	}, "session.ended", session.SessionID)
+	}, "session.ended", session.SessionID, envelope.id, true)
 }
 
 // qualityOf carries the RTCP view of a leg onto the wire.
@@ -202,7 +225,7 @@ func (a *LifecycleAnnouncer) RTPTimedOut(session rtp.SessionSummary, silentFor t
 				Source:  mediaevents.Source,
 				Data:    data,
 			})
-	}, "session.rtp-timeout", session.SessionID)
+	}, "session.rtp-timeout", session.SessionID, envelope.id, false)
 }
 
 // PlaybackFinished publishes `playback.finished`.
@@ -250,7 +273,7 @@ func (a *LifecycleAnnouncer) PlaybackFinished(
 				Source:  mediaevents.Source,
 				Data:    data,
 			})
-	}, "playback.finished", session.SessionID)
+	}, "playback.finished", session.SessionID, envelope.id, false)
 }
 
 // RecordingFinished publishes `recording.finished`.
@@ -305,7 +328,7 @@ func (a *LifecycleAnnouncer) RecordingFinished(
 				Source:  mediaevents.Source,
 				Data:    data,
 			})
-	}, "recording.finished", session.SessionID)
+	}, "recording.finished", session.SessionID, envelope.id, true)
 }
 
 // recordingPauses is the PCI half of the payload: every stretch `pause-recording` silenced, against
@@ -368,7 +391,7 @@ func (a *LifecycleAnnouncer) DtmfReceived(session rtp.SessionSummary, digit rtp.
 			Source:  mediaevents.Source,
 			Data:    data,
 		})
-	}, "dtmf.received", session.SessionID)
+	}, "dtmf.received", session.SessionID, envelope.id, true)
 }
 
 // envelopeHeader is the three values every envelope needs that are derived rather than copied.
@@ -391,20 +414,6 @@ func (a *LifecycleAnnouncer) envelope(
 		at:      contract.NewEventTime(time.Now()),
 		subject: subject,
 	}, nil
-}
-
-// publish runs one publish under a bounded deadline and logs a failure rather than retrying.
-//
-// No retry, deliberately: these events describe something that has already happened to a call that
-// is already over, and a retry loop would keep a goroutine alive per failed publish exactly when the
-// broker is struggling. JetStream's duplicate window covers a lost ack.
-func (a *LifecycleAnnouncer) publish(do func(context.Context) error, eventType, sessionID string) {
-	ctx, cancel := context.WithTimeout(context.Background(), mediaevents.PublishTimeout)
-	defer cancel()
-	if err := do(ctx); err != nil {
-		a.log.Warn("cannot publish a media lifecycle event",
-			"type", eventType, "sessionId", sessionID, "error", err)
-	}
 }
 
 // forget removes a session's directory entry, best effort.

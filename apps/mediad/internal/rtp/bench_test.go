@@ -247,10 +247,11 @@ func benchConference(b *testing.B, portBase, members int) *Conference {
 	for index := range members {
 		session := benchSession(b, allocator, fmt.Sprintf("m%d", index), PayloadTypePCMU)
 		latchTo(session, sink.addr)
-		member, err := conference.join(session, JoinOptions{Hear: Everyone(), SpeakTo: Everyone()})
+		member, err := newMember(session, JoinOptions{Hear: Everyone(), SpeakTo: Everyone()})
 		if err != nil {
-			b.Fatalf("join: %v", err)
+			b.Fatalf("newMember: %v", err)
 		}
+		conference.seat(member)
 		payload := benchPayload(audio.FrameSamples)
 		now := time.Now()
 		// Fill past the priming target so every tick pops a real frame rather than silence.
@@ -261,8 +262,34 @@ func benchConference(b *testing.B, portBase, members int) *Conference {
 	return conference
 }
 
-func BenchmarkMixTick8(b *testing.B)  { benchmarkMixTick(b, 42000, 8) }
-func BenchmarkMixTick32(b *testing.B) { benchmarkMixTick(b, 42100, 32) }
+func BenchmarkMixTick8(b *testing.B)   { benchmarkMixTick(b, 42000, 8) }
+func BenchmarkMixTick32(b *testing.B)  { benchmarkMixTick(b, 42100, 32) }
+func BenchmarkMixTick128(b *testing.B) { benchmarkMixTick(b, 45000, 128) }
+
+// BenchmarkBridgeLookup is the membership question the control path asks on nearly every command,
+// measured against a manager holding `n` unrelated bridges. It is the reverse index's whole point:
+// the answer must not depend on how busy the box is.
+func BenchmarkBridgeLookup(b *testing.B) {
+	for _, n := range []int{100, 1000, 10000} {
+		b.Run(fmt.Sprint(n), func(b *testing.B) {
+			manager := &Manager{
+				bridges:         make(map[string][2]string, n),
+				bridgeBySession: make(map[string]string, 2*n),
+			}
+			for index := range n {
+				first, second := fmt.Sprintf("a%d", index), fmt.Sprintf("b%d", index)
+				id := fmt.Sprint(index)
+				manager.bridges[id] = [2]string{first, second}
+				manager.bridgeBySession[first] = id
+				manager.bridgeBySession[second] = id
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				manager.unbridgeSessionLocked("absent")
+			}
+		})
+	}
+}
 
 func benchmarkMixTick(b *testing.B, portBase, members int) {
 	conference := benchConference(b, portBase, members)
@@ -362,8 +389,8 @@ func BenchmarkPlaybackFrame(b *testing.B) {
 // hand-off. The file writer's own cost is not on the packet path and is not measured here.
 func BenchmarkRecordingEnqueue(b *testing.B) {
 	recording := &Recording{
-		received: make(chan []byte, recordingQueueFrames),
-		sent:     make(chan []byte, recordingQueueFrames),
+		received: make(chan capturedFrame, recordingQueueFrames),
+		sent:     make(chan capturedFrame, recordingQueueFrames),
 	}
 	payload := benchPayload(audio.FrameSamples)
 	drained := make(chan struct{})
