@@ -225,15 +225,35 @@ func (s *Server) InstanceID() string { return s.instanceID }
 //
 // The queue group lets several mediad instances share the subjects without a load balancer;
 // per-instance addressing after allocate comes from the media-sessions KV directory.
-func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscription, error) {
-	if conn == nil {
-		return nil, errors.New("control: a NATS connection is required")
-	}
+// CommandSubjects lists every RPC subject Serve subscribes to, in registration order; the boot
+// banner prints it and a test pins it to the handler table so the two cannot drift.
+var CommandSubjects = []string{
+	SubjectAllocateSession,
+	SubjectBridgeSessions,
+	SubjectUnbridgeSessions,
+	SubjectReleaseSession,
+	SubjectStartPlayback,
+	SubjectStopPlayback,
+	SubjectSendDtmf,
+	SubjectStartRecording,
+	SubjectStopRecording,
+	SubjectPauseRecording,
+	SubjectTapSession,
+	SubjectUntapSession,
+	SubjectMuteSession,
+	SubjectHoldSession,
+	SubjectCreateOffer,
+	SubjectAcceptAnswer,
+}
 
-	handlers := []struct {
-		subject string
-		handle  func([]byte) []byte
-	}{
+type commandHandler struct {
+	subject string
+	handle  func([]byte) []byte
+}
+
+// commandHandlers is the one table Serve subscribes from; CommandSubjects mirrors its order.
+func (s *Server) commandHandlers() []commandHandler {
+	return []commandHandler{
 		{SubjectAllocateSession, s.HandleAllocateSession},
 		{SubjectBridgeSessions, s.HandleBridgeSessions},
 		{SubjectUnbridgeSessions, s.HandleUnbridgeSessions},
@@ -251,6 +271,23 @@ func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscrip
 		{SubjectCreateOffer, s.HandleCreateOffer},
 		{SubjectAcceptAnswer, s.HandleAcceptAnswer},
 	}
+}
+
+func (s *Server) handlerSubjects() []string {
+	handlers := s.commandHandlers()
+	subjects := make([]string, 0, len(handlers))
+	for _, handler := range handlers {
+		subjects = append(subjects, handler.subject)
+	}
+	return subjects
+}
+
+func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscription, error) {
+	if conn == nil {
+		return nil, errors.New("control: a NATS connection is required")
+	}
+
+	handlers := s.commandHandlers()
 
 	subscriptions := make([]*nats.Subscription, 0, len(handlers))
 	for _, handler := range handlers {
