@@ -118,6 +118,71 @@ describe("seizing a shared line — single instance", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
+// What the mid-call half asks
+// ---------------------------------------------------------------------------------------------
+
+describe("resuming and finding a seizure", () => {
+	it("finds the line a CALL is on, which is the only question a media event can ask", async () => {
+		const { registry } = shared();
+		await registry.seize(ORG, LINE, seizure({ callId: "call-7" }));
+
+		expect(registry.seizureForCall("call-7")?.sharedLineId).toBe(LINE);
+		expect(registry.seizureForCall("call-8")).toBeUndefined();
+	});
+
+	it("puts a held line back in use and drops the hold clock the recall reasons about", async () => {
+		const { registry, bucket } = shared();
+		await registry.seize(ORG, LINE, seizure());
+		await registry.hold(ORG, LINE);
+
+		const result = await registry.resume(ORG, LINE);
+
+		expect(result.kind).toBe("held");
+		expect(stateAt(bucket).state).toBe("seized");
+		expect(registry.held(ORG, LINE)?.heldAtMs).toBeUndefined();
+	});
+
+	it("re-points the seizure at the appearance that retrieved it, without freeing it in between", async () => {
+		const { registry, bucket } = shared();
+		await registry.seize(ORG, LINE, seizure());
+		await registry.hold(ORG, LINE);
+
+		await registry.resume(ORG, LINE, {
+			extensionId: "ext-b",
+			appearanceIndex: 2,
+			callId: "call-7",
+			legId: "leg-7",
+		});
+
+		// One key, written throughout: a third appearance never sees the line free.
+		expect([...bucket.entries.keys()]).toEqual([kvKeyFor.sharedLineState(ORG, LINE)]);
+		expect(stateAt(bucket)).toMatchObject({
+			state: "seized",
+			heldByExtensionId: "ext-b",
+			heldByAppearanceIndex: 2,
+			legId: "leg-7",
+		});
+	});
+
+	it("cancels an armed recall, because a resumed line is not a forgotten one", async () => {
+		const timers = manualTimers();
+		const { registry } = shared({ setTimer: timers.setTimer });
+		await registry.seize(ORG, LINE, seizure());
+		await registry.hold(ORG, LINE);
+		registry.armRecall(ORG, LINE, 45_000, () => undefined);
+
+		await registry.resume(ORG, LINE);
+
+		expect(registry.hasRecallArmed(ORG, LINE)).toBe(false);
+	});
+
+	it("answers not-held for a line this instance does not hold", async () => {
+		const { registry } = shared();
+		expect((await registry.resume(ORG, LINE)).kind).toBe("not-held");
+	});
+});
+
+// ---------------------------------------------------------------------------------------------
 // Shared seizures
 // ---------------------------------------------------------------------------------------------
 

@@ -5,8 +5,9 @@ import { makeCdrLegWriteEvent, makeVoicemailEvent, validateEvent } from "@optimi
 import { createEntityId } from "@optimiq-voice/identifiers";
 import { getLogger } from "@optimiq-voice/logging";
 import { resolveInbound, resolveInternal, resolveOutbound } from "@optimiq-voice/routing";
-import { isDtmfDigit } from "@optimiq-voice/telephony";
+import { hangupCauseCode, isDtmfDigit } from "@optimiq-voice/telephony";
 import { SplitPlaneMediaPort } from "../media/split-plane.port";
+import { CallControlService as EngineCallControlService } from "../nats/call-control.service";
 import { CallEventPublisher } from "../nats/call-event-publisher.service";
 import {
 	CHANNEL_OWNER_EXPIRES_AT_VARIABLE,
@@ -24,6 +25,7 @@ import { SessionVerbService } from "../nats/session-verb.service";
 import { SipInviteService } from "../nats/sip-invite.service";
 import { SipTransferService } from "../nats/sip-transfer.service";
 import { AgentStateStore } from "../queue/agent-state.store";
+import { QueueCallbackScheduler } from "../queue/queue-callback.scheduler";
 import { QueueEventPublisher } from "../queue/queue-event-publisher.service";
 import { QueueMembershipSource } from "../queue/queue-membership.source";
 import { QueueCursors } from "../queue/queue-registry";
@@ -32,11 +34,14 @@ import { CallSignalBus, legSignalKey, recordingSignalKey } from "../routing/call
 import { ConferenceRegistry } from "../routing/conference-registry";
 import { DidIndexSource } from "../routing/did-index.source";
 import { ExtensionFeatureRpcPort } from "../routing/extension-feature.source";
+import { HotDeskRpcPort } from "../routing/hot-desk.source";
 import { LastCallerRpcSource } from "../routing/last-caller.source";
 import { ParkRegistry } from "../routing/park-registry";
 import { PlanWalker } from "../routing/plan-walker";
 import { RoutingArtifactSource } from "../routing/routing-artifact.source";
+import { SharedLineRegistry } from "../routing/shared-line-registry";
 import { SupervisorAuthzRpcPort } from "../routing/supervisor-authz.source";
+import { ToggleFeatureRpcPort } from "../routing/toggle-feature.source";
 import { TrunkCapacityRegistry } from "../routing/trunk-capacity";
 import { TrunkStatusPublisher } from "../routing/trunk-status.publisher";
 import { VoicemailGreetingRpcPort } from "../routing/voicemail-greeting.source";
@@ -47,7 +52,7 @@ import { DtmfRegistry } from "../verbs/dtmf-registry";
 import { callDirectionFrom, dialStringOr, hangupSideFor } from "./ari-mapping";
 import { CallControl, pickupGroupFilter } from "./call-control";
 import { CallControlRegistry } from "./call-control-registry";
-import { authorizationOf, buildCdrLegWrite, queueLegOf } from "./cdr-leg";
+import { attestationOf, authorizationOf, buildCdrLegWrite, queueLegOf } from "./cdr-leg";
 import { ChannelAggregate } from "./channel-aggregate";
 import {
 	callIdForAriChannel,
@@ -61,13 +66,16 @@ import {
 } from "./channel-identity";
 import { ChannelRegistry } from "./channel-registry";
 import { MidCallFeatureRuntime } from "./mid-call-features";
-import { planOriginate } from "./originate-plan";
+import { planOriginate, planQueueCallback } from "./originate-plan";
 import type { EngineEnv } from "../config/engine-env";
 import type { MediaChannelSnapshot, MediaEvent } from "../media/media-event";
 import type { MediaDirection, MediaPort } from "../media/media-port";
+import type { CallControlOutcome } from "../nats/call-control.service";
 import type { ConferenceControlOutcome } from "../nats/conference-control.service";
+import type { ChannelClaimResult } from "../nats/jetstream.service";
 import type { OriginatePlacement } from "../nats/originate.service";
 import type { SipInviteAdmission, SipReplacesAuthorization } from "../nats/sip-invite.service";
+import type { QueueCallbackSchedulePort } from "../queue/queue-session";
 import type { ConferenceMember } from "../routing/conference-registry";
 import type { PlanDestination } from "../routing/plan-destination";
 import type {
@@ -80,7 +88,9 @@ import type {
 	WalkerQueueOutcome,
 	WalkerChannel,
 } from "../routing/plan-walker";
+import type { PlanWalkerDependencies } from "../routing/plan-walker";
 import type { VerbDispatchOutcome } from "../session/application-sessions";
+import type { VerbFailure } from "../verbs/verb-errors";
 import type { VerbChannelContext, VerbExecutorRuntime } from "../verbs/verb-executor";
 import type {
 	CallControlHost,
@@ -89,14 +99,17 @@ import type {
 	PickupCandidate,
 	RouteOutcome,
 	RouteRequest,
+	SharedLine,
 	SupervisionTarget,
 } from "./call-control";
 import type {
+	CallControlRequest,
 	CallDirection,
 	CallEvent,
 	ConferenceControlRequest,
 	LegSide,
 	OriginateRequest,
+	QueueCallbackRpcRequest,
 	SipInviteRequest,
 } from "@optimiq-voice/events";
 import type {
@@ -127,6 +140,16 @@ const OWNERSHIP_RENEWAL_BATCH = 16;
 const DESTINATION_TYPE_VARIABLE = "OPTIMIQ_DESTINATION_TYPE";
 const DESTINATION_REF_VARIABLE = "OPTIMIQ_DESTINATION_REF";
 /**
+ * The music-on-hold class the destination this leg reached configured.
+ *
+ * Mirrored onto the leg for the same reason the destination is, and read at a moment the walk is
+ * long over: hold arrives as a re-INVITE from a phone, minutes into a conversation, and SIP gives it
+ * no way to name a class. Without a variable the far end always heard the media server's default and
+ * the tenant's own music was reachable only from a queue or a park lot. Absent means exactly what it
+ * means in the compiler — "the media server's default class".
+ */
+const MOH_CLASS_VARIABLE = "OPTIMIQ_MOH_CLASS";
+/**
  * Which authorisation code opened a gated outbound route, mirrored exactly as the destination is.
  *
  * Channel variables and not walk state, for the reason `recordDestination` gives: the CDR is written
@@ -135,6 +158,74 @@ const DESTINATION_REF_VARIABLE = "OPTIMIQ_DESTINATION_REF";
  */
 const AUTH_PIN_ORDINAL_VARIABLE = "OPTIMIQ_AUTH_PIN_ORDINAL";
 const AUTH_PIN_LABEL_VARIABLE = "OPTIMIQ_AUTH_PIN_LABEL";
+/**
+ * The carrier's STIR/SHAKEN claim about the calling number, stamped onto the A-leg at admission.
+ *
+ * Channel variables for the reason the pin ordinal is one: the CDR is written by whichever of the
+ * teardown and the walk's return gets there first, and only the variables are visible to both —
+ * and they travel into the `channels` bucket, so a replica adopting the leg after a failover writes
+ * the same record. The alternative, holding the INVITE request in memory until hangup, loses the
+ * fact on exactly the restart a traceback would be asking about.
+ *
+ * Only ever set from a TRUNK INVITE (the edge refuses to read the headers off a digest one), and
+ * only the keys the carrier actually sent — an absent claim is an absent variable, never an empty
+ * string, so `attestationOf` can tell "no claim" from "a claim that said nothing".
+ */
+const SIP_ATTESTATION_VARIABLE = "OPTIMIQ_SIP_ATTESTATION";
+const SIP_VERSTAT_VARIABLE = "OPTIMIQ_SIP_VERSTAT";
+const SIP_ORIGID_VARIABLE = "OPTIMIQ_SIP_ORIGID";
+/**
+ * The registered device a digest INVITE authenticated as.
+ *
+ * Same mechanism and the same reason: the walker reads it back off the leg when it publishes
+ * `call.emergency.dialed`, and a Ray Baum dispatchable location that survives a failover is the
+ * whole point of not keeping it in process memory.
+ */
+const DEVICE_ID_VARIABLE = "OPTIMIQ_DEVICE_ID";
+/**
+ * Every variable an arriving leg carries, in ONE list, because the two halves drifted apart once.
+ *
+ * `invitedChannelSnapshot` stamps these onto the arriving snapshot and `readEngineVariables` reads
+ * them back onto the aggregate. When the stamping side grew `OPTIMIQ_DEVICE_ID` and the three
+ * attestation names, the reading side did not learn about them, and every one was dropped between
+ * the INVITE and the aggregate — which silently emptied the STIR/SHAKEN CDR columns and made the
+ * hot-desk feature code's `deviceId` precondition unsatisfiable by any endpoint.
+ *
+ * Both halves are now derived from this array: the stamp builds a `Record<ArrivalVariable, …>`, so
+ * a name added here fails to compile until it is stamped, and the read iterates the same array, so
+ * a name that is stamped is by construction a name that is read.
+ */
+const ARRIVAL_VARIABLES = [
+	"OPTIMIQ_ORG_ID",
+	"OPTIMIQ_CALL_DIRECTION",
+	"OPTIMIQ_ROUTING_CONTEXT",
+	"OPTIMIQ_LEG",
+	SIP_CALL_ID_VARIABLE,
+	SIPD_INSTANCE_ID_VARIABLE,
+	REPLACES_LEG_ID_VARIABLE,
+	DEVICE_ID_VARIABLE,
+	SIP_ATTESTATION_VARIABLE,
+	SIP_VERSTAT_VARIABLE,
+	SIP_ORIGID_VARIABLE,
+] as const;
+type ArrivalVariable = (typeof ARRIVAL_VARIABLES)[number];
+/**
+ * What to ask the media server for when nothing stamped the variable inline.
+ *
+ * An entry ABSENT here is inline-or-nothing, and that is the whole distinction `readEngineVariables`
+ * documents: the facts the SIP edge carries — which instance holds the dialog, the authorised
+ * `Replaces`, the device, the carrier's attestation — exist on no media server, so there is nothing
+ * to ask and asking costs a round trip per call per variable.
+ */
+const ARRIVAL_VARIABLE_READS: Readonly<Partial<Record<ArrivalVariable, string>>> = {
+	OPTIMIQ_ORG_ID: "OPTIMIQ_ORG_ID",
+	OPTIMIQ_CALL_DIRECTION: "OPTIMIQ_CALL_DIRECTION",
+	OPTIMIQ_ROUTING_CONTEXT: "OPTIMIQ_ROUTING_CONTEXT",
+	// Marks a leg the engine originated. Read here rather than guessed from the dialplan, because it
+	// is the only thing that is true of every originated leg and of nothing else.
+	OPTIMIQ_LEG: "OPTIMIQ_LEG",
+	[SIP_CALL_ID_VARIABLE]: SIP_CALL_ID_CHANNEL_FUNCTION,
+};
 /**
  * The queue's verdict on a caller's stay, mirrored onto the leg exactly as the destination is.
  *
@@ -161,6 +252,15 @@ const BRIDGE_PEER_VARIABLE = "OPTIMIQ_BRIDGE_PEER_LEG_ID";
 const CDR_ID_VARIABLE = "OPTIMIQ_CDR_ID";
 const CDR_EVENT_ID_VARIABLE = "OPTIMIQ_CDR_EVENT_ID";
 const CDR_HANGUP_CAUSE_CODE_VARIABLE = "OPTIMIQ_CDR_HANGUP_CAUSE_CODE";
+/**
+ * The cross-CALL link, for a leg this engine created to settle an earlier one.
+ *
+ * `call_legs` links legs WITHIN one `call_id` (`originatingLegId`, `bridgeLegId`); nothing linked two
+ * calls until `related_call_id`. A queue callback is the first thing that needs it: it is a new call,
+ * minutes later, and this is the only thing that says which wait it settled. A channel variable
+ * rather than a field on the aggregate, so it survives the snapshot an instance reads after failover.
+ */
+const CDR_RELATED_CALL_ID_VARIABLE = "OPTIMIQ_CDR_RELATED_CALL_ID";
 const TERMINAL_HANGUP_EVENT_ID_VARIABLE = "OPTIMIQ_TERMINAL_HANGUP_EVENT_ID";
 const TERMINAL_DESTROYED_EVENT_ID_VARIABLE = "OPTIMIQ_TERMINAL_DESTROYED_EVENT_ID";
 const TERMINAL_EVENTS_PUBLISHED_VARIABLE = "OPTIMIQ_TERMINAL_EVENTS_PUBLISHED";
@@ -231,6 +331,8 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	private readonly walks = new Map<string, Promise<void>>();
 	private readonly originatedCallers = new Map<string, MediaChannelSnapshot>();
 	private draining = false;
+	/** Monotonic: channels taken over from a replica proved dead by its instance lease. */
+	private adoptedFromDeadPeers = 0;
 	/** Hold, transfer, park, pickup and on-demand recording, over the ports below. */
 	private readonly control: CallControl;
 	/** Calls this instance has handed to an external application. See `application-sessions.ts`. */
@@ -251,6 +353,22 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	 * call it was armed for. See {@link ChannelOrchestrator.armCallDurationCeiling}.
 	 */
 	private readonly durationCeilings = new Map<string, ReturnType<typeof setTimeout>>();
+	/**
+	 * The setup cut-off, per admitted leg that has produced no response yet.
+	 *
+	 * The other half of `durationCeilings`, and the half that was missing: that one is armed when a
+	 * leg is ANSWERED, so a walk that hangs before it rings leaves a leg with no timer at all. See
+	 * {@link ChannelOrchestrator.armSetupDeadline}.
+	 */
+	private readonly setupDeadlines = new Map<string, ReturnType<typeof setTimeout>>();
+	/**
+	 * Adopted legs that never answered, waiting to be checked against the SIP edge's own record.
+	 *
+	 * Bounded by the number of legs this instance has adopted and drained on the next maintenance
+	 * tick; an entry is removed whether or not the check could be made, because a leg that survives
+	 * one inconclusive check is covered by its setup deadline. See {@link reconcileAdoptedLegs}.
+	 */
+	private readonly adoptedPendingReconcile = new Set<string>();
 	/** One capped-backoff terminal reporting retry timer per leg. */
 	private readonly cdrRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly cdrRetryAttempts = new Map<string, number>();
@@ -308,12 +426,39 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		 * exactly what every engine did before this wave.
 		 */
 		@Optional() private readonly conferenceControl?: ConferenceControlService,
+		/**
+		 * `*65` / `*64` — the organization-wide toggles, and the shared-line seizure registry. Both
+		 * optional and last for the reason every entry above them is: the spec harnesses construct this
+		 * class positionally. Absent, the walker announces the toggle codes as unavailable and refuses
+		 * to seize a shared line, which is what the walker's `toggles`/`sharedLines` deps already
+		 * document; the deployed module always provides both from `RoutingModule`.
+		 */
+		@Optional() private readonly toggles?: ToggleFeatureRpcPort,
+		@Optional() private readonly sharedLines?: SharedLineRegistry,
+		@Optional() private readonly hotDesk?: HotDeskRpcPort,
+		/**
+		 * Virtual hold's sweep, told when a queue owes somebody a call. Optional and last on the same
+		 * terms; absent means a promise is written and swept by whichever instance does have one.
+		 */
+		@Optional() private readonly queueCallbacks?: QueueCallbackScheduler,
+		/**
+		 * The PBX recording control, arriving from `apps/api`. Optional and last, for the reason every
+		 * entry above it is: the spec harnesses construct this class positionally. Absent is an engine
+		 * whose recordings run and cannot be paused over HTTP — which is what every engine did before
+		 * this wave, and is still what one does for a call under an application's control, where the
+		 * session verb channel is the surface.
+		 */
+		@Optional() private readonly recordingControl?: EngineCallControlService,
 	) {
 		this.control = new CallControl({
 			media: this.media,
 			signals: this.signals,
 			parks: this.parks,
 			host: this.callControlHost(),
+			// The mid-call half of a shared line. Optional on `CallControlDependencies`, so a spec that
+			// does not construct one gets a deployment whose shared lines ring and bridge and do not
+			// light each other's keys — which is what every engine did before this wave.
+			...(this.sharedLines === undefined ? {} : { sharedLines: this.sharedLines }),
 			parkHandoff: this.parkHandoff,
 			// A getter rather than the runtime itself: `this.midCall` is built from `this.control`, so
 			// it does not exist yet at this point in the constructor.
@@ -380,13 +525,26 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			// start a routing walk this process abandons halfway through somebody's hold music.
 			resolveDialog: async (request) =>
 				this.draining ? undefined : this.resolveSipDialog(request.sipCallId),
+			// The consultation the phone brokered on its own second line, which is a call of THIS
+			// engine's — the reason a `Replaces` is honourable here at all. Resolved on the same
+			// `Call-ID` index and by the same drain rule as the dialog the REFER arrived in.
+			resolveReplacedDialog: async (request) =>
+				this.draining || request.replaces === undefined
+					? undefined
+					: this.resolveSipDialog(request.replaces.callId),
 			legFor: (mediaChannelId) => this.controlledLegFor(mediaChannelId),
 			isDialableTarget: async (leg, destination) => await this.isDialableFromLeg(leg, destination),
 			transfer: async (leg, request) => await this.control.transfer(leg, request),
+			completeAttendedTransfer: async (transferor, consultation, destination) =>
+				await this.control.completeAttendedRefer(transferor, consultation, destination),
 		});
 		// Click-to-call, arriving from `apps/api` on `rpc.engine.v1.originate`. Same push, same reason.
 		this.originate.attach({
 			place: async (request) => await this.placeOriginatedCall(request),
+			// The queue's own outbound call. A separate entry rather than a shape on `place`, for the
+			// reason `rpc.engine.v1.queue-callback` is a separate subject: one is an extension placing a
+			// call and is authorised as one, and the other is the tenant calling a customer back.
+			placeQueueCallback: async (request) => await this.placeQueueCallbackCall(request),
 		});
 		// A call arriving on the SIP edge, asking to be admitted. Same push, same reason — and the one
 		// place on this list where the responder decides something before the call path is asked: the
@@ -432,6 +590,12 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		this.conferenceControl?.attach({
 			moderate: async (request) => await this.moderateConference(request),
 		});
+		// The recording control, from `apps/api`. Attached here for the reason the two above it are:
+		// this class holds the registry AND the call-control runtime, and the responder is built by
+		// the NATS module long before either.
+		this.recordingControl?.attach({
+			control: async (request) => await this.controlCallRecording(request),
+		});
 	}
 
 	/** Live legs this instance is handling. `/healthz` and the drain both read it. */
@@ -471,6 +635,100 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		this.startOwnershipMaintenance();
 		this.logger.info({ channels: hydrated }, "hydrated channel state from KV");
 		return hydrated;
+	}
+
+	/**
+	 * Takes over one snapshot whose ownership lease has lapsed, for the `channels` watch.
+	 *
+	 * The expiry-fenced half of adoption, driven per key by an event instead of by a cluster-wide
+	 * listing every heartbeat. `adoptChannel` refuses anything a live replica still holds, so this is
+	 * safe to call on any snapshot the watch reports.
+	 */
+	async adoptOrphanedChannel(snapshot: ChannelSnapshot, now = Date.now()): Promise<boolean> {
+		if (this.draining) {
+			return false;
+		}
+		return await this.hydrateChannel(snapshot, now);
+	}
+
+	/**
+	 * Contests every channel a PROVED-DEAD engine replica owned, and resumes the ones this instance
+	 * wins.
+	 *
+	 * ## Why this is separate from {@link maintainChannelOwnership}
+	 *
+	 * That pass adopts a channel whose ownership lease has EXPIRED, and it must: an unexpired lease
+	 * is the only evidence a survivor has that a peer is alive, and adopting past it would take a
+	 * busy replica's calls out from under it. But that lease is ninety seconds wide, so a SIGKILLed
+	 * engine's calls sit unowned for up to a minute and a half — media flowing, dialog standing, no
+	 * aggregate anywhere in the fleet, and a BYE arriving in that window returning early against a
+	 * replica that has no leg for it. Measured live: forty seconds after the kill, nothing adopted,
+	 * no CDR.
+	 *
+	 * `engine-instances` is the evidence that closes it. When {@link EngineLivenessService} reports
+	 * a peer's lease lapsed, that peer is gone, and its channel leases are promises nobody is left
+	 * to keep — so this pass contests them regardless of their expiry, fenced instead by the
+	 * revision-CAS in {@link JetStreamService.adoptChannelFromInstance} (so exactly one survivor
+	 * wins each channel) and by the requirement that the snapshot still name the dead instance (so a
+	 * peer's death can never be used to take a third party's calls).
+	 *
+	 * Winning is not the end of it: {@link installChannel} re-registers the leg with the split-plane
+	 * port, restores its variables, resubscribes to its media events and re-indexes its SIP dialog,
+	 * which is what makes the next BYE end the call and file both CDR legs.
+	 */
+	async adoptChannelsOfInstance(deadInstanceId: string, now = Date.now()): Promise<number> {
+		if (this.draining) {
+			// This instance is leaving. Adopting a dead peer's calls now would hand them straight to
+			// the drain's straggler teardown, which ends a live call the next survivor could have kept.
+			return 0;
+		}
+		if (deadInstanceId === this.env.ENGINE_INSTANCE_ID) {
+			// Our own id, reported lost — a renewal this process failed to write, not a death. Every
+			// channel named here is one we are actively serving.
+			this.logger.warn(
+				{ instanceId: deadInstanceId },
+				"refusing to contest this instance's own channels",
+			);
+			return 0;
+		}
+		let adopted = 0;
+		let candidates = 0;
+		for await (const snapshot of this.jetstream.channelSnapshots()) {
+			if (channelOwnershipOf(snapshot)?.instanceId !== deadInstanceId) {
+				continue;
+			}
+			candidates += 1;
+			if (
+				await this.installChannel(
+					snapshot,
+					async () => await this.jetstream.adoptChannelFromInstance(snapshot, deadInstanceId, now),
+				)
+			) {
+				adopted += 1;
+				// One line per adoption, at INFO, naming the call: this is the record that a stranded
+				// call was picked up, and it is the first thing an operator greps for after a crash.
+				this.logger.info(
+					{
+						instanceId: deadInstanceId,
+						callId: snapshot.callId,
+						channelId: snapshot.channelId,
+						organizationId: snapshot.organizationId,
+					},
+					"adopted a channel from an engine replica that died",
+				);
+			}
+		}
+		this.logger.warn(
+			{ instanceId: deadInstanceId, candidates, adopted },
+			"finished contesting the channels of an engine replica that died",
+		);
+		this.adoptedFromDeadPeers += adopted;
+		return adopted;
+	}
+
+	/** Channels this instance has taken over from a dead replica. `/healthz` reads it. */
+	get adoptedChannelCount(): number {
+		return this.adoptedFromDeadPeers;
 	}
 
 	/** Renews local leases and adopts snapshots whose previous owner stopped heartbeating. */
@@ -558,15 +816,112 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			}
 			await this.hydrateChannel(snapshot, now);
 		}
+
+		await this.reconcileAdoptedLegs();
+	}
+
+	/**
+	 * Ends the adopted legs no plane knows about any more.
+	 *
+	 * ## The residue this closes
+	 *
+	 * A survivor adopting a dead peer's channels cannot tell a call that is still ringing from one
+	 * the SIP edge refused seconds after its owner died: both are snapshots in a pre-answer state
+	 * with nothing driving them. Measured live — two WSS legs admitted five seconds after a SIGKILL,
+	 * rejected by `sipd` at admission, correctly adopted, and then held in `activeChannels` with no
+	 * dialog behind them.
+	 *
+	 * ## Why `sip-dialogs` is the right witness
+	 *
+	 * It is the EDGE's own record of which dialogs exist, written by the process that owns the
+	 * socket and deleted when the dialog ends. Asking it is asking the only party that knows. A
+	 * missing entry is not ambiguous the way a stale channel snapshot is: `sipd` writes the claim as
+	 * part of accepting the dialog, so a leg with no claim is a leg that has no dialog anywhere.
+	 *
+	 * ## Why an unanswerable question changes nothing
+	 *
+	 * `sipDialogExists` answers `undefined` when the read failed, and that is left ALONE. Treating a
+	 * broker blip as "the edge has no dialog" would hang up every live pre-answer call on the
+	 * platform at once, which is a far worse outcome than the leak this is closing.
+	 *
+	 * Answered legs are never checked: a dialog claim can be reaped under a call that is still up,
+	 * and the answered ones are covered by `armCallDurationCeiling` anyway.
+	 */
+	private async reconcileAdoptedLegs(): Promise<void> {
+		const pending = [...this.adoptedPendingReconcile];
+		this.adoptedPendingReconcile.clear();
+		for (const mediaChannelId of pending) {
+			const live = this.registry.byAriChannelId(mediaChannelId);
+			if (live === undefined || live.isTearingDown || live.isAnswered) {
+				continue;
+			}
+			const exists = await this.jetstream.sipDialogExists(mediaChannelId);
+			if (exists !== false) {
+				continue;
+			}
+			this.logger.warn(
+				{ channelId: live.channelId, callId: live.callId, state: live.state },
+				"ending an adopted leg the sip edge has no dialog for: it never answered and no plane " +
+					"knows about it, so nothing else would ever end it",
+			);
+			live.markHangup({ cause: "NO_USER_RESPONSE", at: Date.now(), initiatedByEngine: true });
+			await this.endStalledLeg(mediaChannelId);
+		}
+	}
+
+	/**
+	 * Ends a leg locally as well as on the wire.
+	 *
+	 * `hangupQuietly` alone is not enough here, and the reason is the whole shape of the leak these
+	 * two callers close. An ordinary hangup is finished by the EVENT it provokes — `dialog.terminated`
+	 * from the edge, `session.ended` from the media plane — and that is what removes the aggregate,
+	 * files the CDR and frees the channel. A leg nobody has a dialog for provokes no event: `sipd`
+	 * answers the BYE `unknown_dialog` and there is nothing left to report anything. So the leg stayed
+	 * in `activeChannels` after being told to hang up — observed live, on the two channels the
+	 * adoption pass left behind and on a walk that had already decided to hang up three milliseconds
+	 * after admission.
+	 *
+	 * `onLegEnded` is the same local teardown `endLegsOnPlaneLoss` drives for the same reason, and it
+	 * is idempotent: a `dialog.terminated` that does arrive afterwards finds nothing to end.
+	 */
+	private async endStalledLeg(mediaChannelId: string): Promise<void> {
+		await this.hangupQuietly(mediaChannelId, "NO_USER_RESPONSE");
+		try {
+			await this.onLegEnded(
+				mediaChannelId,
+				"NO_USER_RESPONSE",
+				hangupCauseCode("NO_USER_RESPONSE"),
+			);
+		} catch (error) {
+			this.logger.error(
+				{ mediaChannelId, err: String(error) },
+				"could not finish ending a leg that produced no response",
+			);
+		}
 	}
 
 	private async hydrateChannel(snapshot: ChannelSnapshot, now: number): Promise<boolean> {
+		return await this.installChannel(
+			snapshot,
+			async () => await this.jetstream.adoptChannel(snapshot, now),
+		);
+	}
+
+	/**
+	 * Claims one snapshot with `claim`, then rebuilds everything this instance needs to finish the
+	 * call: the aggregate, its dialog index, its media subscription, and — the half that was missing
+	 * — the split-plane port's per-leg record. See {@link SplitPlaneMediaPort.registerAdoptedLeg}.
+	 */
+	private async installChannel(
+		snapshot: ChannelSnapshot,
+		claimWith: () => Promise<ChannelClaimResult | "vanished">,
+	): Promise<boolean> {
 		try {
 			const candidate = ChannelAggregate.hydrate(snapshot);
 			if (this.registry.byAriChannelId(candidate.ariChannelId) !== undefined) {
 				return false;
 			}
-			const claim = await this.jetstream.adoptChannel(snapshot, now);
+			const claim = await claimWith();
 			if (claim !== "claimed") {
 				return false;
 			}
@@ -584,6 +939,25 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 
 			const aggregate = ChannelAggregate.hydrate(recoverable);
 			this.registry.add(aggregate);
+			if (!aggregate.isAnswered && !aggregate.isTearingDown) {
+				// An adopted leg that never answered is the one shape nothing on this platform could
+				// end. Two guards, deliberately both: the reconcile below asks the SIP edge whether the
+				// dialog still exists and ends it in seconds when it does not, and the setup deadline is
+				// the backstop for when the edge cannot be asked at all.
+				this.adoptedPendingReconcile.add(aggregate.ariChannelId);
+				this.armSetupDeadline(aggregate);
+			}
+			if (this.media instanceof SplitPlaneMediaPort) {
+				// Without this the adopted leg has no plane state, and `hangup` — which tolerates a
+				// missing leg — silently skips the BYE: the aggregate is torn down and the CDR filed
+				// while both phones are still up and still hearing each other.
+				this.media.registerAdoptedLeg(aggregate.ariChannelId, {
+					orgId: recoverable.organizationId,
+					callId: recoverable.callId,
+					sipdInstanceId: recoverable.variables[SIPD_INSTANCE_ID_VARIABLE],
+					variables: recoverable.variables,
+				});
+			}
 			const sipCallId = normalizeSipCallId(recoverable.variables[SIP_CALL_ID_VARIABLE]);
 			if (sipCallId !== undefined) {
 				this.registry.indexSipDialog(aggregate, sipCallId);
@@ -618,6 +992,8 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		this.dtmf.release(aggregate.channelId);
 		this.midCall.release(aggregate.ariChannelId);
 		this.disarmCallDurationCeiling(aggregate.ariChannelId);
+		this.disarmSetupDeadline(aggregate.ariChannelId);
+		this.adoptedPendingReconcile.delete(aggregate.ariChannelId);
 		this.clearCdrRetry(aggregate.ariChannelId);
 		await this.jetstream.releaseChannelOwnership(aggregate.snapshot);
 		this.logger.warn(
@@ -712,6 +1088,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 					kind: "recording-finished",
 					durationMs: event.durationMs,
 					...(event.bytes === undefined ? {} : { bytes: event.bytes }),
+					...(event.pauses === undefined ? {} : { pauses: event.pauses }),
 				});
 				return;
 			case "recording-failed":
@@ -842,6 +1219,9 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		}
 
 		this.registry.add(aggregate);
+		// Armed the moment the leg is ours, so no admitted leg is ever without a timer. Disarmed by
+		// the first sign of life — a `180`, progress, or an answer. See `armSetupDeadline`.
+		this.armSetupDeadline(aggregate);
 		// Read in the same batch as the other four variables, so indexing it costs no extra round trip.
 		const sipCallId = normalizeSipCallId(variables[SIP_CALL_ID_VARIABLE]);
 		if (sipCallId !== undefined) {
@@ -1103,10 +1483,11 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			"resolved a route",
 		);
 
-		const walker = this.walkerFor(
-			aggregate,
-			artifact.settings.realm === undefined ? {} : { realm: artifact.settings.realm },
-		);
+		const walker = this.walkerFor(aggregate, {
+			...(artifact.settings.realm === undefined ? {} : { realm: artifact.settings.realm }),
+			...(artifact.prompts === undefined ? {} : { prompts: artifact.prompts }),
+			queueNumbers: queueNumbersOf(artifact),
+		});
 
 		const outcome = await walker.walk({
 			plan: route.plan,
@@ -1122,6 +1503,12 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			})(),
 			...(route.callerIdNumber === undefined ? {} : { callerIdNumber: route.callerIdNumber }),
 			...(route.callerIdName === undefined ? {} : { callerIdName: route.callerIdName }),
+			// The extension's CLIR setting. It rides beside the number and the name because it is the
+			// third part of one identity: a trunk attempt that carries the number but not the
+			// presentation asserts an identity the caller asked to withhold.
+			...(route.callerIdPresentation === undefined
+				? {}
+				: { callerIdPresentation: route.callerIdPresentation }),
 			...(route.featureArgument === undefined ? {} : { featureArgument: route.featureArgument }),
 			// The mailbox table travels with the plan so a `check` can answer "does the extension
 			// this call came from have a box?" without a database handle. See `WalkInput.mailboxes`.
@@ -1166,20 +1553,53 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			/**
 			 * The tenant's SIP realm from the compiled artifact (`CompiledRoutingSettings.realm`), when
 			 * the caller has the artifact in hand. Both callers do — a routing walk and a re-route each
-			 * read the org's artifact one line above — so the realm is passed rather than re-fetched. The
-			 * fleet-wide `ENGINE_SIP_REALM` is the fallback, applied here so the walker sees one resolved
-			 * value.
+			 * read the org's artifact one line above — so the realm is passed rather than re-fetched.
+			 *
+			 * There is NO fleet-wide fallback. A realm identifies exactly one tenant on the sipd plane
+			 * (`sip-credentials.service.ts` refuses a realm two organizations claim), so substituting a
+			 * deployment default would dial an extension into another tenant's domain. Absent leaves
+			 * `sipRealm` undefined and the composite refuses the B-leg `originate` by name.
 			 */
 			readonly realm?: string;
+			/**
+			 * The artifact's `prompts` table — prompt row id → `object://<objectKey>`. Passed for the
+			 * same reason and by the same two callers as {@link realm}: it is per-organization, it is
+			 * in the artifact each of them already holds, and without it a tenant's prompt id is
+			 * rendered under the deployment-wide prefix and names a file that does not exist.
+			 */
+			readonly prompts?: Readonly<Record<string, string>>;
+			/**
+			 * Queue id → the queue's own dialable number, from the artifact's internal match table.
+			 *
+			 * Passed for the same reason and by the same two callers as {@link realm}. What needs it is
+			 * virtual hold: `QueueCallbackRunner` hands the number to `planQueueCallback` as the `from`
+			 * of the outbound resolve, and it is also where the answered customer is put back. Without
+			 * it the resolve runs with an empty `from`, so a tenant whose outbound rules are gated on
+			 * the queue's toll class matches nothing and every callback is refused `invalid_target` —
+			 * which is a promise made to a caller and silently never kept.
+			 */
+			readonly queueNumbers?: Readonly<Record<string, string>>;
 		} = {},
 	): PlanWalker {
+		// Held in the closure rather than on the aggregate: it belongs to THIS walk, a walk runs its
+		// verbs one at a time, and a field on the aggregate would outlive the walk that set it.
+		let lastVerbFailure: string | undefined;
 		return new PlanWalker({
 			media: this.media,
 			signals: this.signals,
 			channel: walkerChannelFor(aggregate),
-			execute: (verb) => this.execute(aggregate, verb),
+			execute: async (verb) => {
+				const outcome = await this.execute(aggregate, verb);
+				if ("failed" in outcome) {
+					lastVerbFailure = outcome.failed;
+					return undefined;
+				}
+				lastVerbFailure = undefined;
+				return outcome.ok;
+			},
+			verbFailure: () => lastVerbFailure,
 			publish: (type, data) => this.publishCallEvent(aggregate, type, data),
-			settings: this.walkerSettings(extra.realm ?? this.env.ENGINE_SIP_REALM),
+			settings: this.walkerSettings(extra.realm, extra.prompts),
 			peerLegId: (id) => this.domainLegId(id),
 			legs: this.legHooksFor(aggregate),
 			voicemail: this.voicemailPortFor(aggregate),
@@ -1188,6 +1608,15 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			// read behind `*69`, and the greeting `*99` files. All three are stateless over the shared
 			// rpc client, so one instance serves every walk — see `routing.module.ts`.
 			features: this.extensionFeatures,
+			// `*65`/`*64`'s write seam — the same shape as `features`, aimed at a row that is not on an
+			// extension. Missing means the walker announces "not available" rather than pretending the
+			// office is now closed.
+			...(this.toggles === undefined ? {} : { toggles: this.toggles }),
+			// `*31`/`*32` — hot desking. The same shape again, aimed at `device_line`: the walk gathers
+			// the extension and the PIN and the API verifies both, because compiling a hot-desk gate
+			// would broadcast every agent's PIN digest on the routing bucket. Missing means the code
+			// announces rather than leaving a desk phone bound to somebody who has gone home.
+			...(this.hotDesk === undefined ? {} : { hotDesk: this.hotDesk }),
 			lastCaller: this.lastCaller,
 			// `*0`'s gate. Wired in exactly the same shape as its two neighbours above and with the
 			// OPPOSITE meaning when it is missing: `features` and `lastCaller` absent means the code
@@ -1214,12 +1643,25 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			// a queue node needs all five or none of them, and a walk that had four would fail in the
 			// middle of somebody's hold music rather than at construction.
 			conferences: this.conferences,
+			// The shared-line seizure compare-and-set, plus the one mid-call operation a WALK reaches:
+			// dialling a held line's number from a second appearance is a retrieve, and it arrives here
+			// as an ordinary call. Seize and release go straight to the registry; retrieve goes through
+			// call control, which owns the bridge.
+			...(this.sharedLines === undefined
+				? {}
+				: { sharedLines: this.sharedLinePortFor(aggregate, this.sharedLines) }),
 			queue: {
 				membership: this.queueMembership,
 				agents: this.agentState,
 				events: this.queueEvents,
 				waiting: this.queueWaiting,
 				cursor: this.queueCursors,
+				// Virtual hold's sweep. Optional on `QueueServices` and optional here: the token a session
+				// writes is already durable when this is called, so a queue the scheduler never heard
+				// about is picked up by the next caller who joins it rather than being lost.
+				...(this.queueCallbacks === undefined
+					? {}
+					: { callbacks: queueCallbackPort(this.queueCallbacks, extra.queueNumbers) }),
 			},
 			control: this.walkerCallControlFor(aggregate),
 			// The `application` destination. `run` blocks for the length of the session — see
@@ -1624,6 +2066,9 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			get destinationNumber(): string | undefined {
 				return aggregate.snapshot.profile.destinationNumber;
 			},
+			get side(): LegSide {
+				return legSideOf(aggregate);
+			},
 			moveTo: (state) => aggregate.tryTransitionTo(state),
 			moveCallStateTo: (state) => aggregate.tryCallStateTo(state),
 			setBridge: (bridgeId) => {
@@ -1652,6 +2097,155 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		};
 	}
 
+	/**
+	 * The PBX recording control: pause, resume or stop the recording on a call NOBODY was handed.
+	 *
+	 * ## The whole authorisation, in the order it runs
+	 *
+	 * legs of this call in THIS organization → this instance still owns one → something is actually
+	 * recording on it → the verb. The organization comes from the request and is compared against
+	 * the LEG's own, never the other way round, so a caller who guesses a call id from another
+	 * tenant finds nothing and is answered exactly as one who guessed an id that never existed.
+	 * That is the same "do not let them enumerate" rule `ApplicationSessions.execute` follows for
+	 * the session channel.
+	 *
+	 * ## Why `legId` is usually absent, and what is done about it
+	 *
+	 * The control plane knows the CALL — that is what the `channels` bucket and the CDR are keyed by
+	 * — and not which of its legs the recorder is attached to. So an absent `legId` means "the
+	 * recorded leg of this call", answered by asking the call-control runtime which of this call's
+	 * legs has a session. It is unambiguous because `startRecording` refuses a second recording on a
+	 * leg that already has one, and because the on-demand recorder attaches to the leg that asked
+	 * for it rather than to both sides.
+	 *
+	 * ## `wrong_instance` and `unknown-call` say different things
+	 *
+	 * The first means the address was stale: this instance has the leg in its registry and the
+	 * ownership variable names somebody else, which is the window between a failover and an
+	 * adoption. The caller should re-read the bucket. The second means nothing here has ever heard
+	 * of the call — it ended, or it is on an instance the caller has not addressed — and the button
+	 * should go away.
+	 */
+	private async controlCallRecording(request: CallControlRequest): Promise<CallControlOutcome> {
+		if (this.draining) {
+			return {
+				ok: false,
+				verb: request.verb,
+				reason: "shutting-down",
+				error: "this instance is draining",
+			};
+		}
+
+		// A linear scan of this instance's legs, deliberately: there is no by-call index, the map is
+		// one entry per LIVE leg on one process, and the caller is a person pressing a button. A
+		// fifth index maintained on every call setup to serve a human-speed path would cost the hot
+		// path to save this one nothing measurable.
+		const legs = this.registry.all.filter(
+			(aggregate) =>
+				aggregate.callId === request.callId &&
+				aggregate.organizationId === request.orgId &&
+				!aggregate.isTearingDown &&
+				(request.legId === undefined || aggregate.channelId === request.legId),
+		);
+		if (legs.length === 0) {
+			return {
+				ok: false,
+				verb: request.verb,
+				reason: "unknown-call",
+				error: "no live leg of that call in that organization on this instance",
+			};
+		}
+		// A leg whose ownership variable is ABSENT counts as ours. It is in this instance's registry,
+		// which is the stronger fact, and the variable is stamped by the KV mirror — so a call
+		// controlled in the window between admission and the first `putChannel` would otherwise be
+		// refused as somebody else's. Only a variable that NAMES another instance is evidence.
+		const owned = legs.filter((aggregate) => {
+			const owner = aggregate.snapshot.variables[CHANNEL_OWNER_INSTANCE_VARIABLE];
+			return owner === undefined || owner === this.env.ENGINE_INSTANCE_ID;
+		});
+		if (owned.length === 0) {
+			return {
+				ok: false,
+				verb: request.verb,
+				legId: legs[0]?.channelId,
+				reason: "wrong_instance",
+				error: "another engine instance owns that leg; re-read the channels bucket",
+			};
+		}
+
+		const recorded = owned
+			.map((aggregate) => ({
+				aggregate,
+				recording: this.control.recordingFor(aggregate.ariChannelId),
+			}))
+			.find((candidate) => candidate.recording !== undefined);
+		if (recorded === undefined) {
+			return {
+				ok: false,
+				verb: request.verb,
+				legId: owned[0]?.channelId,
+				recording: false,
+				reason: "not-recording",
+				error: "nothing is being recorded on that call",
+			};
+		}
+
+		const leg = this.controlledLeg(recorded.aggregate);
+		const result =
+			request.verb === "stopRecord"
+				? await this.control.stopRecording(leg)
+				: await this.control.pauseRecording(leg, request.verb === "pauseRecord");
+		const after = this.control.recordingFor(recorded.aggregate.ariChannelId);
+		if (!result.ok) {
+			this.logger.info(
+				{
+					orgId: request.orgId,
+					callId: request.callId,
+					legId: leg.legId,
+					verb: request.verb,
+					byUserId: request.byUserId,
+					reason: result.reason,
+				},
+				"a recording control verb was refused",
+			);
+			return {
+				ok: false,
+				verb: request.verb,
+				legId: leg.legId,
+				recording: after !== undefined,
+				...(after === undefined ? {} : { paused: after.paused }),
+				// The media plane refusing is NOT the same as the platform being unable to: the ARI
+				// driver refuses `pauseRecording` outright because its pause SHORTENS the file, so the
+				// intervals it reported would not name the silence they describe — and a caller has to
+				// be able to HIDE the control for that rather than retry it. `CallControl` flattens the
+				// throw into its refusal string, so the driver's own error NAME is what tells the two
+				// apart; it is a pinned field on the class, not a message a rewording can lose.
+				reason: result.reason.includes("MediaOperationNotSupportedError")
+					? "unsupported"
+					: "media-refused",
+				error: result.reason,
+			};
+		}
+
+		this.logger.info(
+			{
+				orgId: request.orgId,
+				callId: request.callId,
+				legId: leg.legId,
+				verb: request.verb,
+				byUserId: request.byUserId,
+			},
+			"a recording control verb ran",
+		);
+		return {
+			ok: true,
+			verb: request.verb,
+			legId: leg.legId,
+			recording: after !== undefined,
+			...(after === undefined ? {} : { paused: after.paused }),
+		};
+	}
+
 	/** Everything the call-control runtime needs that only this class can answer. */
 	private callControlHost(): CallControlHost {
 		return {
@@ -1666,9 +2260,50 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				}
 				await this.publishCallEvent(aggregate, type, data);
 			},
+			markRecording: (leg, state) => {
+				const recorded = this.registry.byDomainChannelId(leg.legId);
+				if (recorded === undefined) {
+					this.logger.warn(
+						{ legId: leg.legId, active: state.active, paused: state.paused },
+						"could not mirror a recording state: this instance no longer holds the leg",
+					);
+					return;
+				}
+				// BOTH legs of the call, not only the one the recorder is attached to. A conversation
+				// recording covers the two parties, and the surface that has to draw the indicator is
+				// the softphone of whoever is ON the call — which reads its OWN `channels` row. Stamping
+				// the recorded leg alone left the agent's row saying `flags: ["answered"]` while a
+				// recorder was demonstrably running, so the control was never drawn however well the
+				// pause worked.
+				const peer = recorded.snapshot.variables[BRIDGE_PEER_VARIABLE];
+				const legs = [
+					recorded,
+					...(peer === undefined ? [] : [this.registry.byDomainChannelId(peer)]),
+				];
+				for (const aggregate of legs) {
+					// A leg on its way out is skipped rather than mirrored, on the same rule every other
+					// late write here follows: the teardown has already cleared the KV entry, and a write
+					// after it would leave a live-looking channel for a call that is over.
+					if (aggregate === undefined || aggregate.isTearingDown) {
+						continue;
+					}
+					if (state.active) {
+						aggregate.addFlag("recording");
+					} else {
+						aggregate.removeFlag("recording");
+					}
+					if (state.active && state.paused) {
+						aggregate.addFlag("recording-paused");
+					} else {
+						aggregate.removeFlag("recording-paused");
+					}
+					void this.jetstream.putChannel(aggregate.snapshot);
+				}
+			},
 			route: async (leg, request) => await this.routeLeg(leg, request),
 			parkLotFor: async (leg, lotRef) => await this.parkLotFor(leg, lotRef),
 			parkLotForSlot: async (leg, slot) => await this.parkLotForSlot(leg, slot),
+			sharedLineFor: async (leg, sharedLineId) => await this.sharedLineFor(leg, sharedLineId),
 		};
 	}
 
@@ -1807,9 +2442,13 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		// The walker's hook takes a bridge id it has no use for; the caller's takes none. Adapted here
 		// rather than widening the caller's contract with an argument no call-control operation reads.
 		const beforeBridge = request.beforeBridge;
+		const callerIdNumber = request.callerIdNumber ?? resolved.callerIdNumber;
+		const callerIdName = request.callerIdName ?? resolved.callerIdName;
 		const outcome = await this.walkerFor(aggregate, {
 			...(beforeBridge === undefined ? {} : { beforeBridge: async () => await beforeBridge() }),
 			...(artifact.settings.realm === undefined ? {} : { realm: artifact.settings.realm }),
+			...(artifact.prompts === undefined ? {} : { prompts: artifact.prompts }),
+			queueNumbers: queueNumbersOf(artifact),
 		}).walk({
 			plan: resolved.plan as ExecutionPlan,
 			timeConditions: artifact.timeConditions,
@@ -1818,8 +2457,20 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			// park exactly as it would for a caller who dialled them.
 			originalDialedNumber: request.destination,
 			...(resolved.dialedNumber === undefined ? {} : { dialedNumber: resolved.dialedNumber }),
-			...(request.callerIdNumber === undefined ? {} : { callerIdNumber: request.callerIdNumber }),
-			...(request.callerIdName === undefined ? {} : { callerIdName: request.callerIdName }),
+			// The RESOLVE's identity behind the request's, which is the same cascade the inbound walk
+			// uses and was missing here entirely. A re-entrant dial — `*67<number>`, `*82<number>`,
+			// `*69` — arrives with no caller id on the request, so the walk had none to put on the
+			// trunk attempt and the INVITE asserted the EDGE's own identity instead of the caller's:
+			// under `Privacy: id` that is the harmful direction, because the network is told to
+			// withhold an identity that was never asserted.
+			...(callerIdNumber === undefined ? {} : { callerIdNumber }),
+			...(callerIdName === undefined ? {} : { callerIdName }),
+			// And the presentation beside them, for the reason it rides beside them on the main walk:
+			// the three are one identity, and a leg that carries the number without the flag asserts
+			// what the caller asked to withhold.
+			...(resolved.callerIdPresentation === undefined
+				? {}
+				: { callerIdPresentation: resolved.callerIdPresentation }),
 			...(resolved.featureArgument === undefined
 				? {}
 				: { featureArgument: resolved.featureArgument }),
@@ -1963,7 +2614,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			}
 			targets.push({
 				leg: this.controlledLeg(aggregate),
-				side: aggregate.snapshot.variables.OPTIMIQ_LEG === "b" ? "b" : "a",
+				side: legSideOf(aggregate),
 				startedAtMs: aggregate.snapshot.createdAt,
 			});
 		}
@@ -2027,6 +2678,64 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				...(park?.mohClass === undefined ? {} : { mohClass: park.mohClass }),
 			};
 		});
+	}
+
+	/** The walker's shared-line port: the registry, plus the retrieve that needs a bridge. */
+	private sharedLinePortFor(
+		aggregate: ChannelAggregate,
+		lines: SharedLineRegistry,
+	): NonNullable<PlanWalkerDependencies["sharedLines"]> {
+		return {
+			seize: async (orgId, sharedLineId, seizing) =>
+				await lines.seize(orgId, sharedLineId, seizing),
+			releaseOwn: async (orgId, sharedLineId) => await lines.releaseOwn(orgId, sharedLineId),
+			held: (orgId, sharedLineId) => lines.held(orgId, sharedLineId),
+			retrieve: async (orgId, sharedLineId) => {
+				const outcome = await this.control.retrieveSharedLine(this.controlledLeg(aggregate), {
+					sharedLineId,
+				});
+				return outcome.ok
+					? { retrieved: true }
+					: {
+							retrieved: false,
+							...(outcome.reason === undefined ? {} : { reason: outcome.reason }),
+						};
+			},
+		};
+	}
+
+	/**
+	 * A shared line as the mid-call half needs it, from the compiled artifact.
+	 *
+	 * The recall timeout and the appearance NUMBERS, which is the pair the seizure cannot carry: a
+	 * seizure records an extension ID, and a recall has to ring a number. Looked up by scanning the
+	 * artifact's nodes, which is the same shape `parkLots` uses and for the same reason — there is no
+	 * `sharedLineId -> node` index in the artifact, and building one here would be a second cache to
+	 * keep in step with the first.
+	 */
+	private async sharedLineFor(
+		leg: ControlledLeg,
+		sharedLineId: string,
+	): Promise<SharedLine | undefined> {
+		const artifact = await this.routing.get(leg.organizationId);
+		if (artifact === undefined) {
+			return undefined;
+		}
+		for (const node of Object.values(artifact.nodes)) {
+			if (node.kind !== "shared-line" || node.sharedLineId !== sharedLineId) {
+				continue;
+			}
+			return {
+				sharedLineId,
+				holdRecallTimeoutSeconds: node.holdRecallTimeoutSeconds,
+				appearances: node.appearances.map((appearance) => ({
+					appearanceIndex: appearance.appearanceIndex,
+					extensionId: appearance.extensionId,
+					extensionNumber: appearance.extensionNumber,
+				})),
+			};
+		}
+		return undefined;
 	}
 
 	/**
@@ -2265,12 +2974,15 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	/** The walker's deployment knobs, assembled from the engine's environment. */
 	/**
 	 * @param realm the tenant's SIP realm — the per-org value from the compiled artifact, already
-	 *   resolved by {@link walkerFor} against the fleet-wide `ENGINE_SIP_REALM` fallback. Absent leaves
+	 *   read from the compiled artifact by {@link walkerFor} and never from a deployment default. Absent leaves
 	 *   {@link PlanWalkerSettings.sipRealm} undefined, which is exactly right on the Asterisk plane and
 	 *   makes the composite refuse an extension B-leg's `originate` by name on the `sipd` plane rather
 	 *   than dialling a hostless URI.
 	 */
-	private walkerSettings(realm?: string): Partial<PlanWalkerSettings> {
+	private walkerSettings(
+		realm?: string,
+		prompts?: Readonly<Record<string, string>>,
+	): Partial<PlanWalkerSettings> {
 		return {
 			application: this.env.ARI_APP,
 			extensionDialTemplate: this.env.ENGINE_EXTENSION_DIAL_TEMPLATE,
@@ -2293,6 +3005,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				promptPrefix: this.env.ENGINE_PROMPT_MEDIA_PREFIX,
 				fallbackMedia: this.env.ENGINE_UNAVAILABLE_ANNOUNCEMENT,
 				objectMediaRoot: this.env.ENGINE_MEDIA_OBJECT_ROOT,
+				prompts: prompts ?? {},
 			},
 		};
 	}
@@ -2322,12 +3035,20 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	 * `runEffect` remains the seam for the session-protocol HTTP surface that lands in P3.
 	 *
 	 * Returns the verb's RESULT rather than a boolean, because the plan walker needs it: an IVR's
-	 * `gather` is only useful if the digits come back, and `undefined` remains the single, honest
-	 * "this verb did not run".
+	 * `gather` is only useful if the digits come back.
+	 *
+	 * It returns the failure's DETAIL rather than a bare `undefined` for a reason the live stack
+	 * taught: `mediad refused start-playback (bad_request): audio: no such prompt: sound:moh/default`
+	 * ended up in a log line and nowhere else, so the call it broke showed up as an IVR the caller
+	 * abandoned. {@link walkerFor} collapses this back to `undefined` for the walk — which still
+	 * treats a failed verb as fatal — while keeping the sentence for the walk's notes.
 	 */
-	private async execute(aggregate: ChannelAggregate, verb: Verb): Promise<VerbResult | undefined> {
+	private async execute(
+		aggregate: ChannelAggregate,
+		verb: Verb,
+	): Promise<{ ok: VerbResult } | { failed: string }> {
 		if (verb.verb === "ringing" && aggregate.isAnswered) {
-			return { verb: "ringing", endReason: "completed" };
+			return { ok: { verb: "ringing", endReason: "completed" } };
 		}
 		if (verb.verb === "hangup") {
 			// Fix the cause BEFORE the media server is told, because the media server will not tell
@@ -2353,14 +3074,14 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 
 		const exit = await this.runtime.runPromiseExit((executor) => executor.dispatch(context, verb));
 		if (Exit.isSuccess(exit)) {
-			return exit.value;
+			return { ok: exit.value };
 		}
 
 		this.logger.warn(
 			{ verb: verb.verb, channelId: aggregate.channelId, cause: Cause.pretty(exit.cause) },
 			"verb execution failed",
 		);
-		return undefined;
+		return { failed: verbFailureDetail(verb.verb, exit.cause) };
 	}
 
 	/**
@@ -2448,6 +3169,19 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		) {
 			if (!(await this.settleOutboundAnswer(mediaChannelId, sdpAnswer))) return;
 		}
+
+		// The same settle a beat earlier, when the carrier committed its answer on a `183` instead of a
+		// `200`. Nothing about billing moves here — `markAnswered` below stays on `active` — but the
+		// audio has to be accepted now or the caller hears silence over the announcement that told
+		// them the number is out of service.
+		if (
+			nextCallState === "early" &&
+			sdpAnswer !== undefined &&
+			this.media instanceof SplitPlaneMediaPort
+		) {
+			if (!(await this.settleOutboundAnswer(mediaChannelId, sdpAnswer))) return;
+			await this.relayEarlyMedia(mediaChannelId);
+		}
 		if (aggregate === undefined) {
 			this.emitLegProgress(mediaChannelId, nextCallState);
 			return;
@@ -2457,13 +3191,39 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		// walker waits for exactly this: `answer` is a request and `active` is the confirmation.
 		this.emitLegProgress(mediaChannelId, nextCallState);
 
+		// A split-plane B-leg's dialog identity, filed the first time the leg says anything. The
+		// originate reply is where the `Call-ID` becomes knowable and the arrival path never sees it,
+		// so without this the leg carries no `sip_call_id` on its CDR row and — the sharper half —
+		// `resolveSipDialog` cannot find it, which is what makes the engine answer `unknown_dialog` to
+		// a REFER sent by the party who ANSWERED. Split plane only: on ARI the arrival path already
+		// read the value and a second read would be an HTTP round trip per state change.
+		if (
+			this.media instanceof SplitPlaneMediaPort &&
+			aggregate.snapshot.variables[SIP_CALL_ID_VARIABLE] === undefined
+		) {
+			await this.recordSipDialogFor(aggregate);
+		}
+
 		if (aggregate.isTearingDown) {
+			return;
+		}
+
+		// A leg that has COMMITTED an offer/answer exchange on a `183` is not un-committed by a later
+		// `180`. The state machine allows `early → ringing` because a leg can genuinely fall back to
+		// ringback, but on this path the 180 is either a retransmission or a chatty carrier, and
+		// letting it win reported a leg carrying audio as one that is merely alerting — on the
+		// `channels` mirror a softphone and a wallboard both read.
+		if (nextCallState === "ringing" && aggregate.snapshot.callState === "early") {
 			return;
 		}
 
 		if (!aggregate.tryCallStateTo(nextCallState)) {
 			return;
 		}
+
+		// Any call state past `initializing` is a response the caller can hear: the leg is alive and
+		// the setup phase this deadline bounds is over.
+		this.disarmSetupDeadline(mediaChannelId);
 
 		if (nextCallState === "ringing") {
 			await this.events.publish("channel.ringing", {
@@ -2531,6 +3291,69 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		);
 		await port.hangup(channelId, "INCOMPATIBLE_DESTINATION");
 		return false;
+	}
+
+	/**
+	 * Passes a B-leg's early media on to the caller as a `183` of their own.
+	 *
+	 * The carrier's audio is settled on the B-leg by the time this runs, but the A-leg is still an
+	 * un-answered dialog with no media path — so nothing reaches the person who dialled until their own
+	 * offer/answer exchange is committed too, which is what the `183` does.
+	 *
+	 * ## Two ways to name the originator, because one of them was silently empty
+	 *
+	 * The composite's own record is asked first: {@link SplitPlaneMediaPort.originate} stamps the leg
+	 * it was dialled FOR, and that is the authoritative answer. It is not the ONLY one, and treating it
+	 * as such is what made this feature fail on the wire with no log line at all — a B-leg whose plane
+	 * record was rebuilt without it (an adoption, a re-registration, a leg the port learned about after
+	 * the originate) returns `undefined` here and the caller silently hears nothing until the `200`.
+	 * `OPTIMIQ_ORIGINATING_LEG_ID` is the same fact mirrored onto the B-leg as a channel variable — it
+	 * is what assembles a fan-out back into one call on the CDR — so it can answer the same question
+	 * from the registry when the port cannot, and it survives a failover where the port record does not.
+	 *
+	 * Anything left after both is logged. The silence on this path is why finding it took a wire
+	 * capture, and a `warn` costs one line per call that could not relay.
+	 *
+	 * Best-effort. A refusal here costs the caller the announcement, and failing the call over it would
+	 * cost them the call — and the `200` that follows will open the media path anyway.
+	 */
+	private async relayEarlyMedia(mediaChannelId: string): Promise<void> {
+		const port = this.media;
+		if (!(port instanceof SplitPlaneMediaPort)) {
+			return;
+		}
+		const originator = port.originatorOf(mediaChannelId) ?? this.originatorFromLeg(mediaChannelId);
+		if (originator === undefined) {
+			this.logger.warn(
+				{ legId: mediaChannelId },
+				"early media arrived on a leg with no known originator; the caller hears ringback until answer",
+			);
+			return;
+		}
+		try {
+			await port.earlyMedia(originator);
+		} catch (error) {
+			this.logger.warn(
+				{ channelId: originator, legId: mediaChannelId, err: String(error) },
+				"could not relay the callee's early media to the caller; they hear ringback until answer",
+			);
+		}
+	}
+
+	/**
+	 * The media channel of the leg that dialled this one, off the B-leg's own mirrored variable.
+	 *
+	 * The fallback half of {@link relayEarlyMedia}'s originator lookup. `OPTIMIQ_ORIGINATING_LEG_ID`
+	 * holds the DOMAIN leg id (that is what the CDR links on), so it is resolved through the registry
+	 * to get back to the media channel every port command is addressed by.
+	 */
+	private originatorFromLeg(mediaChannelId: string): string | undefined {
+		const originatingLegId =
+			this.registry.byAriChannelId(mediaChannelId)?.snapshot.variables.OPTIMIQ_ORIGINATING_LEG_ID;
+		if (originatingLegId === undefined) {
+			return undefined;
+		}
+		return this.registry.byDomainChannelId(originatingLegId)?.ariChannelId;
 	}
 
 	private async onDtmf(mediaChannelId: string, digit: string, durationMs: number): Promise<void> {
@@ -2632,17 +3455,32 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			aggregate.removeFlag("hold");
 		}
 
+		// What the far end asked for, else the class the destination this call reached configured,
+		// else nothing — which the media port reads as its own default. A SIP phone naming a class is
+		// the rare case (`ari-mapping` carries one when Asterisk reports it); a re-INVITE naming none
+		// is every browser softphone, and it is the case the variable exists for.
+		const mohClass = musicClass ?? this.mohClassFor(aggregate, peer);
+
 		if (peer !== undefined && !peer.isTearingDown) {
 			try {
 				if (held) {
-					await this.media.startMusicOnHold(peer.ariChannelId, musicClass);
+					await this.media.startMusicOnHold(peer.ariChannelId, mohClass);
 				} else {
 					await this.media.stopMusicOnHold(peer.ariChannelId);
 				}
 			} catch (error) {
+				// The held party now hears silence, which is the outcome this whole path exists to
+				// prevent, so the class that could not be started is named: the live stack's version of
+				// this was `no such prompt: sound:moh/default` on a deployment with no prompt pack, and
+				// a log line that did not say which class was asked for could not have told anybody so.
 				this.logger.warn(
-					{ ariChannelId: peer.ariChannelId, held, err: String(error) },
-					"could not move the far end's hold music",
+					{
+						ariChannelId: peer.ariChannelId,
+						held,
+						mohClass: mohClass ?? "(the media server's default)",
+						err: String(error),
+					},
+					"could not move the far end's hold music; the held party hears silence",
 				);
 			}
 			// `held → unheld → active`: the transient state is what lets a watcher tell "resumed" from
@@ -2658,13 +3496,36 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				callId: peer.callId,
 				data: {
 					legId: peer.channelId,
-					...(held && musicClass !== undefined ? { mohClass: musicClass } : {}),
+					...(held && mohClass !== undefined ? { mohClass } : {}),
 				} as never,
 			});
 			await this.jetstream.putChannel(peer.snapshot);
 		}
 
 		await this.jetstream.putChannel(aggregate.snapshot);
+
+		// The shared-line half. Last, and deliberately after the far end already has its music: a line
+		// whose lamp did not update is a worse shared line, and a caller in silence is a worse call.
+		// `aggregate` is the APPEARANCE that pressed the key; `onSharedLineHold` is a no-op for the
+		// overwhelming majority of holds, which are not on a shared line at all.
+		await this.control.onSharedLineHold(this.controlledLeg(aggregate), held);
+	}
+
+	/**
+	 * The music-on-hold class for a hold, off whichever of the two legs the walk labelled.
+	 *
+	 * The HOLDER's leg first: on an inbound call it is the B-leg the walk originated for the
+	 * extension node, and that node is the one carrying the tenant's class. The held peer is the
+	 * fallback for the mirror-image case — the caller pressing hold on a call they placed — and
+	 * `undefined` means the compiler resolved no class, which the media port reads as its default.
+	 */
+	private mohClassFor(
+		holder: ChannelAggregate,
+		peer: ChannelAggregate | undefined,
+	): string | undefined {
+		return (
+			holder.snapshot.variables[MOH_CLASS_VARIABLE] ?? peer?.snapshot.variables[MOH_CLASS_VARIABLE]
+		);
 	}
 
 	private onVariableSet(mediaChannelId: string, variable: string, value: string): void {
@@ -2733,6 +3594,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		// every time a leg ends outside the registry and the trunk eventually refuses everything.
 		this.trunkCapacity.releaseLeg(mediaChannelId);
 		this.disarmCallDurationCeiling(mediaChannelId);
+		this.disarmSetupDeadline(mediaChannelId);
 
 		// A remote BYE terminates SIP but does not release the independently owned media session.
 		// Release it even when there is no aggregate; successful release also drops local leg state.
@@ -2931,6 +3793,14 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		}
 
 		this.clearCdrRetry(aggregate.ariChannelId);
+		// A shared line this leg was on is freed here, at the one point every ending call passes
+		// through, rather than on each of the several paths that can end one. A no-op for every leg
+		// that is not the party a shared line was seized for.
+		await this.control.releaseSharedLine(
+			aggregate.organizationId,
+			aggregate.callId,
+			aggregate.channelId,
+		);
 		aggregate.transitionTo("destroyed");
 		await this.jetstream.deleteChannel(aggregate.snapshot);
 		this.registry.remove(aggregate);
@@ -3028,7 +3898,11 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			return;
 		}
 		peer.markHangup({ cause: "NORMAL_CLEARING", at: Date.now(), initiatedByEngine: true });
-		await this.hangupQuietly(peer.ariChannelId, "NORMAL_CLEARING");
+		// The cause that WON, not the one just offered: `markHangup` is first-wins, so a peer whose
+		// cause was already fixed — a plane-loss teardown's `NORMAL_TEMPORARY_FAILURE`, a duration
+		// ceiling's `ALLOTTED_TIMEOUT` — must put that on the wire too. Sending 16 while the CDR says
+		// 41 tells the far end's carrier a crashed call was a normal hang-up.
+		await this.hangupQuietly(peer.ariChannelId, peer.hangupCause ?? "NORMAL_CLEARING");
 	}
 
 	/**
@@ -3055,6 +3929,9 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		aggregate.setVariable(DESTINATION_TYPE_VARIABLE, destination.destinationType);
 		if (destination.destinationRef !== undefined) {
 			aggregate.setVariable(DESTINATION_REF_VARIABLE, destination.destinationRef);
+		}
+		if (destination.mohClass !== undefined) {
+			aggregate.setVariable(MOH_CLASS_VARIABLE, destination.mohClass);
 		}
 		// The variables are set either way — an in-flight CDR reads them from the snapshot, not from
 		// KV — but the bucket must not be written for a leg whose entry has already been deleted, or
@@ -3152,6 +4029,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			// the leg that dialled it.
 			const originatingLegId = aggregate.snapshot.variables.OPTIMIQ_ORIGINATING_LEG_ID;
 			const bridgeLegId = aggregate.snapshot.variables[BRIDGE_PEER_VARIABLE];
+			const sipCallId = normalizeSipCallId(aggregate.snapshot.variables[SIP_CALL_ID_VARIABLE]);
 			const data = buildCdrLegWrite({
 				id: aggregate.snapshot.variables[CDR_ID_VARIABLE],
 				snapshot: aggregate.snapshot,
@@ -3167,15 +4045,46 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				...(destinationRef === undefined ? {} : { destinationRef }),
 				...queueLegOf(aggregate.snapshot.variables),
 				...authorizationOf(aggregate.snapshot.variables),
+				...attestationOf(aggregate.snapshot.variables),
+				// The carrier's `Call-ID` for this leg's dialog. Off the variable and not the dialog
+				// registry, so an adopted leg files the same value the original instance would have.
+				...(sipCallId === undefined ? {} : { sipCallId }),
+				// Off the channel variable rather than off the aggregate, so it survives the snapshot an
+				// instance reads after a failover — the same rule every other CDR identity here follows.
+				...(aggregate.snapshot.variables[CDR_RELATED_CALL_ID_VARIABLE] === undefined
+					? {}
+					: { relatedCallId: aggregate.snapshot.variables[CDR_RELATED_CALL_ID_VARIABLE] }),
 			});
-			const envelope = makeCdrLegWriteEvent({
-				id: aggregate.snapshot.variables[CDR_EVENT_ID_VARIABLE],
-				at: new Date(input.endedAt),
-				orgId: aggregate.organizationId,
-				source: "engine",
-				data,
-			});
-			validateEvent(envelope.subject, envelope);
+			let envelope: ReturnType<typeof makeCdrLegWriteEvent>;
+			try {
+				envelope = makeCdrLegWriteEvent({
+					id: aggregate.snapshot.variables[CDR_EVENT_ID_VARIABLE],
+					at: new Date(input.endedAt),
+					orgId: aggregate.organizationId,
+					source: "engine",
+					data,
+				});
+				validateEvent(envelope.subject, envelope);
+			} catch (invalid) {
+				// PERMANENT, and told apart from a publish failure for that reason. A payload its own
+				// schema rejects will be rejected identically by every redelivery and by every
+				// replacement process, so the retry loop below can only spin: two legs carrying a
+				// synthetic `feature-code:<kind>:<uuid>` destination held `activeChannels: 2` across a
+				// restart and wrote 483 identical error lines. The row is dropped and the leg is
+				// released — a lost CDR is a reporting hole, a leg nothing can free is a call the
+				// platform believes is still up.
+				this.logger.error(
+					{
+						channelId: aggregate.channelId,
+						callId: aggregate.callId,
+						destinationType,
+						destinationRef,
+						err: String(invalid),
+					},
+					"dropping an unwritable CDR for a finished leg; the payload fails its own contract and no retry can fix it",
+				);
+				return true;
+			}
 			await this.jetstream.publishCdrLeg(envelope);
 			return true;
 		} catch (error) {
@@ -3187,6 +4096,154 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			);
 			return false;
 		}
+	}
+
+	// -------------------------------------------------------------------------------------------
+	// Plane loss
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * Ends every leg whose plane went away, with a cause, a CDR and a BYE where one can still be sent.
+	 *
+	 * ## Why this exists at all
+	 *
+	 * The split plane made each half of a call independently mortal, and it made exactly one of the
+	 * two failures silent. A `mediad` crash is loud — the relay stops and both parties hear nothing —
+	 * but the engine's own hangup path went THROUGH `mediad`, so the one process that could end the
+	 * call could not. A `sipd` crash is worse: the media keeps flowing perfectly, the engine is told
+	 * nothing at all, and the phone's BYE is answered `481` by whatever replaced the dead process.
+	 * Both leave a live billing leg that nobody on the platform can end. Neither is a leak to be
+	 * cleaned up later; both are calls that must be ENDED, now, and recorded as ended.
+	 *
+	 * ## Why `NORMAL_TEMPORARY_FAILURE`
+	 *
+	 * Q.850 41, which is the same cause `apps/sipd`'s own claim reaper publishes for the same event,
+	 * and the same one the drain uses for a straggler — "the platform ended this call and it may be
+	 * retried". It is not `NORMAL_CLEARING`: filing a crash as a hang-up makes an availability
+	 * incident invisible in the CDR, which is precisely the question somebody asks afterwards. The
+	 * taxonomy has no code for "the media owner vanished", and inventing one would be a schema
+	 * change on the billing boundary to say something 41 already says; the REASON travels in the log
+	 * line and in the event, where an operator reads it.
+	 *
+	 * ## Ordering
+	 *
+	 * The cause is fixed on the aggregate FIRST, because `markHangup` is first-wins and a late event
+	 * from a plane that is coming back must not relabel a call the engine ended. Then the BYE, but
+	 * only towards a plane that can still carry one — signalling at a dead `sipd` would be addressed
+	 * at a process that never had the call and would cost a full RPC timeout per leg. Then
+	 * {@link onLegEnded}, explicitly rather than by waiting for an event: the whole point is that the
+	 * plane which would have reported it is gone.
+	 */
+	async endLegsOnPlaneLoss(loss: PlaneLoss): Promise<number> {
+		if (this.draining) {
+			// The drain is already hanging these legs up with a cause of its own, and both paths
+			// calling `onLegEnded` for one leg would race over which cause the CDR keeps.
+			return 0;
+		}
+		const port = this.media instanceof SplitPlaneMediaPort ? this.media : undefined;
+		const affected = this.channelsAffectedBy(loss, port);
+		if (affected.length === 0) {
+			this.logger.info(
+				{ plane: loss.plane, instanceId: loss.instanceId },
+				"a plane was lost while this instance held no legs on it",
+			);
+			return 0;
+		}
+
+		this.logger.error(
+			{
+				plane: loss.plane,
+				instanceId: loss.instanceId,
+				reason: loss.reason,
+				count: affected.length,
+			},
+			"ending every leg on a plane that is gone",
+		);
+		if (loss.plane === "media") {
+			// Before the first teardown, so no leg pays the release timeout for a relay that is gone.
+			port?.setMediaPlaneLost(true);
+		}
+
+		// Every cause fixed BEFORE the first teardown, not per leg inside the loop. `markHangup` is
+		// first-wins, and ending the A-leg runs `endBridgePeer`, which hangs its bridged partner up
+		// with `NORMAL_CLEARING` — so a per-leg mark would reach the B-leg too late and file half of
+		// a crashed call as a normal hang-up. Proved live: the B-leg's CDR came back
+		// `NORMAL_CLEARING` against a cause code of 41.
+		const at = Date.now();
+		for (const mediaChannelId of affected) {
+			const aggregate = this.registry.byAriChannelId(mediaChannelId);
+			aggregate?.markHangup({ cause: PLANE_LOSS_HANGUP_CAUSE, at, initiatedByEngine: true });
+			// The numeric code too, and OVERWRITING whatever a dial or a bridge stamped earlier.
+			// `finishReporting` keeps a code once written, for retry stability, and the CDR takes its
+			// NAME from `markHangup` — so a leg that already carried a 16 would be filed as
+			// `NORMAL_TEMPORARY_FAILURE` with a cause code of 16, which is a billing row that
+			// contradicts itself. Seen live on the B-leg of a bridged pair. The loss is the terminal
+			// decision and postdates anything stamped before it.
+			aggregate?.setVariable(
+				CDR_HANGUP_CAUSE_CODE_VARIABLE,
+				String(hangupCauseCode(PLANE_LOSS_HANGUP_CAUSE)),
+			);
+			if (loss.plane === "signalling") {
+				// Dropped from the composite BEFORE any teardown runs, not inside the loop. There is
+				// nobody to send a BYE to, and every command addressed at the dead instance costs the
+				// full RPC timeout — including the one `endBridgePeer` issues from inside another
+				// leg's teardown, which is how a 500 ms wait on a dead edge appeared in the live log.
+				// The media session is still released: `releaseEndedLeg` keys on the channel id.
+				port?.forget(mediaChannelId);
+			}
+		}
+
+		let ended = 0;
+		for (const mediaChannelId of affected) {
+			if (loss.plane === "media") {
+				// `sipd` is alive: this is the BYE that tells both parties the call is over, and it is
+				// the half that was impossible while the hangup path needed `mediad`.
+				await this.hangupQuietly(mediaChannelId, PLANE_LOSS_HANGUP_CAUSE);
+			}
+			try {
+				await this.onLegEnded(
+					mediaChannelId,
+					PLANE_LOSS_HANGUP_CAUSE,
+					hangupCauseCode(PLANE_LOSS_HANGUP_CAUSE),
+				);
+				ended += 1;
+			} catch (error) {
+				this.logger.error(
+					{ mediaChannelId, plane: loss.plane, err: String(error) },
+					"could not finish ending a leg whose plane was lost",
+				);
+			}
+		}
+		this.logger.warn(
+			{ plane: loss.plane, instanceId: loss.instanceId, ended, affected: affected.length },
+			"finished ending the legs on a lost plane",
+		);
+		return ended;
+	}
+
+	/**
+	 * The legs one plane loss took with it.
+	 *
+	 * A media loss is total: the reachability probe is queue-grouped, so "no reply" means no `mediad`
+	 * in the fleet answered and every session this engine holds is dead. A signalling loss is
+	 * per-instance, and is read from BOTH the composite port's own record of which instance holds
+	 * which dialog and the leg variable the arrival stamped — the port forgets a leg on teardown and
+	 * the variable survives into the `channels` snapshot, so neither is complete on its own.
+	 */
+	private channelsAffectedBy(
+		loss: PlaneLoss,
+		port: SplitPlaneMediaPort | undefined,
+	): readonly string[] {
+		if (loss.plane === "media") {
+			return this.registry.all.map((aggregate) => aggregate.ariChannelId);
+		}
+		const affected = new Set<string>(port?.legsForInstance(loss.instanceId) ?? []);
+		for (const aggregate of this.registry.all) {
+			if (aggregate.snapshot.variables[SIPD_INSTANCE_ID_VARIABLE] === loss.instanceId) {
+				affected.add(aggregate.ariChannelId);
+			}
+		}
+		return [...affected];
 	}
 
 	// -------------------------------------------------------------------------------------------
@@ -3218,6 +4275,11 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		this.parks.clear();
 		// Same problem again: a ceiling that fired mid-drain would hang a call up with
 		// `ALLOTTED_TIMEOUT` on an instance that is already handing its work over.
+		for (const timer of this.setupDeadlines.values()) {
+			clearTimeout(timer);
+		}
+		this.setupDeadlines.clear();
+		this.adoptedPendingReconcile.clear();
 		for (const timer of this.durationCeilings.values()) {
 			clearTimeout(timer);
 		}
@@ -3304,6 +4366,69 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		}, seconds * 1_000);
 		timer.unref?.();
 		this.durationCeilings.set(mediaChannelId, timer);
+	}
+
+	/**
+	 * Arms the setup cut-off for a leg that has just been admitted.
+	 *
+	 * ## The invariant this exists to make true
+	 *
+	 * **Every admitted leg is covered by a timer.** `armCallDurationCeiling` covers the ANSWERED
+	 * ones; before this, nothing covered the rest. A routing walk is an unbounded await — a dial
+	 * waiting on a signal, a queue session waiting on an agent — and a walk that hangs left a leg in
+	 * `activeChannels` with no CDR, no final response and no clock, until the four-hour maximum-call
+	 * ceiling that had never been armed for it. Measured under load at 2 walks in 200: the caller's
+	 * INVITE simply ended with nothing.
+	 *
+	 * ## Why it cannot cut a legitimate call
+	 *
+	 * It is disarmed by the FIRST call-state progression — `ringing`, progress, or an answer — which
+	 * every real destination produces within milliseconds. A queue caller has been sent `180` (and
+	 * usually answered for hold music) long before this fires; so has an IVR, a ring group and a
+	 * voicemail box. What survives to this deadline is a leg nothing is driving.
+	 *
+	 * ## Why `NO_USER_RESPONSE`
+	 *
+	 * The taxonomy's 18 is exactly this fact and no other: the call was placed and nothing answered
+	 * it, provisionally or otherwise. `NORMAL_TEMPORARY_FAILURE` would say the platform refused a
+	 * call it in fact accepted and then lost, and the CDR is the only artefact anyone has afterwards.
+	 */
+	private armSetupDeadline(aggregate: ChannelAggregate): void {
+		const seconds = this.env.ENGINE_SETUP_TIMEOUT_SECONDS;
+		if (!Number.isFinite(seconds) || seconds <= 0) {
+			return;
+		}
+		const mediaChannelId = aggregate.ariChannelId;
+		this.disarmSetupDeadline(mediaChannelId);
+
+		const timer = setTimeout(() => {
+			this.setupDeadlines.delete(mediaChannelId);
+			const live = this.registry.byAriChannelId(mediaChannelId);
+			if (live === undefined || live.isTearingDown || live.isAnswered) {
+				return;
+			}
+			this.logger.warn(
+				{ channelId: live.channelId, callId: live.callId, seconds, state: live.state },
+				"an admitted leg produced no response inside the setup deadline; the engine is ending " +
+					"it. This is a hung routing walk: the caller heard nothing and has already given up.",
+			);
+			// Fixed before the hangup, for the reason the duration ceiling fixes its own: `markHangup`
+			// is first-wins and the CDR must say the platform cut this, not that it cleared normally.
+			live.markHangup({ cause: "NO_USER_RESPONSE", at: Date.now(), initiatedByEngine: true });
+			void this.endStalledLeg(mediaChannelId);
+		}, seconds * 1_000);
+		timer.unref?.();
+		this.setupDeadlines.set(mediaChannelId, timer);
+	}
+
+	/** Drops a leg's setup cut-off. Unarmed legs cost one map lookup. */
+	private disarmSetupDeadline(mediaChannelId: string): void {
+		const timer = this.setupDeadlines.get(mediaChannelId);
+		if (timer === undefined) {
+			return;
+		}
+		clearTimeout(timer);
+		this.setupDeadlines.delete(mediaChannelId);
 	}
 
 	/** Drops a leg's cut-off. Called on every leg end, so an unarmed leg costs one map lookup. */
@@ -3416,38 +4541,33 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	/**
 	 * Reads the engine's channel variables in one pass. Absent variables come back `undefined`.
 	 *
-	 * Four of the first five are stored under the name they are read by. The fifth is not: the SIP
-	 * `Call-ID` is READ from a dialplan function and STORED under an `OPTIMIQ_` name, because a
-	 * variable is what survives into the KV snapshot and what a dialplan can pre-stamp, while the
-	 * function is what the media server actually answers. Hence a pair per entry rather than a name.
+	 * The names are {@link ARRIVAL_VARIABLES} and nothing else, because that array is also what
+	 * `invitedChannelSnapshot` stamps — the two lists were maintained separately once and four
+	 * stamped variables were dropped here for it.
 	 *
-	 * ## Two entries have no `read`, and that is the whole distinction
+	 * Most are stored under the name they are read by. The SIP `Call-ID` is not: it is READ from a
+	 * dialplan function and STORED under an `OPTIMIQ_` name, because a variable is what survives into
+	 * the KV snapshot and what a dialplan can pre-stamp, while the function is what the media server
+	 * actually answers. Hence {@link ARRIVAL_VARIABLE_READS} being a map rather than a flag.
 	 *
-	 * The variables the SIP edge stamps — which instance holds the dialog, and which leg an authorised
-	 * `Replaces` is taking over — exist on NO media server. There is nothing to ask: `MediadMediaPort`
-	 * refuses `getVariable` outright and Asterisk has never heard of them. An entry with no `read` is
-	 * therefore inline-or-absent, which saves a round trip per call per variable on the ARI plane and,
-	 * more importantly, says what is true: these are facts the ARRIVAL carried, not facts a media
-	 * server holds. Whatever this method returns is what lands on the aggregate and in the `channels`
-	 * bucket, so a variable that is not read here is a variable a failover cannot recover.
+	 * ## Most entries have no `read`, and that is the whole distinction
+	 *
+	 * The variables the SIP edge stamps — which instance holds the dialog, which leg an authorised
+	 * `Replaces` is taking over, the registered device, the carrier's attestation — exist on NO media
+	 * server. There is nothing to ask: `MediadMediaPort` refuses `getVariable` outright and Asterisk
+	 * has never heard of them. An entry with no `read` is therefore inline-or-absent, which saves a
+	 * round trip per call per variable on the ARI plane and, more importantly, says what is true:
+	 * these are facts the ARRIVAL carried, not facts a media server holds. Whatever this method
+	 * returns is what lands on the aggregate and in the `channels` bucket, so a variable that is not
+	 * read here is a variable a failover cannot recover.
 	 */
 	private async readEngineVariables(
 		channel: MediaChannelSnapshot,
 	): Promise<Record<string, string | undefined>> {
 		const fromEvent = channel.variables;
-		const names: readonly { readonly variable: string; readonly read?: string }[] = [
-			{ variable: "OPTIMIQ_ORG_ID", read: "OPTIMIQ_ORG_ID" },
-			{ variable: "OPTIMIQ_CALL_DIRECTION", read: "OPTIMIQ_CALL_DIRECTION" },
-			{ variable: "OPTIMIQ_ROUTING_CONTEXT", read: "OPTIMIQ_ROUTING_CONTEXT" },
-			// Marks a leg the engine originated. Read here rather than guessed from the dialplan,
-			// because it is the only thing that is true of every originated leg and of nothing else.
-			{ variable: "OPTIMIQ_LEG", read: "OPTIMIQ_LEG" },
-			{ variable: SIP_CALL_ID_VARIABLE, read: SIP_CALL_ID_CHANNEL_FUNCTION },
-			{ variable: SIPD_INSTANCE_ID_VARIABLE },
-			{ variable: REPLACES_LEG_ID_VARIABLE },
-		];
 		const entries = await Promise.all(
-			names.map(async ({ variable, read }) => {
+			ARRIVAL_VARIABLES.map(async (variable) => {
+				const read: string | undefined = ARRIVAL_VARIABLE_READS[variable];
 				// The event's variables are only populated when the media server is configured to
 				// export them with every event, so they are an optimisation, never the truth.
 				const inline = fromEvent[variable] ?? (read === undefined ? undefined : fromEvent[read]);
@@ -3487,7 +4607,24 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		if (aggregate === undefined) {
 			return;
 		}
-		const sipCallId = await this.readSipCallId(channel);
+		await this.recordSipDialogFor(aggregate, channel.variables);
+	}
+
+	/**
+	 * The same, for a leg whose event carried no snapshot.
+	 *
+	 * The split plane's B-leg reaches the registry through `legHooksFor(…).originated`, which runs
+	 * BEFORE the INVITE goes out and therefore before anything knows the dialog's `Call-ID`. The
+	 * first moment that value exists on this side is the originate reply, which
+	 * {@link SplitPlaneMediaPort.originate} stamps as {@link SIP_CALL_ID_VARIABLE}; the first moment
+	 * the engine is called again for that leg is its `18x` or its `200`. So the dialog is filed from
+	 * the state change, which is why a `dialog.progressed` on a leg with no Call-ID yet reads one.
+	 */
+	private async recordSipDialogFor(
+		aggregate: ChannelAggregate,
+		inlineVariables: Readonly<Record<string, string>> = {},
+	): Promise<void> {
+		const sipCallId = await this.readSipCallId(aggregate.ariChannelId, inlineVariables);
 		if (
 			sipCallId === undefined ||
 			aggregate.snapshot.variables[SIP_CALL_ID_VARIABLE] === sipCallId
@@ -3500,20 +4637,33 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	}
 
 	/** The leg's SIP `Call-ID`: pre-stamped if a dialplan did it, read off the media server if not. */
-	private async readSipCallId(channel: MediaChannelSnapshot): Promise<string | undefined> {
+	private async readSipCallId(
+		mediaChannelId: string,
+		variables: Readonly<Record<string, string>>,
+	): Promise<string | undefined> {
 		const inline = normalizeSipCallId(
-			channel.variables[SIP_CALL_ID_VARIABLE] ?? channel.variables[SIP_CALL_ID_CHANNEL_FUNCTION],
+			variables[SIP_CALL_ID_VARIABLE] ?? variables[SIP_CALL_ID_CHANNEL_FUNCTION],
 		);
 		if (inline !== undefined) {
 			return inline;
 		}
-		try {
-			return normalizeSipCallId(
-				await this.media.getVariable(channel.id, SIP_CALL_ID_CHANNEL_FUNCTION),
-			);
-		} catch {
-			return undefined;
+		// The VARIABLE before the channel function, because only one of the two exists per plane and
+		// asking in the other order costs a split-plane B-leg its dialog. `SplitPlaneMediaPort` stamps
+		// the originate reply's `Call-ID` here (it has no PJSIP session to ask), while Asterisk answers
+		// `CHANNEL(pjsip,call-id)` and has nothing under this name. Both reads are local or one round
+		// trip, and the first defined answer wins.
+		for (const name of [SIP_CALL_ID_VARIABLE, SIP_CALL_ID_CHANNEL_FUNCTION]) {
+			try {
+				const value = normalizeSipCallId(await this.media.getVariable(mediaChannelId, name));
+				if (value !== undefined) {
+					return value;
+				}
+			} catch {
+				// A media server that refuses the read is a leg with no readable dialog, which is the
+				// documented outcome of this whole function. Try the other name before giving up.
+			}
 		}
+		return undefined;
 	}
 
 	/**
@@ -3666,7 +4816,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			request.callerIdName ?? plan.callerIdName ?? request.callerIdNumber ?? plan.callerIdNumber;
 		const callerIdNumber = request.callerIdNumber ?? plan.callerIdNumber;
 		const native = this.media instanceof SplitPlaneMediaPort;
-		const realm = artifact.settings.realm ?? this.env.ENGINE_SIP_REALM;
+		const realm = artifact.settings.realm;
 		if (native && !realm) {
 			return { kind: "refused", reason: "internal", error: "the organization has no SIP realm" };
 		}
@@ -3712,6 +4862,9 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 							callerId:
 								callerId === callerIdNumber ? callerIdNumber : `"${callerId}" <${callerIdNumber}>`,
 						}),
+				...(plan.callerIdPresentation === undefined
+					? {}
+					: { callerIdPresentation: plan.callerIdPresentation }),
 				...(request.ringTimeoutSeconds === undefined
 					? {}
 					: { timeoutSeconds: request.ringTimeoutSeconds }),
@@ -3752,6 +4905,181 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			callId: callIdForAriChannel(request.originateId),
 			legId: this.domainLegId(request.originateId),
 			endpoint: plan.endpoint,
+		};
+	}
+
+	/**
+	 * Rings a customer back on behalf of a queue.
+	 *
+	 * ## Why this is not `placeOriginatedCall` with different arguments
+	 *
+	 * Click-to-call is an EXTENSION placing a call: it originates towards that extension's own handset
+	 * and the person picks up their own phone. A callback has no extension and no handset — the leg it
+	 * creates goes OUT, to a customer, and the queue is what it presents. The two share a media
+	 * originate and nothing above it, which is why `planQueueCallback` resolves outbound only and why
+	 * the subject is its own.
+	 *
+	 * ## The answered leg walks to the queue, rather than being handed an agent
+	 *
+	 * `OPTIMIQ_DIALED_NUMBER` is the QUEUE's number, so once the customer answers, the ordinary walk
+	 * takes them into the ordinary queue node and the ordinary distribution loop reaches the ordinary
+	 * agent. There is no second "connect the agent" path here, and inventing one would be a second
+	 * ACD that had to be kept in step with the first.
+	 *
+	 * ## `relatedCallId` travels on the leg, not on this reply
+	 *
+	 * A callback is a NEW `call_id` — it happens minutes later, with its own answer, its own trunk and
+	 * its own billing, and reusing the queued call's id would make every duration in the ledger a sum
+	 * over time the customer was not on the phone. The link is a channel variable so it survives onto
+	 * the leg's CDR write, which is the only row that can carry it.
+	 */
+	private async placeQueueCallbackCall(
+		request: QueueCallbackRpcRequest,
+	): Promise<OriginatePlacement> {
+		const existing = this.registry.byAriChannelId(request.callbackId);
+		if (existing !== undefined) {
+			// The retry path, on the same terms click-to-call's is: the caller asked for a call to
+			// exist and it does. A second originate here would ring the customer twice.
+			return {
+				kind: "placed",
+				callId: existing.callId,
+				legId: existing.channelId,
+				endpoint: existing.snapshot.profile.channelName ?? "",
+			};
+		}
+		if (this.draining || !this.registry.isAccepting) {
+			return {
+				kind: "refused",
+				reason: "shutting_down",
+				error: "this engine instance is draining",
+			};
+		}
+
+		const artifact = await this.routing.get(request.orgId);
+		if (artifact === undefined) {
+			return {
+				kind: "refused",
+				reason: "internal",
+				error: `no routing artifact for organization ${request.orgId}`,
+			};
+		}
+
+		const plan = planQueueCallback(artifact, {
+			to: request.to,
+			...(request.queueNumber === undefined ? {} : { queueNumber: request.queueNumber }),
+			...(request.callerIdNumber === undefined ? {} : { callerIdNumber: request.callerIdNumber }),
+			...(request.callerIdName === undefined ? {} : { callerIdName: request.callerIdName }),
+			now: new Date(),
+		});
+		if (!plan.ok) {
+			return { kind: "refused", reason: plan.reason, error: plan.error };
+		}
+
+		// The trunk the matched outbound route selected. `planQueueCallback` answers WHICH NUMBER to
+		// dial and which route matched; turning that into an endpoint is this class's, because the
+		// dial template is deployment configuration rather than artifact.
+		//
+		// KNOWN LIMIT, stated rather than hidden: this takes the route's FIRST attempt. Trunk chains,
+		// capacity ceilings and `continueOnCauses` failover are the plan walker's, and they need an
+		// A-leg to fail over on — a callback has none until the customer answers. A tenant whose first
+		// trunk is down gets a deferred callback attempt (which the runner retries) rather than an
+		// automatic hop to the second carrier.
+		// An INTERNAL callback is dialled as an AOR at the tenant's realm, exactly as the walker dials
+		// an extension. The party who waited in the queue was very often an extension, and the
+		// trunk-only branch below refused every one of them — a queue that promised a callback to a
+		// colleague could never make it.
+		const onNet = plan.context === "internal";
+		const realm = artifact.settings.realm;
+		if (onNet && (realm === undefined || realm === "")) {
+			return {
+				kind: "refused",
+				reason: "internal",
+				error: "the organization has no SIP realm to dial an internal callback at",
+			};
+		}
+		const node = plan.planNodeId === undefined ? undefined : artifact.nodes[plan.planNodeId];
+		const attempt =
+			!onNet && node?.kind === "trunk-dial"
+				? [...node.attempts].sort((left, right) => left.order - right.order)[0]
+				: undefined;
+		if (!onNet && attempt === undefined) {
+			return {
+				kind: "refused",
+				reason: "invalid_target",
+				error: `the route matching ${request.to} names no trunk to dial it on`,
+			};
+		}
+		const endpoint = onNet
+			? this.env.ENGINE_EXTENSION_DIAL_TEMPLATE.replaceAll("{number}", plan.destination)
+			: this.env.ENGINE_TRUNK_DIAL_TEMPLATE.replaceAll("{number}", plan.destination).replaceAll(
+					"{trunk}",
+					attempt?.name ?? "",
+				);
+
+		const callerId = plan.callerIdName ?? plan.callerIdNumber;
+		// Where the answered customer is walked to. The queue's number when it has one; its id
+		// otherwise, which the walk resolves the same way a dialled number would.
+		const dialed = request.queueNumber ?? request.queueId;
+		try {
+			await this.media.originate({
+				endpoint,
+				// The structured target for the SIP edge, exactly as the walker builds it: an AOR at the
+				// tenant's realm on net, the trunk row's id plus the number off it. The Asterisk plane
+				// ignores it and dials `endpoint`.
+				target: onNet
+					? { kind: "aor", aor: `sip:${plan.destination}@${realm ?? ""}` }
+					: { kind: "trunk", trunkId: attempt?.trunkId ?? "", number: plan.destination },
+				application: this.env.ARI_APP,
+				channelId: request.callbackId,
+				...(plan.callerIdNumber === undefined
+					? {}
+					: {
+							callerId:
+								callerId === plan.callerIdNumber
+									? plan.callerIdNumber
+									: `"${callerId ?? ""}" <${plan.callerIdNumber}>`,
+						}),
+				...(request.ringTimeoutSeconds === undefined
+					? {}
+					: { timeoutSeconds: request.ringTimeoutSeconds }),
+				variables: {
+					OPTIMIQ_ORG_ID: request.orgId,
+					// The direction the leg actually took: `outbound` over a trunk, `internal` when the
+					// party who waited was one of this tenant's own extensions. Calling an on-net
+					// callback `outbound` would bill an internal call as a carrier minute.
+					OPTIMIQ_CALL_DIRECTION: onNet ? "internal" : "outbound",
+					OPTIMIQ_ROUTING_CONTEXT: "internal",
+					OPTIMIQ_DIALED_NUMBER: dialed,
+					...(request.relatedCallId === undefined
+						? {}
+						: { [CDR_RELATED_CALL_ID_VARIABLE]: request.relatedCallId }),
+				},
+			});
+		} catch (error) {
+			this.logger.info(
+				{
+					callbackId: request.callbackId,
+					orgId: request.orgId,
+					queueId: request.queueId,
+					endpoint,
+					err: String(error),
+				},
+				"could not originate a queue callback towards the customer",
+			);
+			// `extension_offline` is the contract's "the far end could not be reached at all", which is
+			// what an unroutable trunk presents as. The runner reads any refusal as one spent attempt.
+			return {
+				kind: "refused",
+				reason: "extension_offline",
+				error: `could not reach ${request.to}: ${String(error)}`,
+			};
+		}
+
+		return {
+			kind: "placed",
+			callId: callIdForAriChannel(request.callbackId),
+			legId: this.domainLegId(request.callbackId),
+			endpoint,
 		};
 	}
 
@@ -3969,8 +5297,8 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	/**
 	 * The arriving INVITE as the arrival path reads it.
 	 *
-	 * Every one of the five variables `readEngineVariables` looks for is stamped here, and that is the
-	 * point rather than an optimisation. Under this plane there is no media server to read a variable
+	 * Every one of the variables `readEngineVariables` looks for is stamped here — the compiler now
+	 * says so, see {@link ARRIVAL_VARIABLES} — and that is the point rather than an optimisation. Under this plane there is no media server to read a variable
 	 * OFF — `MediadMediaPort` refuses `getVariable` because channel variables are a dialplan concept —
 	 * so the snapshot's `variables` map stops being "an OPTIMISATION, never the source of truth"
 	 * (`media-event.ts`) and becomes the only truth there is. `plans/sipd-invite-design.md` §3.4 calls
@@ -3994,6 +5322,27 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		// asked for a trunk-capable context, so what arrives here is a context the sender may have —
 		// and a digest-authenticated one keeps it, which is what lets a desk phone dial out.
 		const routingContext = request.routingContext;
+		// Exhaustive over `ArrivalVariable` on purpose: a name added to `ARRIVAL_VARIABLES` — which is
+		// what `readEngineVariables` reads back — does not compile until it is stamped here. An absent
+		// claim stays absent rather than becoming an empty string, so `attestationOf` can still tell
+		// "no claim" from "a claim that said nothing"; `definedOnly` drops the holes.
+		const variables: Record<ArrivalVariable, string | undefined> = {
+			OPTIMIQ_ORG_ID: organizationId,
+			// A digest-authenticated INVITE is an extension dialling: `internal`, which takes the
+			// internal-then-outbound ladder. A trunk INVITE is a carrier delivering a DID and is
+			// resolved against the DID table, which is what `inbound` selects.
+			OPTIMIQ_CALL_DIRECTION: request.authentication === "digest" ? "internal" : "inbound",
+			OPTIMIQ_ROUTING_CONTEXT: routingContext,
+			OPTIMIQ_LEG: "a",
+			[SIP_CALL_ID_VARIABLE]: request.sipCallId,
+			// The address every later command on this leg is sent to. See `channel-identity.ts`.
+			[SIPD_INSTANCE_ID_VARIABLE]: request.sipdInstanceId,
+			[REPLACES_LEG_ID_VARIABLE]: request.replacesLegId,
+			[DEVICE_ID_VARIABLE]: request.deviceId,
+			[SIP_ATTESTATION_VARIABLE]: request.attestation?.level,
+			[SIP_VERSTAT_VARIABLE]: request.attestation?.verstat,
+			[SIP_ORIGID_VARIABLE]: request.attestation?.origId,
+		};
 		return {
 			id: request.legId,
 			name: `sipd/${request.sipdInstanceId}`,
@@ -4001,21 +5350,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			callerNumber: request.from.number,
 			dialedNumber: request.to.number,
 			context: routingContext,
-			variables: {
-				OPTIMIQ_ORG_ID: organizationId,
-				// A digest-authenticated INVITE is an extension dialling: `internal`, which takes the
-				// internal-then-outbound ladder. A trunk INVITE is a carrier delivering a DID and is
-				// resolved against the DID table, which is what `inbound` selects.
-				OPTIMIQ_CALL_DIRECTION: request.authentication === "digest" ? "internal" : "inbound",
-				OPTIMIQ_ROUTING_CONTEXT: routingContext,
-				OPTIMIQ_LEG: "a",
-				[SIP_CALL_ID_VARIABLE]: request.sipCallId,
-				// The address every later command on this leg is sent to. See `channel-identity.ts`.
-				[SIPD_INSTANCE_ID_VARIABLE]: request.sipdInstanceId,
-				...(request.replacesLegId === undefined
-					? {}
-					: { [REPLACES_LEG_ID_VARIABLE]: request.replacesLegId }),
-			},
+			variables: definedOnly(variables),
 		};
 	}
 
@@ -4255,6 +5590,12 @@ function walkerChannelFor(aggregate: ChannelAggregate): WalkerChannel {
 		get callerIdName(): string | undefined {
 			return aggregate.snapshot.profile.callerIdName;
 		},
+		get deviceId(): string | undefined {
+			return aggregate.snapshot.variables[DEVICE_ID_VARIABLE];
+		},
+		get bridgeId(): string | undefined {
+			return aggregate.snapshot.bridgeId;
+		},
 		moveTo: (state) => aggregate.tryTransitionTo(state),
 		setBridge: (bridgeId) => {
 			aggregate.setBridge(bridgeId);
@@ -4283,8 +5624,100 @@ function emptyToUndefined(value: string | undefined): string | undefined {
 	return trimmed === undefined || trimmed === "" ? undefined : trimmed;
 }
 
+/**
+ * Queue id → the queue's own dialable number, off the artifact's exact-match table.
+ *
+ * There is no `queueId -> number` index in the artifact and no number on `QueuePlanNode`, which is
+ * why virtual hold went without one: the map is built by scanning the table the same way `parkLots`
+ * and `sharedLineFor` scan the nodes, and for the same reason — a second index kept in step with the
+ * first is worse than one pass over a table that has one entry per dialable thing in the tenant.
+ *
+ * A queue reachable on two numbers keeps the FIRST, which is the table's own iteration order and is
+ * stable for one artifact. Either number is a correct `from` for the outbound resolve, and picking
+ * deterministically is what stops two engines dialling the same callback under two toll classes.
+ */
+export function queueNumbersOf(artifact: RoutingArtifact): Record<string, string> {
+	const numbers: Record<string, string> = {};
+	for (const entry of Object.values(artifact.internal.numbers)) {
+		if (entry.kind === "queue" && numbers[entry.entityId] === undefined) {
+			numbers[entry.entityId] = entry.number;
+		}
+	}
+	return numbers;
+}
+
+/**
+ * The scheduler as a walk sees it, with the queue's own number folded in.
+ *
+ * `QueueCallbackSchedulePort.register` is deliberately three arguments — a queue session knows the
+ * queue it is in and the plan it promised, and nothing about the tenant's number plan — so the
+ * number is supplied HERE, where the artifact is in hand, rather than by widening the ACD plane's
+ * view of the world.
+ */
+export function queueCallbackPort(
+	scheduler: QueueCallbackScheduler,
+	numbers: Readonly<Record<string, string>> | undefined,
+): QueueCallbackSchedulePort {
+	return {
+		register: (orgId, queueId, plan) => {
+			const queueNumber = numbers?.[queueId];
+			scheduler.register(orgId, queueId, plan, queueNumber === undefined ? {} : { queueNumber });
+		},
+	};
+}
+
 function definedOnly(values: Readonly<Record<string, string | undefined>>): Record<string, string> {
 	return Object.fromEntries(
 		Object.entries(values).filter((entry): entry is [string, string] => entry[1] !== undefined),
 	);
 }
+
+/**
+ * One sentence naming why a verb did not run, for the walk's notes.
+ *
+ * The typed failure carries the useful half — `MediaCommandFailure.detail` is the media plane's own
+ * refusal, verbatim, which for `mediad` is a message like `no such prompt: sound:moh/default` that
+ * names the exact reference an operator has to go and provide. `Cause.pretty` is the fallback for a
+ * defect, where there is no typed failure to read and a stack is better than nothing.
+ */
+function verbFailureDetail(verb: string, cause: Cause.Cause<VerbFailure>): string {
+	const failure = Cause.findErrorOption(cause);
+	if (failure._tag === "None") {
+		return `the ${verb} verb died: ${Cause.pretty(cause)}`;
+	}
+	const error = failure.value;
+	switch (error._tag) {
+		case "MediaCommandFailure":
+			return `the media plane refused ${verb}: ${error.detail}`;
+		case "VerbNotPermittedFailure":
+			return `${verb} was not permitted: ${error.reason}`;
+		case "UnsupportedVerbFailure":
+			return `this engine does not implement ${error.verb}`;
+		default:
+			return `the ${verb} verb failed: ${error.message}`;
+	}
+}
+
+/**
+ * The cause every plane-loss teardown files: Q.850 41, "temporary failure".
+ *
+ * The same code `apps/sipd`'s claim reaper publishes for the identical event and the same one the
+ * drain gives a straggler. Not 16: a crash filed as a normal hang-up is an availability incident
+ * that cannot be seen in the CDR.
+ */
+const PLANE_LOSS_HANGUP_CAUSE = "NORMAL_TEMPORARY_FAILURE" as const;
+
+/** A plane this engine's legs depended on, and which is now gone. */
+export type PlaneLoss =
+	| {
+			/** No `mediad` answered the reachability probe, so every media session is dead. */
+			readonly plane: "media";
+			readonly instanceId?: undefined;
+			readonly reason: string;
+	  }
+	| {
+			/** One `sipd` stopped renewing its liveness lease. Its dialogs died with it. */
+			readonly plane: "signalling";
+			readonly instanceId: string;
+			readonly reason: string;
+	  };

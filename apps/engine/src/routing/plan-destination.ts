@@ -21,10 +21,36 @@ import type { PlanNode } from "@optimiq-voice/routing";
  * for those, so a report can tell "forwarded to a mobile" from "hung up".
  */
 
+/**
+ * Whether a ref may go on the wire as `destinationRef`.
+ *
+ * The CDR column and `cdrLegWriteDataSchema` both say UUID, and a value that is not one is not a
+ * ref this platform can file — it is a synthetic id the compiler invented for a node with no row.
+ * Checked here rather than at the writer because this is where the projection is made and where the
+ * "only kinds backed by a row" rule is already stated.
+ */
+function isUuid(value: string | undefined): value is string {
+	return (
+		value !== undefined &&
+		/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+	);
+}
+
 /** What the CDR records about where a call went. */
 export interface PlanDestination {
 	readonly destinationType: string;
 	readonly destinationRef?: string;
+	/**
+	 * The music-on-hold class this destination configured, when it configured one.
+	 *
+	 * Not a CDR field — it is carried here because this is already the projection that travels from
+	 * the walk onto the leg, and hold happens long after the walk has finished. A phone that presses
+	 * hold re-INVITEs with `sendonly` and names no music (SIP has no way to name any), so without
+	 * this the far end always got the media server's default class and a tenant's configured music
+	 * was reachable from the queue and the park lot and from nowhere else. See
+	 * `ChannelOrchestrator.onPhoneHold`.
+	 */
+	readonly mohClass?: string;
 }
 
 /**
@@ -38,25 +64,45 @@ export interface PlanDestination {
 export function planDestinationOf(node: PlanNode): PlanDestination | undefined {
 	switch (node.kind) {
 		case "extension": {
-			return { destinationType: node.kind, destinationRef: node.extensionId };
+			return {
+				destinationType: node.kind,
+				destinationRef: node.extensionId,
+				...(node.mohClass === undefined ? {} : { mohClass: node.mohClass }),
+			};
 		}
 		case "ring-group": {
-			return { destinationType: node.kind, destinationRef: node.ringGroupId };
+			return {
+				destinationType: node.kind,
+				destinationRef: node.ringGroupId,
+				...(node.mohClass === undefined ? {} : { mohClass: node.mohClass }),
+			};
 		}
 		case "ivr-menu": {
 			return { destinationType: node.kind, destinationRef: node.ivrMenuId };
 		}
 		case "queue": {
-			return { destinationType: node.kind, destinationRef: node.queueId };
+			return {
+				destinationType: node.kind,
+				destinationRef: node.queueId,
+				...(node.mohClass === undefined ? {} : { mohClass: node.mohClass }),
+			};
 		}
 		case "voicemail": {
 			return { destinationType: node.kind, destinationRef: node.voicemailBoxId };
 		}
 		case "conference": {
-			return { destinationType: node.kind, destinationRef: node.conferenceId };
+			return {
+				destinationType: node.kind,
+				destinationRef: node.conferenceId,
+				...(node.mohClass === undefined ? {} : { mohClass: node.mohClass }),
+			};
 		}
 		case "park": {
-			return { destinationType: node.kind, destinationRef: node.parkLotId };
+			return {
+				destinationType: node.kind,
+				destinationRef: node.parkLotId,
+				...(node.mohClass === undefined ? {} : { mohClass: node.mohClass }),
+			};
 		}
 		case "shared-line": {
 			// A shared line IS where the call went — the caller reached a seizable appearance — on the
@@ -72,7 +118,17 @@ export function planDestinationOf(node: PlanNode): PlanDestination | undefined {
 			return { destinationType: node.kind, destinationRef: node.pagingGroupId };
 		}
 		case "feature-code": {
-			return { destinationType: node.kind, destinationRef: node.featureCodeId };
+			// The ref is dropped when it is not a UUID, and that is not defensive coding — the
+			// compiler MINTS a synthetic `feature-code:<kind>:<uuid>` for the `*65`/`*64`-style
+			// call-flow and time-condition toggles, which have no `feature_code` row of their own.
+			// `cdrLegWriteDataSchema.destinationRef` is a `z.uuid()`, so a leg that visited one
+			// produced a CDR that could never validate; the engine retried the publish forever and
+			// never released the leg, and two of them held `activeChannels: 2` across a restart. The
+			// TYPE still travels, exactly as it does for `external`.
+			return {
+				destinationType: node.kind,
+				...(isUuid(node.featureCodeId) ? { destinationRef: node.featureCodeId } : {}),
+			};
 		}
 		case "trunk-dial": {
 			return { destinationType: node.kind, destinationRef: node.outboundRouteId };

@@ -321,3 +321,54 @@ describe("refuse, never throw", () => {
 		expect(fake.requests).toHaveLength(0);
 	});
 });
+
+/**
+ * Log level, which is a correctness property here rather than a cosmetic one.
+ *
+ * On a stack with stale WebSocket bindings this line was appearing 2.4 times per call — the third
+ * copy of a fact `apps/sipd` already logs and the caller already branches on — and it drowned the
+ * lines that do carry an action. A refusal that is a race outcome or stale state is DEBUG; one that
+ * names a fault, a limit or a build gap stays WARN.
+ */
+describe("refusal log level", () => {
+	function captured(sipd: SipdCommandClient) {
+		const levels: string[] = [];
+		const record = (level: string) => (_details: unknown, _message: string) => {
+			levels.push(level);
+		};
+		(sipd as unknown as { logger: Record<string, unknown> }).logger = {
+			debug: record("debug"),
+			info: record("info"),
+			warn: record("warn"),
+			error: record("error"),
+		};
+		return levels;
+	}
+
+	it.each([
+		["unknown_dialog", "debug"],
+		["dialog_gone", "debug"],
+		["wrong_instance", "debug"],
+		["invalid_state", "debug"],
+		["unregistered_target", "debug"],
+		["no_route", "debug"],
+		["internal", "warn"],
+		["bad_request", "warn"],
+		["capacity", "warn"],
+		["not_supported", "warn"],
+	])("logs a %s refusal at %s", async (reason, level) => {
+		const fake = fakeConnection();
+		const sipd = client(fake);
+		const levels = captured(sipd);
+		fake.reply(subjectFor.sipHangupRpc(EDGE), {
+			ok: false,
+			legId: "leg-a",
+			instanceId: EDGE,
+			reason,
+		});
+
+		await sipd.hangup(EDGE, { legId: "leg-a", cause: 16 });
+
+		expect(levels).toEqual([level]);
+	});
+});

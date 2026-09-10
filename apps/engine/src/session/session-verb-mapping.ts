@@ -13,7 +13,7 @@ import type { DtmfDigit, HangupCause, Verb, VerbResult } from "@optimiq-voice/te
  * `packages/events` models a verb as `{ verb, arguments }` — a name plus one flat argument record —
  * because the contract is generated into Go and the emitter has no representation for a tagged
  * union (see `sessionVerbArgumentsSchema`). `packages/telephony` models the same thing as a
- * discriminated union of 28 members, because that is what makes the engine's `switch` exhaustive at
+ * discriminated union of 30 members, because that is what makes the engine's `switch` exhaustive at
  * compile time. Both are right for where they are, and this file is the seam between them.
  *
  * That makes THIS the place the flat record's cost is paid, and paying it here is the point: a
@@ -125,6 +125,10 @@ export function toRuntimeVerb(request: SessionVerbRequest): VerbMappingResult {
 					...(args.format === undefined ? {} : { format: args.format }),
 				},
 			};
+		case "pauseRecord":
+			return { verb: { verb: "pauseRecord" } };
+		case "resumeRecord":
+			return { verb: { verb: "resumeRecord" } };
 		case "dial": {
 			if (args.targets === undefined || args.targets.length === 0) {
 				return missing("at least one target");

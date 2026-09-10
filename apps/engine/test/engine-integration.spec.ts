@@ -1298,6 +1298,7 @@ function itLeg(id: string): ControlledLeg & { bridgeId: string | undefined } {
 		bridgeId: undefined as string | undefined,
 		peerMediaChannelId: undefined,
 		callerIdNumber: `n-${id}`,
+		side: "a" as const,
 		moveTo: () => true,
 		moveCallStateTo: () => true,
 		setBridge: (bridgeId: string | undefined) => {
@@ -1356,9 +1357,11 @@ async function parkInstance(natsUrl: string, instanceId: string) {
 		ringingFor: async () => [],
 		activeCallsFor: () => [],
 		publish: async () => undefined,
+		markRecording: () => undefined,
 		route: async () => ({ status: "aborted", notes: [] }),
 		parkLotFor: async () => PARK_IT_LOT,
 		parkLotForSlot: async () => PARK_IT_LOT,
+		sharedLineFor: async () => undefined,
 	};
 	const control = new CallControl({
 		media,

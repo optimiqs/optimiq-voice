@@ -116,6 +116,17 @@ export class FakeMediadTransport implements MediadTransport {
 					sessionId: "leg-a",
 					instanceId: "mediad-fake",
 				};
+			case RPC_SUBJECTS.mediaPauseRecording:
+				// The state AFTER the command, like the mute reply below: `resume` is the request's
+				// bit and `paused` is its inverse, so a caller deriving one from the other is caught.
+				return {
+					ok: true,
+					recordingRef: request["recordingRef"],
+					paused: request["resume"] !== true,
+					applied: true,
+					sessionId: "leg-a",
+					instanceId: "mediad-fake",
+				};
 			case RPC_SUBJECTS.mediaMuteSession:
 				// Additive, exactly as the real one is: the reply carries the state AFTER the command,
 				// and a fake that echoed the request back would let a caller that derived its answer

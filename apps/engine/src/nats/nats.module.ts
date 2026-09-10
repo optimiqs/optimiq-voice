@@ -2,8 +2,11 @@ import { Global, Module } from "@nestjs/common";
 import { ClientsModule, Transport } from "@nestjs/microservices";
 import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import { loadEngineEnv } from "../config/engine-env";
+import { CallControlService } from "./call-control.service";
 import { CallEventPublisher } from "./call-event-publisher.service";
+import { ChannelWatchService } from "./channel-watch.service";
 import { ConferenceControlService } from "./conference-control.service";
+import { EngineLivenessService } from "./engine-liveness.service";
 import { ENVELOPE_ONLY_SERIALIZER } from "./envelope.serializer";
 import { JetStreamService } from "./jetstream.service";
 import { CALL_EVENTS_CLIENT, ENGINE_ENV, ROUTING_RPC_CLIENT } from "./nats.tokens";
@@ -85,7 +88,10 @@ import type { EngineEnv } from "../config/engine-env";
 	providers: [
 		{ provide: ENGINE_ENV, useFactory: () => loadEngineEnv() },
 		JetStreamService,
+		ChannelWatchService,
+		EngineLivenessService,
 		CallEventPublisher,
+		CallControlService,
 		ConferenceControlService,
 		OriginateService,
 		ParkHandoffService,
@@ -98,7 +104,10 @@ import type { EngineEnv } from "../config/engine-env";
 		ClientsModule,
 		ENGINE_ENV,
 		JetStreamService,
+		ChannelWatchService,
+		EngineLivenessService,
 		CallEventPublisher,
+		CallControlService,
 		ConferenceControlService,
 		OriginateService,
 		ParkHandoffService,

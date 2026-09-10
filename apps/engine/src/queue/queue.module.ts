@@ -1,5 +1,7 @@
 import { Global, Module } from "@nestjs/common";
 import { AgentStateStore } from "./agent-state.store";
+import { QueueCallbackDialerService } from "./queue-callback.dialer";
+import { QueueCallbackScheduler } from "./queue-callback.scheduler";
 import { QueueEventPublisher } from "./queue-event-publisher.service";
 import { QueueMembershipSource } from "./queue-membership.source";
 import { QueueCursors } from "./queue-registry";
@@ -23,11 +25,18 @@ import { QueueWaitingStore } from "./queue-waiting.store";
  * per queued caller, over that caller's channel and that caller's node, and it holds per-call state
  * (the penalty box, the frozen `sequential` order, the announcement clock). A singleton would need a
  * map keyed by call and would be one bug away from serving one caller's position to another.
+ *
+ * {@link QueueCallbackScheduler} IS a provider, and is the one thing here that owns a timer. It has
+ * to be a singleton for the reason the cursors do: two schedulers would be two sweeps over the same
+ * tokens, and a token read twice before either pass recorded its attempt is a customer rung twice.
+ * Its timer is cleared on `onApplicationShutdown`, so a draining engine leaks nothing.
  */
 @Global()
 @Module({
 	providers: [
 		QueueEventPublisher,
+		QueueCallbackDialerService,
+		QueueCallbackScheduler,
 		AgentStateStore,
 		QueueMembershipSource,
 		QueueWaitingStore,
@@ -35,6 +44,7 @@ import { QueueWaitingStore } from "./queue-waiting.store";
 	],
 	exports: [
 		QueueEventPublisher,
+		QueueCallbackScheduler,
 		AgentStateStore,
 		QueueMembershipSource,
 		QueueWaitingStore,

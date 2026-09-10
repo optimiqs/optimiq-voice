@@ -1,3 +1,4 @@
+import type { SipTransport } from "@optimiq-voice/events";
 import type { BridgeMode, HangupCause } from "@optimiq-voice/telephony";
 
 /**
@@ -55,7 +56,22 @@ export interface PlayRequest {
  * adapter, and this rides alongside it for the composite.
  */
 export type DialTarget =
-	| { readonly kind: "aor"; readonly aor: string; readonly contactUri?: string }
+	| {
+			readonly kind: "aor";
+			readonly aor: string;
+			readonly contactUri?: string;
+			/**
+			 * What `rpc.sip.v1.resolve-target` said about THIS contact, when a resolution has already
+			 * happened. ENGINE-LOCAL and never on the wire — `SplitPlaneMediaPort.originate` strips it
+			 * when it builds the request, because `sipDialTargetSchema` is the shape the Go side reads.
+			 *
+			 * It exists so the dial does not re-resolve what the walk resolved milliseconds earlier.
+			 * The edge answers `resolve-target` in ~2 ms idle and ~90 ms at a hundred concurrent calls,
+			 * so the second lookup was a whole round trip in the middle of a call setup that could only
+			 * ever produce the answer already in hand.
+			 */
+			readonly resolvedEdge?: { readonly instanceId: string; readonly transport: SipTransport };
+	  }
 	| { readonly kind: "trunk"; readonly trunkId: string; readonly number: string }
 	| { readonly kind: "uri"; readonly uri: string };
 
@@ -90,6 +106,17 @@ export interface OriginateRequest {
 	 * that hides a trunk's proxy and credentials; this carries them structurally instead.
 	 */
 	readonly target?: DialTarget;
+	/**
+	 * Whether {@link callerId} may be shown to the called party — CLIP/CLIR for this call.
+	 *
+	 * ADDITIVE and optional on the same contract {@link target} states: the `sipd` composite forwards
+	 * it and the edge writes the headers, while `AriMediaAdapter` and `MediadMediaPort` ignore it and
+	 * dial as before. Absent means `allowed`, so nothing that never sets it changes behaviour.
+	 *
+	 * The engine says only what it INTENDS. Anonymising is the edge's to do because only the edge
+	 * knows the trunk it is leaving on — see `sipOriginateRequestSchema.callerIdPresentation`.
+	 */
+	readonly callerIdPresentation?: "allowed" | "restricted";
 }
 
 export interface OriginatedChannel {
@@ -321,6 +348,22 @@ export interface MediaPort {
 	/** SIP 180. Alerting, no media. */
 	ring(channelId: string): Promise<void>;
 
+	/**
+	 * SIP 183 with an answer. Alerting WITH media, and still not billable.
+	 *
+	 * Separate from {@link ring} rather than an argument on it because the two differ in what the
+	 * driver must produce, not just in the status number: a 180 is a status line, while a 183 commits
+	 * this leg's offer/answer exchange and therefore needs a real SDP answer from the media plane
+	 * before it can be sent. A driver whose signalling and media are the same server (`AriMediaAdapter`)
+	 * has no way to say "answer the offer but do not answer the call" and refuses with
+	 * {@link import("./media-not-supported.error").MediaOperationNotSupportedError}, which is the same refusal `verb-executor.ts` already
+	 * makes for the `earlyMedia` verb on ARI.
+	 *
+	 * Idempotent by contract: a carrier that sends `183` several times must not re-negotiate the
+	 * caller's media or re-send the response on each one.
+	 */
+	earlyMedia(channelId: string): Promise<void>;
+
 	/** Start audio. Returns the handle the engine will stop it with. */
 	play(channelId: string, request: PlayRequest): Promise<PlaybackHandle>;
 
@@ -382,6 +425,27 @@ export interface MediaPort {
 
 	/** Finalise a recording started by {@link record}. Already-finished is a no-op. */
 	stopRecording(name: string): Promise<void>;
+
+	/**
+	 * Stop capturing audio into a live recording WITHOUT ending its file. PCI.
+	 *
+	 * A caller reads a card number, the agent pauses, and the recording stays ONE artifact with
+	 * silence where the number was. That is the whole reason this is not
+	 * {@link stopRecording} followed by {@link record}: a stop ends the object, publishes the
+	 * "it is safe to archive" event for half a call, and gives the rest a different object key —
+	 * so the CDR row that names the recording names half of it, and the boundary falls exactly
+	 * where a compliance reviewer is looking.
+	 *
+	 * Idempotent in both directions, and pausing a recording that has already finished is a no-op
+	 * for the same reason stopping one is: it may have hit its own limit first.
+	 *
+	 * The intervals themselves ride the driver's own "recording finished" event, because only the
+	 * process that wrote the audio knows where in the file the silence landed.
+	 *
+	 * @throws {import("./media-not-supported.error").MediaOperationNotSupportedError} when the
+	 * driver cannot pause a live recording.
+	 */
+	pauseRecording(name: string, paused: boolean): Promise<void>;
 
 	/** Start music on hold from a configured class. Separate from hold, which is signalling. */
 	startMusicOnHold(channelId: string, mohClass?: string): Promise<void>;

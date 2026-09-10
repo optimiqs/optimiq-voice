@@ -373,6 +373,10 @@ describe("call-control verbs", () => {
 					return { result: { ok: true }, recordingId: "rec-1", objectKey: "org/call/rec-1.wav" };
 				},
 				stopRecording: async () => ({ ok: true }),
+				pauseRecording: async (_leg, paused) => {
+					calls.push({ verb: "pauseRecording", args: paused });
+					return { ok: true };
+				},
 				dial: async (_leg, request) => {
 					calls.push({ verb: "dial", args: request });
 					return { result: { ok: true }, answeredTargetIndex: 0, bridged: true, notes: [] };
@@ -449,6 +453,39 @@ describe("call-control verbs", () => {
 		expect(bound.calls[0]?.args).toEqual({ maxDurationMs: 60_000 });
 	});
 
+	/**
+	 * Two verbs, one seam call, and the flag is the only thing that differs — so the assertion is on
+	 * the flag rather than on the verb name, which is what a resume dispatched as a pause would get
+	 * past.
+	 */
+	it("pauses and resumes a recording through the same seam call, with opposite flags", async () => {
+		const bound = boundExecutor();
+		successValue(await bound.dispatch({ verb: "pauseRecord" }));
+		successValue(await bound.dispatch({ verb: "resumeRecord" }));
+		expect(bound.calls).toEqual([
+			{ verb: "pauseRecording", args: true },
+			{ verb: "pauseRecording", args: false },
+		]);
+	});
+
+	/**
+	 * `AriMediaAdapter` has no pause at all, and `CallControl.pauseRecording` turns that into a
+	 * refusal rather than letting it escape. The executor must carry the reason across, because an
+	 * application told "internal" cannot tell a driver that will never support the verb from a
+	 * recording that simply is not running.
+	 */
+	it("carries a media plane's refusal to pause across as a reason, not a throw", async () => {
+		const bound = boundExecutor({
+			pauseRecording: async () => ({
+				ok: false,
+				reason: "the media plane cannot pause a recording: this driver has no pause",
+			}),
+		});
+		const failure = failureValue(await bound.dispatch({ verb: "pauseRecord" }));
+		expect(failure).toBeInstanceOf(VerbNotPermittedFailure);
+		expect((failure as VerbNotPermittedFailure).reason).toContain("has no pause");
+	});
+
 	it("turns a refusal into a typed failure carrying the reason", async () => {
 		const bound = boundExecutor({
 			hold: async () => ({ ok: false, reason: "the leg is already on hold" }),
@@ -477,6 +514,15 @@ describe("call-control verbs", () => {
 		const failure = failureValue(exit);
 		expect(failure).toBeInstanceOf(VerbNotPermittedFailure);
 		expect((failure as VerbNotPermittedFailure).reason).toContain("not handling the leg");
+
+		const pause = await Effect.runPromiseExit(
+			makeVerbExecutor({
+				media: fakeMedia().port,
+				collectDtmf: async () => COLLECTION,
+				callControl: registry,
+			}).dispatch(ANSWERED, { verb: "pauseRecord" }),
+		);
+		expect(failureValue(pause)).toBeInstanceOf(VerbNotPermittedFailure);
 	});
 
 	/**
@@ -602,6 +648,8 @@ describe("dispatch coverage", () => {
 		"stopPlay",
 		"setVariable",
 		"record",
+		"pauseRecord",
+		"resumeRecord",
 		"hold",
 		"unhold",
 		"park",
@@ -620,7 +668,7 @@ describe("dispatch coverage", () => {
 		// The executor's `switch` is exhaustive over the union at COMPILE time; this asserts the
 		// runtime consequence, so that a verb added to `packages/telephony` without a case here
 		// cannot slip through as an unhandled default.
-		expect(VERB_NAMES.length).toBe(28);
+		expect(VERB_NAMES.length).toBe(30);
 		expect([...IMPLEMENTED].every((verb) => (VERB_NAMES as readonly string[]).includes(verb))).toBe(
 			true,
 		);

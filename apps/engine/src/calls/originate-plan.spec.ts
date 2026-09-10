@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { ROUTING_ARTIFACT_VERSION } from "@optimiq-voice/routing";
-import { planOriginate } from "./originate-plan";
+import { planOriginate, planQueueCallback } from "./originate-plan";
+import type { QueueCallbackPlanInput } from "./originate-plan";
 import type { ExtensionIndexEntry, PlanNodeTable, RoutingArtifact } from "@optimiq-voice/routing";
 
 /**
@@ -92,13 +93,17 @@ function artifact(options: ArtifactOptions = {}): RoutingArtifact {
 				options.outbound === true
 					? [
 							{
-								routeId: "0195c0f0-1c2f-7000-8000-0000000000b1",
+								// `id` and `destinationNodeId` are the field names `resolveOutbound`
+								// reads. A rule spelled `routeId`/`nodeId` still MATCHES and then
+								// resolves to `plan: undefined`, so the case below would pass
+								// without ever exercising `planNodeId`.
+								id: "0195c0f0-1c2f-7000-8000-0000000000b1",
 								name: "everything",
 								priority: 100,
 								enabled: true,
 								patterns: [{ kind: "regex", value: "^\\+?[0-9]{6,15}$" }],
 								tollClass: "national",
-								nodeId: "trunk:pstn",
+								destinationNodeId: "trunk:pstn",
 							},
 						]
 					: [],
@@ -151,6 +156,32 @@ describe("planning a click-to-call", () => {
 		expect(result.ok === true && result.callerIdName).toBe("Support");
 	});
 
+	/**
+	 * The CLIR setting is not on `ExtensionIndexEntry` yet — the column, the compiler mapping and the
+	 * API surface are still to come — so the fixture writes it the way the compiler eventually will,
+	 * and the plan is asserted to carry it through untouched. Absent stays absent, which the edge
+	 * reads as `allowed`.
+	 */
+	it("carries the extension's caller-id presentation, and omits it when unset", () => {
+		const entry = {
+			extensionId: "0195c0f0-1c2f-7000-8000-0000000000e1",
+			nodeId: "ext:1001" as const,
+		};
+		const withSetting = plan({
+			numbers: { "1002": "ext:1002" },
+			extensions: {
+				"1001": {
+					...entry,
+					outboundCallerIdPresentation: "restricted",
+				} as Partial<ExtensionIndexEntry>,
+			},
+		});
+		expect(withSetting.ok === true && withSetting.callerIdPresentation).toBe("restricted");
+
+		const without = plan({ numbers: { "1002": "ext:1002" }, extensions: { "1001": entry } });
+		expect(without.ok === true && without.callerIdPresentation).toBeUndefined();
+	});
+
 	it("refuses an extension number this tenant does not have", () => {
 		const result = plan({ from: "9999", numbers: { "1002": "ext:1002" } });
 		expect(result.ok).toBe(false);
@@ -201,5 +232,102 @@ describe("planning a click-to-call", () => {
 			now: NOW,
 		});
 		expect(result.ok === true && result.endpoint).toBe("PJSIP/1001");
+	});
+});
+
+/**
+ * Virtual hold's half of the same file: the queue calls a customer back.
+ *
+ * The two things worth pinning are the ones that make it a separate function — the resolve runs the
+ * internal-then-outbound ladder and reports which rung matched, and the caller id presented is the
+ * queue's rather than anybody else's — plus the toll-class refusal, which fails closed on purpose.
+ */
+describe("planning a queue callback", () => {
+	function callback(
+		options: { readonly to?: string; readonly queueNumber?: string } & ArtifactOptions &
+			Pick<QueueCallbackPlanInput, "callerIdNumber" | "callerIdName"> = {},
+	) {
+		const { to, queueNumber, callerIdNumber, callerIdName, ...artifactOptions } = options;
+		return planQueueCallback(artifact(artifactOptions), {
+			to: to ?? "+15551234567",
+			now: NOW,
+			...(queueNumber === undefined ? {} : { queueNumber }),
+			...(callerIdNumber === undefined ? {} : { callerIdNumber }),
+			...(callerIdName === undefined ? {} : { callerIdName }),
+		});
+	}
+
+	const QUEUE_EXTENSION = {
+		"4010": {
+			extensionId: "0195c0f0-1c2f-7000-8000-0000000000f1",
+			nodeId: "ext:1001" as const,
+		},
+	};
+
+	it("dials the customer through the org's outbound routing", () => {
+		const result = callback({ outbound: true, queueNumber: "4010", extensions: QUEUE_EXTENSION });
+		expect(result.ok).toBe(true);
+		expect(result.ok === true && result.destination).toBe("+15551234567");
+		// The rule must RESOLVE, not merely match: a fixture whose id/destinationNodeId are
+		// misspelled still matches and yields `plan: undefined`, leaving this case green while
+		// the callback path is handed a route with no trunk on it.
+		expect(result.ok === true && result.planNodeId).toBe("trunk:pstn");
+	});
+
+	it("presents the caller id pinned on the queue, ahead of the route's own", () => {
+		const result = callback({
+			outbound: true,
+			queueNumber: "4010",
+			extensions: QUEUE_EXTENSION,
+			callerIdNumber: "+15559990000",
+			callerIdName: "Acme Support",
+		});
+		expect(result.ok === true && result.callerIdNumber).toBe("+15559990000");
+		expect(result.ok === true && result.callerIdName).toBe("Acme Support");
+	});
+
+	/**
+	 * The finding this rung exists for. The party who waited in a queue is as often an EXTENSION as a
+	 * customer on a trunk — an internal transfer into support, a branch office, a warm hand-off — and
+	 * an outbound-only resolve refused every one of them `invalid_target`, thirty seconds at a time,
+	 * after the caller had been told their place was held.
+	 */
+	it("dials an internal caller back, and says which rung matched", () => {
+		// The tenant has NO outbound route, and `1002` is one of its extensions.
+		const result = callback({
+			to: "1002",
+			numbers: { "1002": "ext:1002" },
+			queueNumber: "4010",
+			extensions: { ...QUEUE_EXTENSION, "1002": { nodeId: "ext:1002" as const } },
+		});
+		expect(result.ok).toBe(true);
+		expect(result.ok === true && result.context).toBe("internal");
+		expect(result.ok === true && result.destination).toBe("1002");
+	});
+
+	/**
+	 * The collision the outbound-only rule used to be afraid of is not one: an internal table holds
+	 * extension numbers, and a customer's number is an E.164 no extension table contains. So an
+	 * external number still takes the outbound rung it always did.
+	 */
+	it("still dials an external number outbound, and says so", () => {
+		const result = callback({ outbound: true, queueNumber: "4010", extensions: QUEUE_EXTENSION });
+		expect(result.ok).toBe(true);
+		expect(result.ok === true && result.context).toBe("outbound");
+	});
+
+	/**
+	 * Fails CLOSED. A queue with no number of its own has no toll entitlement to read, and inventing
+	 * one would turn a misconfigured callback into an unmetered dialler.
+	 */
+	it("refuses when the queue has no number to take a toll class from", () => {
+		const result = callback({ outbound: true });
+		expect(result.ok).toBe(false);
+		expect(result.ok === false && result.reason).toBe("invalid_target");
+	});
+
+	it("refuses a blank number rather than resolving one", () => {
+		const result = callback({ outbound: true, to: "   " });
+		expect(result.ok === false && result.reason).toBe("bad_request");
 	});
 });

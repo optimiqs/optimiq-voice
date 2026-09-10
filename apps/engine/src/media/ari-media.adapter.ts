@@ -1,5 +1,6 @@
 import { AriHttpError } from "@optimiq-voice/media-ari";
 import { ariReasonCodeFor } from "../calls/ari-mapping";
+import { MediaOperationNotSupportedError } from "./media-not-supported.error";
 import type {
 	BridgeHandle,
 	CreateBridgeRequest,
@@ -53,6 +54,21 @@ export class AriMediaAdapter implements MediaPort {
 
 	async ring(channelId: string): Promise<void> {
 		await this.client.channels.ring(channelId);
+	}
+
+	/**
+	 * ARI exposes `ring` (180) and `answer` (200) and nothing in between — there is no way to ask
+	 * Asterisk to answer the offer without answering the call, so a 183 carrying SDP cannot be
+	 * expressed. `verb-executor.ts` already refuses the `earlyMedia` VERB on this driver for exactly
+	 * this reason; refusing the port method too keeps the two from disagreeing.
+	 */
+	async earlyMedia(channelId: string): Promise<void> {
+		void channelId;
+		throw new MediaOperationNotSupportedError(
+			"earlyMedia",
+			"183 with an SDP answer, which ARI does not expose",
+			"ari",
+		);
 	}
 
 	async play(channelId: string, request: PlayRequest): Promise<PlaybackHandle> {
@@ -154,6 +170,24 @@ export class AriMediaAdapter implements MediaPort {
 
 	async stopRecording(name: string): Promise<void> {
 		await this.client.recordings.stop(name);
+	}
+
+	/**
+	 * Asterisk has `POST /recordings/live/{name}/pause`, but its pause SHORTENS the file rather than
+	 * silencing it: the audio after the gap moves earlier, so the offsets a reviewer would read the
+	 * intervals against are not the offsets in the object. Serving `pauseRecording` off it would
+	 * hand back intervals that do not name the silence they describe, which is worse than a refusal
+	 * — a compliance answer that is confidently wrong. `mediad` writes silence on its own clock and
+	 * keeps the timeline, so the capability lives there.
+	 */
+	async pauseRecording(name: string, paused: boolean): Promise<void> {
+		void name;
+		void paused;
+		throw new MediaOperationNotSupportedError(
+			"pauseRecording",
+			"a pause that keeps the file's timeline, which ARI's shortening pause does not",
+			"ari",
+		);
 	}
 
 	async startMusicOnHold(channelId: string, mohClass?: string): Promise<void> {

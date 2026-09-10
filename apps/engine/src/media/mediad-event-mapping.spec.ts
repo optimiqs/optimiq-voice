@@ -173,6 +173,34 @@ describe("toMediaEventFromMediad", () => {
 		});
 	});
 
+	it("carries the PCI pause intervals through, since nothing above the seam can produce them", () => {
+		const event = makeMediaEvent("recording.finished", {
+			orgId: ORG,
+			source: "mediad",
+			data: {
+				sessionId: SESSION,
+				instanceId: "mediad-1",
+				callId: CALL,
+				recordingRef: "rec-1",
+				reason: "stopped" as const,
+				durationMs: 30_000,
+				bytes: 480_044,
+				objectKey: `${ORG}/${CALL}/rec-1.wav`,
+				direction: "both" as const,
+				pauses: [{ startMs: 8_000, endMs: 14_000 }],
+			},
+		});
+
+		expect(toMediaEventFromMediad(event)).toMatchObject({
+			type: "recording-finished",
+			pauses: [{ startMs: 8_000, endMs: 14_000 }],
+		});
+	});
+
+	it("leaves the pauses off a recording nobody paused", () => {
+		expect(toMediaEventFromMediad(recordingFinished())).not.toHaveProperty("pauses");
+	});
+
 	it("treats every complete-file ending as finished, however the recording stopped", () => {
 		// A voicemail that ran out of silence is the NORMAL end of a voicemail, and a caller who hung
 		// up mid-message still left a playable message. Reporting either as a failure would throw

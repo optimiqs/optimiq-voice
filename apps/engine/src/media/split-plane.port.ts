@@ -1,9 +1,11 @@
 import { getLogger, type PinoLogger } from "@optimiq-voice/logging";
 import { hangupCauseCode } from "@optimiq-voice/telephony";
+import { SIP_CALL_ID_VARIABLE } from "../calls/channel-identity";
 import {
 	MediaCommandRefusedError,
 	MediaOperationNotSupportedError,
 } from "./media-not-supported.error";
+import type { RpcLatencyReport } from "../nats/rpc-latency";
 import type { SipdCommandPort } from "../nats/sipd-command.client";
 import type {
 	BridgeHandle,
@@ -48,6 +50,24 @@ interface LegRecord {
 	instanceId: string | undefined;
 	/** The A-leg's offer, which `answer` hands to `mediad` to produce the 200 OK's body. */
 	sdpOffer: string | undefined;
+	/**
+	 * The leg this one was originated FOR, on an outbound leg the walker dialled.
+	 *
+	 * Recorded because such a B-leg is deliberately not filed as a call of its own, so when its
+	 * carrier sends early media there is no registry entry to walk back to the caller who should hear
+	 * it. Kept here rather than in a map of its own so it is evicted by the same {@link
+	 * SplitPlaneMediaPort.forget} that already bounds every other fact about the leg.
+	 */
+	originatorChannelId: string | undefined;
+	/**
+	 * The answer `mediad` wrote for this leg's `183`, on an A-leg that has relayed early media.
+	 *
+	 * Both the idempotency latch for {@link SplitPlaneMediaPort.earlyMedia} — a carrier that sends
+	 * five `18x` must not renegotiate the caller five times — and the body the later `200 OK` repeats.
+	 * RFC 3261 §13.2.1 requires that repeat, and `sipd` guarantees it from its own record; producing a
+	 * SECOND answer here would allocate a second session for a leg that already has one.
+	 */
+	earlyMediaAnswer: string | undefined;
 }
 
 /**
@@ -140,6 +160,17 @@ export class SplitPlaneMediaPort implements MediaPort {
 	private readonly legs = new Map<string, LegRecord>();
 
 	/**
+	 * Set while the media relay is known to be gone, so a release is skipped rather than waited on.
+	 *
+	 * Not an optimisation. When `mediad` dies the engine has to hang up every leg it was holding, and
+	 * each of those teardowns would otherwise spend the full RPC timeout waiting for a reply from a
+	 * process that no longer exists — serialised, that is the difference between ending fifty calls
+	 * in a moment and ending them over half a minute. A relay that died holding its sessions has
+	 * nothing left to leak on its side either, so there is nothing the skipped release would free.
+	 */
+	private mediaPlaneLost = false;
+
+	/**
 	 * The engine-side channel-variable store, §3.4.
 	 *
 	 * Kept OUT of {@link LegRecord} on purpose: variables are written and read independently of a leg's
@@ -161,6 +192,15 @@ export class SplitPlaneMediaPort implements MediaPort {
 		private readonly logger: PinoLogger = getLogger("engine.split-plane"),
 		private readonly engineInstanceId?: string,
 	) {}
+
+	/**
+	 * Per-command round-trip latency to the SIP edge, since boot. Empty when the signalling client
+	 * does not keep any — a fake in a spec. Read by `/healthz`, where it is the half of "where did
+	 * the call setup go" that belongs to `apps/sipd`; `MediadService.rpcLatency` is the other half.
+	 */
+	get signallingLatency(): Record<string, RpcLatencyReport> {
+		return this.signalling.rpcLatency ?? {};
+	}
 
 	// --- registration: the lead hands the composite each leg's plane state ------------------------
 
@@ -185,6 +225,8 @@ export class SplitPlaneMediaPort implements MediaPort {
 			role: "inbound",
 			instanceId: context.sipdInstanceId,
 			sdpOffer: context.sdpOffer,
+			originatorChannelId: undefined,
+			earlyMediaAnswer: undefined,
 		});
 	}
 
@@ -204,7 +246,58 @@ export class SplitPlaneMediaPort implements MediaPort {
 			role: "outbound",
 			instanceId: undefined,
 			sdpOffer: undefined,
+			originatorChannelId: undefined,
+			earlyMediaAnswer: undefined,
 		});
+	}
+
+	/**
+	 * Restores the plane state of a leg this instance ADOPTED from a dead engine replica.
+	 *
+	 * ## Why registration is not optional after an adoption
+	 *
+	 * Everything this class holds is in memory, by nature — a dialog lives on one `sipd` and the
+	 * offer that answered it is a moment in time. When a replica dies, the surviving engine rebuilds
+	 * the aggregate from the `channels` snapshot but had, until this method, no way to rebuild the
+	 * leg record. The consequence is quiet and expensive: {@link hangup} tolerates a missing leg, so
+	 * the adopted call's BYE was never sent to the edge. The phones stayed up, the aggregate was
+	 * torn down, and the CDR recorded a call that both parties could still hear.
+	 *
+	 * ## What is recoverable, and what deliberately is not
+	 *
+	 * The owning `sipd` instance travels in the snapshot as a channel variable, and it is the one
+	 * field every later command on the leg needs. The SDP offer does not travel and is not restored:
+	 * an adopted leg is by definition already answered, and {@link answer} is the only operation that
+	 * wants the offer — so a leg that somehow needed answering again fails loudly with
+	 * {@link SplitPlaneLegStateError} rather than answering with a body from another call. Adopted
+	 * legs are recorded as `inbound` because that is the role the edge's own dialog record has;
+	 * nothing below this seam distinguishes them once the dialog is established.
+	 */
+	registerAdoptedLeg(
+		channelId: string,
+		context: {
+			readonly orgId: string;
+			readonly callId: string;
+			readonly sipdInstanceId: string | undefined;
+			readonly variables?: Readonly<Record<string, string>>;
+		},
+	): void {
+		this.legs.set(channelId, {
+			orgId: context.orgId,
+			callId: context.callId,
+			role: "inbound",
+			instanceId: context.sipdInstanceId,
+			sdpOffer: undefined,
+			originatorChannelId: undefined,
+			earlyMediaAnswer: undefined,
+		});
+		if (context.variables !== undefined) {
+			// The variable store is the SOURCE of truth on this plane (§3.4) — there is no dialplan
+			// and no media server holding a copy — so a leg adopted with an empty store would answer
+			// every `getVariable` with `undefined`, which is how a resumed call loses its recording
+			// flag and its CDR cause.
+			this.variables.set(channelId, new Map(Object.entries(context.variables)));
+		}
 	}
 
 	/**
@@ -227,6 +320,35 @@ export class SplitPlaneMediaPort implements MediaPort {
 	forget(channelId: string): void {
 		this.legs.delete(channelId);
 		this.variables.delete(channelId);
+	}
+
+	/** The leg an outbound leg was originated for, when one was named. */
+	originatorOf(channelId: string): string | undefined {
+		return this.legs.get(channelId)?.originatorChannelId;
+	}
+
+	/** The legs this composite believes `sipd` instance `instanceId` holds the dialog for. */
+	legsForInstance(instanceId: string): readonly string[] {
+		const legs: string[] = [];
+		for (const [channelId, leg] of this.legs) {
+			if (leg.instanceId === instanceId) {
+				legs.push(channelId);
+			}
+		}
+		return legs;
+	}
+
+	/** Every leg this composite still holds plane state for. Read by the plane-loss teardown. */
+	get legIds(): readonly string[] {
+		return [...this.legs.keys()];
+	}
+
+	/**
+	 * Declares the media relay gone (or back), so releases stop waiting on a process that is not
+	 * there. See {@link mediaPlaneLost}; a leg's own teardown is otherwise unchanged.
+	 */
+	setMediaPlaneLost(lost: boolean): void {
+		this.mediaPlaneLost = lost;
 	}
 
 	// --- MediaPort: bridge mode and the three signalling compositions -----------------------------
@@ -267,7 +389,13 @@ export class SplitPlaneMediaPort implements MediaPort {
 		const groups = new Map<number, DialTarget[]>();
 		for (const contact of [...reply.contacts].sort((a, b) => b.q - a.q)) {
 			const group = groups.get(contact.q) ?? [];
-			group.push({ ...target, contactUri: contact.requestUri });
+			// The edge and transport travel WITH the contact, so the dial below does not ask the same
+			// question again. See `DialTarget.resolvedEdge`.
+			group.push({
+				...target,
+				contactUri: contact.requestUri,
+				resolvedEdge: { instanceId: contact.instanceId, transport: contact.transport },
+			});
 			groups.set(contact.q, group);
 		}
 		return [...groups.values()];
@@ -325,6 +453,26 @@ export class SplitPlaneMediaPort implements MediaPort {
 		}
 		if (leg.instanceId === undefined) {
 			throw new SplitPlaneLegStateError("answer", channelId, "no owning sipd instance is known");
+		}
+
+		// A leg that already relayed early media has a committed offer/answer exchange and a live
+		// `mediad` session. RFC 3261 §13.2.1 says the 200 repeats that same answer, and allocating a
+		// second session for a leg that has one would strand the first — so the 200 carries the bytes
+		// the 183 carried and nothing is negotiated twice.
+		if (leg.earlyMediaAnswer !== undefined) {
+			const reply = await this.signalling.answer(leg.instanceId, {
+				legId: channelId,
+				sdpAnswer: leg.earlyMediaAnswer,
+			});
+			if (!reply.ok) {
+				throw new SplitPlaneSignallingRefusedError(
+					"answer",
+					channelId,
+					reply.reason,
+					reply.error ?? "no detail",
+				);
+			}
+			return;
 		}
 
 		// Same shape as `originate`'s cleanup, and for a sharper reason: a `sipd` refusal here is a
@@ -393,6 +541,93 @@ export class SplitPlaneMediaPort implements MediaPort {
 	}
 
 	/**
+	 * `183 Session Progress` with the media plane's answer — the caller hears the carrier.
+	 *
+	 * Composed exactly like {@link answer}, and deliberately so: the only difference between a 183 and a
+	 * 200 on this plane is the status line `sipd` puts on the response, because both COMMIT the A-leg's
+	 * offer/answer exchange and both therefore need a real answer from `mediad` first. What must NOT
+	 * follow is any of the billing `answer` triggers — the orchestrator keeps `markAnswered` on `active`
+	 * — since a caller listening to a carrier's announcement has not been connected to anyone.
+	 *
+	 * Idempotent: the answer is latched on the leg record, so the second, third and fifth `18x` a chatty
+	 * carrier sends find the work already done rather than renegotiating a caller mid-announcement.
+	 * That latch is also what the later {@link answer} repeats.
+	 */
+	async earlyMedia(channelId: string): Promise<void> {
+		const leg = this.require("earlyMedia", channelId);
+		if (leg.earlyMediaAnswer !== undefined) {
+			return;
+		}
+		if (leg.sdpOffer === undefined) {
+			throw new SplitPlaneLegStateError(
+				"earlyMedia",
+				channelId,
+				"no A-leg SDP offer was registered",
+			);
+		}
+		if (leg.instanceId === undefined) {
+			throw new SplitPlaneLegStateError(
+				"earlyMedia",
+				channelId,
+				"no owning sipd instance is known",
+			);
+		}
+
+		// `sendrecv`, the same direction `answer` asks for, even though early media only needs B→A.
+		// `mediad`'s `ApplyDirection` moves the mute flags and never the session mode, so a leg
+		// narrowed here would have to be widened by a second negotiation at the 200 — and the 200
+		// repeats this answer rather than negotiating. One direction for the life of the leg is the
+		// only shape that stays true through both responses.
+		//
+		// `answer`'s cleanup, for `answer`'s reason: a CANCEL that raced the 183 tears the aggregate
+		// down before anything downstream could release the session this just allocated.
+		try {
+			const allocation = await this.media.allocateSession({
+				sessionId: channelId,
+				orgId: leg.orgId,
+				callId: leg.callId,
+				legId: channelId,
+				sdpOffer: leg.sdpOffer,
+				direction: "sendrecv",
+			});
+			if (allocation.sdpAnswer === undefined) {
+				throw new SplitPlaneLegStateError(
+					"earlyMedia",
+					channelId,
+					"mediad allocated the session but produced no SDP answer",
+				);
+			}
+
+			const reply = await this.signalling.ring(leg.instanceId, {
+				legId: channelId,
+				status: 183,
+				sdpAnswer: allocation.sdpAnswer,
+			});
+			if (!reply.ok) {
+				throw new SplitPlaneSignallingRefusedError(
+					"earlyMedia",
+					channelId,
+					reply.reason,
+					reply.error ?? "no detail",
+				);
+			}
+			// Latched only once the 183 is on the wire: a refused response is not a committed exchange,
+			// and latching before it would leave the later 200 repeating an answer nobody ever received.
+			leg.earlyMediaAnswer = allocation.sdpAnswer;
+		} catch (error) {
+			try {
+				await this.media.releaseSession(channelId);
+			} catch (cleanupError) {
+				this.logger.error(
+					{ channelId, err: cleanupError },
+					"failed to release the media session of a refused early-media response",
+				);
+			}
+			throw error;
+		}
+	}
+
+	/**
 	 * Place a call — a UAC INVITE composed of a `mediad` offer and a `sipd` originate (§5).
 	 *
 	 * Ask `mediad` to WRITE an offer for the B-leg (it has none — we are the caller), hand that offer to
@@ -412,11 +647,28 @@ export class SplitPlaneMediaPort implements MediaPort {
 			);
 		}
 		const leg = this.require("originate", request.channelId);
-		const resolved = await this.signalling.resolveTarget?.({
-			legId: request.channelId,
-			orgId: leg.orgId,
-			target: request.target,
-		});
+		// The caller this leg is being dialled FOR, kept so early media on it can be relayed back to
+		// them: a walker-dialled B-leg is not filed in the registry, so this record is the only path
+		// from the carrier's 183 to the person who should hear what it carries.
+		leg.originatorChannelId = request.originatorChannelId;
+		// A target the WALK already resolved carries its edge with it, and re-asking could only
+		// produce the same answer a whole round trip later — on the one path a caller hears as
+		// silence before ringback. Anything else (a trunk, a bare URI, an AoR nobody has resolved)
+		// still asks.
+		const carried =
+			request.target.kind === "aor" && request.target.resolvedEdge !== undefined
+				? request.target.resolvedEdge
+				: undefined;
+		const resolved =
+			carried === undefined
+				? await this.signalling.resolveTarget?.({
+						legId: request.channelId,
+						orgId: leg.orgId,
+						target: wireTarget(request.target),
+					})
+				: undefined;
+		const edge = carried?.instanceId ?? resolved?.instanceId;
+		const transport = carried?.transport ?? resolved?.transport;
 		if (resolved !== undefined && !resolved.ok) {
 			throw new SplitPlaneSignallingRefusedError(
 				"originate",
@@ -426,13 +678,10 @@ export class SplitPlaneMediaPort implements MediaPort {
 			);
 		}
 
-		if (resolved?.instanceId !== undefined)
-			this.setInstance(request.channelId, resolved.instanceId);
+		if (edge !== undefined) this.setInstance(request.channelId, edge);
 		try {
 			const offer = await this.media.createOffer({
-				...(resolved?.transport === "ws" || resolved?.transport === "wss"
-					? { transport: "webrtc" as const }
-					: {}),
+				...(transport === "ws" || transport === "wss" ? { transport: "webrtc" as const } : {}),
 				sessionId: request.channelId,
 				orgId: leg.orgId,
 				callId: leg.callId,
@@ -456,9 +705,10 @@ export class SplitPlaneMediaPort implements MediaPort {
 					callId: leg.callId,
 					target:
 						request.target.kind === "aor" && resolved?.requestUri !== undefined
-							? { ...request.target, contactUri: resolved.requestUri }
-							: request.target,
+							? wireTarget({ ...request.target, contactUri: resolved.requestUri })
+							: wireTarget(request.target),
 					...splitCallerId(request.callerId),
+					callerIdPresentation: this.callerIdPresentation(request),
 					sdpOffer: offer.sdpOffer,
 					headers: Object.fromEntries(
 						["Alert-Info", "Call-Info"].flatMap((name) => {
@@ -470,7 +720,7 @@ export class SplitPlaneMediaPort implements MediaPort {
 						? {}
 						: { ringTimeoutMs: request.timeoutSeconds * MILLIS_PER_SECOND }),
 				},
-				resolved?.instanceId,
+				edge,
 			);
 			if (!reply.ok) {
 				throw new SplitPlaneSignallingRefusedError(
@@ -482,6 +732,15 @@ export class SplitPlaneMediaPort implements MediaPort {
 			}
 			if (reply.instanceId !== undefined) {
 				this.setInstance(request.channelId, reply.instanceId);
+			}
+			// The B-leg's SIP `Call-ID`, from the only place the engine will ever be told it
+			// synchronously. There is no `CHANNEL(pjsip,call-id)` on this plane — the orchestrator's
+			// fallback read is an Asterisk function this port answers out of a local map nothing else
+			// writes — so without this stamp an originated leg has no dialog identity at all: its CDR
+			// row carries no `sip_call_id` and `resolveSipDialog` cannot find it, which is what makes
+			// the engine answer `unknown_dialog` to a REFER the ANSWERING party sends.
+			if (reply.sipCallId !== undefined && reply.sipCallId !== "") {
+				await this.setVariable(request.channelId, SIP_CALL_ID_VARIABLE, reply.sipCallId);
 			}
 			return { channelId: request.channelId };
 		} catch (error) {
@@ -538,15 +797,43 @@ export class SplitPlaneMediaPort implements MediaPort {
 				}
 			}
 		} finally {
-			await this.media.releaseSession(channelId);
+			await this.releaseMediaQuietly(channelId);
 			this.forget(channelId);
 		}
 	}
 
 	/** A remote BYE has already ended signalling; release its media without sending another BYE. */
 	async releaseEndedLeg(channelId: string): Promise<void> {
-		await this.media.releaseSession(channelId);
+		await this.releaseMediaQuietly(channelId);
 		this.forget(channelId);
+	}
+
+	/**
+	 * Releases a leg's media session, treating an unreachable relay as released.
+	 *
+	 * A throw here used to propagate out of `hangup`'s `finally` and out of `releaseEndedLeg`, which
+	 * skipped {@link forget}: the dialog was gone, the media server was gone, and the leg stayed
+	 * pinned in this port and counted in `activeChannels` for the life of the process. A relay that
+	 * cannot answer has no session left to leak on its side either — it died holding it — so the only
+	 * thing a failed release can still cost is the state on THIS side, and dropping that is the
+	 * point of the call.
+	 *
+	 * When the relay is KNOWN to be gone ({@link setMediaPlaneLost}) the request is not made at all:
+	 * the outcome is identical and the timeout is not paid once per leg while a plane-loss teardown
+	 * is trying to end every call on the instance.
+	 */
+	private async releaseMediaQuietly(channelId: string): Promise<void> {
+		if (this.mediaPlaneLost) {
+			return;
+		}
+		try {
+			await this.media.releaseSession(channelId);
+		} catch (error) {
+			this.logger.warn(
+				{ channelId, err: String(error) },
+				"the media relay did not confirm a session release; dropping the leg anyway",
+			);
+		}
 	}
 
 	// --- MediaPort: channel variables, served from the engine's own store (§3.4) -------------------
@@ -584,6 +871,10 @@ export class SplitPlaneMediaPort implements MediaPort {
 
 	async stopRecording(name: string): Promise<void> {
 		await this.media.stopRecording(name);
+	}
+
+	async pauseRecording(name: string, paused: boolean): Promise<void> {
+		await this.media.pauseRecording(name, paused);
 	}
 
 	async sendDtmf(channelId: string, request: SendDtmfRequest): Promise<void> {
@@ -686,7 +977,40 @@ export class SplitPlaneMediaPort implements MediaPort {
 		}
 		return leg;
 	}
+
+	/**
+	 * CLIR for this leg: the per-call override first, the configured setting second.
+	 *
+	 * The override is a channel variable rather than a request field because the thing that will
+	 * eventually set it — a `*67`/`*82` prefix code — belongs to the dial plan, and the dial plan's
+	 * only seam onto a leg is {@link OriginateRequest.variables}. It is read from the ORIGINATING
+	 * leg's store as well as this request's own variables: a caller who dials `*67` stamps their own
+	 * A-leg, and the B-leg the walk then dials is a different channel that must still be anonymised.
+	 *
+	 * A value that is neither `allowed` nor `restricted` is ignored rather than refused — an unknown
+	 * override must not be the thing that turns a dial into a failed call, and falling through to the
+	 * setting is the safe reading of it.
+	 */
+	private callerIdPresentation(request: OriginateRequest): "allowed" | "restricted" | undefined {
+		const originator = request.originatorChannelId;
+		const override =
+			request.variables?.[CLIR_VARIABLE] ??
+			(originator === undefined ? undefined : this.variables.get(originator)?.get(CLIR_VARIABLE));
+		if (override === "allowed" || override === "restricted") {
+			return override;
+		}
+		return request.callerIdPresentation;
+	}
 }
+
+/**
+ * The per-call CLIR override, in the `OPTIMIQ_*` channel-variable convention the engine already uses.
+ *
+ * `allowed` or `restricted`; anything else is ignored. It exists so a dial-plan prefix code can drive
+ * presentation the day `packages/routing` grows a caller-id feature-code action — today nothing in
+ * the product writes it, and the configured setting decides.
+ */
+export const CLIR_VARIABLE = "OPTIMIQ_CLIR";
 
 /** `RecordRequest`/`OriginateRequest` speak seconds; the `sip.v1` wire speaks milliseconds. */
 const MILLIS_PER_SECOND = 1_000;
@@ -714,5 +1038,23 @@ function splitCallerId(callerId: string | undefined): {
 	return {
 		...(name === undefined || name === "" ? {} : { callerIdName: name }),
 		...(number === undefined ? {} : { callerIdNumber: number }),
+	};
+}
+
+/**
+ * A dial target as the WIRE carries it — `sipDialTargetSchema` and nothing else.
+ *
+ * `DialTarget.resolvedEdge` is the engine's own note to itself about a resolution it already has;
+ * `apps/sipd` unmarshals a bare contract struct and has no field for it. Stripping it here keeps
+ * the promise `DialTarget`'s own doc makes, that it mirrors the schema exactly.
+ */
+function wireTarget(target: DialTarget): DialTarget {
+	if (target.kind !== "aor" || target.resolvedEdge === undefined) {
+		return target;
+	}
+	return {
+		kind: "aor",
+		aor: target.aor,
+		...(target.contactUri === undefined ? {} : { contactUri: target.contactUri }),
 	};
 }

@@ -178,6 +178,26 @@ export class SipInviteService implements OnApplicationBootstrap, OnApplicationSh
 	private draining = false;
 	private served = 0;
 	private admitted = 0;
+	/**
+	 * Refusals since boot, by reason. Kept here rather than derived from `served - admitted`, which
+	 * is not the same number — an INVITE can be served and still be in flight — and which cannot say
+	 * WHICH refusal an operator is looking at. The keys are a closed union, so this map is bounded by
+	 * the vocabulary and is safe to publish as a metric label.
+	 */
+	private readonly refusals = new Map<SipInviteRefusalReason, number>();
+	/** The admissions running right now. Its SIZE is the concurrency ceiling's counter. */
+	private readonly inFlight = new Set<Promise<void>>();
+	/**
+	 * Admissions in progress, by the edge's leg id.
+	 *
+	 * `placeInvitedCall` is idempotent on `legId` against a leg it has ALREADY filed. It cannot be
+	 * idempotent against one still being filed, and concurrency is what makes that window reachable:
+	 * an edge retry arriving inside its own one-second deadline would find no leg in the registry
+	 * yet, race the first attempt to the `channels` compare-and-set, lose it, and be refused
+	 * `internal` — a `500` for a call that is going through. Sharing the first attempt's reply
+	 * answers the retry with the truth instead.
+	 */
+	private readonly admitting = new Map<string, Promise<SipInviteResponse>>();
 
 	constructor(
 		@Inject(ENGINE_ENV) private readonly env: EngineEnv,
@@ -189,11 +209,13 @@ export class SipInviteService implements OnApplicationBootstrap, OnApplicationSh
 		readonly listening: boolean;
 		readonly served: number;
 		readonly admitted: number;
+		readonly refusals: Readonly<Partial<Record<SipInviteRefusalReason, number>>>;
 	} {
 		return {
 			listening: this.subscription !== undefined,
 			served: this.served,
 			admitted: this.admitted,
+			refusals: Object.fromEntries(this.refusals),
 		};
 	}
 
@@ -229,22 +251,25 @@ export class SipInviteService implements OnApplicationBootstrap, OnApplicationSh
 		const subscription = this.subscription;
 
 		void (async () => {
+			const ceiling = this.env.ENGINE_SIP_INVITE_CONCURRENCY;
 			for await (const message of subscription) {
-				// Sequential, as with every other responder on this connection. Admission is a tenant
-				// lookup and a claim write, both bounded, and the alternative — admitting concurrently
-				// off one loop — would let a slow `did-index` read accumulate half-admitted calls nobody
-				// is waiting for, on the one path an attacker controls the rate of.
-				const reply = await this.answer(message.data);
-				if (message.reply === undefined) {
-					this.logger.warn({ subject }, "an invite arrived with no reply subject");
-					continue;
+				// Admitted with BOUNDED concurrency, not one at a time. Admission is a tenant lookup, a
+				// ceiling check and a `channels` compare-and-set — three NATS round trips this loop does
+				// nothing but wait on — so serialising them makes the hundredth caller in a burst wait
+				// out the ninety-nine in front of them for no protection at all. The ceiling is what the
+				// old comment here was actually reaching for: the rate on this path is chosen by whoever
+				// is calling in, so a flood must queue in the BROKER, where the edge's own deadline turns
+				// it into a `503` a carrier can fail over, rather than in this process's heap.
+				while (this.inFlight.size >= ceiling) {
+					await Promise.race(this.inFlight);
 				}
-				message.respond(this.encoder.encode(JSON.stringify(reply)));
-				this.served += 1;
-				if (reply.ok) {
-					this.admitted += 1;
-				}
+				const served = this.serve(message);
+				this.inFlight.add(served);
+				void served.finally(() => this.inFlight.delete(served));
 			}
+			// A drain must not answer the last INVITEs with a closed socket: the loop ends when the
+			// subscription does, and anything still admitting has a caller holding a handset.
+			await Promise.allSettled(this.inFlight);
 			if (!this.draining) {
 				this.logger.warn({ subject }, "the sip invite subscription ended unexpectedly");
 			}
@@ -263,6 +288,55 @@ export class SipInviteService implements OnApplicationBootstrap, OnApplicationSh
 	}
 
 	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * Answers one message. NEVER rejects: the loop's ceiling counts these, and a rejection that
+	 * escaped would both lose the reply and leave an unhandled rejection on a process holding calls.
+	 */
+	private async serve(message: {
+		readonly data: Uint8Array;
+		readonly reply?: string;
+		respond(payload: Uint8Array): boolean;
+	}): Promise<void> {
+		try {
+			const reply = await this.answerOnce(message.data);
+			if (message.reply === undefined) {
+				this.logger.warn({ subject: this.subject }, "an invite arrived with no reply subject");
+				return;
+			}
+			message.respond(this.encoder.encode(JSON.stringify(reply)));
+			this.served += 1;
+			if (reply.ok) {
+				this.admitted += 1;
+			}
+		} catch (error) {
+			this.logger.error({ err: String(error) }, "answering an arriving invite threw");
+		}
+	}
+
+	/**
+	 * `answer`, with concurrent retries of the SAME leg id folded onto one attempt. See `admitting`.
+	 *
+	 * The leg id is read with a tolerant parse rather than the schema: a request too malformed to
+	 * yield one cannot collide with anything, and `answer` is the place that refuses it by name.
+	 */
+	private async answerOnce(data: Uint8Array): Promise<SipInviteResponse> {
+		const legId = legIdOf(data, this.decoder);
+		if (legId === undefined) {
+			return await this.answer(data);
+		}
+		const running = this.admitting.get(legId);
+		if (running !== undefined) {
+			return await running;
+		}
+		const attempt = this.answer(data);
+		this.admitting.set(legId, attempt);
+		try {
+			return await attempt;
+		} finally {
+			this.admitting.delete(legId);
+		}
+	}
 
 	/** Decodes one request and produces the reply. NEVER throws — a throw would end the loop. */
 	private async answer(data: Uint8Array): Promise<SipInviteResponse> {
@@ -474,6 +548,7 @@ export class SipInviteService implements OnApplicationBootstrap, OnApplicationSh
 	}
 
 	private refuse(legId: string, reason: SipInviteRefusalReason, error: string): SipInviteResponse {
+		this.refusals.set(reason, (this.refusals.get(reason) ?? 0) + 1);
 		return {
 			ok: false,
 			legId,
@@ -484,5 +559,21 @@ export class SipInviteService implements OnApplicationBootstrap, OnApplicationSh
 			reason,
 			error: error.slice(0, 512),
 		};
+	}
+}
+
+/**
+ * The leg id in a request, or `undefined` when the bytes do not carry a readable one.
+ *
+ * Deliberately not the schema parse: this runs before `answer` and its only job is to key the
+ * in-flight map. A request that cannot yield a leg id here is handed straight to `answer`, which
+ * refuses it `bad_request` with the real parse error rather than a truncated one from this function.
+ */
+function legIdOf(data: Uint8Array, decoder: TextDecoder): string | undefined {
+	try {
+		const parsed = JSON.parse(decoder.decode(data)) as { readonly legId?: unknown };
+		return typeof parsed.legId === "string" && parsed.legId !== "" ? parsed.legId : undefined;
+	} catch {
+		return undefined;
 	}
 }

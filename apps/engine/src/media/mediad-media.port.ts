@@ -10,6 +10,7 @@ import {
 	mediaStartPlaybackResponseSchema,
 	mediaStartRecordingResponseSchema,
 	mediaStopPlaybackResponseSchema,
+	mediaPauseRecordingResponseSchema,
 	mediaStopRecordingResponseSchema,
 	mediaTapSessionResponseSchema,
 	mediaUnbridgeSessionsResponseSchema,
@@ -631,6 +632,25 @@ export class MediadMediaPort implements MediaPort {
 	}
 
 	/**
+	 * Pauses or resumes a live recording WITHOUT ending its file. PCI.
+	 *
+	 * `mediad` keeps the recorder's own 20 ms clock running and writes silence, so the object stays
+	 * one artifact and the audio after the gap is still at the offset it happened at. It answers
+	 * `ok: true, applied: false` for a reference nothing is recording — the same no-op
+	 * {@link stopRecording} relies on, and for the same reason.
+	 *
+	 * The intervals are NOT on this reply. They ride `recording.finished`'s `pauses`, because the
+	 * process that wrote the audio is the only one that can say where in the file the silence is.
+	 */
+	async pauseRecording(name: string, paused: boolean): Promise<void> {
+		await this.call(
+			RPC_SUBJECTS.mediaPauseRecording,
+			{ recordingRef: name, resume: !paused },
+			mediaPauseRecordingResponseSchema,
+		);
+	}
+
+	/**
 	 * Satisfied by construction, which is why it is not a refusal.
 	 *
 	 * `watchChannel` exists because ARI's narrow subscription STOPS when a channel leaves the
@@ -772,6 +792,11 @@ export class MediadMediaPort implements MediaPort {
 	async ring(channelId: string): Promise<void> {
 		void channelId;
 		return this.refuse("ring", "SIP signalling, which apps/sipd owns (design doc §5)");
+	}
+
+	async earlyMedia(channelId: string): Promise<void> {
+		void channelId;
+		return this.refuse("earlyMedia", "SIP signalling, which apps/sipd owns (design doc §5)");
 	}
 
 	async getVariable(channelId: string, name: string): Promise<string | undefined> {

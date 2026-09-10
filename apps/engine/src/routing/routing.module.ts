@@ -4,11 +4,13 @@ import { ClaimHeartbeatService } from "./claim-heartbeat.service";
 import { ConferenceRegistry } from "./conference-registry";
 import { DidIndexSource } from "./did-index.source";
 import { ExtensionFeatureRpcPort } from "./extension-feature.source";
+import { HotDeskRpcPort } from "./hot-desk.source";
 import { LastCallerRpcSource } from "./last-caller.source";
 import { ParkRegistry } from "./park-registry";
 import { RoutingArtifactSource } from "./routing-artifact.source";
 import { SharedLineRegistry } from "./shared-line-registry";
 import { SupervisorAuthzRpcPort } from "./supervisor-authz.source";
+import { ToggleFeatureRpcPort } from "./toggle-feature.source";
 import { TrunkStatusPublisher } from "./trunk-status.publisher";
 import { VoicemailGreetingRpcPort } from "./voicemail-greeting.source";
 import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
@@ -29,6 +31,10 @@ import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
  * health check reads. They are here
  * rather than in `CallsModule` for the reason the mailbox source is: the star codes that use them
  * are executed by the plan walker, and the walker's collaborators are this module's.
+ * {@link HotDeskRpcPort} joins them on exactly those terms too, with one difference worth writing
+ * down for a different reason than the supervision gate's: its request carries a live PIN, so it is
+ * its own subject with its own broker grant, and nothing on its path — here, in the port, or in the
+ * walker — logs the payload.
  * {@link SupervisorAuthzRpcPort} joins them on those same terms with one difference worth writing
  * down: its ABSENCE is not a degradation. Every other port here missing means a feature announces
  * "not available"; this one missing means `*0` is refused, because the engine would have no way to
@@ -66,6 +72,8 @@ import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
 		DidIndexSource,
 		VoicemailMailboxRpcSource,
 		ExtensionFeatureRpcPort,
+		ToggleFeatureRpcPort,
+		HotDeskRpcPort,
 		LastCallerRpcSource,
 		VoicemailGreetingRpcPort,
 		SupervisorAuthzRpcPort,
@@ -81,6 +89,8 @@ import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
 		DidIndexSource,
 		VoicemailMailboxRpcSource,
 		ExtensionFeatureRpcPort,
+		ToggleFeatureRpcPort,
+		HotDeskRpcPort,
 		LastCallerRpcSource,
 		VoicemailGreetingRpcPort,
 		SupervisorAuthzRpcPort,

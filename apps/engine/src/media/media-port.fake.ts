@@ -88,6 +88,14 @@ export interface FakeMediaPortOptions {
 	 */
 	readonly onAnswer?: (channelId: string) => void;
 	readonly bridgeFails?: boolean;
+	/**
+	 * Lets a spec make ONE bridge refuse a member.
+	 *
+	 * Keyed on the bridge rather than a flag, because the paths that have to survive a refusal are
+	 * the ones that then put the leg back where it was — and a fake that refused every bridge would
+	 * let a runtime with no restore step pass.
+	 */
+	readonly addToBridgeFails?: (bridgeId: string) => Error | undefined;
 	readonly recordFails?: boolean;
 	/** Makes the music class unavailable, which every hold path has to survive. */
 	readonly musicOnHoldFails?: boolean;
@@ -111,6 +119,8 @@ export interface FakeMediaPort extends MediaPort {
 	/** Every tap opened, in order — what an eavesdrop/whisper/barge spec actually asserts on. */
 	readonly taps: () => TapRequest[];
 	readonly hungUp: () => { channelId: string; cause: HangupCause }[];
+	/** Every channel answered, in order. Which legs a feature answers is part of what it means. */
+	readonly answered: () => string[];
 }
 
 export function makeFakeMediaPort(options: FakeMediaPortOptions = {}): FakeMediaPort {
@@ -140,6 +150,8 @@ export function makeFakeMediaPort(options: FakeMediaPortOptions = {}): FakeMedia
 					channelId: call.args[0] as string,
 					cause: call.args[1] as HangupCause,
 				})),
+		answered: () =>
+			calls.filter((call) => call.method === "answer").map((call) => call.args[0] as string),
 
 		answer: async (channelId: string): Promise<void> => {
 			record("answer", channelId);
@@ -147,6 +159,9 @@ export function makeFakeMediaPort(options: FakeMediaPortOptions = {}): FakeMedia
 		},
 		ring: async (channelId: string): Promise<void> => {
 			record("ring", channelId);
+		},
+		earlyMedia: async (channelId: string): Promise<void> => {
+			record("earlyMedia", channelId);
 		},
 		play: async (channelId: string, request: PlayRequest): Promise<PlaybackHandle> => {
 			// The WHOLE request, not just the media list: `playbackRef` is what barge-in stops, and a
@@ -189,6 +204,10 @@ export function makeFakeMediaPort(options: FakeMediaPortOptions = {}): FakeMedia
 		},
 		addToBridge: async (bridgeId: string, channelIds: readonly string[]): Promise<void> => {
 			record("addToBridge", bridgeId, [...channelIds]);
+			const failure = options.addToBridgeFails?.(bridgeId);
+			if (failure !== undefined) {
+				throw failure;
+			}
 		},
 		removeFromBridge: async (bridgeId: string, channelIds: readonly string[]): Promise<void> => {
 			record("removeFromBridge", bridgeId, [...channelIds]);
@@ -203,6 +222,9 @@ export function makeFakeMediaPort(options: FakeMediaPortOptions = {}): FakeMedia
 			}
 			options.onRecord?.(channelId, request);
 			return { name: request.name, format: request.format };
+		},
+		pauseRecording: async (name: string, paused: boolean): Promise<void> => {
+			record("pauseRecording", name, paused);
 		},
 		stopRecording: async (name: string): Promise<void> => {
 			record("stopRecording", name);

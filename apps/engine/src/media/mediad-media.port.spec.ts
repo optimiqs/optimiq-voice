@@ -11,6 +11,7 @@ import {
 	mediaStartPlaybackRequestSchema,
 	mediaStartRecordingRequestSchema,
 	mediaStopPlaybackRequestSchema,
+	mediaPauseRecordingRequestSchema,
 	mediaStopRecordingRequestSchema,
 	mediaTapSessionRequestSchema,
 	mediaUnbridgeSessionsRequestSchema,
@@ -748,6 +749,33 @@ describe("recording (rung 4)", () => {
 
 		await expect(port.stopRecording("rec-1")).resolves.toBeUndefined();
 	});
+
+	it("pauses and resumes a recording on one subject with a resume bit", async () => {
+		// PCI: the file survives the gap, so this is not a stop followed by a start.
+		const { port, transport } = newPort();
+		await port.pauseRecording("rec-1", true);
+		await port.pauseRecording("rec-1", false);
+
+		const requests = transport.on(RPC_SUBJECTS.mediaPauseRecording);
+		expect(requests.map((request) => request.payload)).toEqual([
+			{ recordingRef: "rec-1", resume: false },
+			{ recordingRef: "rec-1", resume: true },
+		]);
+		expect(mediaPauseRecordingRequestSchema.parse(requests[0]?.payload)).toBeDefined();
+	});
+
+	it("treats pausing an already-finished recording as a no-op", async () => {
+		const { port, transport } = newPort();
+		transport.reply(RPC_SUBJECTS.mediaPauseRecording, {
+			ok: true,
+			recordingRef: "rec-1",
+			paused: false,
+			applied: false,
+			instanceId: "mediad-fake",
+		});
+
+		await expect(port.pauseRecording("rec-1", true)).resolves.toBeUndefined();
+	});
 });
 
 describe("the declared bridge mode", () => {
@@ -977,7 +1005,15 @@ describe("the not-supported map", () => {
 		[
 			"originate",
 			"signalling",
-			(port) => port.originate({ endpoint: "PJSIP/1001", application: "app", channelId: "leg-b" }),
+			// Carrying `callerIdPresentation` here on purpose: an additive field must not change WHICH
+			// refusal an unreached rung produces.
+			(port) =>
+				port.originate({
+					endpoint: "PJSIP/1001",
+					application: "app",
+					channelId: "leg-b",
+					callerIdPresentation: "restricted",
+				}),
 		],
 		["getVariable", "dialplan", (port) => port.getVariable("leg-a", "X")],
 		["setVariable", "dialplan", (port) => port.setVariable("leg-a", "X", "1")],
@@ -1048,6 +1084,9 @@ describe("the not-supported map", () => {
 			// `RecordRequest` has nowhere to say which.
 			"record",
 			"stopRecording",
+			// Rung 4's PCI half: one file with a silence gap, which is the whole reason it is not a
+			// stop followed by a start.
+			"pauseRecording",
 			// Rung 5. Both halves of the state pair, plus the music that is a PLAYBACK rather than a
 			// hold — see the methods. These five moved out of the refused list together, because
 			// `hold-session` and `mute-session` reached the wire in one change.
@@ -1076,6 +1115,7 @@ describe("the not-supported map", () => {
 			"hold",
 			"mute",
 			"originate",
+			"pauseRecording",
 			"play",
 			"record",
 			"removeFromBridge",
@@ -1096,6 +1136,6 @@ describe("the not-supported map", () => {
 		expect(methods).toEqual(expected);
 		// One per `MediaPort` method. `bridgeMode` is a declaration, not a method, and is asserted in
 		// its own describe block above.
-		expect(methods).toHaveLength(27);
+		expect(methods).toHaveLength(28);
 	});
 });

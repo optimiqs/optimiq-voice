@@ -2,6 +2,8 @@ import { describe, expect, it } from "bun:test";
 import { QUEUE_WAITING_MAX_ENTRIES } from "@optimiq-voice/events";
 import {
 	compareWaiting,
+	deferCallback,
+	dueCallbacks,
 	emptyWaitingRecord,
 	isRenewalDue,
 	longestWaitMs,
@@ -212,5 +214,120 @@ describe("abandoned-resume tombstones", () => {
 	it("prunes a lapsed promise on the way past, like a lapsed entry", () => {
 		const record = putTombstone(emptyWaitingRecord(ORG, QUEUE, NOW), tombstone(), NOW);
 		expect(pruneWaiting(record, NOW + 60_001).tombstones).toHaveLength(0);
+	});
+});
+
+/**
+ * Virtual hold's half of the tombstone.
+ *
+ * A callback token IS a resume promise with one extra block, which is what makes "we never call
+ * somebody who is already back in the line" a property of the data structure: the token is claimed
+ * by the ordinary `takeTombstone` when the caller rings back first.
+ */
+describe("callback tokens", () => {
+	const token = (overrides: Record<string, unknown> = {}) => ({
+		callerNumber: "+15551234567",
+		joinedAt: NOW - 60_000,
+		priority: 0,
+		abandonedAt: NOW,
+		expiresAt: NOW + 3_600_000,
+		callback: { attempts: 0, maxAttempts: 3, nextAttemptAt: 0 },
+		...overrides,
+	});
+
+	it("owes a call only on a tombstone that carries a callback block", () => {
+		const both = putTombstone(
+			putTombstone(emptyWaitingRecord(ORG, QUEUE, NOW), token(), NOW),
+			{
+				callerNumber: "+15559990000",
+				joinedAt: NOW,
+				priority: 0,
+				abandonedAt: NOW,
+				expiresAt: NOW + 60_000,
+			},
+			NOW,
+		);
+		expect(dueCallbacks(both, NOW).map((entry) => entry.callerNumber)).toEqual(["+15551234567"]);
+	});
+
+	it("orders the tokens the way the line ordered the callers who left it", () => {
+		let record = putTombstone(emptyWaitingRecord(ORG, QUEUE, NOW), token(), NOW);
+		record = putTombstone(
+			record,
+			token({ callerNumber: "+15550000002", joinedAt: NOW - 90_000 }),
+			NOW,
+		);
+		record = putTombstone(
+			record,
+			token({ callerNumber: "+15550000003", joinedAt: NOW - 10_000, priority: 800 }),
+			NOW,
+		);
+		expect(dueCallbacks(record, NOW).map((entry) => entry.callerNumber)).toEqual([
+			// Priority first, then the older place — the same order `compareWaiting` gives the line.
+			"+15550000003",
+			"+15550000002",
+			"+15551234567",
+		]);
+	});
+
+	it("holds a token back until its retry delay has passed", () => {
+		const record = putTombstone(
+			emptyWaitingRecord(ORG, QUEUE, NOW),
+			token({ callback: { attempts: 1, maxAttempts: 3, nextAttemptAt: NOW + 5_000 } }),
+			NOW,
+		);
+		expect(dueCallbacks(record, NOW)).toHaveLength(0);
+		expect(dueCallbacks(record, NOW + 5_000)).toHaveLength(1);
+	});
+
+	it("never owes a call on a token that has expired", () => {
+		const record = putTombstone(
+			emptyWaitingRecord(ORG, QUEUE, NOW),
+			token({ expiresAt: NOW + 1_000 }),
+			NOW,
+		);
+		expect(dueCallbacks(record, NOW + 1_001)).toHaveLength(0);
+	});
+
+	it("counts a failed attempt and pushes the next one out", () => {
+		const record = putTombstone(emptyWaitingRecord(ORG, QUEUE, NOW), token(), NOW);
+		const deferred = deferCallback(record, "+15551234567", NOW, 300_000);
+		expect(deferred.dropped).toBe(false);
+		expect(deferred.record.tombstones[0]?.callback).toEqual({
+			attempts: 1,
+			maxAttempts: 3,
+			nextAttemptAt: NOW + 300_000,
+		});
+	});
+
+	/**
+	 * Dropping rather than letting it expire: the place it holds is a place in a line, and one held
+	 * for a number nobody is going to call again is a slot the queue counts and never fills.
+	 */
+	it("drops the promise once its attempts are spent", () => {
+		const record = putTombstone(
+			emptyWaitingRecord(ORG, QUEUE, NOW),
+			token({ callback: { attempts: 2, maxAttempts: 3, nextAttemptAt: 0 } }),
+			NOW,
+		);
+		const deferred = deferCallback(record, "+15551234567", NOW, 300_000);
+		expect(deferred.dropped).toBe(true);
+		expect(deferred.record.tombstones).toHaveLength(0);
+	});
+
+	it("leaves a plain resume promise alone", () => {
+		const record = putTombstone(
+			emptyWaitingRecord(ORG, QUEUE, NOW),
+			{
+				callerNumber: "+15551234567",
+				joinedAt: NOW,
+				priority: 0,
+				abandonedAt: NOW,
+				expiresAt: NOW + 60_000,
+			},
+			NOW,
+		);
+		const deferred = deferCallback(record, "+15551234567", NOW, 300_000);
+		expect(deferred).toEqual({ record, dropped: false });
 	});
 });

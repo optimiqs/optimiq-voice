@@ -7,6 +7,7 @@ import { decodeMediadEvent } from "./mediad-event-mapping";
 import { MediadMediaPort } from "./mediad-media.port";
 import { NatsMediadTransport } from "./mediad-transport";
 import type { EngineEnv } from "../config/engine-env";
+import type { RpcLatencyReport } from "../nats/rpc-latency";
 import type { MediaEvent } from "./media-event";
 import type { Subscription } from "nats";
 
@@ -37,6 +38,7 @@ export class MediadService implements OnModuleInit, OnApplicationShutdown {
 
 	readonly port: MediadMediaPort;
 	private handler: ((event: MediaEvent) => void) | undefined;
+	private planeLostHandler: (() => void) | undefined;
 	private subscription: Subscription | undefined;
 	private reachable = false;
 	private subscriptionStateValue: MediadSubscriptionState = "idle";
@@ -48,14 +50,24 @@ export class MediadService implements OnModuleInit, OnApplicationShutdown {
 	private hasProbed = false;
 	private lastProbeError: string | undefined;
 
+	private readonly transport: NatsMediadTransport;
+
 	constructor(
 		@Inject(ENGINE_ENV) private readonly env: EngineEnv,
 		private readonly jetstream: JetStreamService,
 	) {
-		this.port = new MediadMediaPort(
-			new NatsMediadTransport(() => this.jetstream.rawConnection),
-			env.ENGINE_MEDIAD_RPC_TIMEOUT_MS,
-		);
+		this.transport = new NatsMediadTransport(() => this.jetstream.rawConnection);
+		this.port = new MediadMediaPort(this.transport, env.ENGINE_MEDIAD_RPC_TIMEOUT_MS);
+	}
+
+	/**
+	 * Per-operation round-trip latency to `mediad`, since boot. Read by `/healthz`.
+	 *
+	 * The engine's own CPU profile cannot see this: a process waiting on a reply is a process at
+	 * idle. Half of a call setup is spent here, so this is where "setup got slower" is answered.
+	 */
+	get rpcLatency(): Record<string, RpcLatencyReport> {
+		return this.transport.rpcLatency;
 	}
 
 	/** Whether this driver is the selected one. Read by the module factory and by `/healthz`. */
@@ -91,6 +103,21 @@ export class MediadService implements OnModuleInit, OnApplicationShutdown {
 	 */
 	setEventHandler(handler: (event: MediaEvent) => void): void {
 		this.handler = handler;
+	}
+
+	/**
+	 * Registers the sink for "the media plane is gone".
+	 *
+	 * Called once on each transition from reachable to unreachable — the moment a probe that used to
+	 * be answered stops being answered — and never on the first probe, which is boot rather than
+	 * loss. Optional: an engine with no handler behaves exactly as it did before, degrading readiness
+	 * and nothing more.
+	 *
+	 * The handler MUST NOT throw. It runs inside the probe, and a throw would end the interval that
+	 * is the only thing watching the media plane.
+	 */
+	setPlaneLostHandler(handler: () => void): void {
+		this.planeLostHandler = handler;
 	}
 
 	/**
@@ -162,6 +189,19 @@ export class MediadService implements OnModuleInit, OnApplicationShutdown {
 					{ err: this.lastProbeError },
 					"mediad stopped answering reachability probes; readiness is degraded",
 				);
+				// The transition, not the state: a plane that has been down for a minute must not
+				// re-report a loss on every probe. A draining process is excluded because its own
+				// drain is already hanging its channels up with a cause of its own.
+				if (!this.draining) {
+					try {
+						this.planeLostHandler?.();
+					} catch (error) {
+						this.logger.error(
+							{ err: String(error) },
+							"the media-plane-lost handler threw; reachability probing continues",
+						);
+					}
+				}
 			}
 			return false;
 		}

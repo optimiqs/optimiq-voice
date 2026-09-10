@@ -1,11 +1,16 @@
 import { describe, expect, it } from "bun:test";
 import { makeFakeMediaPort } from "../media/media-port.fake";
+import { CLIR_VARIABLE } from "../media/split-plane.port";
 import { CallSignalBus, legSignalKey, recordingSignalKey } from "./call-signals";
 import { extensionNode, featureCodeNode, planOf, voicemailNode } from "./plan-fixtures.fake";
 import { DEFAULT_PLAN_WALKER_SETTINGS, PlanWalker } from "./plan-walker";
 import type {
 	ExtensionFeatureChange,
 	ExtensionFeatureOutcome,
+	ToggleFeatureChange,
+	ToggleFeatureOutcome,
+	HotDeskChange,
+	HotDeskOutcome,
 	LastCallerResult,
 	RecordedGreeting,
 	SupervisorAuthzRequest,
@@ -16,7 +21,7 @@ import type {
 } from "./plan-walker";
 import type { CallEvent } from "@optimiq-voice/events";
 import type { MailboxEntry, PlanNode } from "@optimiq-voice/routing";
-import type { Verb, VerbResult } from "@optimiq-voice/telephony";
+import type { DtmfDigit, Verb, VerbResult } from "@optimiq-voice/telephony";
 
 /**
  * The self-service star codes, as the plan walker executes them.
@@ -38,6 +43,7 @@ const A_LEG_ID = "0195c0f0-1c2f-7000-8000-0000000000a1";
 const CALL_ID = "0195c0f0-1c2f-7000-8000-0000000000c1";
 const ORG_ID = "0195c0f0-1c2f-7000-8000-000000000001";
 const CALLER = "1001";
+const DEVICE_ID = "0195c0f0-1c2f-7000-8000-0000000000d1";
 
 const ACTIVATED = DEFAULT_PLAN_WALKER_SETTINGS.featureActivatedAnnouncement;
 const DEACTIVATED = DEFAULT_PLAN_WALKER_SETTINGS.featureDeactivatedAnnouncement;
@@ -46,6 +52,18 @@ const UNAVAILABLE = DEFAULT_PLAN_WALKER_SETTINGS.unavailableAnnouncement;
 interface HarnessOptions {
 	/** What the feature RPC answers. Absent means the walk has no feature port at all. */
 	readonly feature?: ExtensionFeatureOutcome | "throws";
+	/** What the toggle RPC answers. Absent means the walk has no toggle port at all. */
+	readonly toggle?: ToggleFeatureOutcome | "throws";
+	/** What the hot-desk RPC answers. Absent means the walk has no hot-desk port at all. */
+	readonly hotDesk?: HotDeskOutcome | "throws";
+	/**
+	 * The handset this leg authenticated as. `null` is a leg with NO device identity — a trunk call,
+	 * an API-originated one, or a SIP edge that predates the field — which every hot-desk code must
+	 * refuse rather than fall back to the calling number for.
+	 */
+	readonly deviceId?: string | null;
+	/** Digits the hot-desk challenge collects. Absent means the gather times out empty. */
+	readonly pinDigits?: readonly DtmfDigit[];
 	/** What the ledger answers. Absent means the walk has no last-caller source at all. */
 	readonly lastCaller?: LastCallerResult | "throws";
 	/** Absent means the walk has nowhere to file a greeting. */
@@ -86,6 +104,8 @@ function harness(options: HarnessOptions = {}) {
 	const verbs: Verb[] = [];
 	const published: { readonly type: CallEvent }[] = [];
 	const changes: ExtensionFeatureChange[] = [];
+	const toggled: ToggleFeatureChange[] = [];
+	const hotDesked: HotDeskChange[] = [];
 	const dials: { readonly destination: string }[] = [];
 	const monitors: { readonly extension: string; readonly mode: string }[] = [];
 	const authorized: SupervisorAuthzRequest[] = [];
@@ -122,6 +142,7 @@ function harness(options: HarnessOptions = {}) {
 		callId: CALL_ID,
 		organizationId: ORG_ID,
 		...(options.callerNumber === null ? {} : { callerIdNumber: options.callerNumber ?? CALLER }),
+		...(options.deviceId === null ? {} : { deviceId: options.deviceId ?? DEVICE_ID }),
 		isDetached: false,
 		get isTearingDown(): boolean {
 			return state.tearingDown;
@@ -130,6 +151,7 @@ function harness(options: HarnessOptions = {}) {
 			return state.answered;
 		},
 		moveTo: () => true,
+		bridgeId: undefined,
 		setBridge: () => undefined,
 	};
 
@@ -145,13 +167,18 @@ function harness(options: HarnessOptions = {}) {
 			return { verb: "hangup", endReason: "completed" };
 		}
 		if (verb.verb === "gather") {
-			// No box in these specs carries a PIN, so nothing should ever reach here; a collection is
-			// returned rather than `undefined` so a spec that accidentally triggers the gate fails on
-			// the assertion it is about rather than on a media failure.
+			// No box in these specs carries a PIN, so nothing should ever reach here EXCEPT the hot-desk
+			// challenge, which is the one gate in this file that collects digits. A collection is
+			// returned rather than `undefined` so a spec that accidentally triggers another gate fails
+			// on the assertion it is about rather than on a media failure.
+			const digits = options.pinDigits ?? [];
 			return {
 				verb: "gather",
-				endReason: "timeout",
-				collection: { digits: [], endReason: "timeout" },
+				endReason: digits.length === 0 ? "timeout" : "completed",
+				collection: {
+					digits: [...digits],
+					endReason: digits.length === 0 ? "timeout" : "terminator",
+				},
 				elapsedMs: 1,
 			};
 		}
@@ -192,6 +219,32 @@ function harness(options: HarnessOptions = {}) {
 								throw new Error("the broker is unreachable");
 							}
 							return options.feature as ExtensionFeatureOutcome;
+						},
+					},
+				}),
+		...(options.toggle === undefined
+			? {}
+			: {
+					toggles: {
+						toggle: async (change: ToggleFeatureChange): Promise<ToggleFeatureOutcome> => {
+							toggled.push(change);
+							if (options.toggle === "throws") {
+								throw new Error("the broker is unreachable");
+							}
+							return options.toggle as ToggleFeatureOutcome;
+						},
+					},
+				}),
+		...(options.hotDesk === undefined
+			? {}
+			: {
+					hotDesk: {
+						apply: async (change: HotDeskChange): Promise<HotDeskOutcome> => {
+							hotDesked.push(change);
+							if (options.hotDesk === "throws") {
+								throw new Error("the broker is unreachable");
+							}
+							return options.hotDesk as HotDeskOutcome;
 						},
 					},
 				}),
@@ -248,7 +301,19 @@ function harness(options: HarnessOptions = {}) {
 		delay: async () => undefined,
 	});
 
-	return { walker, media, verbs, published, changes, dials, filed, monitors, authorized };
+	return {
+		walker,
+		media,
+		verbs,
+		published,
+		changes,
+		toggled,
+		hotDesked,
+		dials,
+		filed,
+		monitors,
+		authorized,
+	};
 }
 
 /** The media a `play` verb was given, in order. The one thing a caller actually experiences. */
@@ -1049,5 +1114,323 @@ describe("a call flow reached mid-walk", () => {
 			expect(outcome.visited, mode).toEqual(["cf", mode]);
 			expect(outcome.notes.join(" "), mode).toContain(`in ${mode} mode`);
 		}
+	});
+});
+
+// =================================================================================================
+// `*65` / `*64` — the organization-wide toggles
+// =================================================================================================
+
+/**
+ * The two codes that live on an ENTITY rather than in the feature-code catalogue. They were
+ * validated on the form, offered in the admin UI, and reached nothing at all until the compiler
+ * learned to synthesise a catalogue entry for each — `E2E-routing2.md` recorded a `*65` answered by
+ * "no outbound route matched".
+ */
+describe("*65 / *64 — organization-wide toggles", () => {
+	const flowCode = (overrides = {}) =>
+		featureCodeNode("code", {
+			code: "*65",
+			action: "call-flow-toggle",
+			params: { callFlowId: "cf-1" },
+			...overrides,
+		});
+
+	it("flips the call flow the code was compiled against, and says which", async () => {
+		const h = harness({ toggle: { applied: true, state: "night" } });
+		const outcome = await h.walker.walk(walkInput([flowCode()]));
+
+		expect(h.toggled).toEqual([
+			{
+				organizationId: ORG_ID,
+				target: "call-flow",
+				callFlowId: "cf-1",
+				extensionNumber: CALLER,
+				callId: CALL_ID,
+			},
+		]);
+		expect(played(h.verbs)).toEqual([DEFAULT_PLAN_WALKER_SETTINGS.featureActivatedAnnouncement]);
+		expect(outcome.hangupCause).toBe("NORMAL_CLEARING");
+	});
+
+	it("plays the de-activated tone on the way back to day mode", async () => {
+		const h = harness({ toggle: { applied: true, state: "day" } });
+		await h.walker.walk(walkInput([flowCode()]));
+
+		expect(played(h.verbs)).toEqual([DEFAULT_PLAN_WALKER_SETTINGS.featureDeactivatedAnnouncement]);
+	});
+
+	it("cycles a time condition and treats any non-auto state as overruled", async () => {
+		const h = harness({ toggle: { applied: true, state: "forced-no-match" } });
+		await h.walker.walk(
+			walkInput([
+				featureCodeNode("code", {
+					code: "*64",
+					action: "time-condition-override",
+					params: { timeConditionId: "tc-1" },
+				}),
+			]),
+		);
+
+		expect(h.toggled[0]).toMatchObject({ target: "time-condition", timeConditionId: "tc-1" });
+		expect(played(h.verbs)).toEqual([DEFAULT_PLAN_WALKER_SETTINGS.featureActivatedAnnouncement]);
+	});
+
+	it("announces returning a condition to the clock as de-activated", async () => {
+		const h = harness({ toggle: { applied: true, state: "auto" } });
+		await h.walker.walk(
+			walkInput([
+				featureCodeNode("code", {
+					code: "*64",
+					action: "time-condition-override",
+					params: { timeConditionId: "tc-1" },
+				}),
+			]),
+		);
+
+		expect(played(h.verbs)).toEqual([DEFAULT_PLAN_WALKER_SETTINGS.featureDeactivatedAnnouncement]);
+	});
+
+	/**
+	 * A lobby phone with caller id suppressed is exactly the handset a night-mode key is provisioned
+	 * on, so refusing over a missing number would take the feature away from its commonest install.
+	 */
+	it("works for a caller with no number, and sends none", async () => {
+		const h = harness({ toggle: { applied: true, state: "night" }, callerNumber: null });
+		await h.walker.walk(walkInput([flowCode()]));
+
+		expect(h.toggled[0]).not.toHaveProperty("extensionNumber");
+	});
+
+	it("announces unavailable when the walk has no toggle port", async () => {
+		const h = harness({});
+		const outcome = await h.walker.walk(walkInput([flowCode()]));
+
+		expect(played(h.verbs)).toEqual([DEFAULT_PLAN_WALKER_SETTINGS.unavailableAnnouncement]);
+		expect(outcome.hangupCause).toBe("FACILITY_NOT_IMPLEMENTED");
+	});
+
+	it("refuses a code the compiler pinned no entity onto rather than guessing at one", async () => {
+		const h = harness({ toggle: { applied: true, state: "night" } });
+		const outcome = await h.walker.walk(walkInput([flowCode({ params: undefined })]));
+
+		expect(h.toggled).toEqual([]);
+		expect(outcome.hangupCause).toBe("FACILITY_NOT_IMPLEMENTED");
+		expect(outcome.notes.join(" ")).toContain("carries no call-flow id");
+	});
+
+	it("treats a thrown port exactly as a refusing one", async () => {
+		const h = harness({ toggle: "throws" });
+		const outcome = await h.walker.walk(walkInput([flowCode()]));
+
+		expect(played(h.verbs)).toEqual([DEFAULT_PLAN_WALKER_SETTINGS.unavailableAnnouncement]);
+		expect(outcome.hangupCause).toBe("NORMAL_TEMPORARY_FAILURE");
+	});
+
+	it("announces a refusal rather than a confirmation for a change that did not land", async () => {
+		const h = harness({ toggle: { applied: false, reason: "no enabled call flow" } });
+		const outcome = await h.walker.walk(walkInput([flowCode()]));
+
+		expect(played(h.verbs)).toEqual([DEFAULT_PLAN_WALKER_SETTINGS.unavailableAnnouncement]);
+		expect(outcome.notes.join(" ")).toContain("no enabled call flow");
+	});
+});
+
+// =================================================================================================
+// `*31` / `*32` — hot desking
+// =================================================================================================
+
+/**
+ * The only star code on this walker whose subject is the HANDSET rather than the caller.
+ *
+ * Every assertion below exists because the obvious implementation gets one of them wrong: falling
+ * back to `callerIdNumber` when the leg has no device (which would let an outside call rebind an
+ * inside phone), sending the caller's number as the extension being claimed (which would claim the
+ * desk's own extension), or gathering a PIN for a logout (which would ask the agent standing at the
+ * desk to prove they are the person giving it back).
+ */
+describe("*31 / *32 — hot desking", () => {
+	const loginCode = (overrides = {}) =>
+		featureCodeNode("code", { code: "*31", action: "hotdesk-login", ...overrides });
+	const logoutCode = () => featureCodeNode("code", { code: "*32", action: "hotdesk-logout" });
+
+	it("gathers a PIN and rebinds the handset the leg authenticated as", async () => {
+		const h = harness({
+			hotDesk: { applied: true, extensionNumber: "1104", expiresAt: "2026-09-10T03:00:00.000Z" },
+			pinDigits: ["4", "3", "2", "1"],
+		});
+		const outcome = await h.walker.walk(walkInput([loginCode()], { featureArgument: "1104" }));
+
+		expect(h.hotDesked).toEqual([
+			{
+				organizationId: ORG_ID,
+				action: "login",
+				deviceId: DEVICE_ID,
+				extensionNumber: "1104",
+				pin: "4321",
+				callId: CALL_ID,
+			},
+		]);
+		expect(played(h.verbs)).toEqual([ACTIVATED]);
+		expect(outcome.hangupCause).toBe("NORMAL_CLEARING");
+		expect(outcome.notes.join(" ")).toContain("until 2026-09-10T03:00:00.000Z");
+	});
+
+	it("logs out without asking for a PIN and without an argument", async () => {
+		const h = harness({ hotDesk: { applied: true, extensionNumber: "1001" } });
+		await h.walker.walk(walkInput([logoutCode()]));
+
+		expect(h.hotDesked).toEqual([
+			{ organizationId: ORG_ID, action: "logout", deviceId: DEVICE_ID, callId: CALL_ID },
+		]);
+		// The gather is the assertion: a logout that challenged would be asking the person holding the
+		// handset to prove they are holding it.
+		expect(h.verbs.some((verb) => verb.verb === "gather")).toBe(false);
+		expect(played(h.verbs)).toEqual([DEACTIVATED]);
+	});
+
+	/**
+	 * The refusal that matters most. A leg with no device identity is a trunk call or an
+	 * API-originated one, and falling back to the calling number would let somebody outside the
+	 * building rebind a phone inside it by dialling the code with a spoofed caller id.
+	 */
+	it("refuses a leg with no device identity rather than falling back to the caller", async () => {
+		const h = harness({ hotDesk: { applied: true }, deviceId: null, pinDigits: ["1", "1"] });
+		const outcome = await h.walker.walk(walkInput([loginCode()], { featureArgument: "1104" }));
+
+		expect(h.hotDesked).toEqual([]);
+		expect(played(h.verbs)).toEqual([UNAVAILABLE]);
+		expect(outcome.hangupCause).toBe("FACILITY_NOT_SUBSCRIBED");
+	});
+
+	it("refuses a login with no extension dialled after the code", async () => {
+		const h = harness({ hotDesk: { applied: true } });
+		const outcome = await h.walker.walk(walkInput([loginCode()]));
+
+		expect(h.hotDesked).toEqual([]);
+		expect(outcome.hangupCause).toBe("INVALID_NUMBER_FORMAT");
+	});
+
+	/**
+	 * A refused login and a wrong PIN are the SAME announcement, which is the point: over a phone
+	 * line, telling them apart is an oracle for enumerating a tenant's extension list.
+	 */
+	it("announces unavailable when the responder refuses, whatever the reason", async () => {
+		const h = harness({
+			hotDesk: { applied: false, reason: "no enabled, hot-deskable extension 1104" },
+			pinDigits: ["9", "9", "9", "9"],
+		});
+		const outcome = await h.walker.walk(walkInput([loginCode()], { featureArgument: "1104" }));
+
+		expect(played(h.verbs)).toEqual([UNAVAILABLE]);
+		expect(outcome.hangupCause).toBe("NORMAL_TEMPORARY_FAILURE");
+	});
+
+	it("treats a thrown port exactly as a refusal, and never as an exception", async () => {
+		const h = harness({ hotDesk: "throws", pinDigits: ["1", "2", "3", "4"] });
+		const outcome = await h.walker.walk(walkInput([loginCode()], { featureArgument: "1104" }));
+
+		expect(played(h.verbs)).toEqual([UNAVAILABLE]);
+		expect(outcome.hangupCause).toBe("NORMAL_TEMPORARY_FAILURE");
+	});
+
+	it("announces unavailable when the walk has no hot-desk port", async () => {
+		const h = harness({});
+		const outcome = await h.walker.walk(walkInput([loginCode()], { featureArgument: "1104" }));
+
+		expect(played(h.verbs)).toEqual([UNAVAILABLE]);
+		expect(outcome.hangupCause).toBe("FACILITY_NOT_IMPLEMENTED");
+	});
+
+	/** A caller who never enters a code is released rather than left holding an open leg. */
+	it("gives up after the attempt budget when no digits are ever entered", async () => {
+		const h = harness({ hotDesk: { applied: true }, pinDigits: [] });
+		const outcome = await h.walker.walk(walkInput([loginCode()], { featureArgument: "1104" }));
+
+		expect(h.hotDesked).toEqual([]);
+		expect(h.verbs.filter((verb) => verb.verb === "gather")).toHaveLength(
+			DEFAULT_PLAN_WALKER_SETTINGS.hotDeskPinAttempts,
+		);
+		expect(outcome.hangupCause).toBe("CALL_REJECTED");
+	});
+});
+
+// =================================================================================================
+// Per-call CLIR — `*67` / `*82`
+// =================================================================================================
+
+/**
+ * The override is a channel VARIABLE rather than an argument to the dial, because the destination is
+ * reached by a fresh walk (`control.dial`) that carries nothing from this one. `SplitPlaneMediaPort`
+ * reads it off the originating leg, which is why the assertions are about the variable and the dial
+ * rather than about anything on the originate this walk makes — this walk makes none.
+ */
+describe("feature code — per-call caller-id presentation", () => {
+	function clirCode(action: "caller-id-presentation-restrict" | "caller-id-presentation-allow") {
+		return featureCodeNode("f", {
+			action,
+			code: action === "caller-id-presentation-restrict" ? "*67" : "*82",
+		});
+	}
+
+	it("stamps the withhold on the leg and dials the argument", async () => {
+		const h = harness({ dial: { status: "bridged" } });
+		const outcome = await h.walker.walk(
+			walkInput([clirCode("caller-id-presentation-restrict")], {
+				featureArgument: "+15551230001",
+			}),
+		);
+
+		expect(h.media.variables[CLIR_VARIABLE]).toBe("restricted");
+		expect(h.dials).toEqual([{ destination: "+15551230001" }]);
+		expect(outcome.status).toBe("bridged");
+	});
+
+	it("stamps the lift for *82, so one call can present a number the setting withholds", async () => {
+		const h = harness({ dial: { status: "bridged" } });
+		await h.walker.walk(
+			walkInput([clirCode("caller-id-presentation-allow")], { featureArgument: "+15551230001" }),
+		);
+
+		expect(h.media.variables[CLIR_VARIABLE]).toBe("allowed");
+	});
+
+	it("announces when the code was dialled with nothing after it", async () => {
+		const h = harness({});
+		const outcome = await h.walker.walk(walkInput([clirCode("caller-id-presentation-restrict")]));
+
+		expect(played(h.verbs)).toEqual([UNAVAILABLE]);
+		expect(outcome.hangupCause).toBe("INVALID_NUMBER_FORMAT");
+		expect(h.dials).toEqual([]);
+	});
+
+	/** The whole point of `*67` is that the number is NOT presented; dialling anyway is the harm. */
+	it("refuses to dial when the withhold could not be stamped", async () => {
+		const h = harness({ dial: { status: "bridged" } });
+		h.media.setVariable = async () => {
+			throw new Error("the media plane is unreachable");
+		};
+		const outcome = await h.walker.walk(
+			walkInput([clirCode("caller-id-presentation-restrict")], {
+				featureArgument: "+15551230001",
+			}),
+		);
+
+		expect(h.dials).toEqual([]);
+		expect(outcome.hangupCause).toBe("NORMAL_TEMPORARY_FAILURE");
+	});
+
+	/** Failing to LIFT a withhold leaves the standing setting in force, which is not a harm. */
+	it("still dials when the *82 lift could not be stamped", async () => {
+		const h = harness({ dial: { status: "bridged" } });
+		h.media.setVariable = async () => {
+			throw new Error("the media plane is unreachable");
+		};
+		const outcome = await h.walker.walk(
+			walkInput([clirCode("caller-id-presentation-allow")], { featureArgument: "+15551230001" }),
+		);
+
+		expect(h.dials).toEqual([{ destination: "+15551230001" }]);
+		expect(outcome.status).toBe("bridged");
 	});
 });

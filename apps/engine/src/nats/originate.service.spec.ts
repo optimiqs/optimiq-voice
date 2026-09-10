@@ -29,25 +29,48 @@ function request(overrides: Partial<OriginateRequest> = {}): OriginateRequest {
 	};
 }
 
-/** A NATS connection made of two queues, exactly as in `sip-transfer.service.spec.ts`. */
+/**
+ * A NATS connection made of one queue PER SUBJECT, so the two responders on it do not eat each
+ * other's messages.
+ *
+ * The shape follows `sip-transfer.service.spec.ts`; the per-subject split is what this file needs
+ * and that one does not, because `OriginateService` serves both `rpc.engine.v1.originate` and
+ * `rpc.engine.v1.queue-callback` off the one connection.
+ */
 function fakeConnection() {
 	const encoder = new TextEncoder();
 	const decoder = new TextDecoder();
 	const replies: unknown[] = [];
 	const subscribed: { subject: string; queue?: string }[] = [];
-	const pending: { data: Uint8Array; reply?: string }[] = [];
-	let wake: (() => void) | undefined;
+	const queues = new Map<
+		string,
+		{
+			pending: { data: Uint8Array; reply?: string }[];
+			wake: (() => void) | undefined;
+		}
+	>();
 
-	async function* messages(): AsyncGenerator<{
+	function queueFor(subject: string) {
+		const existing = queues.get(subject);
+		if (existing !== undefined) {
+			return existing;
+		}
+		const created = { pending: [] as { data: Uint8Array; reply?: string }[], wake: undefined };
+		queues.set(subject, created);
+		return created;
+	}
+
+	async function* messages(subject: string): AsyncGenerator<{
 		data: Uint8Array;
 		reply?: string;
 		respond: (data: Uint8Array) => void;
 	}> {
+		const queue = queueFor(subject);
 		for (;;) {
-			const next = pending.shift();
+			const next = queue.pending.shift();
 			if (next === undefined) {
 				await new Promise<void>((resolve) => {
-					wake = resolve;
+					queue.wake = resolve;
 				});
 				continue;
 			}
@@ -61,13 +84,13 @@ function fakeConnection() {
 		}
 	}
 
-	const iterator = messages();
 	const connection = {
 		subscribe: (subject: string, options?: { queue?: string }) => {
 			subscribed.push({
 				subject,
 				...(options?.queue === undefined ? {} : { queue: options.queue }),
 			});
+			const iterator = messages(subject);
 			return { [Symbol.asyncIterator]: () => iterator, unsubscribe: () => undefined };
 		},
 		isClosed: () => false,
@@ -78,7 +101,7 @@ function fakeConnection() {
 		replies,
 		subscribed,
 		/**
-		 * Delivers one raw request and settles the responder's answer.
+		 * Delivers one raw request onto one subject and settles the responder's answer.
 		 *
 		 * `options` rather than an optional `reply` argument, because passing `undefined` to an
 		 * argument with a default gets the default — which is exactly the case the no-reply test needs
@@ -86,14 +109,15 @@ function fakeConnection() {
 		 */
 		deliver: async (
 			bytes: string,
-			options: { readonly reply?: string } = { reply: "_INBOX.test" },
+			options: { readonly reply?: string; readonly subject?: string } = { reply: "_INBOX.test" },
 		): Promise<void> => {
-			pending.push({
+			const queue = queueFor(options.subject ?? "rpc.engine.v1.originate");
+			queue.pending.push({
 				data: encoder.encode(bytes),
 				...(options.reply === undefined ? {} : { reply: options.reply }),
 			});
-			wake?.();
-			wake = undefined;
+			queue.wake?.();
+			queue.wake = undefined;
 			for (let tick = 0; tick < 20; tick += 1) {
 				await Promise.resolve();
 			}
@@ -145,6 +169,8 @@ describe("the originate subscription", () => {
 		expect(built.subject).toBe(subjectFor.engineOriginateRpc());
 		expect(fake.subscribed).toEqual([
 			{ subject: "rpc.engine.v1.originate", queue: "optimiq-engine-originate" },
+			// A queue group of its own, so a burst of callbacks does not sit in front of a dial button.
+			{ subject: "rpc.engine.v1.queue-callback", queue: "optimiq-engine-queue-callback" },
 		]);
 		expect(built.stats.listening).toBe(true);
 	});
@@ -160,7 +186,7 @@ describe("the originate subscription", () => {
 		const fake = fakeConnection();
 		const built = service(fake, callPath().path);
 		built.onApplicationBootstrap();
-		expect(fake.subscribed).toHaveLength(1);
+		expect(fake.subscribed).toHaveLength(2);
 	});
 });
 
@@ -265,5 +291,124 @@ describe("answering an originate", () => {
 
 		expect(fake.replies).toHaveLength(0);
 		expect(built.stats.served).toBe(0);
+	});
+});
+
+/**
+ * `rpc.engine.v1.queue-callback` — the same responder, the same rule: every path ANSWERS.
+ *
+ * What is different and worth pinning is the refusal an engine with no callback call path gives.
+ * The requester is a sweep with an attempt budget, and a silence would cost it the whole five-second
+ * deadline once per token while telling it nothing about why.
+ */
+describe("answering a queue callback", () => {
+	const CALLBACK_ID = "0195c0f0-1c2f-7000-8000-0000000000b2";
+	const QUEUE_ID = "0195c0f0-1c2f-7000-8000-0000000000c3";
+	const SUBJECT = "rpc.engine.v1.queue-callback";
+
+	function callbackRequest(overrides: Record<string, unknown> = {}) {
+		return JSON.stringify({
+			orgId: ORG,
+			callbackId: CALLBACK_ID,
+			queueId: QUEUE_ID,
+			to: "+15551234567",
+			...overrides,
+		});
+	}
+
+	it("replies with the engine's own ids for the new call", async () => {
+		const fake = fakeConnection();
+		const received: unknown[] = [];
+		const built = service(fake, {
+			place: async () => ({ kind: "refused", reason: "internal", error: "not this path" }),
+			placeQueueCallback: async (request) => {
+				received.push(request);
+				return { kind: "placed", callId: "call-9", legId: "leg-9", endpoint: "PJSIP/+1555@pstn" };
+			},
+		});
+
+		await fake.deliver(callbackRequest({ relatedCallId: ORG }), {
+			reply: "_INBOX.test",
+			subject: SUBJECT,
+		});
+
+		expect(fake.replies).toEqual([
+			{
+				ok: true,
+				callbackId: CALLBACK_ID,
+				instanceId: "engine-1",
+				callId: "call-9",
+				legId: "leg-9",
+				endpoint: "PJSIP/+1555@pstn",
+			},
+		]);
+		expect(built.stats.callbacksPlaced).toBe(1);
+		expect((received[0] as { relatedCallId?: string }).relatedCallId).toBe(ORG);
+	});
+
+	it("refuses `not_supported` when the call path has no callback half", async () => {
+		const fake = fakeConnection();
+		service(fake, callPath().path);
+
+		await fake.deliver(callbackRequest(), { reply: "_INBOX.test", subject: SUBJECT });
+
+		expect(fake.replies).toEqual([
+			{
+				ok: false,
+				callbackId: CALLBACK_ID,
+				instanceId: "engine-1",
+				reason: "not_supported",
+				error: "this engine has no queue-callback call path attached",
+			},
+		]);
+	});
+
+	it("refuses bytes that are not the contract rather than letting the loop die", async () => {
+		const fake = fakeConnection();
+		service(fake, callPath().path);
+
+		await fake.deliver("{not json", { reply: "_INBOX.test", subject: SUBJECT });
+		await fake.deliver(JSON.stringify({ orgId: ORG }), {
+			reply: "_INBOX.test",
+			subject: SUBJECT,
+		});
+
+		expect(fake.replies).toHaveLength(2);
+		for (const reply of fake.replies as { ok: boolean; reason: string }[]) {
+			expect(reply.ok).toBe(false);
+			expect(reply.reason).toBe("bad_request");
+		}
+	});
+
+	it("turns a call path that throws into a refusal and keeps serving", async () => {
+		const fake = fakeConnection();
+		service(fake, {
+			place: async () => ({ kind: "refused", reason: "internal", error: "not this path" }),
+			placeQueueCallback: async () => {
+				throw new Error("the media server is on fire");
+			},
+		});
+
+		await fake.deliver(callbackRequest(), { reply: "_INBOX.test", subject: SUBJECT });
+
+		expect((fake.replies[0] as { ok: boolean; reason: string }).reason).toBe("internal");
+	});
+
+	it("refuses `shutting_down` once the instance is draining, so the sweep retries elsewhere", async () => {
+		const fake = fakeConnection();
+		const built = service(fake, {
+			place: async () => ({ kind: "refused", reason: "internal", error: "not this path" }),
+			placeQueueCallback: async () => ({
+				kind: "placed",
+				callId: "call-9",
+				legId: "leg-9",
+				endpoint: "e",
+			}),
+		});
+		built.onApplicationShutdown();
+
+		await fake.deliver(callbackRequest(), { reply: "_INBOX.test", subject: SUBJECT });
+
+		expect((fake.replies[0] as { reason: string }).reason).toBe("shutting_down");
 	});
 });

@@ -6,7 +6,7 @@
  * (the same variable `apps/sipd`'s integration tests read) or put one on `PATH`.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect, type NatsConnection } from "nats";
@@ -21,22 +21,37 @@ function freePort(): number {
 	return 4300 + Math.floor(Math.random() * 400);
 }
 
-export async function startBroker(): Promise<Broker> {
+/**
+ * `extraConfig` is appended verbatim to a generated config file instead of using the flag form.
+ *
+ * The one caller that needs it is `routing-watch-stall.spec.ts`, which has to reproduce a broker
+ * REFUSING a publish — an authorization block is the only way to make a real server do that, and
+ * a real server doing it is the whole point of that spec.
+ */
+export async function startBroker(
+	options: { extraConfig?: string; probe?: { user: string; pass: string } } = {},
+): Promise<Broker> {
 	const bin = process.env.NATS_SERVER_BIN ?? "nats-server";
 	const store = mkdtempSync(join(tmpdir(), "optimiq-bench-js-"));
 	const port = freePort();
-	const child: ChildProcess = spawn(
-		bin,
-		["-js", "-sd", store, "-p", String(port), "-a", "127.0.0.1"],
-		{
-			stdio: "ignore",
-		},
+	const conf = join(store, "nats.conf");
+	writeFileSync(
+		conf,
+		`port: ${String(port)}\nhost: "127.0.0.1"\njetstream: { store_dir: "${store}/js" }\n${options.extraConfig ?? ""}\n`,
 	);
+	const child: ChildProcess = spawn(bin, ["-c", conf], {
+		stdio: "ignore",
+	});
 	const url = `nats://127.0.0.1:${String(port)}`;
 	const deadline = Date.now() + 10_000;
 	for (;;) {
 		try {
-			const probe = await connect({ servers: url, maxReconnectAttempts: 1, timeout: 500 });
+			const probe = await connect({
+				servers: url,
+				maxReconnectAttempts: 1,
+				timeout: 500,
+				...options.probe,
+			});
 			await probe.close();
 			break;
 		} catch (error) {

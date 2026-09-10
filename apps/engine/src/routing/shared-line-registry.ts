@@ -154,6 +154,95 @@ export class SharedLineRegistry {
 	}
 
 	/**
+	 * The line this instance holds for a CALL, looked up the other way round.
+	 *
+	 * The mid-call half asks exactly this question and has no other way to ask it: a desk phone
+	 * pressing hold arrives as a media event carrying a channel, and what the orchestrator can derive
+	 * from a channel is its call id. Nothing on the leg says "this call is on shared line X".
+	 *
+	 * A linear scan over `seizures`, which is bounded by the lines THIS instance holds — a handful on
+	 * a busy tenant, not the tenant's line count. An index keyed by call id would have to be kept
+	 * consistent through seize, takeover, heartbeat loss and release, which is four more places to get
+	 * wrong for a map that is never long enough to matter.
+	 */
+	seizureForCall(
+		callId: string,
+	): { readonly sharedLineId: string; readonly value: SharedLineState } | undefined {
+		for (const held of this.seizures.values()) {
+			if (held.value.callId === callId) {
+				return { sharedLineId: held.value.sharedLineId, value: held.value };
+			}
+		}
+		return undefined;
+	}
+
+	/**
+	 * The inverse of {@link hold}: the line goes back to `seized` and stops being recallable.
+	 *
+	 * Used by the appearance that took the line off hold, and by a DIFFERENT appearance that
+	 * retrieved it — which is why `seizing` may re-point the seizure. The line is the same line and
+	 * the caller on it is the same caller; who is talking to them changed, and the lamps have to say
+	 * so or the retrieving phone shows the line as somebody else's.
+	 *
+	 * A line this instance does not hold is `not-held`, never an error: the retrieval that raced a
+	 * hang-up is an ordinary outcome.
+	 */
+	async resume(
+		orgId: string,
+		sharedLineId: string,
+		seizing?: SharedLineSeizure,
+	): Promise<HoldResult> {
+		let key: string;
+		try {
+			key = kvKeyFor.sharedLineState(orgId, sharedLineId);
+		} catch (error) {
+			return {
+				kind: "claims-unavailable",
+				reason: `not a valid shared-line-state key: ${String(error)}`,
+			};
+		}
+		const held = this.seizures.get(key);
+		if (held === undefined) {
+			return { kind: "not-held" };
+		}
+		const now = this.now();
+		// `heldAtMs` is dropped rather than kept: it is what `armRecall`'s timer reasons about, and a
+		// line that is back in use has no hold to time out.
+		const rest = { ...held.value };
+		delete (rest as { heldAtMs?: number }).heldAtMs;
+		const next: SharedLineState = {
+			...rest,
+			state: "seized",
+			heartbeatAt: now,
+			expiresAt: now + CLAIM_LEASE_MS,
+			...(seizing === undefined
+				? {}
+				: {
+						heldByExtensionId: seizing.extensionId,
+						heldByAppearanceIndex: seizing.appearanceIndex,
+						callId: seizing.callId,
+						legId: seizing.legId,
+					}),
+		};
+
+		this.cancelRecallByKey(key);
+		if (!this.bucket.isConfigured) {
+			this.remember(key, next, 0);
+			return { kind: "held", revision: 0 };
+		}
+
+		const written = await this.bucket.update(key, next, held.revision);
+		if (written.kind === "written") {
+			this.remember(key, next, written.revision);
+			return { kind: "held", revision: written.revision };
+		}
+		if (written.kind === "unavailable") {
+			return { kind: "claims-unavailable", reason: written.reason };
+		}
+		return { kind: "not-held" };
+	}
+
+	/**
 	 * Seizes a shared line for one appearance.
 	 *
 	 * The `create` decides the race against every other instance: a WON create means this appearance
@@ -282,6 +371,18 @@ export class SharedLineRegistry {
 	 * over is left untouched. Any armed recall for the line is cancelled: the line is being collected,
 	 * not abandoned.
 	 */
+	/**
+	 * {@link release}, for a caller that knows the line but not which instance it is.
+	 *
+	 * A walk is exactly that caller: it seized the line through this registry a moment ago and has to
+	 * give the seizure back when the bridge it took it for did not happen. Making it name the
+	 * instance would mean plumbing the instance id onto the walk for one call, where the only correct
+	 * value is the one this object already holds.
+	 */
+	async releaseOwn(orgId: string, sharedLineId: string): Promise<boolean> {
+		return await this.release(orgId, sharedLineId, this.instance);
+	}
+
 	async release(orgId: string, sharedLineId: string, instanceId: string): Promise<boolean> {
 		let key: string;
 		try {

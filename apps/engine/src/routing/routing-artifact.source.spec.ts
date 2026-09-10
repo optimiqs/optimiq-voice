@@ -56,6 +56,7 @@ interface WatchEntry {
 	readonly key: string;
 	readonly operation: string;
 	readonly value: Uint8Array;
+	readonly revision?: number;
 }
 
 /** A KV bucket whose `get` is a map and whose `watch` is a queue the spec pushes into. */
@@ -67,6 +68,9 @@ function fakeBucket(seed: Record<string, unknown> = {}) {
 	let notify: (() => void) | undefined;
 	let stopped = false;
 	let gets = 0;
+	// The bucket's own last revision, which is what the stale guard compares the watch against.
+	let lastSeq = 0;
+	let watches = 0;
 
 	const bucket = {
 		get: async (key: string) => {
@@ -74,32 +78,45 @@ function fakeBucket(seed: Record<string, unknown> = {}) {
 			const value = store.get(key);
 			return value === undefined ? null : { key, value, operation: "PUT" };
 		},
-		watch: async () => ({
-			stop: () => {
-				stopped = true;
-				notify?.();
-			},
-			async *[Symbol.asyncIterator](): AsyncIterator<WatchEntry> {
-				while (!stopped) {
-					const next = pending.shift();
-					if (next !== undefined) {
-						yield next;
-						continue;
+		status: async () => ({ streamInfo: { state: { last_seq: lastSeq } } }),
+		watch: async () => {
+			watches += 1;
+			stopped = false;
+			return {
+				stop: () => {
+					stopped = true;
+					notify?.();
+				},
+				async *[Symbol.asyncIterator](): AsyncIterator<WatchEntry> {
+					while (!stopped) {
+						const next = pending.shift();
+						if (next !== undefined) {
+							yield next;
+							continue;
+						}
+						await new Promise<void>((resolve) => {
+							notify = resolve;
+						});
 					}
-					await new Promise<void>((resolve) => {
-						notify = resolve;
-					});
-				}
-			},
-		}),
+				},
+			};
+		},
 	};
 
 	return {
 		bucket,
 		gets: () => gets,
+		watches: () => watches,
 		push: (entry: WatchEntry) => {
 			pending.push(entry);
+			if (entry.revision !== undefined && entry.revision > lastSeq) {
+				lastSeq = entry.revision;
+			}
 			notify?.();
+		},
+		/** A write the watch is NOT told about — the shape a stalled watch produces. */
+		advanceBucket: (revision: number) => {
+			lastSeq = revision;
 		},
 		put: (key: string, value: unknown) => {
 			store.set(key, encode(value));
@@ -111,7 +128,11 @@ function fakeBucket(seed: Record<string, unknown> = {}) {
 }
 
 function env(overrides: Partial<EngineEnv> = {}): EngineEnv {
-	return { ENGINE_ROUTING_RPC_TIMEOUT_MS: 500, ...overrides } as EngineEnv;
+	return {
+		ENGINE_ROUTING_RPC_TIMEOUT_MS: 500,
+		ENGINE_ROUTING_WATCH_PROBE_MS: 25,
+		...overrides,
+	} as EngineEnv;
 }
 
 interface HarnessOptions {
@@ -328,6 +349,32 @@ describe("invalidation", () => {
 		expect(h.source.stats.cached).toBe(0);
 	});
 
+	/**
+	 * The failure this closes was found end to end: the API restarted, re-made the KV bucket, and
+	 * this process's watch iterator went on existing while delivering nothing. No error means no
+	 * reconnect, so `invalidateAll` never ran and every plan published afterwards was compiled,
+	 * stored, and never seen — calls walked the deleted plan for as long as the process lived.
+	 */
+	it("stops trusting a memory copy once the watch has gone silent", async () => {
+		const h = harness({ seed: { [routingCacheKey(ORG)]: artifact(ORG, "hash-1") } });
+		await h.source.onModuleInit();
+		await settle();
+		await h.source.get(ORG);
+		expect(h.kv.gets()).toBe(1);
+
+		// The API published while the watch was deaf, so nothing arrived on it.
+		h.kv.put(routingCacheKey(ORG), artifact(ORG, "hash-2"));
+		const realNow = Date.now;
+		Date.now = () => realNow() + 120_000;
+		try {
+			const found = await h.source.get(ORG);
+			expect(found?.snapshotHash).toBe("hash-2");
+			expect(h.kv.gets()).toBe(2);
+		} finally {
+			Date.now = realNow;
+		}
+	});
+
 	it("reports that it is watching once the bucket is open", async () => {
 		const h = harness();
 		await h.source.onModuleInit();
@@ -386,5 +433,108 @@ describe("findTrunkEndpoint", () => {
 async function settle(): Promise<void> {
 	for (let index = 0; index < 8; index += 1) {
 		await new Promise((resolve) => setTimeout(resolve, 1));
+	}
+}
+
+/**
+ * The stalled-watch guard.
+ *
+ * A `kv.watch()` can stop delivering while staying open and erroring nothing — the broker refuses
+ * the flow-control reply and simply stops pushing (see the class note, and
+ * `routing-watch-stall.spec.ts` for the same thing against a real broker). Nothing inside the
+ * client can see that, so the guard compares the bucket's own last revision against the highest
+ * one the watch delivered, and re-establishes the watch when the bucket has moved on without it.
+ */
+describe("a watch that stalls without ending", () => {
+	it("re-establishes the watch when the bucket has moved past it", async () => {
+		const h = harness({ seed: { [routingCacheKey(ORG)]: artifact() } });
+		await h.source.onModuleInit();
+		h.kv.push({
+			key: routingCacheKey(ORG),
+			operation: "PUT",
+			value: encode(artifact()),
+			revision: 4,
+		});
+		await settle();
+		expect(h.kv.watches()).toBe(1);
+
+		// A write the watch never sees: the bucket's revision advances, its delivery does not.
+		h.kv.advanceBucket(9);
+		await stale();
+
+		expect(h.kv.watches()).toBeGreaterThan(1);
+		expect(h.source.stats.staleRecoveries).toBe(1);
+	});
+
+	it("drops every memory copy when it recovers, so nothing unverified is served", async () => {
+		const h = harness({ seed: { [routingCacheKey(ORG)]: artifact() } });
+		await h.source.onModuleInit();
+		await h.source.get(ORG);
+		expect(h.source.stats.cached).toBe(1);
+
+		h.kv.advanceBucket(9);
+		await stale();
+
+		expect(h.source.stats.cached).toBe(0);
+	});
+
+	it("leaves a quiet bucket alone, however long it stays quiet", async () => {
+		// The distinction the whole guard exists for: a tenant nobody is configuring produces the
+		// same silence a wedged iterator does, and must not cost a watch re-create every probe.
+		const h = harness({ seed: { [routingCacheKey(ORG)]: artifact() } });
+		await h.source.onModuleInit();
+		h.kv.push({
+			key: routingCacheKey(ORG),
+			operation: "PUT",
+			value: encode(artifact()),
+			revision: 4,
+		});
+		await stale();
+
+		expect(h.kv.watches()).toBe(1);
+		expect(h.source.stats.staleRecoveries).toBe(0);
+	});
+
+	it("needs two consecutive probes, so a write still in flight is not a stall", async () => {
+		const h = harness({ seed: { [routingCacheKey(ORG)]: artifact() } });
+		await h.source.onModuleInit();
+		await settle();
+		h.kv.advanceBucket(9);
+		// One probe's worth of time, then the entry lands: the gap closes and no strike survives.
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		h.kv.push({
+			key: routingCacheKey(ORG),
+			operation: "PUT",
+			value: encode(artifact()),
+			revision: 9,
+		});
+		await stale();
+
+		expect(h.source.stats.staleRecoveries).toBe(0);
+		expect(h.kv.watches()).toBe(1);
+	});
+
+	it("re-establishes ONCE for a revision no watch can reach", async () => {
+		// A bucket whose newest revision belongs to a compacted-away write is a permanent gap. It
+		// costs one recovery to find that out; it must not cost one every probe for ever.
+		const h = harness({ seed: { [routingCacheKey(ORG)]: artifact() } });
+		await h.source.onModuleInit();
+		await settle();
+		h.kv.advanceBucket(9);
+		await stale();
+		await stale();
+		await stale();
+
+		expect(h.source.stats.staleRecoveries).toBe(1);
+	});
+});
+
+/**
+ * Lets the stale guard strike twice AND lets the watch loop finish its reconnect backoff, which is
+ * 250 ms on the first attempt — a recovery is not observable as a new watch until that has elapsed.
+ */
+async function stale(): Promise<void> {
+	for (let index = 0; index < 20; index += 1) {
+		await new Promise((resolve) => setTimeout(resolve, 25));
 	}
 }

@@ -42,6 +42,8 @@ type DialScript =
 
 interface HarnessOptions {
 	readonly node?: Partial<QueuePlanNode>;
+	/** `null` withholds the caller's number — the case virtual hold cannot promise anything to. */
+	readonly callerNumber?: string | null;
 	readonly agents?: readonly QueueMembershipAgent[];
 	readonly membership?: Partial<QueueMembership> | null;
 	/** Statuses to seed, keyed by agent id. Unseeded agents are unknown to the bucket. */
@@ -73,6 +75,8 @@ interface Harness {
 	readonly session: QueueSession;
 	readonly node: QueuePlanNode;
 	readonly services: FakeQueueServices;
+	/** Queues the session told the callback sweep about. */
+	readonly registered: readonly { readonly orgId: string; readonly queueId: string }[];
 	readonly timeline: string[];
 	readonly dialled: QueueDialAttempt[][];
 	readonly notes: string[];
@@ -163,6 +167,13 @@ function harness(options: HarnessOptions = {}): Harness {
 		};
 	}
 
+	const registered: { orgId: string; queueId: string }[] = [];
+	services.callbacks = {
+		register: (orgId, queueId) => {
+			registered.push({ orgId, queueId });
+		},
+	};
+
 	const timeline: string[] = [];
 	const notes: string[] = [];
 	const dialled: QueueDialAttempt[][] = [];
@@ -183,7 +194,9 @@ function harness(options: HarnessOptions = {}): Harness {
 		callerLegId: LEG_ID,
 		callId: CALL_ID,
 		organizationId: ORG,
-		callerNumber: "+15551234567",
+		...(options.callerNumber === null
+			? {}
+			: { callerNumber: options.callerNumber ?? "+15551234567" }),
 		ensureAnswered: async () => {
 			timeline.push("answer");
 			return options.answerFails !== true;
@@ -296,6 +309,7 @@ function harness(options: HarnessOptions = {}): Harness {
 			},
 		}),
 		services,
+		registered,
 		timeline,
 		dialled,
 		notes,
@@ -1439,5 +1453,153 @@ describe("per-tier agent announcements", () => {
 		const h = harness({ agents: [fakeAgent("a")], dials: [{ kind: "answer" }] });
 		await h.session.run();
 		expect(h.timeline.some((entry) => entry.startsWith("whisper:"))).toBe(false);
+	});
+});
+
+// =================================================================================================
+// Virtual hold
+// =================================================================================================
+
+/**
+ * The caller's half of the callback: they are offered one, they take it, and their place is written
+ * as a token the platform owes a call on. The dialling half is `queue-callback.spec.ts`.
+ */
+describe("virtual hold", () => {
+	const callback = (overrides = {}) => ({
+		key: "2",
+		offerAfterSeconds: 0,
+		offerPromptId: "callback-offer",
+		confirmPromptId: "callback-confirm",
+		maxAttempts: 3,
+		retryDelaySeconds: 300,
+		expiresAfterSeconds: 3600,
+		...overrides,
+	});
+
+	it("takes the caller out of the line on the accept key", async () => {
+		const h = harness({ node: { callback: callback() }, digits: ["2"] });
+		const outcome = await h.session.run();
+
+		expect(outcome.kind).toBe("callback");
+		expect(h.dialled).toEqual([]);
+		expect(h.services.waiting.waitingCount).toBe(0);
+	});
+
+	it("stops the hold music and plays the confirmation before ending the call", async () => {
+		const h = harness({ node: { callback: callback() }, digits: ["2"] });
+		await h.session.run();
+
+		expect(h.timeline).toContain("moh:stop");
+		expect(h.timeline).toContain("play:sound:callback-confirm");
+	});
+
+	/**
+	 * Its own reason, not `caller-hangup`: an SLA that counted a caller taking the offer as one
+	 * giving up would penalise the queue for the feature working.
+	 */
+	it("publishes an abandonment a report can tell apart from a caller giving up", async () => {
+		const h = harness({ node: { callback: callback() }, digits: ["2"] });
+		await h.session.run();
+		const abandoned = h.services.events.recorded.find((event) => event.type === "caller.abandoned");
+		expect(abandoned?.data.reason).toBe("callback");
+	});
+
+	it("writes a token the platform owes a call on, keyed by the caller's number", async () => {
+		const h = harness({ node: { callback: callback() }, digits: ["2"] });
+		await h.session.run();
+		const claimed = await h.services.waiting.join({
+			orgId: ORG,
+			queueId: h.node.queueId,
+			callId: OTHER_CALL_ID,
+			legId: LEG_ID,
+			priority: 0,
+			callerNumber: "+15551234567",
+			instanceId: "engine-1",
+			now: h.clock.now,
+			resumeAllowed: true,
+		});
+		// The token IS a resume promise: a caller who rings back first claims their own place, which
+		// is what stops the platform calling somebody who is already back in the line.
+		expect(claimed.resumed).toBe(true);
+	});
+
+	it("announces the offer once the caller has waited long enough, and only once", async () => {
+		const h = harness({
+			node: { callback: callback({ offerAfterSeconds: 1 }) },
+			dials: [{ kind: "no-answer" }, { kind: "no-answer" }, { kind: "answer" }],
+		});
+		await h.session.run();
+
+		expect(h.timeline.filter((entry) => entry === "play:sound:callback-offer")).toHaveLength(1);
+	});
+
+	it("never announces an offer the queue has no wait for", async () => {
+		const h = harness({ node: { callback: callback() }, dials: [{ kind: "answer" }] });
+		await h.session.run();
+
+		expect(h.timeline).not.toContain("play:sound:callback-offer");
+	});
+
+	it("leaves the caller in the queue when they press the key with no number to call back", async () => {
+		const h = harness({
+			node: { callback: callback() },
+			digits: ["2"],
+			callerNumber: null,
+			dials: [{ kind: "answer" }],
+		});
+		const outcome = await h.session.run();
+
+		expect(outcome.kind).toBe("answered");
+		expect(h.notes.join(" ")).toContain("presented no number");
+	});
+
+	it("does nothing at all for a queue that offers no callback", async () => {
+		const h = harness({ digits: ["2"], dials: [{ kind: "answer" }] });
+		expect((await h.session.run()).kind).toBe("answered");
+	});
+
+	/** One poll per pass: the exit key must not eat the digit meant for the callback offer. */
+	it("tells the two keys apart on one polled digit", async () => {
+		const h = harness({ node: { exitKey: "9", callback: callback() }, digits: ["2"] });
+		expect((await h.session.run()).kind).toBe("callback");
+	});
+
+	/**
+	 * The dialler is a sweep, and a sweep only runs for a queue it has been told about. Registering
+	 * happens AFTER the write, so the platform never looks for a promise that failed to persist.
+	 */
+	it("starts the dialling sweep for the queue it just made a promise on", async () => {
+		const h = harness({ node: { callback: callback() }, digits: ["2"] });
+		await h.session.run();
+
+		expect(h.registered).toEqual([{ orgId: ORG, queueId: h.node.queueId }]);
+	});
+
+	it("starts no sweep for a caller who merely hung up", async () => {
+		const h = harness({ node: { callback: callback() }, budget: 2 });
+		await h.session.run();
+
+		expect(h.registered).toEqual([]);
+	});
+
+	/**
+	 * The other end of the token, read back through the REAL store: what the caller's half wrote is
+	 * exactly what the sweep reads, including the queued call that links the two CDRs.
+	 */
+	it("writes a token the sweep can read, carrying the call it settles", async () => {
+		const h = harness({ node: { callback: callback() }, digits: ["2"] });
+		await h.session.run();
+
+		const due = await h.services.waiting.dueCallbacks(ORG, h.node.queueId, h.clock.now);
+		expect(due).toHaveLength(1);
+		expect(due[0]?.callerNumber).toBe("+15551234567");
+		expect(due[0]?.callback?.callId).toBe(CALL_ID);
+
+		// One failed attempt, and the token is still owed two more.
+		expect(
+			await h.services.waiting.deferCallback(ORG, h.node.queueId, "+15551234567", h.clock.now, 0),
+		).toBe(false);
+		const again = await h.services.waiting.dueCallbacks(ORG, h.node.queueId, h.clock.now);
+		expect(again[0]?.callback?.attempts).toBe(1);
 	});
 });

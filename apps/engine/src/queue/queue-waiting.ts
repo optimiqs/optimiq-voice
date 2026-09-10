@@ -254,6 +254,80 @@ export function takeTombstone(
 	};
 }
 
+/**
+ * The tombstones this queue owes a CALL, oldest place first.
+ *
+ * A resume tombstone with a `callback` block is a promise the platform made out loud; one without
+ * is a place held in case the caller happens to ring back. Only the first kind is dialled, and the
+ * order is the line's own — {@link compareWaiting} minus the lease fields — so a callback that was
+ * accepted from position 2 is placed before one accepted from position 9, which is the whole point
+ * of holding the place at all.
+ *
+ * `nextAttemptAt` gates each one: it is `0` on the first attempt and pushed forward by
+ * {@link deferCallback} after a failure, so a number whose owner is not answering does not starve
+ * the queue's other tokens.
+ */
+export function dueCallbacks(
+	record: QueueWaitingRecord,
+	now: number,
+): readonly QueueResumeTombstone[] {
+	return record.tombstones
+		.filter(
+			(tombstone) =>
+				tombstone.callback !== undefined &&
+				tombstone.expiresAt > now &&
+				tombstone.callback.nextAttemptAt <= now,
+		)
+		.sort(
+			(left, right) =>
+				right.priority - left.priority ||
+				left.joinedAt - right.joinedAt ||
+				(left.callerNumber < right.callerNumber ? -1 : 1),
+		);
+}
+
+/**
+ * Records a failed attempt, and says whether the promise survived it.
+ *
+ * The token is DROPPED when its attempts are used up rather than being left to expire: the place it
+ * holds is a place in a line, and one held for a number nobody is going to call again is a slot the
+ * queue counts and never fills. A dropped token is also the only honest end to the promise — the
+ * platform said it would call back, it called back `maxAttempts` times, and there is nothing further
+ * it can offer.
+ */
+export function deferCallback(
+	record: QueueWaitingRecord,
+	callerNumber: string,
+	now: number,
+	retryDelayMs: number,
+): { readonly record: QueueWaitingRecord; readonly dropped: boolean } {
+	const tombstone = record.tombstones.find(
+		(candidate) => candidate.callerNumber === callerNumber && candidate.callback !== undefined,
+	);
+	if (tombstone?.callback === undefined) {
+		return { record, dropped: false };
+	}
+	const others = record.tombstones.filter((candidate) => candidate !== tombstone);
+	const attempts = tombstone.callback.attempts + 1;
+	if (attempts >= tombstone.callback.maxAttempts) {
+		return { record: { ...record, tombstones: others, updatedAt: now }, dropped: true };
+	}
+	return {
+		record: {
+			...record,
+			tombstones: [
+				...others,
+				{
+					...tombstone,
+					callback: { ...tombstone.callback, attempts, nextAttemptAt: now + retryDelayMs },
+				},
+			],
+			updatedAt: now,
+		},
+		dropped: false,
+	};
+}
+
 /** Whether an entry is close enough to its expiry that its owner should push the lease forward. */
 export function isRenewalDue(entry: QueueWaitingEntry, now: number): boolean {
 	return entry.expiresAt - now <= QUEUE_WAITING_LEASE_MS - QUEUE_WAITING_RENEW_AFTER_MS;

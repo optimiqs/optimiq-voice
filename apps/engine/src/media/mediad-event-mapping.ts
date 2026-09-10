@@ -136,6 +136,9 @@ export function toMediaEventFromMediad(envelope: MediaEventEnvelope): MediaEvent
 			recordingName: envelope.data.recordingRef,
 			durationMs: envelope.data.durationMs,
 			bytes: envelope.data.bytes,
+			// Only the process that wrote the audio knows where in the file the silence landed, so
+			// this is the one place the intervals can enter the engine at all.
+			...(envelope.data.pauses === undefined ? {} : { pauses: envelope.data.pauses }),
 		};
 	}
 	// `session.rtp-timeout` and `playback.finished` — see the file header. The first is the

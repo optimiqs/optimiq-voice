@@ -166,7 +166,10 @@ function service(
 	path?: SipInviteCallPath,
 ): SipInviteService {
 	const jetstream = { rawConnection: fake.connection } as unknown as JetStreamService;
-	const built = new SipInviteService({ ENGINE_INSTANCE_ID: "engine-1" } as EngineEnv, jetstream);
+	const built = new SipInviteService(
+		{ ENGINE_INSTANCE_ID: "engine-1", ENGINE_SIP_INVITE_CONCURRENCY: 32 } as EngineEnv,
+		jetstream,
+	);
 	if (path !== undefined) {
 		built.attach(path);
 	}
@@ -188,7 +191,10 @@ describe("the sip invite subscription", () => {
 
 	it("does not subscribe when the engine has no broker connection", () => {
 		const jetstream = { rawConnection: undefined } as unknown as JetStreamService;
-		const built = new SipInviteService({ ENGINE_INSTANCE_ID: "engine-1" } as EngineEnv, jetstream);
+		const built = new SipInviteService(
+			{ ENGINE_INSTANCE_ID: "engine-1", ENGINE_SIP_INVITE_CONCURRENCY: 32 } as EngineEnv,
+			jetstream,
+		);
 		built.onApplicationBootstrap();
 		expect(built.stats.listening).toBe(false);
 	});
@@ -278,6 +284,20 @@ describe("refusing a call", () => {
 		expect((fake.replies[0] as { reason: string }).reason).toBe("shutting_down");
 		expect(path.admits).toHaveLength(0);
 		expect(built.stats.listening).toBe(false);
+	});
+
+	it("counts each refusal under its own reason, which is what the scrape labels", async () => {
+		const fake = fakeConnection();
+		const path = callPath();
+		const built = service(fake, path.path);
+		built.onApplicationShutdown();
+
+		await fake.deliver(JSON.stringify(request()));
+		await fake.deliver(JSON.stringify(request()));
+		await fake.deliver("not json at all");
+
+		// Not `served - admitted`: that number cannot say WHICH refusal an operator is looking at.
+		expect(built.stats.refusals).toEqual({ shutting_down: 2, bad_request: 1 });
 	});
 
 	it("refuses `internal` rather than hanging when no call path is attached yet", async () => {
@@ -488,5 +508,92 @@ describe("an INVITE carrying Replaces", () => {
 
 		expect(path.authorizations).toHaveLength(0);
 		expect((fake.replies[0] as { ok: boolean }).ok).toBe(true);
+	});
+});
+
+describe("admitting concurrently", () => {
+	/**
+	 * A call path whose admissions are held open until released, so a spec can see how many the
+	 * responder is willing to have in flight at once.
+	 */
+	function gatedCallPath(): {
+		readonly path: SipInviteCallPath;
+		readonly started: string[];
+		release(): void;
+	} {
+		const started: string[] = [];
+		const waiters: (() => void)[] = [];
+		return {
+			started,
+			release: () => {
+				for (const resolve of waiters.splice(0)) {
+					resolve();
+				}
+			},
+			path: {
+				admit: async (received: SipInviteRequest) => {
+					started.push(received.legId);
+					await new Promise<void>((resolve) => waiters.push(resolve));
+					return { ...ADMITTED, legId: received.legId };
+				},
+			},
+		};
+	}
+
+	it("does not make the hundredth caller in a burst wait out the ninety-nine in front of them", async () => {
+		const fake = fakeConnection();
+		const gated = gatedCallPath();
+		service(fake, gated.path);
+
+		for (let index = 0; index < 8; index += 1) {
+			await fake.deliver(JSON.stringify(request({ legId: `leg-${index}` })));
+		}
+
+		// All eight are being admitted at once. Serially, only the first would have started.
+		expect(gated.started.length).toBe(8);
+		gated.release();
+	});
+
+	it("bounds the concurrency, so a flood queues in the broker rather than in this heap", async () => {
+		const fake = fakeConnection();
+		const gated = gatedCallPath();
+		const jetstream = { rawConnection: fake.connection } as unknown as JetStreamService;
+		const built = new SipInviteService(
+			{ ENGINE_INSTANCE_ID: "engine-1", ENGINE_SIP_INVITE_CONCURRENCY: 3 } as EngineEnv,
+			jetstream,
+		);
+		built.attach(gated.path);
+		built.onApplicationBootstrap();
+
+		for (let index = 0; index < 8; index += 1) {
+			await fake.deliver(JSON.stringify(request({ legId: `leg-${index}` })));
+		}
+
+		expect(gated.started.length).toBe(3);
+		gated.release();
+		for (let tick = 0; tick < 50; tick += 1) {
+			await Promise.resolve();
+		}
+		expect(gated.started.length).toBeGreaterThan(3);
+		gated.release();
+	});
+
+	it("answers a retry that arrives while the first attempt is still running with the same reply", async () => {
+		const fake = fakeConnection();
+		const gated = gatedCallPath();
+		service(fake, gated.path);
+
+		await fake.deliver(JSON.stringify(request({ legId: "leg-retried" })));
+		await fake.deliver(JSON.stringify(request({ legId: "leg-retried" })));
+
+		// One admission for two INVITEs. Without the fold the retry would race the first to the
+		// `channels` compare-and-set, lose, and be refused `internal` — a 500 for a call going through.
+		expect(gated.started).toEqual(["leg-retried"]);
+		gated.release();
+		for (let tick = 0; tick < 50; tick += 1) {
+			await Promise.resolve();
+		}
+		expect(fake.replies.length).toBe(2);
+		expect(fake.replies.every((reply) => (reply as { ok: boolean }).ok)).toBe(true);
 	});
 });

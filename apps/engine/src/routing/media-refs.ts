@@ -55,12 +55,27 @@ export interface MediaRefSettings {
 	 * falls back. See the header for why there is no HTTP alternative.
 	 */
 	readonly objectMediaRoot: string;
+	/**
+	 * The compiled artifact's `prompts` table: prompt row id → domain `MediaRef`, normally
+	 * `object://<objectKey>`.
+	 *
+	 * A plan node names a tenant's prompt by ROW id, but the audio was uploaded under a DIFFERENT
+	 * id, so `promptPrefix + promptId` names a file that has never existed on any deployment —
+	 * `mediad` answers `no such prompt` and the caller hears nothing. The table is the only thing
+	 * that knows the two ids apart, and it comes from the artifact because it is per-organization
+	 * and the engine holds no database handle.
+	 *
+	 * Empty is the pre-table state (an old artifact, or the platform's own sound set), and a MISS
+	 * falls back to the prefix — which is still right for a bare stem like `unavailable`.
+	 */
+	readonly prompts: Readonly<Record<string, string>>;
 }
 
 export const DEFAULT_MEDIA_REF_SETTINGS: MediaRefSettings = {
 	promptPrefix: "sound:",
 	fallbackMedia: "sound:unavailable",
 	objectMediaRoot: "",
+	prompts: {},
 };
 
 /** Media URI schemes Asterisk understands directly; anything already in one is passed through. */
@@ -84,7 +99,7 @@ export function resolveMediaRef(
 	}
 	const promptId = node.promptId?.trim();
 	if (promptId !== undefined && promptId !== "") {
-		return `${settings.promptPrefix}${promptId}`;
+		return promptMedia(promptId, settings);
 	}
 	return undefined;
 }
@@ -187,7 +202,7 @@ export function translateMediaRef(
 		return trimmed;
 	}
 	if (trimmed.startsWith("prompt://")) {
-		return `${settings.promptPrefix}${trimmed.slice("prompt://".length)}`;
+		return promptMedia(trimmed.slice("prompt://".length), settings);
 	}
 	if (trimmed.startsWith("tone://")) {
 		return `tone:${trimmed.slice("tone://".length)}`;
@@ -205,6 +220,26 @@ export function translateMediaRef(
 	// header: reporting the gap beats playing silence, and {@link resolveMediaRefOrExplain} is what
 	// turns the gap into a sentence an operator can act on.
 	return undefined;
+}
+
+/**
+ * One prompt id in the media server's vocabulary.
+ *
+ * The artifact's table first, because a tenant's prompt is a ROW id and only the table knows which
+ * object holds its audio; the deployment-wide prefix second, because a bare stem (`unavailable`,
+ * `digits/7`) is not a row at all and never appears in the table. A table entry that cannot be
+ * rendered — an `object://` key with no mount — falls through to the prefix rather than to nothing,
+ * which keeps the refusal (and its reason) identical to what every release before the table did.
+ */
+function promptMedia(promptId: string, settings: MediaRefSettings): string {
+	const ref = settings.prompts[promptId];
+	if (ref !== undefined) {
+		const media = translateMediaRef(ref, settings);
+		if (media !== undefined) {
+			return media;
+		}
+	}
+	return `${settings.promptPrefix}${promptId}`;
 }
 
 /**

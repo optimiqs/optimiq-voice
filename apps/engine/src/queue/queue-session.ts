@@ -2,7 +2,7 @@ import { isStaffing } from "./agent-state";
 import { selectAgents } from "./queue-strategy";
 import type { QueueCandidate } from "./queue-strategy";
 import type { AgentStateEntry, QueueMembership, QueueResumeTombstone } from "@optimiq-voice/events";
-import type { QueuePlanNode } from "@optimiq-voice/routing";
+import type { QueueCallbackPlan, QueuePlanNode } from "@optimiq-voice/routing";
 import type { HangupCause } from "@optimiq-voice/telephony";
 
 /**
@@ -284,7 +284,13 @@ export interface QueueEventPort {
 		readonly legId: string;
 		readonly waitMs: number;
 		readonly position?: number;
-		readonly reason: "caller-hangup" | "timeout" | "overflow" | "no-agents" | "exit-key";
+		readonly reason:
+			| "caller-hangup"
+			| "timeout"
+			| "overflow"
+			| "no-agents"
+			| "exit-key"
+			| "callback";
 		readonly exitKey?: string;
 	}): Promise<void>;
 }
@@ -373,6 +379,20 @@ export interface QueueServices {
 	readonly events: QueueEventPort;
 	readonly waiting: QueueWaitingPort;
 	readonly cursor: QueueCursorPort;
+	/**
+	 * Told when this queue owes somebody a call, so virtual hold's sweep starts running for it.
+	 *
+	 * OPTIONAL because the promise is already DURABLE by the time this is called — the token is in
+	 * the bucket — and a session that cannot reach the scheduler must still end the caller's call
+	 * cleanly rather than failing the hangup over the dialler. An unregistered queue is picked up by
+	 * the next caller who joins it; see `queue-callback.scheduler.ts`.
+	 */
+	readonly callbacks?: QueueCallbackSchedulePort;
+}
+
+/** How {@link QueueSession} tells the callback sweep that a queue has a promise outstanding. */
+export interface QueueCallbackSchedulePort {
+	register(orgId: string, queueId: string, plan: QueueCallbackPlan): void;
 }
 
 export interface QueueSessionSettings {
@@ -421,6 +441,15 @@ export type QueueOutcome =
 	 * that times people out. The digit travels so the walker's note and the event can name it.
 	 */
 	| { readonly kind: "exit-key"; readonly digit: string; readonly waitMs: number }
+	/**
+	 * The caller accepted virtual hold. Their place is held as a callback token and the call is over.
+	 *
+	 * Its own outcome and not an `abandoned` for the reason `exit-key` is not a `timeout`: the caller
+	 * neither gave up nor was ejected, they were offered something and took it. The walker ends the
+	 * call on it — there is nowhere to route somebody who has agreed to hang up — and a report that
+	 * counted it as an abandonment would penalise the queue for the feature working.
+	 */
+	| { readonly kind: "callback"; readonly callerNumber: string; readonly waitMs: number }
 	/** The leg went away underneath the session before it could join. */
 	| { readonly kind: "aborted" }
 	/** The roster could not be obtained. Distinguished from "no agents" deliberately. */
@@ -461,6 +490,8 @@ export class QueueSession {
 	private readonly transitionRetries = new Map<string, OwnedTransitionRetry>();
 	/** The frozen order `sequential` walks; computed on the first pass and never recomputed. */
 	private frozenOrder: readonly string[] | undefined;
+	/** Whether the virtual-hold offer has already been announced to this caller. */
+	private callbackOffered = false;
 	/** When this caller's WAIT started. Always their real arrival, even when their place is older. */
 	private joinedAt = 0;
 	/**
@@ -546,12 +577,14 @@ export class QueueSession {
 	/**
 	 * Takes the caller out of the shared line, with a resume promise when they earned one.
 	 *
-	 * Exactly one outcome earns one: `abandoned`, which is the caller hanging up while waiting. Not
-	 * a timeout — the queue decided that, and the caller is being sent somewhere by configuration, so
-	 * holding a place they did not choose to leave would mean their call-back jumped the line ahead of
-	 * people who never gave up. Not an exit key, for a stronger version of the same reason: they chose
-	 * to stop waiting. Not `answered`, obviously. Not `failed` or `aborted`, because a place restored
-	 * on the strength of an infrastructure fault is a place nobody can account for.
+	 * Two outcomes earn one, and they are the two where the caller chose to stop holding without
+	 * being sent anywhere. `abandoned` is the caller hanging up while waiting; `callback` is the
+	 * caller accepting virtual hold. Not a timeout — the queue decided that, and the caller is being
+	 * sent somewhere by configuration, so holding a place they did not choose to leave would mean
+	 * their call-back jumped the line ahead of people who never gave up. Not an exit key, for a
+	 * stronger version of the same reason: they chose to go elsewhere. Not `answered`, obviously. Not
+	 * `failed` or `aborted`, because a place restored on the strength of an infrastructure fault is a
+	 * place nobody can account for.
 	 */
 	private async leaveLine(outcome: QueueOutcome): Promise<void> {
 		const now = this.call.now();
@@ -563,23 +596,53 @@ export class QueueSession {
 			callerNumber !== undefined &&
 			callerNumber !== "";
 
-		await this.services.waiting.leave({
-			orgId: this.call.organizationId,
-			queueId: this.node.queueId,
-			callId: this.call.callId,
-			now,
-			...(holdsPlace
+		// Virtual hold writes the SAME tombstone, with the block that says the platform owes the
+		// call. That is not a coincidence to be tidied away later: a caller who rings back before we
+		// reach them claims their own token through the ordinary `join`, in the compare-and-set that
+		// deletes it — so "we never call somebody who is already back in the line" is a property of
+		// the data structure rather than a check somebody has to remember to write.
+		const callback = this.node.callback;
+		const tombstone =
+			outcome.kind === "callback" && callback !== undefined
 				? {
-						tombstone: {
+						callerNumber: outcome.callerNumber,
+						joinedAt: this.orderedAt,
+						priority: this.priority,
+						abandonedAt: now,
+						expiresAt: now + callback.expiresAfterSeconds * MILLIS_PER_SECOND,
+						callback: {
+							attempts: 0,
+							maxAttempts: callback.maxAttempts,
+							// The wait this callback settles, carried so the two `call_id`s can be related.
+							callId: this.call.callId,
+							// Zero rather than `now`: the first attempt is due the moment an agent frees,
+							// and a delay before it would be the platform making the caller wait twice.
+							nextAttemptAt: 0,
+						},
+					}
+				: holdsPlace
+					? {
 							callerNumber: callerNumber as string,
 							joinedAt: this.orderedAt,
 							priority: this.priority,
 							abandonedAt: now,
 							expiresAt: now + this.node.discardAbandonedAfterSeconds * MILLIS_PER_SECOND,
-						},
-					}
-				: {}),
+						}
+					: undefined;
+
+		await this.services.waiting.leave({
+			orgId: this.call.organizationId,
+			queueId: this.node.queueId,
+			callId: this.call.callId,
+			now,
+			...(tombstone === undefined ? {} : { tombstone }),
 		});
+
+		// AFTER the write, never before: registering a sweep for a token that failed to persist would
+		// have the platform looking for a promise it did not make.
+		if (tombstone?.callback !== undefined && callback !== undefined) {
+			this.services.callbacks?.register(this.call.organizationId, this.node.queueId, callback);
+		}
 	}
 
 	private applyView(view: QueueWaitingView): void {
@@ -600,16 +663,19 @@ export class QueueSession {
 				return await this.abandon("caller-hangup");
 			}
 
-			// Before anything else on the pass. A caller who has pressed the exit key has stopped
-			// being a queued caller, and every line below this — the roster read, the deadlines, the
-			// selection — is work on their behalf that they have just told us not to do. Checking it
-			// first is also what makes the key feel instant rather than "some time in the next second".
-			const exit = await this.exitKeyPressed();
-			if (exit !== undefined) {
-				return exit;
+			// Before anything else on the pass. A caller who has pressed a key has stopped being a
+			// queued caller, and every line below this — the roster read, the deadlines, the selection
+			// — is work on their behalf that they have just told us not to do. Checking it first is
+			// also what makes a key feel instant rather than "some time in the next second".
+			const pressed = await this.keyPressed();
+			if (pressed !== undefined) {
+				return pressed;
 			}
 
 			const waited = this.waitedMs();
+			// After the digit and before the roster: the offer is an announcement over the hold music,
+			// and a caller who is about to be rung should hear the phone rather than the offer.
+			await this.offerCallbackIfDue(waited);
 			const membership = await this.services.membership.membershipFor(
 				this.call.organizationId,
 				this.node.queueId,
@@ -682,23 +748,37 @@ export class QueueSession {
 	}
 
 	/**
-	 * The exit key, checked once per pass.
+	 * One digit, checked once per pass, against the two keys a waiting caller may press.
 	 *
-	 * Digits that are NOT the exit key are ignored here and deliberately left in the leg's buffer —
-	 * see {@link QueueCallPort.pollDigit}. Only one digit is taken per pass, which is enough: the pass
-	 * runs every poll interval, and a caller who mashes four keys has the first of them answered
-	 * within a second rather than having three of them silently discarded.
+	 * ONE poll, not one per key. `pollDigit` consumes, so asking twice would let the exit key eat the
+	 * digit meant for the callback offer and hand the caller silence — and the compiler already
+	 * refuses to compile both keys as the same digit, so a single digit can match at most one of
+	 * them. A digit that matches neither is dropped, which is the same thing the queue did with every
+	 * non-exit digit before the callback existed.
+	 *
+	 * Only one digit per pass, which is enough: the pass runs every poll interval, so a caller who
+	 * mashes four keys has the first of them answered within a second.
 	 */
-	private async exitKeyPressed(): Promise<QueueOutcome | undefined> {
-		const key = this.node.exitKey;
-		if (key === undefined || key === "") {
+	private async keyPressed(): Promise<QueueOutcome | undefined> {
+		const exitKey = this.node.exitKey;
+		const callbackKey = this.node.callback?.key;
+		if ((exitKey === undefined || exitKey === "") && callbackKey === undefined) {
 			return undefined;
 		}
-		const digit = this.call.pollDigit();
-		if (digit === undefined || digit.toUpperCase() !== key.toUpperCase()) {
+		const digit = this.call.pollDigit()?.toUpperCase();
+		if (digit === undefined) {
 			return undefined;
 		}
+		if (exitKey !== undefined && exitKey !== "" && digit === exitKey.toUpperCase()) {
+			return await this.exitKeyPressed(exitKey);
+		}
+		if (callbackKey !== undefined && digit === callbackKey.toUpperCase()) {
+			return await this.acceptCallback("key");
+		}
+		return undefined;
+	}
 
+	private async exitKeyPressed(key: string): Promise<QueueOutcome> {
 		const waitMs = this.waitedMs();
 		this.call.note(
 			`queue "${this.node.queueId}": the caller pressed the exit key "${key}" after ${String(Math.round(waitMs / MILLIS_PER_SECOND))}s and left the queue`,
@@ -715,6 +795,91 @@ export class QueueSession {
 			...(this.position > 0 ? { position: this.position } : {}),
 		});
 		return { kind: "exit-key", digit: key, waitMs };
+	}
+
+	/**
+	 * Announce the callback offer, once, when the caller has waited long enough to be told about it.
+	 *
+	 * Once per call and not once per pass: an offer replayed every second over the hold music is not
+	 * an offer, it is a fault. A queue with `offerAfterSeconds: 0` never reaches this at all and the
+	 * offer exists only for a caller who already knows the key — which is a real configuration for a
+	 * queue whose greeting says so.
+	 */
+	private async offerCallbackIfDue(waitedMs: number): Promise<void> {
+		const callback = this.node.callback;
+		if (
+			callback === undefined ||
+			this.callbackOffered ||
+			callback.offerAfterSeconds <= 0 ||
+			waitedMs < callback.offerAfterSeconds * MILLIS_PER_SECOND
+		) {
+			return;
+		}
+		this.callbackOffered = true;
+		if (!this.callbackReachable()) {
+			// Said once, on the call, rather than played to the caller: there is nothing they can do
+			// about their number being withheld, and an offer they cannot accept is worse than none.
+			this.call.note(
+				`queue "${this.node.queueId}": the callback offer was due but this caller has no number to call back on; it was not made`,
+			);
+			return;
+		}
+		const media = await this.call.resolvePrompt(callback.offerPromptId);
+		if (media === undefined) {
+			this.call.note(
+				`queue "${this.node.queueId}": the callback offer was due but the queue has no offer prompt; the caller was not told about the key`,
+			);
+			return;
+		}
+		await this.call.play(media);
+	}
+
+	/**
+	 * The caller accepted virtual hold.
+	 *
+	 * Refused — silently, from the caller's side — when there is no number to call back on. The
+	 * alternative is a token keyed by nothing, which `queueResumeTombstoneSchema` will not even
+	 * store, and a caller who was told they would be called back and never will be.
+	 */
+	private async acceptCallback(via: "key"): Promise<QueueOutcome | undefined> {
+		const callback = this.node.callback;
+		const callerNumber = this.call.callerNumber;
+		if (callback === undefined) {
+			return undefined;
+		}
+		if (!this.callbackReachable() || callerNumber === undefined) {
+			this.call.note(
+				`queue "${this.node.queueId}": the caller pressed the callback key but presented no number, so no callback could be promised; they stay in the queue`,
+			);
+			return undefined;
+		}
+
+		const waitMs = this.waitedMs();
+		this.call.note(
+			`queue "${this.node.queueId}": the caller accepted a callback by ${via} after ${String(Math.round(waitMs / MILLIS_PER_SECOND))}s; their place is held for ${callerNumber}`,
+		);
+		await this.call.stopMusicOnHold();
+		const confirm = await this.call.resolvePrompt(callback.confirmPromptId);
+		if (confirm !== undefined) {
+			// Best effort. A confirmation that will not play must not cost the caller the promise —
+			// the token is what the platform owes them, and it is written either way.
+			await this.call.play(confirm);
+		}
+		await this.services.events.callerAbandoned({
+			orgId: this.call.organizationId,
+			queueId: this.node.queueId,
+			callId: this.call.callId,
+			legId: this.call.callerLegId,
+			waitMs,
+			reason: "callback",
+			...(this.position > 0 ? { position: this.position } : {}),
+		});
+		return { kind: "callback", callerNumber, waitMs };
+	}
+
+	private callbackReachable(): boolean {
+		const number = this.call.callerNumber;
+		return number !== undefined && number.trim() !== "";
 	}
 
 	/**

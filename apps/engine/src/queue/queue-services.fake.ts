@@ -5,6 +5,7 @@ import { QueueWaitingStore } from "./queue-waiting.store";
 import type {
 	AgentStatePort,
 	AgentTransitionRequest,
+	QueueCallbackSchedulePort,
 	QueueEventPort,
 	QueueMembershipPort,
 	QueueServices,
@@ -277,6 +278,8 @@ export interface FakeQueueServices extends QueueServices {
 	readonly events: FakeQueueEventPort;
 	readonly waiting: QueueWaitingStore;
 	readonly cursor: QueueCursors;
+	/** Writable so a spec can watch which queues the session hands to the callback sweep. */
+	callbacks?: QueueCallbackSchedulePort;
 }
 
 /**

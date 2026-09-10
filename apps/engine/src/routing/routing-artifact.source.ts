@@ -39,6 +39,23 @@ import type { RoutingArtifact } from "@optimiq-voice/routing";
  * when it does — an engine that stopped hearing about changes must not keep serving the last thing
  * it heard as if it were current.
  *
+ * ## A watch can stop delivering without ever dying, so it is also POLLED
+ *
+ * The failure that made this necessary was found live and is worth naming, because nothing in the
+ * client reports it. `kv.watch()` is an ordered push consumer with `flow_control: true`: every few
+ * seconds the broker asks the client to acknowledge the window on `$JS.FC.<stream>.<consumer>.<n>`,
+ * and if that reply never lands the broker simply stops pushing. The subscription stays open, the
+ * iterator stays alive, `sub.closed` never resolves, no error is ever surfaced — the entries just
+ * stop, permanently. A broker-side publish permission that omits `$JS.FC.>` produces exactly this,
+ * and so does any other reason the reply cannot get through.
+ *
+ * So the watch is not trusted to report its own death. {@link RoutingArtifactSource.runStaleGuard}
+ * compares the highest revision the watch has delivered against the bucket's own last revision, and
+ * when the bucket has moved on and the watch has not, it tears the watch down — which puts it
+ * through the same reconnect-and-`invalidateAll` path a broker restart does. That is self-healing
+ * rather than a fix: the underlying cause is still whatever stopped the flow-control reply, which
+ * is why the recovery logs at WARN and is counted rather than being handled quietly.
+ *
  * ## The version guard is a hard failure, deliberately
  *
  * `parseRoutingArtifact` throws on an `artifactVersion` this release does not understand. The entry
@@ -70,6 +87,26 @@ interface CacheEntry {
 const CACHE_TTL_MS = 3_600_000;
 
 /**
+ * How long the watch may deliver NOTHING before its memory copies stop being trusted.
+ *
+ * The class note above names the failure this closes, and an end-to-end run found it: this process's
+ * watch iterator stayed alive yielding nothing — no error, so no reconnect, so no `invalidateAll`.
+ * Every plan the UI published after that moment compiled, stored and never arrived, and calls walked
+ * the old artifact for as long as the process lived. `CACHE_TTL_MS` was nominally the backstop, but
+ * an hour of routing a tenant's calls to the destination they deleted is not a backstop.
+ *
+ * The cause turned out to be the broker refusing the watch's flow-control reply, not anything the
+ * bucket did — see the class note. This rule stays regardless of the cause, because it is the rule
+ * that makes a memory copy only as trustworthy as the channel that would have invalidated it.
+ *
+ * Ninety seconds, because that is the shape of the signal rather than a guess at traffic: a healthy
+ * watch delivers on every compile any tenant makes, and a fleet that has published nothing for a
+ * minute and a half costs one KV read per call to find that out — the same read the miss path
+ * already makes. Being slightly too eager here buys a read; being too patient routes a call wrong.
+ */
+const WATCH_SILENCE_MS = 90_000;
+
+/**
  * How many organizations' artifacts this process holds at once.
  *
  * The watch `remember`s every key any API instance writes, not only the ones this engine has routed
@@ -78,6 +115,21 @@ const CACHE_TTL_MS = 3_600_000;
  * {@link RoutingArtifactSource.remember} re-inserts.
  */
 const CACHE_MAX_ENTRIES = 500;
+
+/**
+ * How many consecutive probes must see the bucket ahead of the watch before it is re-established.
+ *
+ * The probe itself runs every `ENGINE_ROUTING_WATCH_PROBE_MS`, and what it compares is revisions,
+ * not silence: {@link WATCH_SILENCE_MS} stops a stalled watch from being BELIEVED, but silence
+ * cannot tell a wedged iterator from a fleet nobody is configuring, and only "has the BUCKET moved
+ * past what this watch delivered" can.
+ *
+ * One strike is not enough: a `put` that landed between the last delivery and the probe is a gap
+ * that closes by itself milliseconds later, and re-creating the consumer for it would churn the
+ * watch on every write. Two puts a full probe interval of delivery time on the far side of the
+ * write, which is four orders of magnitude more than a push consumer needs.
+ */
+const WATCH_STALE_STRIKES = 2;
 
 @Injectable()
 export class RoutingArtifactSource implements OnModuleInit, OnApplicationShutdown {
@@ -92,6 +144,36 @@ export class RoutingArtifactSource implements OnModuleInit, OnApplicationShutdow
 	private kvReads = 0;
 	private rpcCalls = 0;
 	private invalidations = 0;
+	/**
+	 * When the watch last DELIVERED anything, whether or not it changed the cache.
+	 *
+	 * Separate from `invalidations`, and the difference is the whole point: a recompile that
+	 * produced the same hash is a delivered entry that changes no counter, so a watch which has
+	 * stopped delivering and a tenant whose configuration is simply quiet look identical through
+	 * `invalidations` alone. This one distinguishes them, and it is the field to look at when a
+	 * change has been saved in the UI and the call path is still walking the old plan: `watching`
+	 * can be true — the iterator is alive and yielding nothing — while this timestamp stands still.
+	 */
+	private lastWatchEntryAt: number | undefined;
+	/** When the current watch iterator started, so a fresh watch is not judged for its silence. */
+	private watchStartedAt = Date.now();
+	/** Highest KV revision the CURRENT watch delivered. Reset every time the watch is re-established. */
+	private watchRevision = 0;
+	/**
+	 * A bucket revision a demonstrably healthy watch could not reach, and which is therefore not
+	 * evidence of a stall.
+	 *
+	 * The bucket's last revision counts every write ever made to it; a watch started on last-value
+	 * only ever sees the newest write per key, so a key whose newest write was later superseded and
+	 * compacted away leaves a gap no re-establish will ever close. Without this, such a gap would
+	 * re-create the watch every probe for the life of the process. Recording the
+	 * revision at each recovery makes the gap cost one re-establish, and detection still works,
+	 * because the next real write pushes the bucket past it.
+	 */
+	private settledRevision = 0;
+	private staleStrikes = 0;
+	/** How many times the guard found the watch stalled and re-established it. `/healthz` reads it. */
+	private staleRecoveries = 0;
 
 	constructor(
 		@Inject(ENGINE_ENV) private readonly env: EngineEnv,
@@ -107,6 +189,9 @@ export class RoutingArtifactSource implements OnModuleInit, OnApplicationShutdow
 		readonly rpcCalls: number;
 		readonly invalidations: number;
 		readonly watching: boolean;
+		readonly watchRevision: number;
+		readonly staleRecoveries: number;
+		readonly lastWatchEntryAt?: string;
 	} {
 		return {
 			cached: this.cache.size,
@@ -115,6 +200,11 @@ export class RoutingArtifactSource implements OnModuleInit, OnApplicationShutdow
 			rpcCalls: this.rpcCalls,
 			invalidations: this.invalidations,
 			watching: this.watching,
+			watchRevision: this.watchRevision,
+			staleRecoveries: this.staleRecoveries,
+			...(this.lastWatchEntryAt === undefined
+				? {}
+				: { lastWatchEntryAt: new Date(this.lastWatchEntryAt).toISOString() }),
 		};
 	}
 
@@ -122,7 +212,15 @@ export class RoutingArtifactSource implements OnModuleInit, OnApplicationShutdow
 		// Fire-and-forget: the watch is a long-lived loop and awaiting it here would never return.
 		// A broker that is not up yet is handled by the loop's own retry, not by failing boot — the
 		// engine can still resolve over RPC, and a media server that is up must be able to answer.
-		void this.runWatchLoop();
+		// `.catch` and not a bare `void`: a throw that escapes the loop would otherwise be an
+		// unhandled rejection, which is a process-level crash under `--unhandled-rejections=strict`
+		// and, worse, a silently absent watch under the default.
+		void this.runWatchLoop().catch((error: unknown) => {
+			this.logger.error({ err: String(error) }, "the routing-cache watch loop exited");
+		});
+		void this.runStaleGuard().catch((error: unknown) => {
+			this.logger.error({ err: String(error) }, "the routing-cache watch guard exited");
+		});
 		await Promise.resolve();
 	}
 
@@ -142,7 +240,7 @@ export class RoutingArtifactSource implements OnModuleInit, OnApplicationShutdow
 	async get(organizationId: string): Promise<RoutingArtifact | undefined> {
 		const cached = this.cache.get(organizationId);
 		if (cached !== undefined) {
-			if (Date.now() - cached.at < CACHE_TTL_MS) {
+			if (Date.now() - cached.at < CACHE_TTL_MS && this.watchIsCurrent()) {
 				this.hits += 1;
 				return cached.artifact;
 			}
@@ -159,6 +257,27 @@ export class RoutingArtifactSource implements OnModuleInit, OnApplicationShutdow
 		});
 		this.inFlight.set(organizationId, pending);
 		return await pending;
+	}
+
+	/**
+	 * Whether the invalidation channel is behaving, which is what makes a memory copy trustworthy.
+	 *
+	 * A copy is only as current as the thing that would tell this process it had changed. A watch
+	 * that is not running says so outright; one that is running but has delivered nothing for
+	 * {@link WATCH_SILENCE_MS} cannot be distinguished from a dead one from in here, and the two
+	 * must therefore be treated the same — see the constant for the incident that proves it. The
+	 * cost of being wrong is a KV read the miss path already knows how to make; the cost of the
+	 * other answer is a call routed by a plan the tenant deleted.
+	 */
+	private watchIsCurrent(): boolean {
+		// Only the silence is checked, not `watching`: a watch that ENDS already drops every memory
+		// copy through `invalidateAll`, so there is nothing here for a `watching === false` clause to
+		// protect — and asserting it would turn a broker outage, when the KV read this would force is
+		// the one thing certain to fail, into a compile per call.
+		//
+		// A watch that has only just started has legitimately delivered nothing yet, so the clock runs
+		// from when this iterator began rather than from an absent timestamp.
+		return Date.now() - (this.lastWatchEntryAt ?? this.watchStartedAt) < WATCH_SILENCE_MS;
 	}
 
 	/**
@@ -324,13 +443,18 @@ export class RoutingArtifactSource implements OnModuleInit, OnApplicationShutdow
 					watch.stop();
 				};
 				this.watching = true;
+				this.watchStartedAt = Date.now();
+				// A new iterator has delivered nothing yet, so the previous one's high-water mark
+				// must not vouch for it — this is the number the guard's comparison rests on.
+				this.watchRevision = 0;
+				this.staleStrikes = 0;
 				attempt = 0;
 				this.logger.info("watching the routing-cache KV bucket for artifact updates");
 				for await (const entry of watch) {
 					if (this.stopped) {
 						break;
 					}
-					this.applyWatchEntry(entry.key, entry.operation, entry.value);
+					this.applyWatchEntry(entry.key, entry.operation, entry.value, entry.revision);
 				}
 			} catch (error) {
 				if (!this.stopped) {
@@ -353,7 +477,11 @@ export class RoutingArtifactSource implements OnModuleInit, OnApplicationShutdow
 		}
 	}
 
-	private applyWatchEntry(key: string, operation: string, value: Uint8Array): void {
+	private applyWatchEntry(key: string, operation: string, value: Uint8Array, revision = 0): void {
+		this.lastWatchEntryAt = Date.now();
+		if (revision > this.watchRevision) {
+			this.watchRevision = revision;
+		}
 		const organizationId = key.split(".")[0];
 		if (organizationId === undefined || organizationId === "") {
 			return;
@@ -379,6 +507,72 @@ export class RoutingArtifactSource implements OnModuleInit, OnApplicationShutdow
 			{ organizationId, snapshotHash: artifact.snapshotHash },
 			"applied a routing artifact update from KV",
 		);
+	}
+
+	/**
+	 * Re-establishes a watch the bucket has left behind.
+	 *
+	 * The oracle is the bucket's own last revision, read from its stream state. Every key in
+	 * `routing-cache` is an `<orgId>.artifact` written by `apps/api`, and the watch's filter covers
+	 * all of them, so the last revision is a number a healthy watch must have reached. When it has
+	 * not, and has still not one probe later, the iterator is wedged — see the class note for the
+	 * flow-control mechanism that wedges it — and the only recovery from inside this process is to
+	 * throw the consumer away and take a new one.
+	 *
+	 * `watchAbort` is deliberately how that is done, rather than a second reconnect path: stopping
+	 * the iterator ends the `for await` in {@link runWatchLoop}, which drops every memory copy and
+	 * reconnects exactly as a broker restart already does. One recovery path, not two.
+	 */
+	private async runStaleGuard(): Promise<void> {
+		while (!this.stopped) {
+			await this.sleep(this.env.ENGINE_ROUTING_WATCH_PROBE_MS);
+			if (this.stopped) {
+				return;
+			}
+			const bucket = this.jetstream.routingCache;
+			// A watch that is not running is the reconnect loop's problem, and it is already on it.
+			if (bucket === undefined || !this.watching) {
+				this.staleStrikes = 0;
+				continue;
+			}
+			let bucketRevision: number;
+			try {
+				bucketRevision = (await bucket.status()).streamInfo.state.last_seq;
+			} catch (error) {
+				// An unreadable status is not evidence of a stalled watch — it is evidence of a
+				// broker this process cannot talk to, which the connection layer reports.
+				this.logger.warn(
+					{ err: String(error) },
+					"could not read the routing-cache bucket status; leaving the watch alone",
+				);
+				continue;
+			}
+			if (bucketRevision <= Math.max(this.watchRevision, this.settledRevision)) {
+				this.staleStrikes = 0;
+				continue;
+			}
+			this.staleStrikes += 1;
+			if (this.staleStrikes < WATCH_STALE_STRIKES) {
+				continue;
+			}
+			this.staleStrikes = 0;
+			this.settledRevision = bucketRevision;
+			this.staleRecoveries += 1;
+			this.logger.warn(
+				{
+					bucketRevision,
+					watchRevision: this.watchRevision,
+					staleRecoveries: this.staleRecoveries,
+					...(this.lastWatchEntryAt === undefined
+						? {}
+						: { lastWatchEntryAt: new Date(this.lastWatchEntryAt).toISOString() }),
+				},
+				"the routing-cache watch is alive but behind the bucket; re-establishing it. " +
+					"A watch that stalls without ending is usually the broker's flow-control reply " +
+					"being refused — check the engine's publish grant for $JS.FC.>",
+			);
+			this.watchAbort?.();
+		}
 	}
 
 	// -------------------------------------------------------------------------------------------

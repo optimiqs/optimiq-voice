@@ -90,6 +90,7 @@ function harness(options: HarnessOptions = {}): Harness {
 		isAnswered: options.answered !== false,
 		bridgeId: options.bridged === false ? undefined : "bridge-1",
 		peerMediaChannelId: "b",
+		side: "a",
 		moveTo: () => true,
 		moveCallStateTo: () => true,
 		setBridge: () => undefined,
@@ -113,8 +114,8 @@ function harness(options: HarnessOptions = {}): Harness {
 			return { ok: true };
 		},
 		hasPendingTransfer: () => options.pendingTransfer === true,
-		park: async (_leg, request) => {
-			calls.push({ method: "park", args: request });
+		parkPeer: async (_leg, request) => {
+			calls.push({ method: "parkPeer", args: request });
 			return options.parkResult ?? { result: { ok: true }, slot: 401 };
 		},
 		startRecording: async (): Promise<RecordingOutcome> => {
@@ -344,14 +345,14 @@ describe("*5 — park", () => {
 		await press(h, "*5");
 		h.advanceTo(DEFAULT_MID_CALL_FEATURE_SETTINGS.interDigitTimeoutMs + 1);
 		await flush();
-		expect(h.calls).toEqual([{ method: "park", args: {} }]);
+		expect(h.calls).toEqual([{ method: "parkPeer", args: {} }]);
 	});
 
 	it("takes the orbit the parker asked for", async () => {
 		const h = harness();
 		await press(h, "*5401#");
 		await flush();
-		expect(h.calls).toEqual([{ method: "park", args: { orbit: "401" } }]);
+		expect(h.calls).toEqual([{ method: "parkPeer", args: { orbit: "401" } }]);
 	});
 
 	it("settles the machine when the park is refused, rather than swallowing forever", async () => {

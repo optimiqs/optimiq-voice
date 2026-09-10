@@ -29,7 +29,9 @@ import type { DidIndexSource } from "../routing/did-index.source";
 import type { ExtensionFeatureRpcPort } from "../routing/extension-feature.source";
 import type { LastCallerRpcSource } from "../routing/last-caller.source";
 import type { RoutingArtifactSource } from "../routing/routing-artifact.source";
+import type { SharedLineRegistry } from "../routing/shared-line-registry";
 import type { SupervisorAuthzRpcPort } from "../routing/supervisor-authz.source";
+import type { ToggleFeatureRpcPort } from "../routing/toggle-feature.source";
 import type { VoicemailGreetingRpcPort } from "../routing/voicemail-greeting.source";
 import type { VoicemailMailboxRpcSource } from "../routing/voicemail-mailbox.source";
 import type { ControlledLeg } from "./call-control";
@@ -314,6 +316,10 @@ interface HarnessOptions {
 	readonly onAnswered?: () => MediaEvent;
 	/** Makes `MediaPort.originate` refuse, which is how an unregistered extension presents. */
 	readonly originateFails?: boolean;
+	/** The `*65`/`*64` write seam, for the cases that assert the orchestrator hands it to the walk. */
+	readonly toggles?: ToggleFeatureRpcPort;
+	/** The shared-line seizure registry, for the same reason. */
+	readonly sharedLines?: SharedLineRegistry;
 }
 
 function harness(options: HarnessOptions = {}) {
@@ -424,6 +430,12 @@ function harness(options: HarnessOptions = {}) {
 		sipTransfer.service,
 		originate.service,
 		sipInvite.service,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		options.toggles,
+		options.sharedLines,
 	);
 
 	holder.orchestrator = orchestrator;
@@ -500,6 +512,39 @@ describe("routed inbound calls", () => {
 		expect(h.media.originated()[0]?.endpoint).toBe("PJSIP/1001");
 		expect(h.media.methods()).toContain("createBridge");
 		expect(h.published.map((event) => event.type)).toContain("channel.bridged");
+	});
+
+	/**
+	 * A phone that presses hold re-INVITEs with `sendonly` and names no music — SIP has no way to name
+	 * any — so the far end got the media server's default class and a tenant's own music was reachable
+	 * from a queue and a park lot and from nowhere else. The class the compiler resolved for the
+	 * destination now travels onto the leg beside the destination itself, and the hold path reads it.
+	 */
+	it("plays the destination's own music-on-hold class at the held party", async () => {
+		const h = harness({
+			artifact: artifactWith(
+				[
+					...TERMINALS,
+					{
+						id: "ext:1",
+						kind: "extension",
+						extensionId: "0195c0f0-1c2f-7000-8000-0000000000f1",
+						number: "1001",
+						tollClass: "internal",
+						recordPolicy: "none",
+						timeoutSeconds: 20,
+						doNotDisturb: false,
+						mohClass: "jazz",
+					} as PlanNode,
+				],
+				"ext:1",
+			),
+		});
+
+		await arrive(h);
+		await h.orchestrator.handleEvent(mediaEvent("ChannelHold", { channel: channel() }));
+
+		expect(h.media.calls.find((call) => call.method === "startMusicOnHold")?.args[1]).toBe("jazz");
 	});
 
 	it("does NOT run the pre-routing announcement over the plan", async () => {
@@ -1217,13 +1262,14 @@ describe("placing a click-to-call", () => {
 	const EXTENSION_ID = "0195c0f0-1c2f-7000-8000-0000000000f1";
 	const ORIGINATE_ID = "0195c0f0-1c2f-7000-8000-0000000000a7";
 
-	function clickToCallArtifact(): RoutingArtifact {
+	function clickToCallArtifact(realm?: string): RoutingArtifact {
 		const base = artifactWith(
 			[...TERMINALS, extensionNode("ext:1001", "1001", EXTENSION_ID)],
 			"ext:1001",
 		);
 		return {
 			...base,
+			settings: { ...base.settings, ...(realm === undefined ? {} : { realm }) },
 			internal: {
 				...base.internal,
 				numbers: {
@@ -1269,9 +1315,9 @@ describe("placing a click-to-call", () => {
 		} as unknown as SipdCommandPort;
 		const nativeMedia = new SplitPlaneMediaPort(new MediadMediaPort(transport, 500), signalling);
 		const h = harness({
-			artifact: clickToCallArtifact(),
+			artifact: clickToCallArtifact("tenant.example"),
 			nativeMedia,
-			env: { ENGINE_MEDIA_DRIVER: "mediad", ENGINE_SIP_REALM: "tenant.example" },
+			env: { ENGINE_MEDIA_DRIVER: "mediad" },
 		});
 		const placement = await h.originatePath().place(originateRequest());
 		expect(placement).toMatchObject({
@@ -1285,6 +1331,76 @@ describe("placing a click-to-call", () => {
 		const retry = await h.originatePath().place(originateRequest());
 		expect(retry).toMatchObject({ kind: "placed", legId: ORIGINATE_ID });
 		expect(originated).toHaveLength(1);
+	});
+
+	/**
+	 * The dialog identity of a leg this engine ORIGINATED, which nothing on this plane recorded.
+	 *
+	 * The aggregate is filed BEFORE the INVITE goes out, so the arrival path has no `Call-ID` to
+	 * read, and the composite's `getVariable` is a local map with no `CHANNEL(pjsip,call-id)` in it.
+	 * So the leg carried no `sip_call_id` onto its CDR row and — the sharper half —
+	 * `resolveSipDialog` could not find it, which is what made the engine answer `unknown_dialog` to
+	 * a REFER sent by the party who ANSWERED.
+	 */
+	it("records the dialog the originate reply named, on the leg's first state change", async () => {
+		const SIP_CALL_ID = "originated-9f1c2b7ae4@tenant.example";
+		const transport = new FakeMediadTransport();
+		transport.reply("rpc.media.v1.create-offer", {
+			ok: true,
+			sessionId: ORIGINATE_ID,
+			sdpOffer: "v=0\r\n",
+		});
+		const signalling = {
+			resolveTarget: async () => ({ ok: true, instanceId: "sipd-test", transport: "udp" }),
+			originate: async (request: { legId: string }) => ({
+				ok: true,
+				legId: request.legId,
+				instanceId: "sipd-test",
+				sipCallId: SIP_CALL_ID,
+			}),
+		} as unknown as SipdCommandPort;
+		const nativeMedia = new SplitPlaneMediaPort(new MediadMediaPort(transport, 500), signalling);
+		const h = harness({
+			artifact: clickToCallArtifact("tenant.example"),
+			nativeMedia,
+			env: { ENGINE_MEDIA_DRIVER: "mediad" },
+		});
+
+		await h.originatePath().place(originateRequest());
+		// The reply landed on the PORT. Nothing has put it on the leg yet.
+		expect([...h.kv.values()][0]?.variables.OPTIMIQ_SIP_CALL_ID).toBeUndefined();
+
+		await h.orchestrator.handleEvent({
+			type: "call-state-changed",
+			channelId: ORIGINATE_ID,
+			callState: "ringing",
+		});
+
+		expect([...h.kv.values()][0]?.variables.OPTIMIQ_SIP_CALL_ID).toBe(SIP_CALL_ID);
+	});
+
+	it("refuses to originate for a tenant that has configured no SIP realm", async () => {
+		// No deployment-wide fallback: a realm names exactly one tenant, so borrowing one would dial
+		// this extension into somebody else's domain. Refusing by name is the only safe answer.
+		const signalling = { originate: async () => ({ ok: true }) } as unknown as SipdCommandPort;
+		const nativeMedia = new SplitPlaneMediaPort(
+			new MediadMediaPort(new FakeMediadTransport(), 500),
+			signalling,
+		);
+		const h = harness({
+			artifact: clickToCallArtifact(),
+			nativeMedia,
+			env: { ENGINE_MEDIA_DRIVER: "mediad" },
+		});
+
+		const placement = await h.originatePath().place(originateRequest());
+
+		expect(placement).toMatchObject({
+			kind: "refused",
+			reason: "internal",
+			error: "the organization has no SIP realm",
+		});
+		expect(h.orchestrator.activeChannelCount).toBe(0);
 	});
 
 	it("rings the extension first, in this engine's Stasis app, as an ordinary A-leg", async () => {
@@ -1387,5 +1503,398 @@ describe("placing a click-to-call", () => {
 			first.kind === "placed" ? first.callId : "",
 		);
 		expect(h.media.originated()).toHaveLength(1);
+	});
+});
+
+/**
+ * The two ports the walk gets from THIS class rather than from `RoutingModule` directly.
+ *
+ * Both are `@Optional()` and last on the constructor, so nothing but a wired deployment fails when
+ * they are missing — which is exactly how they went missing for a release while `*65`/`*64` and the
+ * shared-line node were finished on the walker side and announced "not available" on every call.
+ * These two cases are the wire, asserted at the only place that can see it.
+ */
+describe("the walker ports the orchestrator owns", () => {
+	it("hands `*65` the toggle port, so the code flips the flow instead of announcing", async () => {
+		const toggled: unknown[] = [];
+		const h = harness({
+			artifact: artifactWith(
+				[
+					...TERMINALS,
+					{
+						id: "code:*65",
+						kind: "feature-code",
+						code: "*65",
+						action: "call-flow-toggle",
+						params: { callFlowId: "cf-1" },
+					} as unknown as PlanNode,
+				],
+				"code:*65",
+			),
+			toggles: {
+				toggle: async (change: unknown) => {
+					toggled.push(change);
+					return { applied: true, state: "night" };
+				},
+			} as unknown as ToggleFeatureRpcPort,
+		});
+
+		await arrive(h);
+
+		expect(toggled).toHaveLength(1);
+		expect(toggled[0]).toMatchObject({
+			organizationId: ORG,
+			target: "call-flow",
+			callFlowId: "cf-1",
+		});
+	});
+
+	it("hands a shared line the seizure registry, so the appearance that answered takes the line", async () => {
+		const seizures: { extensionId: string; appearanceIndex: number }[] = [];
+		const h = harness({
+			artifact: artifactWith(
+				[
+					...TERMINALS,
+					{
+						id: "ext:a",
+						kind: "extension",
+						extensionId: "0195c0f0-1c2f-7000-8000-0000000000f1",
+						number: "1001",
+						tollClass: "internal",
+						recordPolicy: "none",
+						timeoutSeconds: 20,
+						doNotDisturb: false,
+					} as PlanNode,
+					{
+						id: "sl:1",
+						kind: "shared-line",
+						sharedLineId: "0195c0f0-1c2f-7000-8000-0000000000e1",
+						strategy: "simultaneous",
+						ringTimeoutSeconds: 20,
+						holdRecallTimeoutSeconds: 60,
+						bargeInEnabled: false,
+						appearances: [
+							{
+								appearanceIndex: 1,
+								extensionId: "0195c0f0-1c2f-7000-8000-0000000000f1",
+								extensionNumber: "1001",
+								targetNodeId: "ext:a",
+							},
+						],
+						timeoutNodeId: "hangup:NORMAL_CLEARING",
+					} as unknown as PlanNode,
+				],
+				"sl:1",
+			),
+			sharedLines: {
+				held: () => undefined,
+				seize: async (
+					_orgId: string,
+					_lineId: string,
+					seizing: { extensionId: string; appearanceIndex: number },
+				) => {
+					seizures.push({
+						extensionId: seizing.extensionId,
+						appearanceIndex: seizing.appearanceIndex,
+					});
+					return { won: true, revision: 1 };
+				},
+				releaseOwn: async () => true,
+			} as unknown as SharedLineRegistry,
+		});
+
+		await arrive(h);
+
+		expect(seizures).toEqual([
+			{ extensionId: "0195c0f0-1c2f-7000-8000-0000000000f1", appearanceIndex: 1 },
+		]);
+	});
+});
+
+/**
+ * CLIR on the path every softphone and desk phone takes.
+ *
+ * `resolve.ts` sets `ResolvedRoute.callerIdPresentation` from the caller's extension, `plan-walker`
+ * consumes `WalkInput.callerIdPresentation` and `trunkDialNode` puts it on the attempt — and the
+ * `walk({…})` in `startRoutedProgram` did not pass it, so every layer of the feature was live and
+ * invisible. Only the click-to-call path carried it.
+ */
+describe("caller-id presentation on the ordinary routing walk", () => {
+	const CALLER = "0195c0f0-1c2f-7000-8000-0000000000f7";
+
+	function clirArtifact(presentation?: "allowed" | "restricted"): RoutingArtifact {
+		const base = artifactWith([...TERMINALS], "hangup:NORMAL_CLEARING");
+		return {
+			...base,
+			outbound: {
+				...base.outbound,
+				rules: [
+					{
+						id: "0195c0f0-1c2f-7000-8000-0000000000b1",
+						name: "everything",
+						priority: 100,
+						enabled: true,
+						patterns: [{ kind: "regex", value: "^\\+?[0-9]{6,15}$" }],
+						tollClass: "national",
+						destinationNodeId: "trunk:pstn",
+					},
+				],
+			},
+			nodes: {
+				...base.nodes,
+				"trunk:pstn": {
+					id: "trunk:pstn",
+					kind: "trunk-dial",
+					outboundRouteId: "0195c0f0-1c2f-7000-8000-0000000000b1",
+					tollClass: "national",
+					continueOnCauses: [],
+					recordEnabled: false,
+					attempts: [
+						{
+							trunkId: "0195c0f0-1c2f-7000-8000-0000000000e1",
+							name: "carrier",
+							kind: "register",
+							sipDomain: "carrier.example",
+							sipProxy: "carrier.example",
+							transport: "udp",
+							order: 1,
+						},
+					],
+				},
+			},
+			extensionsByNumber: {
+				"1001": {
+					extensionId: CALLER,
+					number: "1001",
+					tollClass: "national",
+					enabled: true,
+					nodeId: "hangup:NORMAL_CLEARING",
+					outboundCallerIdNumber: "+15005550999",
+					...(presentation === undefined ? {} : { outboundCallerIdPresentation: presentation }),
+				},
+			},
+		} as unknown as RoutingArtifact;
+	}
+
+	async function dialOut(presentation?: "allowed" | "restricted") {
+		const h = harness({ artifact: clirArtifact(presentation) });
+		await h.orchestrator.handleEvent(
+			mediaEvent("StasisStart", {
+				channel: channel({
+					caller: { name: "Alice", number: "1001" },
+					dialplan: { context: "optimiq-outbound", exten: "+15551230001", priority: 1 },
+					channelvars: { OPTIMIQ_ROUTING_CONTEXT: "outbound", OPTIMIQ_ORG_ID: ORG },
+				}),
+				args: [],
+			}),
+		);
+		await h.orchestrator.awaitWalks();
+		return h;
+	}
+
+	it("carries a restricted extension's setting onto the trunk attempt", async () => {
+		const h = await dialOut("restricted");
+		expect(h.media.originated()[0]?.callerIdPresentation).toBe("restricted");
+	});
+
+	/**
+	 * The same identity on the RE-ENTRANT dial — `*67<number>`, `*82<number>`, `*69`.
+	 *
+	 * Those arrive at `routeLeg` with no caller id on the request, and it passed none to the walk. So
+	 * the trunk INVITE asserted the EDGE's own identity instead of the caller's `+15005550999` — and
+	 * under `Privacy: id` that is the harmful direction, because the network is told to withhold an
+	 * identity that was never asserted.
+	 */
+	it("carries the resolved identity onto a re-entrant dial that supplies none", async () => {
+		const h = harness({ artifact: clirArtifact("restricted") });
+		await h.orchestrator.handleEvent(
+			mediaEvent("StasisStart", {
+				channel: channel({
+					caller: { name: "Alice", number: "1001" },
+					dialplan: { context: "optimiq-internal", exten: "1001", priority: 1 },
+					channelvars: { OPTIMIQ_ROUTING_CONTEXT: "internal", OPTIMIQ_ORG_ID: ORG },
+				}),
+				args: [],
+			}),
+		);
+		await h.orchestrator.awaitWalks();
+		h.media.originated().length = 0;
+
+		const leg = (
+			h.orchestrator as unknown as {
+				controlledLegFor(mediaChannelId: string): unknown;
+			}
+		).controlledLegFor(ARI_CHANNEL);
+		await (
+			h.orchestrator as unknown as {
+				routeLeg(leg: unknown, request: unknown): Promise<unknown>;
+			}
+		).routeLeg(leg, { destination: "+15551230001", context: "outbound" });
+
+		const originated = h.media.originated()[0];
+		expect(originated?.callerId).toContain("+15005550999");
+		expect(originated?.callerIdPresentation).toBe("restricted");
+	});
+
+	it("carries nothing at all for an extension that presents its number", async () => {
+		const h = await dialOut();
+		expect(h.media.originated()[0]).not.toHaveProperty("callerIdPresentation");
+	});
+});
+
+/**
+ * Virtual hold's outbound leg, at the layer that actually creates a channel.
+ *
+ * `planQueueCallback` is specced against the artifact in `originate-plan.spec.ts`; what is under
+ * test here is the half only this class can do — the variables the leg carries, which decide how it
+ * is routed once the customer answers, how it is billed, and which wait it settles.
+ */
+describe("the queue-callback call path", () => {
+	const CALLBACK_ID = "0195c0f0-1c2f-7000-8000-0000000000c9";
+	const QUEUE_ID = "0195c0f0-1c2f-7000-8000-0000000000q1".replace("q", "a");
+	const ORIGINAL_CALL_ID = "0195c0f0-1c2f-7000-8000-0000000000d9";
+
+	function callbackArtifact(): RoutingArtifact {
+		const base = artifactWith([...TERMINALS], "hangup:NORMAL_CLEARING");
+		return {
+			...base,
+			outbound: {
+				...base.outbound,
+				rules: [
+					{
+						// `id` and `destinationNodeId` are the field names `resolveOutbound` reads. A rule
+						// spelled `routeId`/`nodeId` still MATCHES and resolves to no plan, which is how the
+						// callback path came to be handed a route with no trunk on it.
+						id: "0195c0f0-1c2f-7000-8000-0000000000b1",
+						name: "everything",
+						priority: 100,
+						enabled: true,
+						patterns: [{ kind: "regex", value: "^\\+?[0-9]{6,15}$" }],
+						tollClass: "national",
+						destinationNodeId: "trunk:pstn",
+					},
+				],
+			},
+			nodes: {
+				...base.nodes,
+				"trunk:pstn": {
+					id: "trunk:pstn",
+					kind: "trunk-dial",
+					outboundRouteId: "0195c0f0-1c2f-7000-8000-0000000000b1",
+					tollClass: "national",
+					continueOnCauses: [],
+					recordEnabled: false,
+					attempts: [
+						{
+							trunkId: "0195c0f0-1c2f-7000-8000-0000000000e1",
+							name: "carrier",
+							kind: "register",
+							sipDomain: "carrier.example",
+							sipProxy: "carrier.example",
+							transport: "udp",
+							order: 1,
+						},
+					],
+				},
+			},
+			extensionsByNumber: {
+				"4010": {
+					extensionId: "0195c0f0-1c2f-7000-8000-0000000000f1",
+					number: "4010",
+					tollClass: "national",
+					enabled: true,
+					nodeId: "hangup:NORMAL_CLEARING",
+				},
+			},
+		} as unknown as RoutingArtifact;
+	}
+
+	function callbackRequest(overrides: Record<string, unknown> = {}) {
+		return {
+			orgId: ORG,
+			callbackId: CALLBACK_ID,
+			queueId: QUEUE_ID,
+			to: "+15551234567",
+			queueNumber: "4010",
+			relatedCallId: ORIGINAL_CALL_ID,
+			...overrides,
+		} as never;
+	}
+
+	it("dials the customer out and walks the answered leg back to the queue", async () => {
+		const h = harness({ artifact: callbackArtifact() });
+
+		const placement = await h.originatePath().placeQueueCallback?.(callbackRequest());
+
+		expect(placement?.kind).toBe("placed");
+		const originated = h.media.originated()[0];
+		expect(originated?.endpoint).toContain("carrier");
+		expect(originated?.endpoint).toContain("+15551234567");
+		// `outbound`, not `internal`: this leg goes to a customer over a trunk and is billed as one.
+		expect(originated?.variables?.OPTIMIQ_CALL_DIRECTION).toBe("outbound");
+		// The QUEUE's number, so the ordinary walk takes the answered customer into the ordinary
+		// queue node and the ordinary distribution loop reaches the ordinary agent.
+		expect(originated?.variables?.OPTIMIQ_DIALED_NUMBER).toBe("4010");
+		// A NEW call id, linked to the wait it settles rather than reusing it.
+		expect(originated?.variables?.OPTIMIQ_CDR_RELATED_CALL_ID).toBe(ORIGINAL_CALL_ID);
+	});
+
+	/**
+	 * The party who waited in a queue is as often an EXTENSION as a customer on a trunk. The
+	 * outbound-only resolve matched nothing for `1002`, so the runner refused `invalid_target` every
+	 * thirty seconds after the caller had been told their place was held.
+	 */
+	it("dials an internal caller back on net, and bills it as an internal call", async () => {
+		const base = callbackArtifact();
+		const artifact = {
+			...base,
+			settings: { ...base.settings, realm: "tenant.example" },
+			internal: {
+				...base.internal,
+				numbers: { ...base.internal.numbers, "1002": "hangup:NORMAL_CLEARING" },
+			},
+		} as unknown as RoutingArtifact;
+		const h = harness({ artifact });
+
+		const placement = await h.originatePath().placeQueueCallback?.(callbackRequest({ to: "1002" }));
+
+		expect(placement?.kind).toBe("placed");
+		const originated = h.media.originated()[0];
+		expect(originated?.endpoint).toContain("1002");
+		expect(originated?.target).toEqual({ kind: "aor", aor: "sip:1002@tenant.example" });
+		// `internal`, not `outbound`: billing an on-net callback as a carrier minute is a refund.
+		expect(originated?.variables?.OPTIMIQ_CALL_DIRECTION).toBe("internal");
+		expect(originated?.variables?.OPTIMIQ_DIALED_NUMBER).toBe("4010");
+	});
+
+	it("is idempotent: a retry of a lost reply does not ring the customer twice", async () => {
+		const h = harness({ artifact: callbackArtifact() });
+
+		const first = await h.originatePath().placeQueueCallback?.(callbackRequest());
+		await h.orchestrator.handleEvent(
+			mediaEvent("StasisStart", {
+				channel: channel({ id: CALLBACK_ID, dialplan: { context: "", exten: "", priority: 1 } }),
+				args: [],
+			}),
+		);
+		const second = await h.originatePath().placeQueueCallback?.(callbackRequest());
+
+		expect(second?.kind).toBe("placed");
+		expect(second?.kind === "placed" && second.callId).toBe(
+			first?.kind === "placed" ? first.callId : "",
+		);
+		expect(h.media.originated()).toHaveLength(1);
+	});
+
+	it("refuses a customer number the tenant's outbound plan does not match", async () => {
+		const h = harness({ artifact: artifactWith([...TERMINALS], "hangup:NORMAL_CLEARING") });
+
+		const placement = await h
+			.originatePath()
+			.placeQueueCallback?.(callbackRequest({ to: "+15551234567" }));
+
+		expect(placement?.kind).toBe("refused");
+		expect(placement?.kind === "refused" && placement.reason).toBe("invalid_target");
+		expect(h.media.originated()).toHaveLength(0);
 	});
 });

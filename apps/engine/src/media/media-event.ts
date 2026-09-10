@@ -106,8 +106,9 @@ export interface MediaCallStateChangedEvent {
 	readonly channelId: string;
 	readonly callState: CallState;
 	/**
-	 * The negotiated SDP answer, present ONLY on the moment a leg the engine ORIGINATED went `active`
-	 * on the `apps/sipd` plane — a callee's `200 OK` carrying its answer to the offer `mediad` wrote.
+	 * The negotiated SDP answer, present ONLY on the moment a leg the engine ORIGINATED committed one
+	 * on the `apps/sipd` plane — a callee's `200 OK` (`active`), or a carrier's `183` carrying early
+	 * media (`early`), each answering the offer `mediad` wrote.
 	 *
 	 * It is an optional field on an existing member rather than a union member of its own, deliberately:
 	 * `sipd-event-mapping.ts` says the union is not extended for this plane, and a whole new member
@@ -199,6 +200,13 @@ export interface MediaRecordingFinishedEvent {
 	readonly recordingName: string;
 	readonly durationMs: number;
 	readonly bytes?: number;
+	/**
+	 * Every stretch a PCI pause silenced, `[startMs, endMs)` against the file's own timeline.
+	 *
+	 * Absent on a driver that cannot pause, and on one that can but was not asked to — the two are
+	 * indistinguishable here and need not be distinguished: neither has a gap to explain.
+	 */
+	readonly pauses?: readonly { readonly startMs: number; readonly endMs: number }[];
 }
 
 /** Recording failed. `reason` is whatever the media server could say about why. */

@@ -11,6 +11,7 @@ import type {
 	PlaybackPlanNode,
 	QueuePlanNode,
 	RingGroupPlanNode,
+	SharedLinePlanNode,
 	TimeConditionPlanNode,
 	TrunkDialPlanNode,
 	VoicemailPlanNode,
@@ -189,6 +190,24 @@ export function featureCodeNode(
 		kind: "feature-code",
 		featureCodeId: `fc-${id}`,
 		code: "*8",
+		...overrides,
+	};
+}
+
+export function sharedLineNode(
+	id: string,
+	overrides: Partial<SharedLinePlanNode> = {},
+): SharedLinePlanNode {
+	return {
+		id,
+		kind: "shared-line",
+		sharedLineId: `sl-${id}`,
+		number: "2000",
+		strategy: "simultaneous",
+		ringTimeoutSeconds: 5,
+		holdRecallTimeoutSeconds: 30,
+		bargeInEnabled: false,
+		appearances: [],
 		...overrides,
 	};
 }

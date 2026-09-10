@@ -17,6 +17,7 @@ import type { ParkedCall, ParkRegistry, ParkResult } from "../routing/park-regis
 import type { ParkHandoffClient } from "./park-handoff";
 import type {
 	CallEvent,
+	LegSide,
 	ParkEndReason,
 	ParkHandoffRefusalReason,
 	ParkHandoffRequest,
@@ -104,6 +105,14 @@ export interface ControlledLeg {
 	readonly callerIdName?: string;
 	/** What this leg was dialled to reach. How a directed pickup finds a ringing phone. */
 	readonly destinationNumber?: string;
+	/**
+	 * Which side of the call this leg is: `b` when the engine originated it, `a` when it arrived.
+	 *
+	 * The distinction decides which field carries the identity of the PERSON on this leg:
+	 * `destinationNumber` on an originated leg — `callerIdNumber` there is the party that started
+	 * the call, not the extension the leg reaches — and `callerIdNumber` on one that arrived.
+	 */
+	readonly side: LegSide;
 	/** Guarded state move. Returns whether the machine actually moved. */
 	moveTo(state: ChannelState): boolean;
 	/** Guarded user-visible state move, for the value a BLF subscriber renders. */
@@ -149,6 +158,65 @@ export interface SupervisionTarget {
 	readonly side: "a" | "b";
 	/** When the leg was created, so the OLDEST match wins deterministically. */
 	readonly startedAtMs: number;
+}
+
+/**
+ * A shared line, as the compiled artifact describes it.
+ *
+ * The mid-call half's view of `SharedLinePlanNode` — deliberately narrower than the node, because
+ * everything the WALK needs (the strategy, the ring timeout, barge-in) is already spent by the time
+ * a line is seized.
+ */
+export interface SharedLine {
+	readonly sharedLineId: string;
+	/** How long a held appearance may sit before the line rings back. `0` means "never recall". */
+	readonly holdRecallTimeoutSeconds: number;
+	readonly appearances: readonly {
+		readonly appearanceIndex: number;
+		readonly extensionId: string;
+		readonly extensionNumber: string;
+	}[];
+}
+
+/**
+ * The shared-line registry, as the mid-call half consumes it.
+ *
+ * Structurally what `SharedLineRegistry` offers, declared here so this class depends on the five
+ * operations it performs rather than on the class — the same rule `PlanWalkerDependencies`'
+ * `SharedLinePort` follows one layer up, with the halves swapped: that port has seize and release
+ * and deliberately no hold, and this one has hold and recall and deliberately no seize.
+ */
+export interface SharedLineControlPort {
+	seizureForCall(
+		callId: string,
+	): { readonly sharedLineId: string; readonly value: SharedLineStateView } | undefined;
+	/** The seizure this instance holds on a line, or `undefined` when it does not hold it. */
+	held(orgId: string, sharedLineId: string): SharedLineStateView | undefined;
+	hold(orgId: string, sharedLineId: string): Promise<{ readonly kind: string }>;
+	resume(
+		orgId: string,
+		sharedLineId: string,
+		seizing?: {
+			readonly extensionId: string;
+			readonly appearanceIndex: number;
+			readonly callId: string;
+			readonly legId: string;
+		},
+	): Promise<{ readonly kind: string }>;
+	releaseOwn(orgId: string, sharedLineId: string): Promise<boolean>;
+	armRecall(orgId: string, sharedLineId: string, timeoutMs: number, onRecall: () => void): void;
+	cancelRecall(orgId: string, sharedLineId: string): void;
+}
+
+/** The fields of a seizure the mid-call half reads. A subset of `SharedLineState`. */
+export interface SharedLineStateView {
+	readonly orgId: string;
+	readonly sharedLineId: string;
+	readonly state: "seized" | "held";
+	readonly heldByExtensionId: string;
+	readonly heldByAppearanceIndex: number;
+	readonly callId: string;
+	readonly legId: string;
 }
 
 /** A park lot, as the compiled artifact describes it. */
@@ -231,6 +299,23 @@ export interface CallControlHost {
 	 */
 	activeCallsFor(leg: ControlledLeg, extension: string): readonly SupervisionTarget[];
 	publish(leg: ControlledLeg, type: CallEvent, data: Record<string, unknown>): Promise<void>;
+	/**
+	 * Records the recorder's state on the leg's own snapshot, and mirrors it.
+	 *
+	 * The ONLY thing that tells a surface outside this process that a call is being recorded. It
+	 * rides the `channels` snapshot rather than an event because the snapshot is already mirrored on
+	 * every change and already reaches the live topic a wallboard and the softphone read — where a
+	 * `channel.record.started` event, which this class also publishes, reaches the CDR writer and
+	 * nothing a browser is subscribed to.
+	 *
+	 * Fire-and-forget, and deliberately: a KV mirror that could not be written must not fail a pause
+	 * that the media plane has already applied. The consequence is a button that lags the recorder
+	 * until the next snapshot write, which is the right way round — the recorder is the truth.
+	 */
+	markRecording(
+		leg: ControlledLeg,
+		state: { readonly active: boolean; readonly paused: boolean },
+	): void;
 	/** Resolves `destination` through the organization's artifact and walks the plan on this leg. */
 	route(leg: ControlledLeg, request: RouteRequest): Promise<RouteOutcome>;
 	/**
@@ -243,6 +328,15 @@ export interface CallControlHost {
 	parkLotFor(leg: ControlledLeg, lotRef?: string): Promise<ParkLot | undefined>;
 	/** The lot whose range contains this orbit. Ranges never overlap — the compiler refuses it. */
 	parkLotForSlot(leg: ControlledLeg, slot: number): Promise<ParkLot | undefined>;
+	/**
+	 * The shared line as the compiled artifact describes it.
+	 *
+	 * Asynchronous for the reason {@link parkLotFor} is: a shared line lives in the artifact, which
+	 * is fetched on a cache miss. The two things the mid-call half needs from it are the recall
+	 * timeout and the appearance NUMBERS — the seizure records an extension id, and a recall has to
+	 * ring a number.
+	 */
+	sharedLineFor(leg: ControlledLeg, sharedLineId: string): Promise<SharedLine | undefined>;
 }
 
 /** Deployment knobs. All have defaults; none is a product decision. */
@@ -294,6 +388,16 @@ export interface CallControlDependencies {
 	 * gave before the RPC existed.
 	 */
 	readonly parkHandoff?: ParkHandoffClient;
+	/**
+	 * The shared-line seizure registry, for the MID-CALL half of a shared line.
+	 *
+	 * The walk seizes the line when an appearance answers; everything after that — hold, retrieve
+	 * from another appearance, the hold recall, and the release when the call ends — happens here,
+	 * because it happens on events this class already owns. Optional, and its absence is a
+	 * deployment with shared lines that ring and bridge and do not light each other's keys, which is
+	 * exactly what every engine did before this wave.
+	 */
+	readonly sharedLines?: SharedLineControlPort;
 	/**
 	 * Where an attended transfer's cancel key is armed and disarmed.
 	 *
@@ -495,14 +599,22 @@ export interface CallControlPort {
 	hold(leg: ControlledLeg, request?: HoldRequest): Promise<CallControlResult>;
 	unhold(leg: ControlledLeg): Promise<CallControlResult>;
 	park(leg: ControlledLeg, request?: ParkRequest): Promise<ParkOutcome>;
+	/** Parks the party on the OTHER side of this leg, recording this leg as the parker. */
+	parkPeer(leg: ControlledLeg, request?: ParkRequest): Promise<ParkOutcome>;
 	unpark(leg: ControlledLeg, request?: UnparkRequest): Promise<CallControlResult>;
 	transfer(leg: ControlledLeg, request: TransferRequest): Promise<CallControlResult>;
 	completeTransfer(leg: ControlledLeg): Promise<CallControlResult>;
+	completeAttendedRefer(
+		transferor: ControlledLeg,
+		consultation: ControlledLeg,
+		destination: string,
+	): Promise<CallControlResult>;
 	cancelTransfer(leg: ControlledLeg): Promise<CallControlResult>;
 	pickup(leg: ControlledLeg, request: PickupRequest): Promise<CallControlResult>;
 	monitor(leg: ControlledLeg, request: MonitorRequest): Promise<CallControlResult>;
 	startRecording(leg: ControlledLeg, request?: StartRecordingRequest): Promise<RecordingOutcome>;
 	stopRecording(leg: ControlledLeg): Promise<CallControlResult>;
+	pauseRecording(leg: ControlledLeg, paused: boolean): Promise<CallControlResult>;
 	dial(leg: ControlledLeg, request: DialLegRequest): Promise<DialLegOutcome>;
 	bridge(leg: ControlledLeg, request: BridgeLegRequest): Promise<BridgeLegOutcome>;
 	unbridge(leg: ControlledLeg): Promise<CallControlResult>;
@@ -551,10 +663,14 @@ interface RecordingCompletion {
 	readonly durationMs: number;
 	readonly bytes?: number;
 	readonly reason: "completed" | "cancelled" | "failed";
+	/** PCI pause intervals, as the media plane reported them against the file's own timeline. */
+	readonly pauses?: readonly { readonly startMs: number; readonly endMs: number }[];
 }
 
 interface RecordingSession {
 	readonly recordingId: string;
+	/** Whether the capture is currently silenced. See {@link CallControl.pauseRecording}. */
+	paused: boolean;
 	readonly objectKey: string;
 	readonly snoopChannelId?: string;
 	readonly format: string;
@@ -691,6 +807,21 @@ function parkRefusal(claim: Exclude<ParkResult, { kind: "parked" }>): string {
 	}
 }
 
+/**
+ * The number of the PERSON on a leg.
+ *
+ * Not `callerIdNumber` unconditionally: on a leg the engine originated that field still carries the
+ * party who started the call, so an extension reached by an originated leg would be identified as
+ * whoever dialled it. `destinationNumber` is what that leg was dialled to reach, which is the
+ * extension itself. See {@link ControlledLeg.side}.
+ */
+function numberOf(leg: ControlledLeg | undefined): string | undefined {
+	if (leg === undefined) {
+		return undefined;
+	}
+	return leg.side === "b" ? leg.destinationNumber : leg.callerIdNumber;
+}
+
 export class CallControl implements CallControlPort {
 	private readonly settings: CallControlSettings;
 	private readonly newId: () => string;
@@ -747,10 +878,18 @@ export class CallControl implements CallControlPort {
 		return this.holds.has(mediaChannelId);
 	}
 
-	/** The recording running on this leg, if any. Read by the record-toggle feature code. */
-	recordingFor(mediaChannelId: string): { readonly recordingId: string } | undefined {
+	/**
+	 * The recording running on this leg, if any. Read by the record-toggle feature code, and by the
+	 * PBX recording control — which needs `paused` too, because it answers a caller that is drawing
+	 * a pause/resume button from the reply.
+	 */
+	recordingFor(
+		mediaChannelId: string,
+	): { readonly recordingId: string; readonly paused: boolean } | undefined {
 		const session = this.recordings.get(mediaChannelId);
-		return session === undefined ? undefined : { recordingId: session.recordingId };
+		return session === undefined
+			? undefined
+			: { recordingId: session.recordingId, paused: session.paused };
 	}
 
 	// -------------------------------------------------------------------------------------------
@@ -890,6 +1029,11 @@ export class CallControl implements CallControlPort {
 	 * is usually gone. So the parker's NUMBER is stored, not their leg, and the timeout re-routes
 	 * the parked call to it through the ordinary routing path — which rings their phone exactly as
 	 * a new call would, including their forwarding rules and their voicemail.
+	 *
+	 * Which number that is depends on which side the parker's leg is — see {@link numberOf}. When
+	 * the leg carries no such number the field is left OFF rather than filled with the other side's
+	 * identity, which would route the parked caller back to the number they are already on; the
+	 * timeout then re-parks them (see {@link CallControl.returnParkedCall}) instead of dropping them.
 	 */
 	async park(leg: ControlledLeg, request: ParkRequest = {}): Promise<ParkOutcome> {
 		const refusal = this.refuseIfUnusable(leg, "park");
@@ -918,6 +1062,7 @@ export class CallControl implements CallControlPort {
 		}
 
 		const parker = request.parkedBy ?? this.peerOf(leg);
+		const parkerNumber = numberOf(parker);
 		const mohClass = request.musicOnHold ?? lot.mohClass;
 		let state: ParkState = INITIAL_PARK_STATE;
 		const claim = await this.deps.parks.park(
@@ -929,7 +1074,7 @@ export class CallControl implements CallControlPort {
 				callId: leg.callId,
 				organizationId: leg.organizationId,
 				...(parker?.legId === undefined ? {} : { parkedByLegId: parker.legId }),
-				...(parker?.callerIdNumber === undefined ? {} : { parkedByNumber: parker.callerIdNumber }),
+				...(parkerNumber === undefined ? {} : { parkedByNumber: parkerNumber }),
 				parkedAtMs: this.now(),
 				...(mohClass === undefined ? {} : { mohClass }),
 			},
@@ -983,6 +1128,48 @@ export class CallControl implements CallControlPort {
 		});
 
 		return { result: ok(), slot: claim.entry.slot, parkLotId: lot.parkLotId };
+	}
+
+	/**
+	 * Parks the OTHER party — what a phone means by the park feature code.
+	 *
+	 * `park` takes the leg that goes INTO the orbit; the person who pressed `*5` stays on their
+	 * phone and expects the far end to be the one put away, and to be the one rung back when the
+	 * timeout fires. Passing the presser's own leg to `park` inverts both halves at once: the
+	 * presser ends up in the lot listening to music, and `parkedByNumber` records the party who is
+	 * already parked, so the recall routes the parked caller at themselves and drops them.
+	 *
+	 * So the seam is here, in one place, rather than at every caller: resolve the peer, park that,
+	 * and name the presser as the parker explicitly.
+	 *
+	 * ## And then the presser's own leg is ENDED, which is the half that was missing
+	 *
+	 * Parking is the phone equivalent of putting the handset down: the far end goes into the orbit
+	 * and the person who pressed `*5` is off the call. Leaving their leg up looks harmless — they
+	 * hear silence and hang up a second later — but it is what broke the recall. The timeout re-routes
+	 * the parked caller at the PARKER'S NUMBER through the ordinary routing path, and that path found
+	 * the parker's extension still occupied by the leg they parked from, fell through the ladder, and
+	 * filed the parked caller in the parker's own voicemail. Every recall, both orientations.
+	 *
+	 * `NORMAL_CLEARING`, because that is what it is: a party who finished with the call deliberately.
+	 * `markHangup` first for the reason {@link CallControl.completeTransfer} does it — the CDR cause
+	 * is first-wins, and the teardown that follows would otherwise supply a generic one.
+	 *
+	 * Only on a park that actually took. A refusal leaves both legs exactly as they were, which is
+	 * what lets the phone report "that lot is full" to somebody who is still on the call.
+	 */
+	async parkPeer(leg: ControlledLeg, request: ParkRequest = {}): Promise<ParkOutcome> {
+		const peer = this.peerOf(leg);
+		if (peer === undefined) {
+			return { result: refuse("this leg has nobody on the other side to park") };
+		}
+		const outcome = await this.park(peer, { ...request, parkedBy: leg });
+		if (!outcome.result.ok) {
+			return outcome;
+		}
+		leg.markHangup("NORMAL_CLEARING");
+		await this.hangupQuietly(leg.mediaChannelId, "NORMAL_CLEARING");
+		return outcome;
 	}
 
 	/**
@@ -1632,6 +1819,145 @@ export class CallControl implements CallControlPort {
 		return ok(`transferred to ${consultation.destination}`);
 	}
 
+	/**
+	 * Finishes an attended transfer the PHONE brokered: two calls this engine holds are joined into
+	 * one, and the party who owns both of them is released from each.
+	 *
+	 * ## Why this is not {@link completeTransfer}
+	 *
+	 * `completeTransfer` finishes a consultation THIS class started, so it has a `Consultation`
+	 * record naming the transferee and the destination, and the target is a B-leg of the
+	 * transferor's own call. A softphone with a second line does none of that: it places an ordinary
+	 * second call, talks on it, and then sends a `REFER` with `Replaces` (RFC 5589 §7) naming that
+	 * consultation dialog. Both halves are real calls of this engine's own — which is exactly what
+	 * makes the join possible — but there is no consultation record to complete, and inventing one
+	 * to reuse the other method would mean fabricating the state it is supposed to be evidence of.
+	 *
+	 * So the two arguments are the transferor's TWO legs: the one the REFER arrived in, and the one
+	 * `Replaces` named. Their peers — the transferee and the target — are the pair that survives.
+	 *
+	 * ## Order, and what a failure leaves behind
+	 *
+	 * The transferee moves into the CONSULTATION's bridge, exactly as `completeTransfer` does and for
+	 * the same reason: the person who agreed to take the call hears no gap. Nothing is hung up until
+	 * that has succeeded, so every failure path here leaves both original calls up and talking and
+	 * returns a named reason — a transfer key that fails visibly is recoverable, and a transfer that
+	 * tore a bridge down before it knew the join would work is not.
+	 *
+	 * ## The CDR
+	 *
+	 * Both surviving legs keep their own `callId`; what links them is the bridge-peer pointer, set in
+	 * both directions here so that whichever of them dies first names the other on its record, plus
+	 * `call.transferred` naming all three parties. `destination` is the `Refer-To` user the phone
+	 * asked for, which is what the event means by it — the engine dials nothing here, so there is no
+	 * other string that would be true. Re-keying one call's legs onto the other's id was
+	 * the alternative and is not available from this layer: the id is on the KV snapshot and on every
+	 * event both calls have already published, and a record that disagreed with its own event stream
+	 * is worse than two records that are each true.
+	 */
+	async completeAttendedRefer(
+		transferor: ControlledLeg,
+		consultation: ControlledLeg,
+		destination: string,
+	): Promise<CallControlResult> {
+		for (const leg of [transferor, consultation]) {
+			const refusal = this.refuseIfUnusable(leg, "an attended transfer");
+			if (refusal !== undefined) {
+				return refusal;
+			}
+		}
+		if (transferor.mediaChannelId === consultation.mediaChannelId) {
+			return refuse("the Replaces named the very dialog the REFER arrived in");
+		}
+		if (this.consultations.has(transferor.mediaChannelId)) {
+			return refuse("this leg already has a transfer in progress");
+		}
+
+		const transferee = this.peerOf(transferor);
+		if (transferee === undefined || transferee.isTearingDown) {
+			return refuse("the transferor is not bridged to anybody, so there is nobody to hand over");
+		}
+		const target = this.peerOf(consultation);
+		if (target === undefined || target.isTearingDown) {
+			return refuse("the consultation is not connected to anybody, so there is nobody to hand to");
+		}
+		const targetBridgeId = consultation.bridgeId;
+		if (targetBridgeId === undefined) {
+			return refuse("the consultation is not in a bridge, so there is nothing to join");
+		}
+		if (transferee.mediaChannelId === target.mediaChannelId) {
+			// Both dialogs lead back to the same person: the phone consulted the party it is holding.
+			// Joining them would bridge a leg to itself and take the call down.
+			return refuse("both dialogs name the same party, so there is nothing to join");
+		}
+
+		// The join is committed here and nowhere earlier: everything above this line is a check that
+		// leaves both calls exactly as it found them, and `completing` means the decision is made.
+		assertTransferTransition(INITIAL_TRANSFER_STATE, "completing");
+
+		const transfereeBridgeId = transferee.bridgeId;
+		this.holds.delete(transferee.mediaChannelId);
+		try {
+			await this.deps.media.stopMusicOnHold(transferee.mediaChannelId);
+		} catch {
+			// Stopping music that is not playing is a no-op. A softphone-brokered consultation
+			// usually leaves the transferee held at the PHONE, where this class never started any.
+		}
+		try {
+			if (transfereeBridgeId !== undefined && transfereeBridgeId !== targetBridgeId) {
+				await this.deps.media.removeFromBridge(transfereeBridgeId, [transferee.mediaChannelId]);
+			}
+			await this.deps.media.addToBridge(targetBridgeId, [transferee.mediaChannelId]);
+		} catch (error) {
+			assertTransferTransition("completing", "failed");
+			// Put them back where they were. The transferor is still up and still bridged, so a
+			// transferee returned to that bridge is the original call, unbroken.
+			if (transfereeBridgeId !== undefined && transfereeBridgeId !== targetBridgeId) {
+				try {
+					await this.deps.media.addToBridge(transfereeBridgeId, [transferee.mediaChannelId]);
+				} catch (restoreError) {
+					this.log("a refused attended transfer could not restore the original bridge", {
+						transfereeMediaChannelId: transferee.mediaChannelId,
+						err: String(restoreError),
+					});
+				}
+			}
+			return refuse(`the transferee could not be joined to the target: ${String(error)}`);
+		}
+
+		transferee.removeFlag("hold");
+		transferee.setBridge(targetBridgeId);
+		transferee.moveTo("exchanging-media");
+		transferee.moveCallStateTo("active");
+		// Both directions, while both legs are up — the rule every other bridge in this file follows.
+		transferee.setBridgePeer(target.legId);
+		target.setBridgePeer(transferee.legId);
+
+		// Cleared before either transferor leg is hung up, and this is the load-bearing part: the
+		// orchestrator's `endBridgePeer` would otherwise follow each hangup straight into the call
+		// that was just handed over and end it.
+		for (const leg of [transferor, consultation]) {
+			leg.addFlag("attended-transfer");
+			leg.setBridgePeer(undefined);
+			leg.setBridge(undefined);
+			leg.markHangup(hangupCauseForTransfer("attended"));
+		}
+		for (const leg of [transferor, consultation]) {
+			await this.hangupQuietly(leg.mediaChannelId, hangupCauseForTransfer("attended"));
+		}
+
+		assertTransferTransition("completing", "completed");
+
+		await this.publishQuietly(transferee, "call.transferred", {
+			legId: transferee.legId,
+			kind: "attended" satisfies TransferKind,
+			destination,
+			transferorLegId: transferor.legId,
+			targetLegId: target.legId,
+		});
+		return ok(`transferred to ${destination}`);
+	}
+
 	/** Abandons an attended transfer and puts the transferee back with the transferor. */
 	async cancelTransfer(leg: ControlledLeg): Promise<CallControlResult> {
 		const consultation = this.consultations.get(leg.mediaChannelId);
@@ -1870,6 +2196,13 @@ export class CallControl implements CallControlPort {
 		const bridgeId = this.newId();
 		try {
 			await this.deps.media.answer(leg.mediaChannelId);
+			// The caller is RINGING, which on a split media plane means they have no session yet:
+			// `answer` is what allocates one. Bridging them without it refused `unknown_session` and
+			// the picker heard the refusal announcement while the caller kept hearing ringback.
+			// Answering is also what a pickup means for the caller — their call has been taken.
+			if (!candidate.callerLeg.isAnswered) {
+				await this.deps.media.answer(candidate.callerLeg.mediaChannelId);
+			}
 			await this.deps.media.createBridge({
 				bridgeId,
 				name: `pickup-${candidate.callerLeg.callId}`,
@@ -2351,6 +2684,7 @@ export class CallControl implements CallControlPort {
 					durationMs: signal.durationMs,
 					reason: "completed",
 					...(signal.bytes === undefined ? {} : { bytes: signal.bytes }),
+					...(signal.pauses === undefined ? {} : { pauses: signal.pauses }),
 				};
 			} else if (signal.kind === "recording-failed") {
 				completion.result = { durationMs: 0, reason: "failed" };
@@ -2385,12 +2719,14 @@ export class CallControl implements CallControlPort {
 			completion,
 			stopWatching,
 			recordingId,
+			paused: false,
 			objectKey,
 			snoopChannelId,
 			format,
 			startedAtMs: this.now(),
 		});
 
+		this.deps.host.markRecording(leg, { active: true, paused: false });
 		await this.publishQuietly(leg, "channel.record.started", {
 			legId: leg.legId,
 			recordingId,
@@ -2399,6 +2735,43 @@ export class CallControl implements CallControlPort {
 			stereo: false,
 		});
 		return { result: ok(), recordingId, objectKey };
+	}
+
+	/**
+	 * Pauses or resumes the recording running on this leg WITHOUT ending its file. PCI.
+	 *
+	 * The card-number case: the caller reads a PAN, the agent pauses, and what lands in the object
+	 * is silence at the offset the number was spoken. One artifact, one `objectKey`, one CDR row —
+	 * which is what a stop-and-start cannot give, because a stop publishes `channel.record.stopped`
+	 * for half the call and the rest gets a different key.
+	 *
+	 * Idempotent, and deliberately so at THIS layer too: an agent who hits the pause feature code
+	 * twice because the first press was not acknowledged must not open a second interval, and one
+	 * who resumes a recording that was never paused must not close one that never opened.
+	 *
+	 * The intervals are not tracked here. They ride the media plane's own recording-finished event,
+	 * because only the process that wrote the audio knows where in the file the silence landed.
+	 */
+	async pauseRecording(leg: ControlledLeg, paused: boolean): Promise<CallControlResult> {
+		const session = this.recordings.get(leg.mediaChannelId);
+		if (session === undefined) {
+			return refuse("this leg is not being recorded");
+		}
+		if (session.paused === paused) {
+			return ok(session.recordingId);
+		}
+		try {
+			await this.deps.media.pauseRecording(session.recordingId, paused);
+		} catch (error) {
+			// The state is NOT flipped on a refusal: a runtime that believed a pause it never got is
+			// one that tells an agent the card number is safe while it is being written to disk.
+			return refuse(
+				`the media plane cannot ${paused ? "pause" : "resume"} a recording: ${String(error)}`,
+			);
+		}
+		session.paused = paused;
+		this.deps.host.markRecording(leg, { active: true, paused });
+		return ok(session.recordingId);
 	}
 
 	/**
@@ -2432,6 +2805,7 @@ export class CallControl implements CallControlPort {
 		}
 		const outcome = await finished.promise;
 		session.stopWatching();
+		this.deps.host.markRecording(leg, { active: false, paused: false });
 		if (session.snoopChannelId !== undefined)
 			await this.hangupQuietly(session.snoopChannelId, "NORMAL_CLEARING");
 
@@ -2440,6 +2814,11 @@ export class CallControl implements CallControlPort {
 			recordingId: session.recordingId,
 			objectKey: session.objectKey,
 			...(outcome.bytes === undefined ? {} : { bytes: outcome.bytes }),
+			// The gap in the audio is deliberate, and this is the only place that says so: the CDR
+			// row is what a compliance reviewer reads, not the media plane's own event stream.
+			...(outcome.pauses === undefined || outcome.pauses.length === 0
+				? {}
+				: { pauses: outcome.pauses.map((pause) => ({ ...pause })) }),
 			durationMs:
 				outcome.durationMs > 0 ? outcome.durationMs : Math.max(0, this.now() - session.startedAtMs),
 			reason: outcome.reason,
@@ -2566,11 +2945,20 @@ export class CallControl implements CallControlPort {
 	 * that is already in a conversation — the application is adding this leg to that call, which is
 	 * what an operator means by it. Both legs are pulled out of any OTHER bridge first, because a
 	 * channel in two bridges is a media loop.
+	 *
+	 * ## An unanswered member is ANSWERED, not refused
+	 *
+	 * A leg that has not answered has no media session on a split plane, so adding it to a bridge is
+	 * refused `unknown_session` one layer down. Refusing it up here instead was tidier and wrong: the
+	 * operations that arrive with a ringing leg are exactly the ones where bridging IS the answer — a
+	 * shared line retrieved from a second appearance above all — and every one of them was told "the
+	 * leg has not answered, so it cannot be used for bridge". {@link CallControl.pickup} and
+	 * {@link CallControl.monitor} already answer inline for this reason; doing it here is why they
+	 * are the only two places that ever had to.
 	 */
 	async bridge(leg: ControlledLeg, request: BridgeLegRequest): Promise<BridgeLegOutcome> {
-		const refusal = this.refuseIfUnusable(leg, "bridge");
-		if (refusal !== undefined) {
-			return { result: refusal };
+		if (leg.isTearingDown) {
+			return { result: refuse("the leg is tearing down, so it cannot be used for bridge") };
 		}
 		const peer = this.deps.host.legByLegId(request.peerLegId);
 		if (peer === undefined || peer.organizationId !== leg.organizationId) {
@@ -2579,9 +2967,22 @@ export class CallControl implements CallControlPort {
 		if (peer.legId === leg.legId) {
 			return { result: refuse("a leg cannot be bridged to itself") };
 		}
-		const peerRefusal = this.refuseIfUnusable(peer, "bridge");
-		if (peerRefusal !== undefined && !peerRefusal.ok) {
-			return { result: refuse(`leg ${peer.legId} is not usable: ${peerRefusal.reason}`) };
+		if (peer.isTearingDown) {
+			return {
+				result: refuse(
+					`leg ${peer.legId} is not usable: the leg is tearing down, so it cannot be used for bridge`,
+				),
+			};
+		}
+		for (const member of [leg, peer]) {
+			if (member.isAnswered) {
+				continue;
+			}
+			try {
+				await this.deps.media.answer(member.mediaChannelId);
+			} catch (error) {
+				return { result: refuse(`leg ${member.legId} could not be answered: ${String(error)}`) };
+			}
 		}
 		if (this.holds.has(leg.mediaChannelId) || this.holds.has(peer.mediaChannelId)) {
 			// Bridging a held leg would put a live conversation on top of hold music, and would leave
@@ -2848,6 +3249,299 @@ export class CallControl implements CallControlPort {
 		}
 	}
 
+	// -------------------------------------------------------------------------------------------
+	// Shared lines, mid-call
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * A phone on a shared line pressed hold, or released it.
+	 *
+	 * ## Why this is not the same event as {@link hold}
+	 *
+	 * `hold` is an APPLICATION holding a leg. This is a desk phone re-INVITEing with `sendonly`, and
+	 * the orchestrator's `onPhoneHold` is where it lands. The two produce the same media outcome and
+	 * completely different bookkeeping: the phone's hold is the one that has to reach the OTHER
+	 * appearances, because the point of a shared line is that pressing hold on one key lights it on
+	 * every other phone that shares the line.
+	 *
+	 * ## The KV write IS the publication
+	 *
+	 * There is no separate lamp event to send. The seizure lives in the shared claim bucket that
+	 * every engine instance and every BLF fan-out already watches, so moving it from `seized` to
+	 * `held` is what the other appearances see. A single-instance deployment with no bucket keeps the
+	 * same state locally and reaches the same code on retrieval.
+	 *
+	 * ## Recall is armed here and nowhere else
+	 *
+	 * The line's `hold_recall_timeout_seconds` starts when the key is pressed, so it is armed here
+	 * and cancelled the moment the line is picked back up — by this appearance or by another one.
+	 *
+	 * `leg` is the leg the media event was about: the APPEARANCE that pressed the key, whose peer is
+	 * the caller now listening to music. Best-effort throughout — a line whose lamp did not update is
+	 * a worse shared line and a much better outcome than an exception on the event socket.
+	 */
+	async onSharedLineHold(leg: ControlledLeg, held: boolean): Promise<void> {
+		const lines = this.deps.sharedLines;
+		if (lines === undefined) {
+			return;
+		}
+		const seizure = lines.seizureForCall(leg.callId);
+		if (seizure === undefined) {
+			return;
+		}
+
+		if (!held) {
+			// Cancelled BEFORE the resume: a recall that fired between the two would ring the line back
+			// at a phone that is already talking on it.
+			lines.cancelRecall(leg.organizationId, seizure.sharedLineId);
+			const resumed = await lines.resume(leg.organizationId, seizure.sharedLineId);
+			if (resumed.kind !== "held") {
+				this.log("a shared line could not be taken off hold", {
+					sharedLineId: seizure.sharedLineId,
+					callId: leg.callId,
+					reason: resumed.kind,
+				});
+			}
+			return;
+		}
+
+		const outcome = await lines.hold(leg.organizationId, seizure.sharedLineId);
+		if (outcome.kind !== "held") {
+			this.log("a shared line could not be moved to held; the other appearances will not light", {
+				sharedLineId: seizure.sharedLineId,
+				callId: leg.callId,
+				reason: outcome.kind,
+			});
+			return;
+		}
+
+		const line = await this.deps.host.sharedLineFor(leg, seizure.sharedLineId);
+		const timeoutMs = Math.max(0, line?.holdRecallTimeoutSeconds ?? 0) * MILLIS_PER_SECOND;
+		// `armRecall` treats `<= 0` as "never", which is the tenant's own choice for a line with no
+		// recall timeout and is why no deployment default is substituted here.
+		lines.armRecall(leg.organizationId, seizure.sharedLineId, timeoutMs, () => {
+			void this.recallSharedLine(leg.organizationId, seizure.sharedLineId);
+		});
+	}
+
+	/**
+	 * Another appearance picked up the held line.
+	 *
+	 * This is the operation a shared line exists for and the one a ring group cannot express: the
+	 * caller is on hold at appearance 1, somebody presses the same lit key on appearance 2, and the
+	 * SAME conversation continues on the second phone. Nothing is re-dialled and nobody is rung.
+	 *
+	 * Modelled on {@link unpark}, and the differences are the interesting part:
+	 *
+	 * - the held party is addressed by DOMAIN leg id, because that is what the seizure records; a
+	 *   media channel id would not survive the call being re-created;
+	 * - the seizure is not released and re-taken but RE-POINTED, so the line never passes through a
+	 *   free state a third appearance could seize in between;
+	 * - a line held by ANOTHER instance is refused honestly rather than half-retrieved, exactly as a
+	 *   foreign park orbit is when no handoff transport is wired. The caller stays where they are.
+	 *
+	 * ## The retrieving leg has NOT answered, and demanding that it had is what broke this
+	 *
+	 * A second appearance retrieves by DIALLING the line, so this runs from the walker's
+	 * `shared-line` node on a leg that is still ringing — the walk deliberately does not answer
+	 * before it knows there is something to connect the caller to. {@link refuseIfUnusable}'s
+	 * `isAnswered` check therefore refused every retrieve there has ever been, with "the leg has not
+	 * answered, so it cannot be used for shared-line retrieve", and the walk fell through to its
+	 * timeout branch. So only the teardown half of that guard applies here, and the leg is answered
+	 * by {@link CallControl.bridge} at the moment there IS something to connect it to — the same
+	 * shape, and for the same reason, as {@link CallControl.pickup} and {@link CallControl.monitor}.
+	 */
+	async retrieveSharedLine(
+		leg: ControlledLeg,
+		request: { readonly sharedLineId: string },
+	): Promise<CallControlResult> {
+		if (leg.isTearingDown) {
+			return refuse("the leg is tearing down, so it cannot be used for shared-line retrieve");
+		}
+		const lines = this.deps.sharedLines;
+		if (lines === undefined) {
+			return refuse("this engine has no shared-line registry");
+		}
+		const line = await this.deps.host.sharedLineFor(leg, request.sharedLineId);
+		if (line === undefined) {
+			return refuse(`shared line ${request.sharedLineId} is not in this organization's artifact`);
+		}
+		const appearance = line.appearances.find(
+			(candidate) => candidate.extensionNumber === leg.destinationNumber,
+		);
+		const heldState = lines.held(leg.organizationId, request.sharedLineId);
+		if (heldState === undefined) {
+			return refuse(`shared line ${request.sharedLineId} is not held on this engine`);
+		}
+		if (heldState.state !== "held") {
+			return refuse(`shared line ${request.sharedLineId} is in use, not on hold`);
+		}
+		const heldParty = this.deps.host.legByLegId(heldState.legId);
+		if (heldParty === undefined || heldParty.isTearingDown) {
+			// The caller hung up between the lamp lighting and this key being pressed. Free the line
+			// rather than leaving every appearance showing a call nobody is on.
+			await lines.releaseOwn(leg.organizationId, request.sharedLineId);
+			return refuse(`the call on shared line ${request.sharedLineId} has already gone`);
+		}
+
+		lines.cancelRecall(leg.organizationId, request.sharedLineId);
+		try {
+			await this.deps.media.stopMusicOnHold(heldParty.mediaChannelId);
+		} catch {
+			// Stopping music that is not playing is a no-op everywhere it matters.
+		}
+		// The phone-pressed hold never went through `this.holds`, but a soft hold on the same leg
+		// would have; clearing it keeps `bridge`'s "one of the legs is on hold" guard honest.
+		this.holds.delete(heldParty.mediaChannelId);
+		heldParty.removeFlag("hold");
+
+		const bridged = await this.bridge(leg, { peerLegId: heldParty.legId });
+		if (!bridged.result.ok) {
+			// Put them back on hold rather than stranding them in silence: the line is still held and
+			// the appearance that had it can still take it back.
+			await this.deps.media.startMusicOnHold(heldParty.mediaChannelId).catch(() => undefined);
+			heldParty.addFlag("hold");
+			return bridged.result;
+		}
+
+		heldParty.moveCallStateTo("unheld");
+		heldParty.moveCallStateTo("active");
+
+		const resumed = await lines.resume(leg.organizationId, request.sharedLineId, {
+			extensionId: appearance?.extensionId ?? heldState.heldByExtensionId,
+			appearanceIndex: appearance?.appearanceIndex ?? heldState.heldByAppearanceIndex,
+			callId: heldParty.callId,
+			legId: heldParty.legId,
+		});
+		if (resumed.kind !== "held") {
+			this.log("a retrieved shared line could not be re-pointed at the retrieving appearance", {
+				sharedLineId: request.sharedLineId,
+				reason: resumed.kind,
+			});
+		}
+		return ok(`retrieved shared line ${request.sharedLineId}`);
+	}
+
+	/**
+	 * The call on a shared line ended: the appearance is freed.
+	 *
+	 * Called from the orchestrator's teardown for every leg, and a no-op for the overwhelming
+	 * majority of them that are not on a shared line. A seizure that outlived its call is a line
+	 * every appearance sees as busy and nobody is on, which is the one failure mode of a shared line
+	 * that a person cannot work around.
+	 *
+	 * The leg is compared, not just the call: a shared-line call has at least two legs, and the
+	 * appearance's leg going away is a blind transfer or a recall re-ring, not the end of the call.
+	 * The line is freed when the leg the seizure NAMES ends — the party who is actually on it.
+	 */
+	async releaseSharedLine(organizationId: string, callId: string, legId: string): Promise<void> {
+		const lines = this.deps.sharedLines;
+		if (lines === undefined) {
+			return;
+		}
+		const seizure = lines.seizureForCall(callId);
+		if (seizure === undefined || seizure.value.legId !== legId) {
+			return;
+		}
+		lines.cancelRecall(organizationId, seizure.sharedLineId);
+		await lines.releaseOwn(organizationId, seizure.sharedLineId);
+	}
+
+	/**
+	 * The hold timeout elapsed: the line rings back at the appearance that put it there.
+	 *
+	 * Through the ordinary routing path rather than by re-bridging that appearance's old leg, for
+	 * the reason {@link returnParkedCall} gives — the leg is usually gone, and routing to the NUMBER
+	 * rings the phone as a new call would, with its forwarding and its voicemail behind it.
+	 *
+	 * The seizure is deliberately NOT released first. A recall that freed the line would let a third
+	 * appearance seize it while the caller is mid-recall, and the caller would then be on a line
+	 * somebody else owns.
+	 *
+	 * ## The appearance's OWN leg is ended first, which is what made the recall reachable
+	 *
+	 * A shared-line hold is a desk phone re-INVITEing `sendonly` — nothing tears its dialog down, so
+	 * the appearance that pressed hold is still in this call when the timer fires. Routing the caller
+	 * at that appearance's extension therefore dialled a number this very call was occupying, the
+	 * ladder fell through, and the recall ended `hangup` (or, on the identical park path, in the
+	 * holder's own voicemail). The call is on the LINE and not on that phone by the time a recall
+	 * fires, so the phone's leg is released and the recall reaches an idle extension. The bridge peer
+	 * link is cut FIRST, for the reason `park` cuts it: `endBridgePeer` would otherwise follow the
+	 * appearance's teardown straight into the caller it is recalling.
+	 */
+	private async recallSharedLine(organizationId: string, sharedLineId: string): Promise<void> {
+		const lines = this.deps.sharedLines;
+		if (lines === undefined) {
+			return;
+		}
+		const heldState = lines.held(organizationId, sharedLineId);
+		if (heldState === undefined || heldState.state !== "held") {
+			return;
+		}
+		const heldParty = this.deps.host.legByLegId(heldState.legId);
+		if (heldParty === undefined || heldParty.isTearingDown) {
+			await lines.releaseOwn(organizationId, sharedLineId);
+			return;
+		}
+		const line = await this.deps.host.sharedLineFor(heldParty, sharedLineId);
+		const seizing = line?.appearances.find(
+			(candidate) => candidate.appearanceIndex === heldState.heldByAppearanceIndex,
+		);
+		if (seizing === undefined) {
+			// No number to ring back. The caller stays on hold rather than being hung up: the
+			// appearance that holds the line can still take them back.
+			this.log("a shared line timed out on hold with no appearance to recall to", {
+				sharedLineId,
+				appearanceIndex: heldState.heldByAppearanceIndex,
+			});
+			return;
+		}
+
+		try {
+			await this.deps.media.stopMusicOnHold(heldParty.mediaChannelId);
+		} catch {
+			// Stopping music that is not playing is a no-op everywhere it matters.
+		}
+		this.holds.delete(heldParty.mediaChannelId);
+		heldParty.removeFlag("hold");
+
+		const holder = this.peerOf(heldParty);
+		if (holder !== undefined && !holder.isTearingDown) {
+			// The BRIDGE as well as the peer pointer, and both before the hangup. `park` clears both
+			// for the same reason: the walk that built this bridge is still watching the other side
+			// of it, and its `onPeerEnded` hangs its own leg up — the caller this recall is about to
+			// dial for — unless the leg has visibly left the bridge first.
+			heldParty.setBridge(undefined);
+			heldParty.setBridgePeer(undefined);
+			holder.setBridgePeer(undefined);
+			holder.markHangup("NORMAL_CLEARING");
+			await this.hangupQuietly(holder.mediaChannelId, "NORMAL_CLEARING");
+		}
+		heldParty.moveTo("routing");
+
+		const outcome = await this.routeTransferee(
+			heldParty,
+			seizing.extensionNumber,
+			this.settings.transferContext,
+		);
+		if (outcome.status !== "bridged") {
+			this.log("a shared line's hold recall did not reach the appearance that held it", {
+				sharedLineId,
+				extensionNumber: seizing.extensionNumber,
+				status: outcome.status,
+			});
+			return;
+		}
+		// The recall built a NEW leg to the appearance, so the seizure now points at a leg that has
+		// gone. Re-point it at the caller's leg, which is the one that survived both sides of this.
+		await lines.resume(organizationId, sharedLineId, {
+			extensionId: seizing.extensionId,
+			appearanceIndex: seizing.appearanceIndex,
+			callId: heldParty.callId,
+			legId: heldParty.legId,
+		});
+	}
+
 	private transitionPark(mediaChannelId: string, to: ParkState): void {
 		const from = this.parkStates.get(mediaChannelId);
 		if (from === undefined) {
@@ -2953,6 +3647,7 @@ export class CallControl implements CallControlPort {
 						durationMs: signal.durationMs,
 						reason: "completed",
 						...(signal.bytes === undefined ? {} : { bytes: signal.bytes }),
+						...(signal.pauses === undefined ? {} : { pauses: signal.pauses }),
 					});
 				} else if (signal.kind === "recording-failed") {
 					done({ durationMs: 0, reason: "failed" });

@@ -19,19 +19,32 @@ const LEG = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53";
 
 const IDENTITY = { sipCallId: "a84b4c76e66710@pc33", localTag: "9f2a11", remoteTag: "as58c1f2" };
 
-function base(): { legId: string; callId: string; instanceId: string; role: "uas" } {
-	return { legId: LEG, callId: CALL, instanceId: "sipd-7c9f", role: "uas" };
+function base(role: "uas" | "uac" = "uas"): {
+	legId: string;
+	callId: string;
+	instanceId: string;
+	role: "uas" | "uac";
+} {
+	return { legId: LEG, callId: CALL, instanceId: "sipd-7c9f", role };
 }
 
-function progressed(overrides: { status?: number; hasEarlyMedia?: boolean } = {}) {
+function progressed(
+	overrides: {
+		status?: number;
+		hasEarlyMedia?: boolean;
+		sdpAnswer?: string;
+		role?: "uas" | "uac";
+	} = {},
+) {
 	return makeSipDialogEvent("dialog.progressed", {
 		orgId: ORG,
 		source: "sipd",
 		data: {
-			...base(),
+			...base(overrides.role ?? "uac"),
 			identity: IDENTITY,
 			status: overrides.status ?? 180,
 			hasEarlyMedia: overrides.hasEarlyMedia ?? false,
+			...(overrides.sdpAnswer === undefined ? {} : { sdpAnswer: overrides.sdpAnswer }),
 		},
 	} as SipDialogEventInput<"dialog.progressed">);
 }
@@ -116,6 +129,37 @@ describe("translating a dialog event", () => {
 			channelId: LEG,
 			callState: "early",
 		});
+	});
+
+	it("carries a carrier's early answer through so the caller can be given the audio", () => {
+		// The 183 half of the settle below: the answer arrives a beat earlier, on the progressed event,
+		// and dropping it here would leave the engine knowing audio was flowing towards it with no way
+		// to accept it — the silence over the announcement that 183 exists to prevent.
+		const sdpAnswer = "v=0\r\no=- 2 2 IN IP4 203.0.113.9\r\nm=audio 40002 RTP/AVP 0\r\n";
+		expect(
+			toMediaEventFromSipd(progressed({ status: 183, hasEarlyMedia: true, sdpAnswer })),
+		).toEqual({ type: "call-state-changed", channelId: LEG, callState: "early", sdpAnswer });
+		// A body on a leg that has NOT committed the exchange is not an answer to settle; settling it
+		// would commit a codec the far end has not agreed to.
+		expect(toMediaEventFromSipd(progressed({ status: 180, sdpAnswer }))).toEqual({
+			type: "call-state-changed",
+			channelId: LEG,
+			callState: "ringing",
+		});
+	});
+
+	it("drops the answer on a leg WE answered, because it is our own body", () => {
+		// A `183` this platform sent carries the answer `mediad` wrote for the caller. The
+		// orchestrator feeds a `progressed` answer straight into `acceptAnswer` for the leg the event
+		// names, so carrying it here would settle the caller's session against its own answer — the
+		// shape of a caller who hears nothing for the life of the call. The FLAG still travels: the
+		// leg genuinely is in early media.
+		const sdpAnswer = "v=0\r\no=- 3 3 IN IP4 203.0.113.9\r\nm=audio 40004 RTP/AVP 0\r\n";
+		expect(
+			toMediaEventFromSipd(
+				progressed({ status: 183, hasEarlyMedia: true, sdpAnswer, role: "uas" }),
+			),
+		).toEqual({ type: "call-state-changed", channelId: LEG, callState: "early" });
 	});
 
 	it("maps an answered dialog to the active state the CDR bills from", () => {

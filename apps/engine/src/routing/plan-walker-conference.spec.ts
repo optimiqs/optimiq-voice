@@ -107,6 +107,9 @@ function caller(options: CallerOptions) {
 			states.push(next);
 			return true;
 		},
+		get bridgeId(): string | undefined {
+			return state.bridgeId;
+		},
 		setBridge: (bridgeId) => {
 			state.bridgeId = bridgeId;
 		},
@@ -339,6 +342,7 @@ describe("a conference with no PIN", () => {
 				isDetached: false,
 				isAnswered: true,
 				moveTo: () => true,
+				bridgeId: undefined,
 				setBridge: () => undefined,
 			},
 			execute: async (verb) => ({ verb: verb.verb as never, endReason: "completed" }),

@@ -1,5 +1,4 @@
 import { createEntityId } from "@optimiq-voice/identifiers";
-import { isAnsweredCause } from "@optimiq-voice/telephony";
 import { dialStringOr } from "./ari-mapping";
 import type { CdrLegWriteData, HangupSide, LegSide } from "@optimiq-voice/events";
 import type { ChannelSnapshot, HangupCause } from "@optimiq-voice/telephony";
@@ -33,11 +32,36 @@ export type CallDisposition = (typeof CALL_DISPOSITIONS)[number];
 export const DEFAULT_DESTINATION_TYPE = "unknown";
 
 /**
+ * The ways a leg ends without anybody having answered it.
+ *
+ * `NORMAL_CLEARING` is in here because of what it means on an UNANSWERED leg, which is not what it
+ * means on an answered one: a ring-all loser cancelled by the media server, a caller who gave up
+ * while the phone was still ringing, a leg the edge tore down after the race was decided. Every one
+ * of those is a call nobody took, and filing them as answered — which is what reading the cause as
+ * "the answer instant was lost" did — inflates the answered count and the per-leg billing metrics
+ * by one row per fan-out target. See `ANSWERED_HANGUP_CAUSES`, which stays what it is: a
+ * reconciliation heuristic for records the ENGINE did not write, and not a source of dispositions.
+ */
+const UNANSWERED_NO_ANSWER_CAUSES = new Set<HangupCause>([
+	"NORMAL_CLEARING",
+	"NO_ANSWER",
+	"NO_USER_RESPONSE",
+	"ORIGINATOR_CANCEL",
+	"LOSE_RACE",
+	"SUBSCRIBER_ABSENT",
+	"ALLOTTED_TIMEOUT",
+	"PROGRESS_TIMEOUT",
+	"PICKED_OFF",
+	"NO_PICKUP",
+]);
+
+/**
  * The reporting outcome of a leg.
  *
- * `answeredAt` is authoritative: if the leg was answered it is `answered`, whatever the cause says.
- * Only an UNANSWERED leg is classified by its cause, and then only for the three outcomes a report
- * distinguishes — a busy signal, a caller who gave up, and everything else, which is a failure.
+ * The ANSWER STATE decides it, and it decides it first: a leg with an `answeredAt` is `answered`
+ * whatever the cause says, and a leg without one is NEVER `answered`, whatever the cause says. The
+ * cause is consulted second and only to tell the three unanswered outcomes a report distinguishes
+ * apart — a busy signal, a call nobody took, and a failure.
  */
 export function dispositionFor(input: {
 	readonly answeredAt?: number;
@@ -53,19 +77,8 @@ export function dispositionFor(input: {
 	if (cause === "USER_BUSY") {
 		return "busy";
 	}
-	if (
-		cause === "NO_ANSWER" ||
-		cause === "NO_USER_RESPONSE" ||
-		cause === "ORIGINATOR_CANCEL" ||
-		cause === "LOSE_RACE" ||
-		cause === "SUBSCRIBER_ABSENT"
-	) {
+	if (UNANSWERED_NO_ANSWER_CAUSES.has(cause)) {
 		return "no-answer";
-	}
-	// A cause that is only reachable after answer, on a leg with no `answeredAt`, means the answer
-	// instant was lost rather than that the call failed (see `ANSWERED_HANGUP_CAUSES`).
-	if (isAnsweredCause(cause)) {
-		return "answered";
 	}
 	return "failed";
 }
@@ -111,6 +124,43 @@ export interface CdrLegInput {
 	readonly queueWaitMs?: number;
 	readonly queueOutcome?: NonNullable<CdrLegWriteData["queueOutcome"]>;
 	readonly queueAgentRef?: string;
+	/**
+	 * The authorisation code that opened a gated outbound route. See {@link authorizationOf}.
+	 *
+	 * The ordinal and the label, never the digits — the digits stop at the walker.
+	 */
+	readonly authPinOrdinal?: number;
+	readonly authPinLabel?: string;
+	/**
+	 * The carrier's STIR/SHAKEN claim, on an inbound trunk leg that arrived with one.
+	 *
+	 * Each field independently optional — see {@link attestationOf} for why this is not the
+	 * all-or-nothing pair the authorisation code is.
+	 */
+	readonly sipAttestation?: "A" | "B" | "C";
+	readonly sipVerstat?: string;
+	readonly sipOrigId?: string;
+	/**
+	 * The SIP `Call-ID` of the dialog this leg IS, when one is known.
+	 *
+	 * `call_legs.sip_call_id` exists and was 0-populated across every row on the stack, which makes
+	 * the one question a carrier ever asks about a record — "show me the call whose Call-ID was
+	 * this" — unanswerable. It is read back off {@link SIP_CALL_ID_VARIABLE}, mirrored like every
+	 * other CDR identity here, so a leg adopted after a failover files the same value.
+	 *
+	 * Absent on a leg with no SIP dialog at all: a Local half, a snoop, a media-only channel.
+	 */
+	readonly sipCallId?: string;
+	/**
+	 * The call this leg SETTLES, when it settles one — a queue callback, today the only such leg.
+	 *
+	 * `originatingLegId` and `bridgeLegId` link legs within one `call_id`; this is the only field
+	 * that links two CALLS. A callback is deliberately a new `call_id` rather than a reuse of the
+	 * queued one: it happens minutes later with its own answer, its own trunk and its own billing,
+	 * and reusing the id would make every duration in the ledger a sum over time the customer was
+	 * not on the phone.
+	 */
+	readonly relatedCallId?: string;
 }
 
 /**
@@ -158,6 +208,17 @@ export function buildCdrLegWrite(input: CdrLegInput): CdrLegWriteData {
 		...(input.queueWaitMs === undefined ? {} : { queueWaitMs: input.queueWaitMs }),
 		...(input.queueOutcome === undefined ? {} : { queueOutcome: input.queueOutcome }),
 		...(input.queueAgentRef === undefined ? {} : { queueAgentRef: input.queueAgentRef }),
+		...(input.authPinOrdinal === undefined ? {} : { authPinOrdinal: input.authPinOrdinal }),
+		...(input.authPinLabel === undefined ? {} : { authPinLabel: input.authPinLabel }),
+		...(input.sipAttestation === undefined ? {} : { sipAttestation: input.sipAttestation }),
+		...(input.sipVerstat === undefined ? {} : { sipVerstat: input.sipVerstat }),
+		...(input.sipOrigId === undefined ? {} : { sipOrigId: input.sipOrigId }),
+		// Omitted rather than nulled on a leg that carries no dialog, for the reason the queue fields
+		// are: an unmapped null would be a null in `raw` for every such leg in the tenant.
+		...(input.sipCallId === undefined ? {} : { sipCallId: input.sipCallId }),
+		// The cross-CALL link, omitted on the overwhelming majority of legs that settle nothing. See
+		// `CdrLegInput.relatedCallId`.
+		...(input.relatedCallId === undefined ? {} : { relatedCallId: input.relatedCallId }),
 	};
 }
 
@@ -222,6 +283,37 @@ export function authorizationOf(variables: Readonly<Record<string, string | unde
 	return {
 		authPinOrdinal: ordinal,
 		...(label === undefined || label === "" ? {} : { authPinLabel: label }),
+	};
+}
+
+/**
+ * The carrier's STIR/SHAKEN claim about the caller, off the leg's variables.
+ *
+ * Symmetric with {@link authorizationOf} and mirrored the same way and for the same reason: the CDR
+ * is written by whichever of teardown and the walk's return gets there first, only the channel
+ * variables are visible to both, and they travel into the `channels` bucket so a replica adopting
+ * the leg after a failover writes the same record.
+ *
+ * **Not all-or-nothing, and that is the difference from {@link authorizationOf}.** There the
+ * ordinal makes the pair real, because a label with no ordinal is a variable set on a call that was
+ * never gated. Here every field is an INDEPENDENT thing a carrier chose to say: `verstat` is stated
+ * by carriers that state no `attest` level at all, and a `tn-validation-failed` with no level is the
+ * single most useful thing this function can report. So each key is taken on its own, and a level
+ * outside the contract's `A`/`B`/`C` vocabulary is dropped rather than passed through — the edge
+ * already refuses one, and a second reader that admitted it would make the first decorative.
+ */
+export function attestationOf(variables: Readonly<Record<string, string | undefined>>): {
+	sipAttestation?: "A" | "B" | "C";
+	sipVerstat?: string;
+	sipOrigId?: string;
+} {
+	const level = variables.OPTIMIQ_SIP_ATTESTATION;
+	const verstat = variables.OPTIMIQ_SIP_VERSTAT;
+	const origId = variables.OPTIMIQ_SIP_ORIGID;
+	return {
+		...(level === "A" || level === "B" || level === "C" ? { sipAttestation: level } : {}),
+		...(verstat === undefined || verstat === "" ? {} : { sipVerstat: verstat.slice(0, 64) }),
+		...(origId === undefined || origId === "" ? {} : { sipOrigId: origId.slice(0, 128) }),
 	};
 }
 

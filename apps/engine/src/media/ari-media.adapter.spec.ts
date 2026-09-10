@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { AriMediaAdapter } from "./ari-media.adapter";
+import { MediaOperationNotSupportedError } from "./media-not-supported.error";
 import type { TapRequest } from "./media-port";
 import type { AriClient } from "@optimiq-voice/media-ari";
 
@@ -152,5 +153,65 @@ describe("AriMediaAdapter.tap — the bridge", () => {
 		expect(calls.map((call) => call.method)).toEqual(["destroy", "hangup"]);
 		expect(calls[0]?.args[0]).toBe("tap-bridge");
 		expect(calls[1]?.args[0]).toBe("tap-channel");
+	});
+
+	/**
+	 * The second thing worth asserting here: a refusal that must NOT become a one-line forward. ARI
+	 * exposes `ring` (180) and `answer` (200) and nothing in between, so a driver that quietly rang
+	 * instead would leave the caller in silence over the announcement they were meant to hear — and
+	 * one that answered instead would start billing a call nobody has taken.
+	 */
+	it("refuses early media rather than ringing or answering instead", async () => {
+		const calls: Recorded[] = [];
+		const adapter = new AriMediaAdapter(fakeAri(calls), "optimiq-engine");
+
+		await expect(adapter.earlyMedia("caller-channel")).rejects.toThrow(
+			MediaOperationNotSupportedError,
+		);
+		expect(calls).toHaveLength(0);
+	});
+
+	/**
+	 * Asterisk does have a live-recording pause, but it SHORTENS the file: the audio after the gap
+	 * moves earlier, so the intervals a reviewer reads would not name the silence they describe. A
+	 * compliance answer that is confidently wrong is worse than a refusal.
+	 */
+	it("refuses to pause a recording rather than shortening the file", async () => {
+		const calls: Recorded[] = [];
+		const adapter = new AriMediaAdapter(fakeAri(calls), "optimiq-engine");
+
+		await expect(adapter.pauseRecording("rec-1", true)).rejects.toThrow(
+			MediaOperationNotSupportedError,
+		);
+		expect(calls).toHaveLength(0);
+	});
+
+	/**
+	 * `callerIdPresentation` is additive on the same contract `target` is: only the `sipd` composite
+	 * can honour it, and the ARI driver must dial exactly as it did before rather than fail on a
+	 * field it has no header to write. Asserted because a driver that threw would turn a tenant
+	 * enabling CLIR into an outage on every Asterisk deployment.
+	 */
+	it("ignores caller-id presentation rather than refusing the originate", async () => {
+		const calls: Recorded[] = [];
+		const originate = async (...args: unknown[]): Promise<unknown> => {
+			calls.push({ method: "originate", args });
+			return { id: "leg-b", name: "PJSIP/1002-00000001" };
+		};
+		const client = fakeAri(calls);
+		(client.channels as { originate: unknown }).originate = originate;
+		const adapter = new AriMediaAdapter(client, "optimiq-engine");
+
+		const result = await adapter.originate({
+			endpoint: "PJSIP/1002",
+			application: "optimiq-engine",
+			channelId: "leg-b",
+			callerIdPresentation: "restricted",
+		});
+
+		expect(result.channelId).toBe("leg-b");
+		const options = calls[0]?.args[0] as Record<string, unknown>;
+		expect(options["endpoint"]).toBe("PJSIP/1002");
+		expect(options).not.toHaveProperty("callerIdPresentation");
 	});
 });

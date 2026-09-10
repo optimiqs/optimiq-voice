@@ -14,6 +14,7 @@ import {
 	CONFERENCE_CLAIMS_KV,
 	conferenceClaimSchema,
 	DID_INDEX_KV,
+	ENGINE_INSTANCES_KV,
 	ensureKvBuckets,
 	ensureStreams,
 	kvKeyFor,
@@ -22,6 +23,8 @@ import {
 	QUEUE_MEMBERSHIP_KV,
 	QUEUE_WAITING_KV,
 	ROUTING_CACHE_KV,
+	SIP_DIALOGS_KV,
+	SIP_INSTANCES_KV,
 	sharedLineStateSchema,
 	subjectFor,
 } from "@optimiq-voice/events";
@@ -82,6 +85,9 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	private queueMembershipKv: KV | undefined;
 	private agentStateKv: KV | undefined;
 	private queueWaitingKv: KV | undefined;
+	private sipInstancesKv: KV | undefined;
+	private sipDialogsKv: KV | undefined;
+	private engineInstancesKv: KV | undefined;
 	private parkClaimsBucket: ClaimBucket<ParkClaim> = new UnclaimedBucket<ParkClaim>();
 	private conferenceClaimsBucket: ClaimBucket<ConferenceClaim> =
 		new UnclaimedBucket<ConferenceClaim>();
@@ -94,8 +100,15 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	/** Serializes each channel's CAS chain so two local events cannot race on the same revision. */
 	private readonly channelOperations = new Map<string, Promise<unknown>>();
 	private ready = false;
+	/** Permission violations the broker has reported on this connection. `/healthz` does not read it. */
+	private permissionViolations = 0;
 
 	constructor(@Inject(ENGINE_ENV) private readonly env: EngineEnv) {}
+
+	/** How many `PERMISSIONS_ERROR`s the broker has raised on this connection since boot. */
+	get permissionViolationCount(): number {
+		return this.permissionViolations;
+	}
 
 	/** Whether the JetStream side is usable. What `/healthz` reports. */
 	get isReady(): boolean {
@@ -131,6 +144,8 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 			maxReconnectAttempts: -1,
 			reconnectTimeWait: 1_000,
 		});
+
+		this.watchConnectionStatus(this.connection);
 
 		const manager: JetStreamManager = await this.connection.jetstreamManager();
 
@@ -180,6 +195,22 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		// that boots before the control plane has ever run must not discover the bucket's absence
 		// from its first queued caller.
 		this.queueWaitingKv = await this.jetstream.views.kv(QUEUE_WAITING_KV.name);
+		// `sip-instances` — written by every `apps/sipd` and read here. It is the only way this engine
+		// learns that a signalling edge died without taking the broker with it, and the calls that
+		// died with it are calls nobody else can end. Opening the view creates the bucket with the
+		// same definition `ensureKvBuckets` applies, so an engine that boots before any `sipd` has
+		// does not discover its absence from the first crash.
+		this.sipInstancesKv = await this.jetstream.views.kv(SIP_INSTANCES_KV.name);
+		// `sip-dialogs` — written by `apps/sipd`, read here and NEVER written. It is the edge's own
+		// record of which dialogs exist, and it is the only thing that can tell an engine that has
+		// ADOPTED a never-answered leg whether that leg is a call still ringing or one the edge
+		// refused seconds after its owner died. See `reconcileAdoptedLegs`.
+		this.sipDialogsKv = await this.jetstream.views.kv(SIP_DIALOGS_KV.name);
+		// `engine-instances` — the symmetric bucket, written and read by every instance of THIS app. It
+		// is what lets a survivor know that a peer died rather than merely that a channel lease lapsed,
+		// which is the difference between adopting a stranded call in seconds and adopting it in the
+		// ninety the channel lease is deliberately sized at.
+		this.engineInstancesKv = await this.jetstream.views.kv(ENGINE_INSTANCES_KV.name);
 		// The two CLAIM buckets. Both are written and read by this engine and by every other instance
 		// of it, and by nothing else — see `claim-store.ts` for why they are wrapped in a
 		// compare-and-set surface rather than exposed raw the way the read-mostly buckets are.
@@ -245,6 +276,56 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	 */
 	get routingCache(): KV | undefined {
 		return this.routingCacheKv;
+	}
+
+	/**
+	 * The `sip-instances` bucket, raw, for {@link import("../media/sipd-liveness.service").SipdLivenessService}.
+	 *
+	 * Raw for the same reason as `routing-cache`: its consumer needs BOTH a long-lived watch and a
+	 * point listing at boot, and a watch is an async iterator whose lifetime belongs to its consumer.
+	 *
+	 * `undefined` before `onModuleInit` has run, or after shutdown.
+	 */
+	get sipInstances(): KV | undefined {
+		return this.sipInstancesKv;
+	}
+
+	/**
+	 * Whether the SIP edge still has a dialog for this leg.
+	 *
+	 * `true` / `false` are answers; **`undefined` means the question could not be asked** — no view,
+	 * a refused read, a broker blip — and callers must treat it as "leave the call alone". The whole
+	 * point of this read is to end a leg no plane knows about, and a read failure is not evidence of
+	 * that: acting on one would hang up live calls every time the broker hiccuped.
+	 */
+	async sipDialogExists(legId: string): Promise<boolean | undefined> {
+		const kv = this.sipDialogsKv;
+		if (kv === undefined) {
+			return undefined;
+		}
+		try {
+			const entry = await kv.get(kvKeyFor.sipDialog(legId));
+			// A KV delete leaves a tombstone whose operation is not `PUT`; `sipd` deletes a dialog's
+			// claim when the dialog ends, so a tombstone is exactly the "the edge knows this is over"
+			// answer this method exists to surface.
+			return entry !== null && entry.operation === "PUT";
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * The `engine-instances` bucket, raw, for
+	 * {@link import("../media/engine-liveness.service").EngineLivenessService}.
+	 *
+	 * Raw for the same reason as `sip-instances`: its consumer both WRITES this process's own lease
+	 * and holds a long-lived watch over its peers', and a watch is an async iterator whose lifetime
+	 * belongs to its consumer.
+	 *
+	 * `undefined` before `onModuleInit` has run, or after shutdown.
+	 */
+	get engineInstances(): KV | undefined {
+		return this.engineInstancesKv;
 	}
 
 	/**
@@ -476,6 +557,90 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 			const result = await this.adoptChannelAt(kv, key, now, true);
 			// Nothing left to adopt: the snapshot this pass read is already gone from the bucket.
 			return result === "vanished" ? "owned" : result;
+		});
+	}
+
+	/**
+	 * Contests a channel whose owning ENGINE INSTANCE has been proved dead.
+	 *
+	 * ## Why this exists beside {@link adoptChannel}
+	 *
+	 * `adoptChannel` will not touch a lease that has not expired, and that refusal is correct: an
+	 * unexpired lease is a live replica's claim and the only evidence a survivor has. But
+	 * `CHANNEL_OWNERSHIP_LEASE_MS` is ninety seconds, because it is renewed by a heartbeat that
+	 * rewrites every live channel on the replica — so a SIGKILLed engine's calls sit unowned for up
+	 * to a minute and a half, with media still flowing and no aggregate anywhere in the fleet to end
+	 * them on. Measured live: the survivor adopted nothing for the whole forty seconds a stranded
+	 * call was observed, and the call was never billed.
+	 *
+	 * `engine-instances` supplies the missing evidence. When that lease has lapsed the owner is not
+	 * slow, it is gone, and its channel lease is a promise nobody is left to keep — so this method
+	 * ignores the expiry and takes the snapshot on the strength of the instance lease instead.
+	 *
+	 * ## What still makes it safe
+	 *
+	 * Three fences, and none of them is the channel expiry:
+	 *
+	 * 1. The caller must name the dead instance, and a snapshot owned by ANYONE else is refused
+	 *    (`"owned"`) — including one the dead instance's replacement has already taken. A survivor
+	 *    cannot use a peer's death to take a third party's calls.
+	 * 2. The write is a revision-fenced `update` at the revision this pass read, so when several
+	 *    survivors contest the same channel exactly one wins and the rest get `"owned"`.
+	 * 3. A key that vanished between the read and the write reads as `"vanished"`, not as a claim.
+	 */
+	async adoptChannelFromInstance(
+		snapshot: ChannelSnapshot,
+		deadInstanceId: string,
+		now = Date.now(),
+	): Promise<ChannelClaimResult | "vanished"> {
+		const kv = this.channelsKv;
+		if (kv === undefined) {
+			return "unavailable";
+		}
+		const key = kvKeyFor.channel(snapshot.organizationId, snapshot.callId, snapshot.channelId);
+		return await this.serializeChannelOperation(key, async () => {
+			let current: { readonly snapshot: ChannelSnapshot; readonly revision: number };
+			try {
+				const entry = await kv.get(key);
+				if (entry === null || entry.value.length === 0) {
+					return "vanished";
+				}
+				const value = JSON.parse(decoder.decode(entry.value)) as ChannelSnapshot;
+				const expectedKey = kvKeyFor.channel(value.organizationId, value.callId, value.channelId);
+				if (expectedKey !== key) {
+					throw new Error(`snapshot belongs at ${expectedKey}`);
+				}
+				current = { snapshot: value, revision: entry.revision };
+			} catch (error) {
+				this.logger.warn({ key, err: String(error) }, "failed to read a dead peer's channel");
+				return "unavailable";
+			}
+
+			const ownership = channelOwnershipOf(current.snapshot);
+			if (ownership?.instanceId !== deadInstanceId) {
+				// Somebody else's — a live replica's, or the survivor that beat us to this one. Read
+				// FRESH rather than from the caller's snapshot, which is why the re-read above is not
+				// redundant with the listing that produced it.
+				return "owned";
+			}
+			const expiresAt = now + CHANNEL_OWNERSHIP_LEASE_MS;
+			try {
+				const revision = await kv.update(
+					key,
+					encodeChannel(
+						withChannelOwnership(current.snapshot, this.env.ENGINE_INSTANCE_ID, expiresAt),
+					),
+					current.revision,
+				);
+				this.rememberChannelOwnership(key, revision, expiresAt);
+				return "claimed";
+			} catch (error) {
+				if (isConflict(error)) {
+					return "owned";
+				}
+				this.logger.warn({ key, err: String(error) }, "failed to adopt a dead peer's channel");
+				return "unavailable";
+			}
 		});
 	}
 
@@ -717,6 +882,83 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		});
 	}
 
+	/**
+	 * Drains the connection's status feed to the log.
+	 *
+	 * Nothing else in this process consumes it, and until it did, an entire class of broker refusal
+	 * was invisible: `nats.js` reports a publish the broker rejected as a `PERMISSIONS_ERROR` on
+	 * this async iterator ONLY. It is not an error on the publishing call — a core publish is
+	 * fire-and-forget — and it is not an error on the subscription the refusal belongs to. A watch
+	 * whose flow-control reply is refused therefore goes quiet with every other signal saying it is
+	 * healthy, which is exactly how a stalled `routing-cache` watch cost an hour of stale routing
+	 * with nothing in the engine's log to point at.
+	 *
+	 * Fire-and-forget on purpose: the iterator ends when the connection closes, and awaiting it
+	 * would never return.
+	 */
+	/**
+	 * Re-applies the JetStream definitions after a reconnect, because a broker that restarted has
+	 * lost every MEMORY-backed one.
+	 *
+	 * `presence` is `storage: "memory"` — deliberately, it is a 5-minute-TTL read model — so a broker
+	 * restart destroys the stream while this process keeps a `KV` handle bound to it. Every write
+	 * then fails `503` for ever and `apps/sipd`'s watch retries `stream not found` for ever, so BLF
+	 * goes dark platform-wide until something reboots. Nothing else recreates it: `ensureKvBuckets`
+	 * ran once, at boot.
+	 *
+	 * Idempotent, and the file-backed buckets survived, so this is a no-op in the common case. A
+	 * failure is logged rather than thrown: the reconnect itself already succeeded, and throwing out
+	 * of a status iterator would end the feed that is the only thing watching the connection.
+	 */
+	private async reapplyDefinitions(): Promise<void> {
+		const connection = this.connection;
+		if (connection === undefined || !this.env.ENGINE_ENSURE_STREAMS) {
+			return;
+		}
+		try {
+			const manager = await connection.jetstreamManager();
+			const buckets = await ensureKvBuckets(manager);
+			const created = buckets.filter((outcome) => outcome.created).map((outcome) => outcome.name);
+			if (created.length > 0) {
+				// The KV handles are bound to the stream by NAME, so a recreated bucket is usable
+				// again through the existing view without reopening it.
+				this.logger.warn({ buckets: created }, "recreated KV buckets the broker had lost");
+			}
+		} catch (error) {
+			this.logger.error({ err: String(error) }, "could not re-apply JetStream definitions");
+		}
+	}
+
+	private watchConnectionStatus(connection: NatsConnection): void {
+		void (async () => {
+			try {
+				for await (const status of connection.status()) {
+					if (status.type === "error" && String(status.data).includes("Permissions")) {
+						this.permissionViolations += 1;
+						// ERROR and not WARN: a refused publish is a deployment that cannot do its
+						// job, and the subject in the message names the exact missing grant.
+						this.logger.error(
+							{ detail: String(status.data), total: this.permissionViolations },
+							"the broker refused an operation on this connection; a NATS permission is missing",
+						);
+						continue;
+					}
+					if (status.type === "disconnect" || status.type === "reconnect") {
+						this.logger.warn(
+							{ event: status.type, server: String(status.data) },
+							"nats connection event",
+						);
+					}
+					if (status.type === "reconnect") {
+						await this.reapplyDefinitions();
+					}
+				}
+			} catch (error) {
+				this.logger.warn({ err: String(error) }, "the nats status feed ended");
+			}
+		})();
+	}
+
 	async onApplicationShutdown(): Promise<void> {
 		this.ready = false;
 		const connection = this.connection;
@@ -729,6 +971,9 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		this.queueMembershipKv = undefined;
 		this.agentStateKv = undefined;
 		this.queueWaitingKv = undefined;
+		this.sipInstancesKv = undefined;
+		this.sipDialogsKv = undefined;
+		this.engineInstancesKv = undefined;
 		this.parkClaimsBucket = new UnclaimedBucket<ParkClaim>();
 		this.conferenceClaimsBucket = new UnclaimedBucket<ConferenceClaim>();
 		this.sharedLineStateBucket = new UnclaimedBucket<SharedLineState>();

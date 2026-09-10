@@ -7,6 +7,7 @@ import { AriConnectionService } from "./ari-connection.service";
 import { AriMediaAdapter } from "./ari-media.adapter";
 import { MediadService } from "./mediad.service";
 import { SipRenegotiateService } from "./sip-renegotiate.service";
+import { SipdLivenessService } from "./sipd-liveness.service";
 import { SipdService } from "./sipd.service";
 import { SplitPlaneMediaPort } from "./split-plane.port";
 import type { EngineEnv } from "../config/engine-env";
@@ -41,6 +42,10 @@ import type { MediaPort } from "./media-port";
 		// is constructed unconditionally for the reason the other two are — the factory below stays a
 		// one-line choice — and starts only on a deployment that signals on `apps/sipd`.
 		SipdService,
+		// The signalling plane's LIVENESS half. It commands nothing either; it watches the
+		// `sip-instances` bucket so a `sipd` that died without saying so stops being a call the engine
+		// holds forever. Constructed unconditionally like the rest, started from `main.ts`.
+		SipdLivenessService,
 		SipRenegotiateService,
 		{
 			provide: MEDIA_PORT,
@@ -81,6 +86,6 @@ import type { MediaPort } from "./media-port";
 			inject: [ENGINE_ENV, AriConnectionService, MediadService, JetStreamService],
 		},
 	],
-	exports: [AriConnectionService, MediadService, SipdService, MEDIA_PORT],
+	exports: [AriConnectionService, MediadService, SipdService, SipdLivenessService, MEDIA_PORT],
 })
 export class AriModule {}

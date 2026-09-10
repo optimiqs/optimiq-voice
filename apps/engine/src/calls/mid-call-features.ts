@@ -74,7 +74,8 @@ export interface MidCallFeatureControl {
 	transfer(leg: ControlledLeg, request: TransferRequest): Promise<CallControlResult>;
 	cancelTransfer(leg: ControlledLeg): Promise<CallControlResult>;
 	hasPendingTransfer(mediaChannelId: string): boolean;
-	park(leg: ControlledLeg, request?: { readonly orbit?: string }): Promise<ParkOutcome>;
+	/** Parks the party at the far end of `leg`, with `leg` recorded as the parker. */
+	parkPeer(leg: ControlledLeg, request?: { readonly orbit?: string }): Promise<ParkOutcome>;
 	startRecording(leg: ControlledLeg): Promise<RecordingOutcome>;
 	stopRecording(leg: ControlledLeg): Promise<CallControlResult>;
 	recordingFor(mediaChannelId: string): { readonly recordingId: string } | undefined;
@@ -513,7 +514,9 @@ export class MidCallFeatureRuntime {
 			}
 
 			case "park": {
-				const outcome = await control.park(
+				// `parkPeer`, not `park`: the code parks the party at the OTHER end and records the
+				// presser as the parker, so the timeout rings the person who pressed the keys.
+				const outcome = await control.parkPeer(
 					leg,
 					execution.argument === "" ? {} : { orbit: execution.argument },
 				);

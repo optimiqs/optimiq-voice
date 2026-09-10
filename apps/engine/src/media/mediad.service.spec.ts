@@ -159,6 +159,63 @@ describe("MediadService readiness", () => {
 		await service.onApplicationShutdown();
 	});
 
+	/**
+	 * The half of P0-4 that had no owner: the engine has the signal within a second and the ability
+	 * to hang up (the BYE goes to `sipd`, not to `mediad`), and nothing joined them. Reported on the
+	 * TRANSITION, exactly once, because the handler ends calls and writes CDRs.
+	 */
+	it("reports the media plane lost once, on the transition, and again only after a recovery", async () => {
+		const fake = fakeConnection();
+		const service = new MediadService(loadEngineEnv({ ENGINE_MEDIA_DRIVER: "mediad" }), {
+			rawConnection: fake.connection,
+			serverUrl: "nats://127.0.0.1:4222",
+		} as unknown as JetStreamService);
+		let losses = 0;
+		service.setPlaneLostHandler(() => {
+			losses += 1;
+		});
+		await service.onModuleInit();
+		service.setEventHandler(() => undefined);
+		await service.start();
+		expect(losses).toBe(0);
+
+		fake.setResponding(false);
+		await service.probeReachability();
+		expect(losses).toBe(1);
+		// Still down: a plane that has been gone for a minute must not re-end calls every five seconds.
+		await service.probeReachability();
+		expect(losses).toBe(1);
+
+		fake.setResponding(true);
+		await service.probeReachability();
+		fake.setResponding(false);
+		await service.probeReachability();
+		expect(losses).toBe(2);
+
+		await service.onApplicationShutdown();
+	});
+
+	/** A handler that throws must not end the interval that is the only thing watching the plane. */
+	it("survives a plane-lost handler that throws", async () => {
+		const fake = fakeConnection();
+		const service = new MediadService(loadEngineEnv({ ENGINE_MEDIA_DRIVER: "mediad" }), {
+			rawConnection: fake.connection,
+			serverUrl: "nats://127.0.0.1:4222",
+		} as unknown as JetStreamService);
+		service.setPlaneLostHandler(() => {
+			throw new Error("the orchestrator exploded");
+		});
+		await service.onModuleInit();
+		service.setEventHandler(() => undefined);
+		await service.start();
+
+		fake.setResponding(false);
+		await expect(service.probeReachability()).resolves.toBe(false);
+		fake.setResponding(true);
+		await expect(service.probeReachability()).resolves.toBe(true);
+		await service.onApplicationShutdown();
+	});
+
 	it("does not mark the event subscription ready until NATS flush acknowledges it", async () => {
 		const fake = fakeConnection();
 		const service = new MediadService(loadEngineEnv({ ENGINE_MEDIA_DRIVER: "mediad" }), {

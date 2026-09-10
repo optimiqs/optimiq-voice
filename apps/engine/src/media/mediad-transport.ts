@@ -1,4 +1,6 @@
 import { headers, type NatsConnection } from "nats";
+import { RpcLatency } from "../nats/rpc-latency";
+import type { RpcLatencyReport } from "../nats/rpc-latency";
 
 /**
  * The raw NATS request seam for `rpc.media.v1.*`.
@@ -43,6 +45,14 @@ export interface MediadTransport {
 
 	/** Whether the transport can reach a broker at all. Read by the health endpoint. */
 	readonly isConnected: boolean;
+
+	/**
+	 * Round-trip latency to the media plane, per subject, since boot. Read by the health endpoint.
+	 *
+	 * OPTIONAL because a fake transport has nothing to report and a spec must not have to invent
+	 * one; the health endpoint reports an empty object when it is absent.
+	 */
+	readonly rpcLatency?: Record<string, RpcLatencyReport>;
 }
 
 /** Thrown when a `mediad` reply cannot be read at all — a timeout, or bytes that are not JSON. */
@@ -66,6 +76,8 @@ export class MediadTransportError extends Error {
 export class NatsMediadTransport implements MediadTransport {
 	private readonly encoder = new TextEncoder();
 	private readonly decoder = new TextDecoder();
+	/** See `RpcLatency`: the media plane's half of "where did the call setup time go". */
+	private readonly latency = new RpcLatency();
 
 	/**
 	 * @param connectionOf reads the live connection each time rather than capturing it.
@@ -81,11 +93,19 @@ export class NatsMediadTransport implements MediadTransport {
 		return connection !== undefined && !connection.isClosed();
 	}
 
+	get rpcLatency(): Record<string, RpcLatencyReport> {
+		return this.latency.snapshot;
+	}
+
 	async request(subject: string, payload: unknown, timeoutMs: number): Promise<unknown> {
 		const connection = this.connectionOf();
 		if (connection === undefined) {
 			throw new MediadTransportError(subject, "the engine has no NATS connection yet");
 		}
+		// The last subject token, so `rpc.media.v1.allocate-session` reports as `allocate-session` and
+		// the report reads as a list of operations rather than a list of fully-qualified subjects.
+		const operation = subject.slice(subject.lastIndexOf(".") + 1);
+		const startedAt = performance.now();
 		let reply: { data: Uint8Array };
 		try {
 			reply = await connection.request(subject, this.encoder.encode(JSON.stringify(payload)), {
@@ -96,12 +116,14 @@ export class NatsMediadTransport implements MediadTransport {
 				headers: headers(),
 			});
 		} catch (error) {
+			this.latency.record(operation, performance.now() - startedAt, true);
 			// A timeout here means one of: no `mediad` is subscribed, every `mediad` is too busy to
 			// answer, or the broker dropped the request. The caller cannot tell them apart and does
 			// not need to — all three mean this leg cannot get media from this plane right now.
 			throw new MediadTransportError(subject, `no reply within ${timeoutMs}ms`, { cause: error });
 		}
 
+		this.latency.record(operation, performance.now() - startedAt);
 		try {
 			return JSON.parse(this.decoder.decode(reply.data)) as unknown;
 		} catch (error) {

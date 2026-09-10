@@ -4,6 +4,8 @@ import { getLogger } from "@optimiq-voice/logging";
 import { isConflict } from "../nats/claim-store";
 import { JetStreamService } from "../nats/jetstream.service";
 import {
+	deferCallback,
+	dueCallbacks,
 	emptyWaitingRecord,
 	isRenewalDue,
 	longestWaitMs,
@@ -15,6 +17,7 @@ import {
 	takeTombstone,
 	upsertWaiting,
 } from "./queue-waiting";
+import type { QueueCallbackPort } from "./queue-callback";
 import type {
 	QueueWaitingJoin,
 	QueueWaitingLeave,
@@ -22,7 +25,11 @@ import type {
 	QueueWaitingRefresh,
 	QueueWaitingView,
 } from "./queue-session";
-import type { QueueWaitingEntry, QueueWaitingRecord } from "@optimiq-voice/events";
+import type {
+	QueueResumeTombstone,
+	QueueWaitingEntry,
+	QueueWaitingRecord,
+} from "@optimiq-voice/events";
 
 /**
  * The engine's writer for the `queue-waiting` bucket — one queue's line, shared by every instance.
@@ -60,7 +67,7 @@ import type { QueueWaitingEntry, QueueWaitingRecord } from "@optimiq-voice/event
  * "lost".
  */
 @Injectable()
-export class QueueWaitingStore implements QueueWaitingPort {
+export class QueueWaitingStore implements QueueWaitingPort, QueueCallbackPort {
 	private readonly logger = getLogger("engine.queue-waiting");
 	/** The line when no bucket is configured. Keyed exactly as the bucket is. */
 	private readonly local = new Map<string, QueueWaitingRecord>();
@@ -196,6 +203,54 @@ export class QueueWaitingStore implements QueueWaitingPort {
 				extra: { resumed: false, joinedAt: request.tombstone.joinedAt },
 			};
 		});
+	}
+
+	// -------------------------------------------------------------------------------------------
+	// Virtual hold
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * The tokens this queue owes a call, oldest place first.
+	 *
+	 * A plain READ, with no lease and no claim: a token is not taken by being read, it is spent by
+	 * {@link deferCallback} or claimed by the caller's own `join`. Two instances that read the same
+	 * token in the same second would both dial, which is why the runner above this gates on free
+	 * agents and why `dialer.place` mints its own channel id — the loser's originate collides with
+	 * the winner's channel and is answered idempotently rather than ringing twice.
+	 */
+	async dueCallbacks(
+		orgId: string,
+		queueId: string,
+		now: number,
+	): Promise<readonly QueueResumeTombstone[]> {
+		const read = await this.read(orgId, queueId, now);
+		if (read === undefined) {
+			// An unreadable record is an unavailability, not an empty line. Answering "nothing is due"
+			// would be indistinguishable from a healthy quiet queue; the runner's `no-tokens` skip is
+			// therefore the honest report either way, and no attempt is spent.
+			return [];
+		}
+		return dueCallbacks(pruneWaiting(read.record, now), now);
+	}
+
+	/** Records a failed attempt. Answers `true` when the promise was given up on. */
+	async deferCallback(
+		orgId: string,
+		queueId: string,
+		callerNumber: string,
+		now: number,
+		retryDelayMs: number,
+	): Promise<boolean> {
+		let dropped = false;
+		// Through `mutate`, so the defer is a compare-and-set against whatever another instance wrote
+		// — including a `join` that took the token because the caller rang back first. Deferring a
+		// token that is no longer there is a no-op, which is exactly the right answer.
+		await this.mutate(orgId, queueId, callerNumber, now, (record) => {
+			const applied = deferCallback(record, callerNumber, now, retryDelayMs);
+			dropped = applied.dropped;
+			return { next: applied.record, extra: { resumed: false, joinedAt: 0 } };
+		});
+		return dropped;
 	}
 
 	// -------------------------------------------------------------------------------------------

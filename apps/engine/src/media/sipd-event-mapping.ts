@@ -131,10 +131,29 @@ export function toMediaEventFromSipd(envelope: SipDialogEventEnvelope): MediaEve
 		// carrying an answer COMMITS the offer/answer exchange, so the caller may already be hearing
 		// audio the tenant is not being charged for; a plain `180` is ringback and nothing more. The
 		// engine's `CallState` already draws that line, so the only translation is the flag.
+		//
+		// The `sdpAnswer` rides along on the `early` half for the same reason it does on
+		// `dialog.answered` below: only a UAC (originated B) leg has one, and it is the carrier's
+		// answer to the offer `mediad` wrote. Dropping it here would mean the engine knew audio was
+		// flowing towards it and had no way to accept it, so the caller would hear the silence the
+		// 183 exists to prevent. Carried only when `hasEarlyMedia` — a plain `180` that somehow
+		// arrived with a body has not committed the offer/answer exchange, so settling it would
+		// commit a codec the far end has not agreed to.
 		return {
 			type: "call-state-changed",
 			channelId: envelope.data.legId,
 			callState: envelope.data.hasEarlyMedia ? "early" : "ringing",
+			// `role === "uac"` as well as the flag, and that half is not belt and braces. The
+			// orchestrator feeds an `sdpAnswer` on this member straight into `mediad.acceptAnswer`
+			// for the leg the event names, which is right for a leg we DIALLED — the body is the
+			// carrier's answer to the offer `mediad` wrote — and wrong for one we ANSWERED, where the
+			// body on a `183` is the answer this platform wrote itself. Settling a session against
+			// its own answer is the shape of a caller who hears nothing for the life of the call.
+			...(envelope.data.hasEarlyMedia &&
+			envelope.data.role === "uac" &&
+			envelope.data.sdpAnswer !== undefined
+				? { sdpAnswer: envelope.data.sdpAnswer }
+				: {}),
 		};
 	}
 	if (envelope.type === "dialog.answered") {

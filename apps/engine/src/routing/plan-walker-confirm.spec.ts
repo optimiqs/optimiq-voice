@@ -152,6 +152,7 @@ function harness(options: HarnessOptions = {}) {
 			return state.answered;
 		},
 		moveTo: () => true,
+		bridgeId: undefined,
 		setBridge: () => undefined,
 	};
 

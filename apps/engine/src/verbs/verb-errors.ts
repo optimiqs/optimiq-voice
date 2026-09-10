@@ -18,7 +18,7 @@ import type { HttpException } from "@nestjs/common";
  * A verb was sent that the engine does not implement yet.
  *
  * A first-class failure rather than a `default:` branch, because the P2 slice implements 5 of the
- * 28 verbs and an application that sends `dial` deserves to be told "not yet", not to have its
+ * 30 verbs and an application that sends `dial` deserves to be told "not yet", not to have its
  * call silently do nothing.
  */
 export class UnsupportedVerbFailure extends Schema.TaggedErrorClass<UnsupportedVerbFailure>()(

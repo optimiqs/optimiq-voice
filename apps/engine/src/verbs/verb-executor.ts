@@ -33,7 +33,7 @@ import type {
  * ## The shape, and why
  *
  * One `Effect`-returning method per verb, plus a `dispatch` that switches EXHAUSTIVELY over the
- * 28-member union from `@optimiq-voice/telephony`. The `never` check in the default branch is
+ * 30-member union from `@optimiq-voice/telephony`. The `never` check in the default branch is
  * load-bearing: adding a verb to the protocol package becomes a compile error here, which is
  * exactly the reminder the next person needs. A registry of string-keyed handlers would have
  * compiled fine and failed at 3am on a live call.
@@ -50,7 +50,8 @@ import type {
  * ## What is implemented
  *
  * The P2 inbound slice — `answer`, `ringing`, `play`, `gather`, `hangup` — plus the call-control
- * wave: `hold`, `unhold`, `park`, `unpark`, `transfer`, `record`, `mute`, `unmute`, `playDtmf`,
+ * wave: `hold`, `unhold`, `park`, `unpark`, `transfer`, `record`, `pauseRecord`, `resumeRecord`,
+ * `mute`, `unmute`, `playDtmf`,
  * `stopPlay`, `setVariable` and `sleep` — plus `dial`, `bridge` and `unbridge`, which the session
  * protocol needed and which the domain-leg lookup on {@link CallControlHost} finally made
  * addressable.
@@ -564,6 +565,17 @@ export function makeVerbExecutor(deps: VerbExecutorDependencies): VerbExecutorIn
 				return yield* setVariable(context, verb);
 			case "record":
 				return yield* record(context, verb);
+			// A refusal here is DATA — `CallControl.pauseRecording` answers "this leg is not being
+			// recorded" and "the media plane cannot pause a recording" the same way, so an ARI-driven
+			// leg that has no pause at all reaches the application as a reason rather than a throw.
+			case "pauseRecord":
+				return yield* controlled("pauseRecord", context, ({ port, leg }) =>
+					port.pauseRecording(leg, true),
+				);
+			case "resumeRecord":
+				return yield* controlled("resumeRecord", context, ({ port, leg }) =>
+					port.pauseRecording(leg, false),
+				);
 			case "dial":
 				return yield* dial(context, verb);
 			case "bridge":

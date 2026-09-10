@@ -170,6 +170,24 @@ describe("SessionVerbService", () => {
 	});
 
 	/**
+	 * The responder holds no verb list of its own: the contract's `sessionVerbNameSchema` is the
+	 * allowlist, and everything past it is the executor's. Pinned with the newest verb, because a
+	 * gate added here later would show up as this test failing rather than as a live refusal.
+	 */
+	it("carries a verb it has never heard of straight to the handler", async () => {
+		const fake = fakeConnection();
+		const responder = service(fake);
+		const attached = handler({ ok: true, verb: "pauseRecord", endReason: "completed" });
+		responder.attach(attached.handler);
+		responder.onApplicationBootstrap();
+
+		await fake.deliver(JSON.stringify(request({ verb: "pauseRecord" })));
+
+		expect(attached.requests[0]).toMatchObject({ verb: "pauseRecord" });
+		expect(fake.replies[0]).toMatchObject({ ok: true, verb: "pauseRecord" });
+	});
+
+	/**
 	 * Bytes that are not the contract are answered, not dropped — and the loop survives, which is the
 	 * half that matters: one malformed frame from one integration must not stop this instance
 	 * serving every other call it is holding.

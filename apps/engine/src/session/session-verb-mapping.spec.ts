@@ -115,6 +115,19 @@ describe("toRuntimeVerb", () => {
 	 * explanation about the engine holding no per-leg playback list, and duplicating that would mean
 	 * two places to change when the runtime learns to track playbacks.
 	 */
+	/**
+	 * A pair rather than one verb with a flag, so the only thing that can go wrong here is the two
+	 * collapsing into each other.
+	 */
+	it("keeps resumeRecord distinct from pauseRecord, neither taking arguments", () => {
+		expect(toRuntimeVerb(request({ verb: "pauseRecord", arguments: { ...COMPLETE } }))).toEqual({
+			verb: { verb: "pauseRecord" },
+		});
+		expect(toRuntimeVerb(request({ verb: "resumeRecord" }))).toEqual({
+			verb: { verb: "resumeRecord" },
+		});
+	});
+
 	it("passes a reference-less stopPlay down to the executor's own refusal", () => {
 		const mapped = toRuntimeVerb(request({ verb: "stopPlay" }));
 		expect(isMappingError(mapped)).toBe(false);

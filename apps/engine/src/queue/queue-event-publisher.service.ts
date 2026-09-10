@@ -103,7 +103,13 @@ export class QueueEventPublisher implements QueueEventPort {
 		readonly legId: string;
 		readonly waitMs: number;
 		readonly position?: number;
-		readonly reason: "caller-hangup" | "timeout" | "overflow" | "no-agents" | "exit-key";
+		readonly reason:
+			| "caller-hangup"
+			| "timeout"
+			| "overflow"
+			| "no-agents"
+			| "exit-key"
+			| "callback";
 		readonly exitKey?: string;
 	}): Promise<void> {
 		await this.publish("caller.abandoned", input.orgId, input.queueId, {
@@ -113,6 +119,42 @@ export class QueueEventPublisher implements QueueEventPort {
 			reason: input.reason,
 			...(input.position === undefined ? {} : { position: input.position }),
 			...(input.exitKey === undefined ? {} : { exitKey: input.exitKey }),
+		});
+	}
+
+	/** Virtual hold made good: the queue dialled a caller back and the call exists. */
+	async callbackPlaced(input: {
+		readonly orgId: string;
+		readonly queueId: string;
+		readonly callId: string;
+		readonly originalCallId?: string;
+		readonly callerNumber: string;
+		readonly attempts: number;
+		readonly heldMs: number;
+	}): Promise<void> {
+		await this.publish("callback.placed", input.orgId, input.queueId, {
+			callId: input.callId,
+			callerNumber: input.callerNumber,
+			attempts: input.attempts,
+			heldMs: input.heldMs,
+			...(input.originalCallId === undefined ? {} : { originalCallId: input.originalCallId }),
+		});
+	}
+
+	/** An attempt did not produce a call. `dropped` says whether the promise survived it. */
+	async callbackFailed(input: {
+		readonly orgId: string;
+		readonly queueId: string;
+		readonly callerNumber: string;
+		readonly attempts: number;
+		readonly dropped: boolean;
+		readonly reason?: string;
+	}): Promise<void> {
+		await this.publish("callback.failed", input.orgId, input.queueId, {
+			callerNumber: input.callerNumber,
+			attempts: input.attempts,
+			dropped: input.dropped,
+			...(input.reason === undefined ? {} : { reason: input.reason }),
 		});
 	}
 

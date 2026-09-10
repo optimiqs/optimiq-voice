@@ -101,6 +101,9 @@ function harness(options: HarnessOptions = {}) {
 			states.push(next);
 			return true;
 		},
+		get bridgeId(): string | undefined {
+			return state.bridgeId;
+		},
 		setBridge: (bridgeId) => {
 			state.bridgeId = bridgeId;
 		},

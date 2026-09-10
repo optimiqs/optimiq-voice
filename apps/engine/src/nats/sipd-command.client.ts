@@ -16,6 +16,8 @@ import {
 	subjectFor,
 } from "@optimiq-voice/events";
 import { getLogger } from "@optimiq-voice/logging";
+import { RpcLatency } from "./rpc-latency";
+import type { RpcLatencyReport } from "./rpc-latency";
 import type {
 	SipAnswerRequest,
 	SipAnswerResponse,
@@ -103,14 +105,54 @@ export interface SipdCommandPort {
 	 * reply's `instanceId` is what every later command on that leg must be addressed at.
 	 */
 	originate(request: SipOriginateRequest, instanceId?: string): Promise<SipOriginateResponse>;
+
+	/**
+	 * Per-command round-trip latency to the edge, since boot. OPTIONAL: a fake has nothing to report
+	 * and a spec must not have to invent one. Read by `/healthz` through `SplitPlaneMediaPort`.
+	 */
+	readonly rpcLatency?: Record<string, RpcLatencyReport>;
 	resolveTarget?(request: SipResolveTargetRequest): Promise<SipResolveTargetResponse>;
 }
+
+/**
+ * The refusals that are a NORMAL outcome of a race or of stale state, not a fault to act on.
+ *
+ * `apps/sipd` already logs each of these once, and this client's own caller branches on the reason —
+ * so a WARN here was the third copy of one fact and, at 2.4 lines a call on a stack with stale
+ * bindings, the loudest thing in the log while saying nothing an operator could do. They stay at
+ * DEBUG, where the leg id and the reason are still there for anyone reading one call.
+ *
+ * Everything NOT in this set stays WARN, deliberately: `internal`, `bad_request`, `capacity`,
+ * `not_supported` and `shutting_down` each describe a fault, a limit or a build gap, and each is
+ * something somebody should see.
+ */
+const EXPECTED_REFUSAL_REASONS: ReadonlySet<SipDialogRefusalReason> = new Set([
+	// The dialog ended between the decision and the command — the ordinary teardown race.
+	"unknown_dialog",
+	"dialog_gone",
+	// A `sipd` restarted and something still addresses the old token. The leg went with the process.
+	"wrong_instance",
+	// The caller's own state was stale: an answer on an answered call, a hangup on a dead one.
+	"invalid_state",
+	// Dialling outcomes, which the caller turns into a hangup cause and reports as the call's.
+	"unregistered_target",
+	"unknown_trunk",
+	"no_route",
+]);
 
 /** {@link SipdCommandPort} over a live NATS connection. */
 export class SipdCommandClient implements SipdCommandPort {
 	private readonly logger = getLogger("engine.sipd-command");
 	private readonly encoder = new TextEncoder();
 	private readonly decoder = new TextDecoder();
+	/**
+	 * How long the SIP edge takes to answer, per command, reported on `/healthz`.
+	 *
+	 * A call setup is a chain of round trips this process does nothing but wait on, so none of it is
+	 * visible in the engine's own CPU profile. This is the half of "why is setup slow" that belongs
+	 * to the edge; `MediadService` carries the other half.
+	 */
+	private readonly latency = new RpcLatency();
 
 	/**
 	 * @param connectionOf reads the live connection each time rather than capturing it.
@@ -122,6 +164,11 @@ export class SipdCommandClient implements SipdCommandPort {
 	 */
 	constructor(private readonly connectionOf: () => NatsConnection | undefined) {}
 
+	/** Per-command round-trip latency to the edge, since boot. Read by the health endpoint. */
+	get rpcLatency(): Record<string, RpcLatencyReport> {
+		return this.latency.snapshot;
+	}
+
 	/** Whether the client can reach a broker at all. Read by the health endpoint. */
 	get isConnected(): boolean {
 		const connection = this.connectionOf();
@@ -131,6 +178,7 @@ export class SipdCommandClient implements SipdCommandPort {
 	async ring(instanceId: string, request: SipRingRequest): Promise<SipRingResponse> {
 		return await this.command(
 			subjectFor.sipRingRpc(instanceId),
+			"ring",
 			request,
 			SIP_RING_RPC.timeoutMs,
 			sipRingResponseSchema,
@@ -140,6 +188,7 @@ export class SipdCommandClient implements SipdCommandPort {
 	async answer(instanceId: string, request: SipAnswerRequest): Promise<SipAnswerResponse> {
 		return await this.command(
 			subjectFor.sipAnswerRpc(instanceId),
+			"answer",
 			request,
 			SIP_ANSWER_RPC.timeoutMs,
 			sipAnswerResponseSchema,
@@ -149,6 +198,7 @@ export class SipdCommandClient implements SipdCommandPort {
 	async hangup(instanceId: string, request: SipHangupRequest): Promise<SipHangupResponse> {
 		return await this.command(
 			subjectFor.sipHangupRpc(instanceId),
+			"hangup",
 			request,
 			SIP_HANGUP_RPC.timeoutMs,
 			sipHangupResponseSchema,
@@ -158,6 +208,7 @@ export class SipdCommandClient implements SipdCommandPort {
 	async reinvite(instanceId: string, request: SipReinviteRequest): Promise<SipReinviteResponse> {
 		return await this.command(
 			subjectFor.sipReinviteRpc(instanceId),
+			"reinvite",
 			request,
 			SIP_REINVITE_RPC.timeoutMs,
 			sipReinviteResponseSchema,
@@ -167,6 +218,7 @@ export class SipdCommandClient implements SipdCommandPort {
 	async resolveTarget(request: SipResolveTargetRequest): Promise<SipResolveTargetResponse> {
 		return await this.command(
 			RPC_SUBJECTS.sipResolveTarget,
+			"resolve-target",
 			request,
 			SIP_RESOLVE_TARGET_RPC.timeoutMs,
 			sipResolveTargetResponseSchema,
@@ -179,6 +231,7 @@ export class SipdCommandClient implements SipdCommandPort {
 	): Promise<SipOriginateResponse> {
 		return await this.command(
 			subjectFor.sipOriginateRpc(instanceId),
+			"originate",
 			request,
 			SIP_ORIGINATE_RPC.timeoutMs,
 			sipOriginateResponseSchema,
@@ -200,6 +253,7 @@ export class SipdCommandClient implements SipdCommandPort {
 	 */
 	private async command<TResponse extends { ok: boolean; legId: string }>(
 		subject: string,
+		operation: string,
 		request: { readonly legId: string },
 		timeoutMs: number,
 		schema: { safeParse(value: unknown): { success: boolean; data?: unknown } },
@@ -215,6 +269,7 @@ export class SipdCommandClient implements SipdCommandPort {
 		}
 
 		let raw: unknown;
+		const startedAt = performance.now();
 		try {
 			const reply = await connection.request(
 				subject,
@@ -228,7 +283,9 @@ export class SipdCommandClient implements SipdCommandPort {
 				},
 			);
 			raw = JSON.parse(this.decoder.decode(reply.data)) as unknown;
+			this.latency.record(operation, performance.now() - startedAt);
 		} catch (error) {
+			this.latency.record(operation, performance.now() - startedAt, true);
 			// `no responders available` when the edge holding this dialog has gone, a timeout when it is
 			// wedged, a parse error when it answered something that is not JSON. See the class note for
 			// why all three are one reason.
@@ -249,15 +306,17 @@ export class SipdCommandClient implements SipdCommandPort {
 			instanceId?: string;
 		};
 		if (!response.ok) {
-			this.logger.warn(
-				{
-					subject,
-					legId: response.legId,
-					reason: response.reason,
-					instanceId: response.instanceId,
-				},
-				"the sip edge refused a dialog command",
-			);
+			const details = {
+				subject,
+				legId: response.legId,
+				reason: response.reason,
+				instanceId: response.instanceId,
+			};
+			if (response.reason !== undefined && EXPECTED_REFUSAL_REASONS.has(response.reason)) {
+				this.logger.debug(details, "the sip edge refused a dialog command");
+			} else {
+				this.logger.warn(details, "the sip edge refused a dialog command");
+			}
 		}
 		return response;
 	}

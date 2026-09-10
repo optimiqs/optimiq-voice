@@ -15,6 +15,7 @@ import {
 	planOf,
 	playbackNode,
 	ringGroupNode,
+	sharedLineNode,
 	timeConditionNode,
 	trunkAttempt,
 	trunkDialNode,
@@ -25,6 +26,7 @@ import { TrunkCapacityRegistry } from "./trunk-capacity";
 import type { FakeMediaPortOptions } from "../media/media-port.fake";
 import type { PlanDestination } from "./plan-destination";
 import type {
+	PlanWalkerDependencies,
 	PlanWalkerSettings,
 	VoicemailMailboxSource,
 	VoicemailMessage,
@@ -76,6 +78,14 @@ interface HarnessOptions {
 	readonly media?: FakeMediaPortOptions;
 	/** Verbs the fake executor should report as FAILED. */
 	readonly failVerbs?: readonly Verb["verb"][];
+	/**
+	 * Verbs that fail only when they carry MEDIA — how a missing prompt is told apart from a broken
+	 * media plane. A `gather` is a playback and a collection in one verb, so this is the shape of
+	 * the real failure: the audio is refused, the digits would still have arrived.
+	 */
+	readonly failVerbsCarryingMedia?: readonly Verb["verb"][];
+	/** What the host reports as the reason for the most recent failed verb. */
+	readonly verbFailureDetail?: string;
 	/** How a started recording ends. Defaults to finishing immediately. */
 	readonly recording?:
 		| { readonly kind: "finished"; readonly durationMs: number }
@@ -94,6 +104,19 @@ interface HarnessOptions {
 	readonly trunkCapacity?: TrunkCapacityPort;
 	/** Absent means an `application` node announces, exactly as it does with no control plane. */
 	readonly application?: WalkerApplicationPort;
+	/**
+	 * How the call-control port answers `startRecording`, or absent for a walk that has no port at
+	 * all — which is the shape an engine without call control really has, and the shape a record
+	 * policy has to survive.
+	 */
+	readonly canRecord?: boolean;
+	/** The device the SIP edge said the A-leg authenticated as. Absent is the un-named case. */
+	readonly deviceId?: string;
+	/**
+	 * The shared-line registry, as a fake. Absent means the walk has none, which is the shape an
+	 * engine without a claim bucket really has and the shape a `shared-line` node has to survive.
+	 */
+	readonly sharedLines?: PlanWalkerDependencies["sharedLines"];
 }
 
 type LegReaction =
@@ -116,6 +139,13 @@ function harness(options: HarnessOptions = {}) {
 	const destinations: PlanDestination[] = [];
 	const gathers = [...(options.gathers ?? [])];
 	const failed = new Set<string>(options.failVerbs ?? []);
+	const failedWithMedia = new Set<string>(options.failVerbsCarryingMedia ?? []);
+	let lastVerbFailure: string | undefined;
+
+	/** Every leg the walker announced it was ending, and with which cause. */
+	const hangingUp: { readonly mediaChannelId: string; readonly cause: HangupCause }[] = [];
+	/** How many times a record policy reached the call-control port. */
+	let recordingStarts = 0;
 
 	const state = {
 		answered: options.answered ?? false,
@@ -186,6 +216,7 @@ function harness(options: HarnessOptions = {}) {
 		organizationId: ORG_ID,
 		callerIdNumber: "+15551234567",
 		callerIdName: "Ada",
+		...(options.deviceId === undefined ? {} : { deviceId: options.deviceId }),
 		get isDetached(): boolean {
 			return state.detached;
 		},
@@ -199,6 +230,9 @@ function harness(options: HarnessOptions = {}) {
 			states.push(next);
 			return true;
 		},
+		get bridgeId(): string | undefined {
+			return state.bridgeId;
+		},
 		setBridge: (bridgeId) => {
 			state.bridgeId = bridgeId;
 		},
@@ -207,9 +241,14 @@ function harness(options: HarnessOptions = {}) {
 	const execute = async (verb: Verb): Promise<VerbResult | undefined> => {
 		verbs.push(verb);
 		timeline.push(`verb:${verb.verb}`);
-		if (failed.has(verb.verb)) {
+		if (
+			failed.has(verb.verb) ||
+			(failedWithMedia.has(verb.verb) && (verb as { media?: unknown }).media !== undefined)
+		) {
+			lastVerbFailure = options.verbFailureDetail;
 			return undefined;
 		}
+		lastVerbFailure = undefined;
 		switch (verb.verb) {
 			case "answer": {
 				state.answered = true;
@@ -245,11 +284,15 @@ function harness(options: HarnessOptions = {}) {
 	};
 
 	let counter = 0;
+	let clock = NOW.getTime();
+	/** Every delay the walk ASKED for, in order. */
+	const delays: number[] = [];
 	const walker = new PlanWalker({
 		media,
 		signals,
 		channel,
 		execute,
+		verbFailure: () => lastVerbFailure,
 		publish: async (type, data) => {
 			if (options.failPublishOf === type) {
 				throw new Error("the broker is unreachable");
@@ -258,6 +301,25 @@ function harness(options: HarnessOptions = {}) {
 		},
 		settings: { answerTimeoutMs: 200, ...options.settings },
 		peerLegId: (mediaChannelId) => `leg-of-${mediaChannelId}`,
+		legs: {
+			originated: () => undefined,
+			hangingUp: (mediaChannelId, cause) => {
+				hangingUp.push({ mediaChannelId, cause });
+			},
+			bridged: () => undefined,
+		},
+		...(options.canRecord === undefined
+			? {}
+			: {
+					control: {
+						startRecording: async () => {
+							recordingStarts += 1;
+							return options.canRecord === true
+								? { ok: true }
+								: { ok: false, reason: "this media plane cannot record" };
+						},
+					} as PlanWalkerDependencies["control"],
+				}),
 		onDestination: async (destination) => {
 			// Onto the SAME timeline as the verbs, because the only thing worth asserting about this
 			// hook is when it fires relative to the node that reported it.
@@ -268,13 +330,20 @@ function harness(options: HarnessOptions = {}) {
 		...(options.mailbox === undefined ? {} : { mailbox: options.mailbox }),
 		...(options.trunkCapacity === undefined ? {} : { trunkCapacity: options.trunkCapacity }),
 		...(options.application === undefined ? {} : { application: options.application }),
+		...(options.sharedLines === undefined ? {} : { sharedLines: options.sharedLines }),
 		random: options.random ?? ((): number => 0),
 		newId: () => {
 			counter += 1;
 			return `id-${String(counter)}`;
 		},
-		// Ring delays are asserted through the originate order, never waited on.
-		delay: async () => undefined,
+		// Ring delays are asserted through the originate order and through `delays`, never waited on.
+		// The clock moves with them, and only with them, so a ladder that reads a member's delay as an
+		// OFFSET from the dial's start is distinguishable from one that reads it as a gap.
+		delay: async (ms: number) => {
+			delays.push(ms);
+			clock += ms;
+		},
+		now: () => clock,
 	});
 
 	return {
@@ -288,6 +357,11 @@ function harness(options: HarnessOptions = {}) {
 		channel,
 		timeline,
 		destinations,
+		delays,
+		hangingUp,
+		get recordingStarts(): number {
+			return recordingStarts;
+		},
 	};
 }
 
@@ -641,6 +715,44 @@ describe("extension nodes", () => {
 		expect(h.media.originated()).toHaveLength(2);
 	});
 
+	/**
+	 * The caller CANCELs while the callee's phone is still ringing.
+	 *
+	 * Under the split plane the A-leg's death arrives as a bus signal, not as the destruction of the
+	 * dial, so the walk has to be watching for it. Without that watch the callee rang for the whole
+	 * timeout on behalf of somebody who had already gone.
+	 */
+	it("cancels the ringing callee when the caller hangs up first", async () => {
+		const h = harness({ reactions: { "PJSIP/1001": { kind: "ring" } } });
+		const originate = h.media.originate.bind(h.media);
+		h.media.originate = async (request) => {
+			const result = await originate(request);
+			h.signals.emit(legSignalKey(A_CHANNEL), {
+				kind: "ended",
+				cause: "NORMAL_CLEARING",
+				causeCode: 16,
+			});
+			return result;
+		};
+
+		const outcome = await h.walker.walk(
+			walkInput([extensionNode("e", { number: "1001", timeoutSeconds: 30 })]),
+		);
+
+		expect(outcome.status).toBe("aborted");
+		// The note is the only thing that distinguishes this abort from the other one a walk can end
+		// with — a caller taken away by a pickup — in a log read after the fact, and the CAUSE in it
+		// is what later distinguishes a real caller teardown from a leg-ended nothing on the wire
+		// produced: a note naming a cause no plane reported is the evidence the signal was synthetic.
+		expect(outcome.notes.join(" ")).toContain(
+			"the caller's leg ended (NORMAL_CLEARING/16) while the dial was running",
+		);
+		expect(h.media.hungUp()).toContainEqual({
+			channelId: h.media.originated()[0]!.channelId,
+			cause: "ORIGINATOR_CANCEL",
+		});
+	});
+
 	const plan = (overrides = {}) => [
 		extensionNode("e", { number: "1001", ...overrides }),
 		hangupNode("busy", "USER_BUSY"),
@@ -709,12 +821,114 @@ describe("extension nodes", () => {
 		expect(h.state.bridgeId).toBeDefined();
 	});
 
+	/**
+	 * The bug behind every abandoned park and shared-line recall in the last E2E round.
+	 *
+	 * Park and a shared-line hold recall take the CALLER out of the bridge and then release the leg
+	 * on the other side. This watcher is a closure over the bridge the walk built, so it went on
+	 * firing: it hung the caller up with `NORMAL_CLEARING` three milliseconds before the recall's own
+	 * dial began, and the recall reported `aborted` with the caller's leg already gone.
+	 */
+	it("leaves the leg alone when the peer of a bridge it has already left ends", async () => {
+		const h = harness({ reactions: { "PJSIP/1001": { kind: "answer" } } });
+		await h.walker.walk(walkInput(plan()));
+		const peerChannelId = h.media.originated()[0]?.channelId as string;
+		expect(h.state.bridgeId).toBeDefined();
+
+		// What `park` and `recallSharedLine` do to the leg they are keeping.
+		h.state.bridgeId = undefined;
+		h.media.hungUp().length = 0;
+		h.signals.emit(legSignalKey(peerChannelId), {
+			kind: "ended",
+			cause: "NORMAL_CLEARING",
+			causeCode: 16,
+		});
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(h.media.hungUp().map((call) => call.channelId)).not.toContain(A_CHANNEL);
+	});
+
+	it("still ends the leg when the peer of the bridge it IS in hangs up", async () => {
+		const h = harness({ reactions: { "PJSIP/1001": { kind: "answer" } } });
+		await h.walker.walk(walkInput(plan()));
+		const peerChannelId = h.media.originated()[0]?.channelId as string;
+		h.media.hungUp().length = 0;
+
+		h.signals.emit(legSignalKey(peerChannelId), {
+			kind: "ended",
+			cause: "NORMAL_CLEARING",
+			causeCode: 16,
+		});
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(h.media.hungUp().map((call) => call.channelId)).toContain(A_CHANNEL);
+	});
+
 	it("takes the busy branch on USER_BUSY", async () => {
 		const h = harness({ reactions: { "PJSIP/1001": { kind: "reject", cause: "USER_BUSY" } } });
 		const outcome = await h.walker.walk(
 			walkInput(plan({ busyNodeId: "busy", noAnswerNodeId: "na", notRegisteredNodeId: "nr" })),
 		);
 		expect(outcome.visited).toEqual(["e", "busy"]);
+	});
+
+	/**
+	 * A refused INVITE leaves a B-leg the orchestrator has already created (`legs.originated` runs
+	 * BEFORE the originate), and nothing else ever gives that leg a cause — so the CDR filed it under
+	 * the teardown's generic clearing. A leg whose INVITE never left the platform is not "nobody
+	 * answered": it is the not-registered branch of the extension, and `settleDial` can only take
+	 * that branch if the cause says so. The cause has to be fixed here, first-wins.
+	 */
+	it("gives an unreachable leg its own cause, not the teardown's generic one", async () => {
+		const h = harness({ reactions: { "PJSIP/1001": { kind: "unreachable" } } });
+		await h.walker.walk(walkInput(plan({ notRegisteredNodeId: "nr" })));
+		// FIRST, because the orchestrator's `hangingUp` is first-wins: the simultaneous dial's own
+		// cleanup pass follows with `ORIGINATOR_CANCEL` and must not be the cause that lands.
+		expect(h.hangingUp[0]?.cause).toBe("USER_NOT_REGISTERED");
+	});
+
+	/**
+	 * `extension.record_policy` was compiled into the plan and read by nothing: a desk phone set to
+	 * "record everything" produced no recording and no note saying why.
+	 */
+	it("records an answered call when the extension policy says to", async () => {
+		for (const recordPolicy of ["all", "inbound"] as const) {
+			const h = harness({ reactions: { "PJSIP/1001": { kind: "answer" } }, canRecord: true });
+			expect((await h.walker.walk(walkInput(plan({ recordPolicy })))).status).toBe("bridged");
+			expect(h.recordingStarts).toBe(1);
+		}
+	});
+
+	it("does not record on a policy that means somebody else starts it", async () => {
+		for (const recordPolicy of ["none", "on-demand", "outbound"] as const) {
+			const h = harness({ reactions: { "PJSIP/1001": { kind: "answer" } }, canRecord: true });
+			await h.walker.walk(walkInput(plan({ recordPolicy })));
+			expect(h.recordingStarts).toBe(0);
+		}
+	});
+
+	it("does not record a call that never bridged", async () => {
+		const h = harness({
+			reactions: { "PJSIP/1001": { kind: "reject", cause: "USER_BUSY" } },
+			canRecord: true,
+		});
+		await h.walker.walk(walkInput(plan({ recordPolicy: "all", busyNodeId: "busy" })));
+		expect(h.recordingStarts).toBe(0);
+	});
+
+	it("says out loud when a recorded extension could not be recorded", async () => {
+		const h = harness({ reactions: { "PJSIP/1001": { kind: "answer" } }, canRecord: false });
+		const outcome = await h.walker.walk(walkInput(plan({ recordPolicy: "all" })));
+		expect(outcome.notes.join(" ")).toContain("record policy");
+	});
+
+	it("says out loud when a recorded extension has no call-control port at all", async () => {
+		const h = harness({ reactions: { "PJSIP/1001": { kind: "answer" } } });
+		const outcome = await h.walker.walk(walkInput(plan({ recordPolicy: "all" })));
+		expect(outcome.notes.join(" ")).toContain("no call-control port");
 	});
 
 	it("takes the not-registered branch when the media server cannot reach the endpoint", async () => {
@@ -1104,6 +1318,172 @@ describe("ring groups", () => {
 		expect(h.media.originated()[0]?.callerId).toBe('"Sales: Ada" <+15551234567>');
 	});
 
+	/**
+	 * `delaySeconds` meant two things: an offset from the call's start in a simultaneous group, and a
+	 * gap AFTER the previous member's ring timeout in a sequential one. The second reading compounds
+	 * with the timeouts ahead of it — a member configured to start eight seconds in rang at sixteen,
+	 * with eight seconds of dead air in the middle — and it is not what the form that sets it says
+	 * ("Start ringing after (seconds)", and a summary line reading `starts at +Ns`). One meaning now:
+	 * the offset. Each hop waits for whatever is LEFT of its own.
+	 */
+	it("reads a sequential member's delay as an offset from the start, not as a gap", async () => {
+		const h = harness({
+			reactions: {
+				"PJSIP/1001": { kind: "reject", cause: "NO_ANSWER" },
+				"PJSIP/1002": { kind: "reject", cause: "NO_ANSWER" },
+				"PJSIP/1003": { kind: "reject", cause: "NO_ANSWER" },
+			},
+		});
+		await h.walker.walk(
+			walkInput([
+				ringGroupNode("g", {
+					strategy: "sequential",
+					members: [
+						{
+							ordinal: 0,
+							delaySeconds: 0,
+							timeoutSeconds: 5,
+							confirmRequired: false,
+							targetNodeId: "a",
+						},
+						{
+							ordinal: 1,
+							delaySeconds: 5,
+							timeoutSeconds: 5,
+							confirmRequired: false,
+							targetNodeId: "b",
+						},
+						{
+							ordinal: 2,
+							delaySeconds: 8,
+							timeoutSeconds: 5,
+							confirmRequired: false,
+							targetNodeId: "c",
+						},
+					],
+				}),
+				extensionNode("a", { number: "1001" }),
+				extensionNode("b", { number: "1002" }),
+				extensionNode("c", { number: "1003" }),
+			]),
+		);
+
+		// +5 s, then the three seconds that are LEFT of +8 s — not another eight.
+		expect(h.delays).toEqual([5_000, 3_000]);
+		expect(h.media.originated().map((leg) => leg.endpoint)).toEqual([
+			"PJSIP/1001",
+			"PJSIP/1002",
+			"PJSIP/1003",
+		]);
+	});
+
+	it("starts a member whose offset has already passed immediately", async () => {
+		const h = harness({
+			reactions: {
+				"PJSIP/1001": { kind: "reject", cause: "NO_ANSWER" },
+				"PJSIP/1002": { kind: "reject", cause: "NO_ANSWER" },
+			},
+		});
+		await h.walker.walk(
+			walkInput([
+				ringGroupNode("g", {
+					strategy: "sequential",
+					members: [
+						{
+							ordinal: 0,
+							delaySeconds: 10,
+							timeoutSeconds: 5,
+							confirmRequired: false,
+							targetNodeId: "a",
+						},
+						{
+							ordinal: 1,
+							delaySeconds: 4,
+							timeoutSeconds: 5,
+							confirmRequired: false,
+							targetNodeId: "b",
+						},
+					],
+				}),
+				extensionNode("a", { number: "1001" }),
+				extensionNode("b", { number: "1002" }),
+			]),
+		);
+
+		expect(h.delays).toEqual([10_000]);
+	});
+
+	/**
+	 * A fan-out reaches every contact an extension registered, and a closed browser tab leaves a dead
+	 * one behind for as long as its binding lasts. The busy phone answers `486`; the dead contact
+	 * fails a moment later, and last-writer-wins made `USER_NOT_REGISTERED` the race's verdict — which
+	 * the edge has no SIP status for and relays as `480 Temporarily Unavailable`. The caller could
+	 * not tell "busy" from "unreachable", and a dial plan reading `480` keeps hunting on a final
+	 * rejection.
+	 */
+	it("keeps a busy callee's own cause when a stale contact fails after it", async () => {
+		const h = harness({
+			reactions: {
+				"PJSIP/1001": { kind: "reject", cause: "USER_BUSY" },
+				// The dead binding a closed tab left behind, refused a moment AFTER the phone that is
+				// genuinely busy answered. Last-writer-wins made this the race's verdict.
+				"PJSIP/1002": { kind: "reject", cause: "SUBSCRIBER_ABSENT" },
+			},
+		});
+		const outcome = await h.walker.walk(
+			walkInput([
+				ringGroupNode("g", {
+					members: [
+						{
+							ordinal: 0,
+							delaySeconds: 0,
+							timeoutSeconds: 5,
+							confirmRequired: false,
+							targetNodeId: "a",
+						},
+						{
+							ordinal: 1,
+							delaySeconds: 0,
+							timeoutSeconds: 5,
+							confirmRequired: false,
+							targetNodeId: "b",
+						},
+					],
+				}),
+				extensionNode("a", { number: "1001" }),
+				extensionNode("b", { number: "1002" }),
+			]),
+		);
+
+		expect(outcome.hangupCause).toBe("USER_BUSY");
+	});
+
+	it("cancels every member of a simultaneous group when the caller hangs up", async () => {
+		const h = harness({ reactions: { PJSIP: { kind: "ring" } } });
+		const originate = h.media.originate.bind(h.media);
+		let originated = 0;
+		h.media.originate = async (request) => {
+			const result = await originate(request);
+			originated += 1;
+			if (originated === 2) {
+				h.signals.emit(legSignalKey(A_CHANNEL), {
+					kind: "ended",
+					cause: "NORMAL_CLEARING",
+					causeCode: 16,
+				});
+			}
+			return result;
+		};
+
+		const outcome = await h.walker.walk(walkInput(group()));
+
+		expect(outcome.status).toBe("aborted");
+		expect(h.media.hungUp().map((leg) => leg.cause)).toEqual([
+			"ORIGINATOR_CANCEL",
+			"ORIGINATOR_CANCEL",
+		]);
+	});
+
 	it("reports the ring group as the CDR destination", async () => {
 		const h = harness({ reactions: { "PJSIP/1001": { kind: "answer" } } });
 		const outcome = await h.walker.walk(walkInput(group()));
@@ -1299,14 +1679,66 @@ describe("IVR menus", () => {
 		expect(outcome.visited).toEqual(["m", "done"]);
 	});
 
-	it("reports direct dial as an unimplemented gap instead of guessing an extension", async () => {
-		const h = harness({ gathers: [{ digits: ["1", "0", "0", "1"], endReason: "max-digits" }] });
-		const outcome = await h.walker.walk(
-			walkInput(menu({ directDialEnabled: true, maxFailures: 0, maxDigits: 4 })),
-		);
+	/**
+	 * Direct dial, and the two entries a single-digit menu has to tell apart. The compiler puts the
+	 * directory's width on the node; the walker collects up to it and lets the inter-digit timeout
+	 * decide which of the two the caller meant.
+	 */
+	describe("direct dial", () => {
+		const directory = (overrides = {}) => [
+			...menu({ directDialEnabled: true, directDialMaxDigits: 4, ...overrides }),
+			extensionNode("ext-1104", { number: "1104", timeoutSeconds: 1 }),
+		];
 
-		expect(outcome.notes.join(" ")).toContain("direct dial");
-		expect(outcome.hangupCause).toBe("INVALID_NUMBER_FORMAT");
+		it("puts a caller who typed a whole extension number through to it", async () => {
+			const h = harness({ gathers: [{ digits: ["1", "1", "0", "4"], endReason: "max-digits" }] });
+			const outcome = await h.walker.walk(walkInput(directory()));
+
+			expect(outcome.visited).toEqual(["m", "ext-1104"]);
+			expect(outcome.notes.join(" ")).toContain("1104 was dialled directly");
+		});
+
+		it("collects up to the directory's width even though maxDigits is one", async () => {
+			const h = harness({ gathers: [{ digits: ["1", "1", "0", "4"], endReason: "max-digits" }] });
+			await h.walker.walk(walkInput(directory()));
+
+			expect(h.verbs[1]).toMatchObject({
+				verb: "gather",
+				maxDigits: 4,
+				interDigitTimeoutMs: 2_000,
+			});
+		});
+
+		it("still takes the option when the caller pressed one digit and stopped", async () => {
+			const h = harness({ gathers: [{ digits: ["1"], endReason: "timeout" }] });
+			const outcome = await h.walker.walk(walkInput(directory()));
+
+			expect(outcome.visited).toEqual(["m", "one"]);
+		});
+
+		it("lets an option win over an extension whose number starts with it", async () => {
+			const h = harness({ gathers: [{ digits: ["1"], endReason: "max-digits" }] });
+			const outcome = await h.walker.walk(walkInput(directory()));
+
+			expect(outcome.visited).toEqual(["m", "one"]);
+		});
+
+		it("takes the invalid branch for digits that are not an extension", async () => {
+			const h = harness({ gathers: [{ digits: ["9", "9", "9", "9"], endReason: "max-digits" }] });
+			const outcome = await h.walker.walk(
+				walkInput(directory({ maxFailures: 0, invalidNodeId: "invalid" })),
+			);
+
+			expect(outcome.visited).toEqual(["m", "invalid"]);
+			expect(outcome.notes.join(" ")).toContain("is not an extension of this organization");
+		});
+
+		it("collects only maxDigits when the menu does not allow direct dial", async () => {
+			const h = harness({ gathers: [{ digits: ["1"], endReason: "max-digits" }] });
+			await h.walker.walk(walkInput(menu()));
+
+			expect(h.verbs[1]).toMatchObject({ verb: "gather", maxDigits: 1 });
+		});
 	});
 
 	it("reports the menu as the CDR destination when the caller never chooses", async () => {
@@ -1322,6 +1754,40 @@ describe("IVR menus", () => {
 		const h = harness({ failVerbs: ["gather"] });
 		const outcome = await h.walker.walk(walkInput(menu()));
 		expect(outcome.hangupCause).toBe("NORMAL_TEMPORARY_FAILURE");
+		expect(outcome.notes.join(" ")).toContain("could not collect digits");
+	});
+
+	/**
+	 * The defect this pins cost a whole E2E scenario: `mediad` refused the greeting playback, the
+	 * executor failed the whole `gather` with it, and the call ended — so the DTMF handling behind
+	 * the menu could not be evaluated at all. A menu with no audio is degraded; a menu that hangs up
+	 * is broken.
+	 */
+	it("collects digits anyway when the greeting is the only thing that would not play", async () => {
+		const h = harness({
+			failVerbsCarryingMedia: ["gather"],
+			verbFailureDetail: "the media plane refused gather: no such prompt: sound:welcome",
+			gathers: [{ digits: ["1"], endReason: "max-digits" }],
+		});
+
+		const outcome = await h.walker.walk(walkInput(menu({ greetingPromptId: "welcome" })));
+
+		expect(outcome.visited).toEqual(["m", "one"]);
+		expect(outcome.notes.join(" ")).toContain("no such prompt: sound:welcome");
+	});
+
+	it("puts the media plane's own refusal on the call when a prompt will not play", async () => {
+		const h = harness({
+			failVerbs: ["play"],
+			verbFailureDetail: "the media plane refused play: no such prompt: sound:sorry",
+			gathers: [{ digits: [], endReason: "timeout" }],
+		});
+
+		const outcome = await h.walker.walk(
+			walkInput(menu({ timeoutPromptId: "sorry", maxTimeouts: 1 })),
+		);
+
+		expect(outcome.notes.join(" ")).toContain("no such prompt: sound:sorry");
 	});
 
 	it("ends the collection on `#` without treating it as a digit", async () => {
@@ -1845,6 +2311,32 @@ describe("trunk dialling", () => {
 		expect(h.media.originated()[0]?.endpoint).toBe("PJSIP/+12125550100@carrier-a");
 	});
 
+	it("carries the caller-id presentation to the trunk originate, and only when set", async () => {
+		const withheld = harness({ reactions: { "carrier-a": { kind: "answer" } } });
+		await withheld.walker.walk(
+			walkInput([trunkDialNode("t")], {
+				dialedNumber: "+12125550100",
+				callerIdPresentation: "restricted",
+			}),
+		);
+		expect(withheld.media.originated()[0]?.callerIdPresentation).toBe("restricted");
+
+		const plain = harness({ reactions: { "carrier-a": { kind: "answer" } } });
+		await plain.walker.walk(walkInput([trunkDialNode("t")], { dialedNumber: "+12125550100" }));
+		expect(plain.media.originated()[0]).not.toHaveProperty("callerIdPresentation");
+	});
+
+	it("never withholds the number on an emergency call", async () => {
+		const h = harness({ reactions: { "carrier-a": { kind: "answer" } } });
+		await h.walker.walk(
+			walkInput([trunkDialNode("t", { emergency: true, elin: "+12125550911" })], {
+				dialedNumber: "911",
+				callerIdPresentation: "restricted",
+			}),
+		);
+		expect(h.media.originated()[0]).not.toHaveProperty("callerIdPresentation");
+	});
+
 	it("fails over to the next trunk on a retryable cause", async () => {
 		const h = harness({
 			reactions: {
@@ -2158,6 +2650,21 @@ describe("an emergency trunk dial", () => {
 			emergencyAddressId: "0195c0f0-1c2f-7000-8000-0000000000d1",
 			trunkName: "carrier-a",
 		});
+	});
+
+	it("names the handset when the SIP edge told us which one it was", async () => {
+		const deviceId = "0195c0f0-1c2f-7000-8000-0000000000f1";
+		const h = harness({ reactions: { "carrier-a": { kind: "answer" } }, deviceId });
+		await h.walker.walk(walkInput([emergencyNode()], { dialedNumber: "911" }));
+		const event = h.published.find((entry) => entry.type === "call.emergency.dialed");
+		expect(event?.data).toMatchObject({ deviceId });
+	});
+
+	it("omits the handset entirely when the edge named none, so the consumer infers", async () => {
+		const h = harness({ reactions: { "carrier-a": { kind: "answer" } } });
+		await h.walker.walk(walkInput([emergencyNode()], { dialedNumber: "911" }));
+		const event = h.published.find((entry) => entry.type === "call.emergency.dialed");
+		expect(event?.data).not.toHaveProperty("deviceId");
 	});
 
 	it("publishes nothing of the kind for an ordinary trunk dial", async () => {
@@ -2562,3 +3069,211 @@ describe("composeCallerId", () => {
 function planOfTrunkWithoutCallerId() {
 	return planOf([trunkDialNode("t")]);
 }
+
+// =================================================================================================
+// Shared lines
+// =================================================================================================
+
+/**
+ * A shared line, as the walk executes it.
+ *
+ * The registry is a fake here, exactly like the media server: what is asserted is the WALK's
+ * decisions — who rings, who takes the line, and what happens to a leg that answered and lost it.
+ * How the seizure holds across instances is `shared-line-registry.spec.ts`'s subject and is not
+ * re-tested through a second layer.
+ */
+describe("shared lines", () => {
+	interface FakeLines {
+		readonly port: NonNullable<PlanWalkerDependencies["sharedLines"]>;
+		readonly seizures: { extensionId: string; appearanceIndex: number }[];
+		readonly releases: string[];
+		readonly retrievals: string[];
+	}
+
+	const fakeLines = (
+		options: {
+			readonly won?: boolean;
+			readonly held?: { readonly state?: string; readonly heldByExtensionId?: string };
+			/** What the mid-call retrieve answers. Absent means the port has no retrieve at all. */
+			readonly retrieve?: { readonly retrieved: boolean; readonly reason?: string };
+		} = {},
+	): FakeLines => {
+		const seizures: { extensionId: string; appearanceIndex: number }[] = [];
+		const releases: string[] = [];
+		const retrievals: string[] = [];
+		return {
+			seizures,
+			releases,
+			retrievals,
+			port: {
+				held: () => options.held,
+				seize: async (_orgId, _lineId, seizing) => {
+					seizures.push({
+						extensionId: seizing.extensionId,
+						appearanceIndex: seizing.appearanceIndex,
+					});
+					return options.won === false
+						? { won: false, heldBy: { heldByExtensionId: "ext-other" } }
+						: { won: true, revision: 3 };
+				},
+				releaseOwn: async (_orgId, lineId) => {
+					releases.push(lineId);
+					return true;
+				},
+				...(options.retrieve === undefined
+					? {}
+					: {
+							retrieve: async (_orgId, lineId) => {
+								retrievals.push(lineId);
+								return options.retrieve as { readonly retrieved: boolean };
+							},
+						}),
+			},
+		};
+	};
+
+	const line = (overrides = {}) => [
+		sharedLineNode("sl", {
+			appearances: [
+				{
+					appearanceIndex: 1,
+					extensionId: "ext-a",
+					extensionNumber: "1001",
+					targetNodeId: "a",
+				},
+				{
+					appearanceIndex: 2,
+					extensionId: "ext-b",
+					extensionNumber: "1002",
+					targetNodeId: "b",
+				},
+			],
+			...overrides,
+		}),
+		extensionNode("a", { number: "1001" }),
+		extensionNode("b", { number: "1002" }),
+		hangupNode("busy", "USER_BUSY"),
+	];
+
+	it("rings every appearance at once and seizes the line for the one that answered", async () => {
+		const lines = fakeLines();
+		const h = harness({ reactions: { "PJSIP/1002": { kind: "answer" } }, sharedLines: lines.port });
+		const outcome = await h.walker.walk(walkInput(line()));
+
+		expect(outcome.status).toBe("bridged");
+		expect(h.media.originated().map((call) => call.endpoint)).toEqual(["PJSIP/1001", "PJSIP/1002"]);
+		expect(lines.seizures).toEqual([{ extensionId: "ext-b", appearanceIndex: 2 }]);
+		expect(outcome.notes.join(" ")).toContain("was seized by appearance 2");
+	});
+
+	/**
+	 * The split this whole feature exists to prevent. An appearance can answer and still lose the
+	 * line to another instance a few milliseconds earlier; bridging it anyway would put two callers
+	 * on one line.
+	 */
+	it("hangs up an appearance that answered and lost the seizure", async () => {
+		const lines = fakeLines({ won: false });
+		const h = harness({ reactions: { "PJSIP/1001": { kind: "answer" } }, sharedLines: lines.port });
+		const outcome = await h.walker.walk(walkInput(line({ timeoutNodeId: "busy" })));
+
+		expect(outcome.visited).toEqual(["sl", "busy"]);
+		expect(h.media.hungUp()).toContainEqual({ channelId: "id-1", cause: "USER_BUSY" });
+	});
+
+	it("refuses a line somebody is already on when barge-in is off, before anything rings", async () => {
+		const lines = fakeLines({ held: { state: "seized", heldByExtensionId: "ext-a" } });
+		const h = harness({ reactions: { "PJSIP/1001": { kind: "answer" } }, sharedLines: lines.port });
+		const outcome = await h.walker.walk(walkInput(line({ timeoutNodeId: "busy" })));
+
+		expect(h.media.originated()).toEqual([]);
+		expect(outcome.visited).toEqual(["sl", "busy"]);
+		expect(outcome.notes.join(" ")).toContain("does not allow barge-in");
+	});
+
+	it("rings the appearances anyway when the line allows barge-in, and says what is missing", async () => {
+		const lines = fakeLines({ held: { state: "seized", heldByExtensionId: "ext-a" } });
+		const h = harness({
+			reactions: { "PJSIP/1001": { kind: "answer" } },
+			sharedLines: lines.port,
+		});
+		const outcome = await h.walker.walk(walkInput(line({ bargeInEnabled: true })));
+
+		expect(h.media.originated()).toHaveLength(2);
+		expect(outcome.notes.join(" ")).toContain("needs a mid-call join this walk cannot make");
+	});
+
+	/**
+	 * The operation a shared line exists for, and the reason it arrives as a WALK: pressing the lit
+	 * key on a second phone dials the line's own number, which is an ordinary inbound call that
+	 * happens to land on a line somebody left on hold.
+	 */
+	it("retrieves a HELD line instead of ringing the appearances again", async () => {
+		const lines = fakeLines({
+			held: { state: "held", heldByExtensionId: "ext-a" },
+			retrieve: { retrieved: true },
+		});
+		const h = harness({ reactions: { "PJSIP/1001": { kind: "answer" } }, sharedLines: lines.port });
+		const outcome = await h.walker.walk(walkInput(line()));
+
+		expect(lines.retrievals).toEqual(["sl-sl"]);
+		expect(h.media.originated()).toEqual([]);
+		expect(outcome.status).toBe("bridged");
+	});
+
+	it("takes the busy branch when the held line could not be retrieved, and says why", async () => {
+		const lines = fakeLines({
+			held: { state: "held", heldByExtensionId: "ext-a" },
+			retrieve: { retrieved: false, reason: "the call has already gone" },
+		});
+		const h = harness({ reactions: { "PJSIP/1001": { kind: "answer" } }, sharedLines: lines.port });
+		const outcome = await h.walker.walk(walkInput(line({ timeoutNodeId: "busy" })));
+
+		expect(outcome.visited).toEqual(["sl", "busy"]);
+		expect(outcome.notes.join(" ")).toContain("the call has already gone");
+	});
+
+	it("takes the timeout branch when no appearance answers", async () => {
+		const lines = fakeLines();
+		const h = harness({ reactions: { PJSIP: { kind: "ring" } }, sharedLines: lines.port });
+		const outcome = await h.walker.walk(walkInput(line({ timeoutNodeId: "busy" })));
+
+		expect(outcome.visited).toEqual(["sl", "busy"]);
+		expect(lines.seizures).toEqual([]);
+	});
+
+	it("skips an appearance that does not point at an extension rather than dialling something else", async () => {
+		const lines = fakeLines();
+		const h = harness({ reactions: { "PJSIP/1001": { kind: "answer" } }, sharedLines: lines.port });
+		const outcome = await h.walker.walk(
+			walkInput(
+				line({
+					appearances: [
+						{
+							appearanceIndex: 1,
+							extensionId: "ext-a",
+							extensionNumber: "1001",
+							targetNodeId: "a",
+						},
+						{
+							appearanceIndex: 2,
+							extensionId: "ext-x",
+							extensionNumber: "9999",
+							targetNodeId: "busy",
+						},
+					],
+				}),
+			),
+		);
+
+		expect(h.media.originated().map((call) => call.endpoint)).toEqual(["PJSIP/1001"]);
+		expect(outcome.notes.join(" ")).toContain("is not an extension");
+	});
+
+	it("announces rather than routing when the walk has no registry at all", async () => {
+		const h = harness({ reactions: { "PJSIP/1001": { kind: "answer" } } });
+		const outcome = await h.walker.walk(walkInput(line()));
+
+		expect(outcome.hangupCause).toBe("FACILITY_NOT_IMPLEMENTED");
+		expect(h.media.originated()).toEqual([]);
+	});
+});
