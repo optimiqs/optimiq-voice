@@ -57,7 +57,9 @@
  * them the optionality is free to go.
  */
 
+import type { UnverifiedCallerIdPolicy } from "./attestation";
 import type { DestinationInput } from "./destinations";
+import type { RecordingConsentPolicy } from "./recording-consent";
 
 /** Values mirrored from `pbx-db` `extensions-schema.ts`. */
 export const TOLL_CLASSES = ["internal", "local", "national", "international", "premium"] as const;
@@ -385,6 +387,21 @@ export interface ExtensionInput extends RoutingEntityInput {
 	 */
 	readonly callScreening?: boolean | null;
 	readonly recordPolicy: RecordPolicy;
+	/**
+	 * Whether a recording of this extension's call is PAUSED while the caller is pressing digits,
+	 * from `extension.record_auto_pause_on_dtmf`.
+	 *
+	 * The PCI-DSS rule in one field: a card number read into a keypad must not land in an audio
+	 * file, and the only moment the platform can act on that is the instant a digit arrives. It is
+	 * per-extension rather than org-wide because the desk that takes payments is rarely the whole
+	 * tenant, and pausing every recording on every digit would silence the IVR selection at the front
+	 * of every recorded call.
+	 *
+	 * Optional for the rollout reason every other late field on this interface is optional: a loader
+	 * that does not select the column produces an extension that pauses nothing, which is what every
+	 * extension did before. `null` and absent both read as `false`.
+	 */
+	readonly recordAutoPauseOnDtmf?: boolean | null;
 	readonly mohClassId?: string | null;
 	readonly tollClass: TollClass;
 	readonly callTimeoutSeconds: number;
@@ -407,6 +424,30 @@ export interface PhoneNumberInput extends RoutingEntityInput, DestinationInput {
 	 * address would take their working calls down to fix a call they have not yet placed.
 	 */
 	readonly emergencyAddressId?: string | null;
+	/**
+	 * This DID's own recording-consent policy, overriding the organization's.
+	 *
+	 * A DID is the unit a tenant buys per market, so it is the unit that carries an obligation: the
+	 * London number a UK team answers and the California number a sales desk answers belong to one
+	 * organization and to two different sets of rules. An org-only setting would force the whole
+	 * tenant to the strictest of them, which is how a keypress gate ends up in front of calls that
+	 * never needed one.
+	 *
+	 * `null` and absent both mean INHERIT — they are not distinguishable here and do not need to be,
+	 * because there is no "record nothing, and ignore the org" state: a tenant that wants no
+	 * announcement on this DID sets `none` explicitly. Absent is also what a loader that does not yet
+	 * select the column produces, and it lands on the same behaviour every DID had before.
+	 */
+	readonly recordingConsentPolicy?: RecordingConsentPolicy | null;
+	/**
+	 * The prompt this DID announces with, overriding the organization's.
+	 *
+	 * Travels with the policy for the same reason it exists: a number bought for one market usually
+	 * needs the announcement in that market's language, and a policy override with the wrong
+	 * recording behind it is not an override. Absent means "use whatever the org named", and the org
+	 * naming nothing means the engine plays its seeded system prompt.
+	 */
+	readonly recordingConsentPromptId?: string | null;
 }
 
 export interface TrunkInput extends RoutingEntityInput {
@@ -444,6 +485,20 @@ export interface InboundRouteInput extends RoutingEntityInput, DestinationInput 
 	readonly failoverDestinationData?: DestinationInput["destinationData"];
 	readonly timeConditionId?: string | null;
 	readonly recordEnabled: boolean;
+	/**
+	 * This route's own recording-consent policy, overriding the organization's.
+	 *
+	 * The same override {@link PhoneNumberInput.recordingConsentPolicy} carries, one level more
+	 * specific: a route is what narrows a DID by caller or by clock, so a tenant that announces only
+	 * to callers from a two-party state expresses it here and nowhere else. When both are set the
+	 * ROUTE wins, because it is the narrower statement — the compiler carries both through and the
+	 * engine resolves the precedence at call time, where it knows which one actually matched.
+	 *
+	 * `null` and absent both mean inherit, exactly as on the DID.
+	 */
+	readonly recordingConsentPolicy?: RecordingConsentPolicy | null;
+	/** The prompt this route announces with. Absent means "whatever the DID or the org named". */
+	readonly recordingConsentPromptId?: string | null;
 }
 
 export interface OutboundRouteInput extends RoutingEntityInput {
@@ -584,6 +639,20 @@ export interface QueueInput extends RoutingEntityInput {
 	 * every queue did before, rather than one the compiler refuses.
 	 */
 	readonly recordPolicy?: RecordPolicy | null;
+	/**
+	 * Whether a recording of a call this queue distributed is PAUSED while digits are being pressed,
+	 * from `queue.record_auto_pause_on_dtmf`.
+	 *
+	 * The queue's copy of {@link ExtensionInput.recordAutoPauseOnDtmf}, and it is a separate field
+	 * rather than something derived from the answering agent's extension for one reason: the caller
+	 * types their card number to the QUEUE — into the payment IVR the queue fronts, or while on hold
+	 * — as readily as to the agent who eventually answers, and a rule that only existed on the
+	 * extension would leave that stretch of audio unprotected.
+	 *
+	 * Optional for the rollout reason every other late field here is optional; `null` and absent both
+	 * read as `false`, which is what every queue did before.
+	 */
+	readonly recordAutoPauseOnDtmf?: boolean | null;
 	/** The single DTMF digit a waiting caller may press to leave. Null/absent disables it. */
 	readonly exitKey?: string | null;
 	readonly exitDestinationType?: DestinationInput["destinationType"] | null;
@@ -1040,6 +1109,28 @@ export interface SpeedDialInput extends RoutingEntityInput, DestinationInput {
  * The org settings routing reads. Everything here has a compiler default, because a tenant that
  * has never opened the settings page must still be routable.
  */
+/**
+ * The toll-fraud policy row, as the loader reads it.
+ *
+ * Every field nullable because every column is: a policy row exists to hold the ceilings somebody
+ * has actually set, and a NULL is "no ceiling on that axis" rather than a value to default. The
+ * compiler drops the NULLs, normalises the country lists and defaults nothing.
+ */
+export interface TollFraudPolicyInput {
+	readonly enabled?: boolean | null;
+	readonly maxConcurrentInternationalCalls?: number | null;
+	readonly maxInternationalMinutesPerHour?: number | null;
+	readonly maxInternationalMinutesPerDay?: number | null;
+	/** ISO-3166 alpha-2, in whatever case and order the row holds them. */
+	readonly allowedCountries?: readonly string[] | null;
+	readonly deniedCountries?: readonly string[] | null;
+	readonly holdFirstCallToNewCountry?: boolean | null;
+	readonly offHoursInternationalLock?: boolean | null;
+	readonly offHoursStartMinute?: number | null;
+	readonly offHoursEndMinute?: number | null;
+	readonly offHoursTimezone?: string | null;
+}
+
 export interface RoutingSettingsInput {
 	/** Fallback IANA zone for a time condition that does not carry one. */
 	readonly defaultTimezone?: string;
@@ -1066,6 +1157,39 @@ export interface RoutingSettingsInput {
 	readonly voicemailCheckPrefix?: string | null;
 	/** Org-wide outbound caller id, used when neither route nor extension supplies one. */
 	readonly outboundCallerIdNumber?: string | null;
+	/**
+	 * What to do with an outbound caller id nobody has vouched for. See
+	 * {@link UnverifiedCallerIdPolicy}; `null` and absent both compile to `"allow"`, which is what
+	 * every tenant had before the attestation seam existed.
+	 */
+	readonly unverifiedCallerIdPolicy?: UnverifiedCallerIdPolicy | null;
+	/**
+	 * Whether this organization's KYC file has been approved, and whether an un-approved one
+	 * actually blocks outbound PSTN calling.
+	 *
+	 * Two flags and not one, because they are set by different people for different reasons. The
+	 * DECISION is the platform operator's and lives on the `organization_kyc` row; the ENFORCEMENT is
+	 * a policy the operator (or the tenant, on a stricter account) turns on. Collapsing them would
+	 * mean that adding the KYC feature at all instantly cut off every existing tenant whose file
+	 * nobody had reviewed yet, which is a migration and not a compliance posture.
+	 */
+	readonly kycApproved?: boolean | null;
+	readonly requireKycForOutbound?: boolean | null;
+	/**
+	 * External numbers this organization has a documented right to present, already filtered for
+	 * expiry by the loader.
+	 *
+	 * The loader does the filtering because the compiler reads no clock — two compiles of one
+	 * snapshot must be byte-identical, and an expiry evaluated at compile time would make the
+	 * artifact change without the configuration changing. A lapsed verification therefore reaches
+	 * here as an absent entry, and the call falls to {@link unverifiedCallerIdPolicy}, which is the
+	 * behaviour a lapsed document should produce.
+	 *
+	 * Numbers the organization OWNS are not listed here: they are already in
+	 * {@link RoutingSnapshotInput.phoneNumbers}, and the compiler derives the `owned` half of the
+	 * right-to-use table from that collection rather than asking the loader to send it twice.
+	 */
+	readonly verifiedCallerIds?: readonly string[];
 	readonly outboundCallerIdName?: string | null;
 	/**
 	 * The country calling code this organization's national numbers belong to — `"1"` for NANP,
@@ -1085,6 +1209,20 @@ export interface RoutingSettingsInput {
 	readonly trunkContinueOnCauses?: readonly string[];
 	/** Whether an internal caller may reach outbound routes at all (org-level kill switch). */
 	readonly outboundEnabled?: boolean;
+	/**
+	 * Hold TLS-registered handsets to SDES-SRTP: their media legs are negotiated with the per-leg
+	 * policy `require` instead of the media plane's `MEDIAD_SRTP_POLICY` floor.
+	 *
+	 * Absent means `false`, and `false` is the only safe default: turning it on REFUSES the call of
+	 * any handset that signals over TLS and offers plain RTP, which is a real population on most
+	 * estates. That is a decision a tenant makes explicitly, having looked at their fleet.
+	 *
+	 * TLS-registered specifically, and not every phone: a handset that already encrypts its
+	 * signalling is one whose vendor and firmware support SRTP, so the refusal is a
+	 * misconfiguration rather than an incompatibility — and a plaintext-signalled phone offered
+	 * SRTP would be handing its keys over in the clear anyway, which buys nothing.
+	 */
+	readonly requireSrtpForTlsPhones?: boolean;
 	/**
 	 * Emergency dial strings this organization recognises **in addition to** the compiled-in NANP
 	 * set (`emergency.ts`). One row for a tenant whose handsets are not all in North America.
@@ -1112,6 +1250,66 @@ export interface RoutingSettingsInput {
 	 * and queue callers too — none of which touch a trunk.
 	 */
 	readonly maxConcurrentCalls?: number | null;
+	/**
+	 * The organization's toll-fraud spend, velocity and geo controls, as the policy row carries them.
+	 *
+	 * Rides `settings` for the same mechanical reason `maxConcurrentCalls` does, stated two entries
+	 * up: `canonicalizeSnapshot` hashes `settings` on an explicit line, and a new top-level field
+	 * would be excluded from `snapshotHash` unless that line were extended too.
+	 *
+	 * `null` and absent both mean "this tenant has no policy row", and the compiler collapses both to
+	 * an absent key — which is what keeps the canonical snapshot of a tenant with no policy
+	 * byte-identical to what it was before this was loaded.
+	 */
+	readonly tollFraud?: TollFraudPolicyInput | null;
+	/**
+	 * What this organization asks of a call it records, before any audio is captured.
+	 *
+	 * The org-wide floor a DID or an inbound route may raise (see
+	 * {@link PhoneNumberInput.recordingConsentPolicy}). `null` and absent both compile to `"none"`,
+	 * which is what every tenant had before this setting existed: recording starts where the record
+	 * policy says it does and nobody is told. That default is deliberate and it is not a legal
+	 * position — the platform cannot know a tenant's obligations, and silently inserting an
+	 * announcement into every recorded call of every existing tenant would change what their callers
+	 * hear without anybody asking for it. The jurisdiction table
+	 * (`recordingAllPartyRegions`) is the safety net that raises it per call.
+	 */
+	readonly recordingConsentPolicy?: RecordingConsentPolicy | null;
+	/**
+	 * The prompt row the announcement plays. Absent means the engine plays the seeded system prompt
+	 * (`sound:recording-consent`), so a tenant that switches the policy on without recording anything
+	 * still announces rather than silently failing the obligation they just took on.
+	 */
+	readonly recordingConsentPromptId?: string | null;
+	/** The digit that ACCEPTS recording under `announce-and-require-keypress`. Defaults to `"1"`. */
+	readonly recordingConsentAcceptDigit?: string | null;
+	/**
+	 * The digit that DECLINES. Defaults to `"2"`.
+	 *
+	 * Configurable, and distinct from "any digit that is not the accept digit", because a decline is
+	 * a deliberate act with a consequence — no recording is started and the call continues — and a
+	 * caller who fumbles the keypad has not declined, they have not answered.
+	 */
+	readonly recordingConsentDeclineDigit?: string | null;
+	/**
+	 * The jurisdictions this organization treats as requiring BOTH parties to be told, as ISO 3166-2
+	 * subdivisions (`US-CA`) or `EU`.
+	 *
+	 * Absent compiles to `DEFAULT_ALL_PARTY_REGIONS` (`recording-consent.ts`) rather than to an empty
+	 * list, which is the
+	 * one default in this block that is not "behave as before": a tenant who has never opened the
+	 * settings page gets the safety net, because the failure mode of the empty list is a recorded
+	 * two-party call nobody was told about, and the failure mode of the seeded list is an
+	 * announcement on a call that did not need one. An explicitly empty array is respected — that is
+	 * a tenant saying they have taken their own advice.
+	 */
+	readonly recordingAllPartyRegions?: readonly string[];
+	/**
+	 * The org-wide default for pausing a recording while digits are pressed. Defaults to `false`;
+	 * {@link ExtensionInput.recordAutoPauseOnDtmf} and {@link QueueInput.recordAutoPauseOnDtmf}
+	 * override it where a tenant takes payments on some seats and not others.
+	 */
+	readonly recordingAutoPauseOnDtmf?: boolean | null;
 }
 
 /** Everything the compiler is allowed to see about one organization. */

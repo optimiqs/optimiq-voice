@@ -109,6 +109,15 @@ export const DIAGNOSTIC_CODES = [
 	 * tenant down with it over one mistyped form field.
 	 */
 	"invalid-queue-priority",
+	/**
+	 * A `queue` destination carried skill requirements that are not a usable list of skill tags.
+	 *
+	 * A warning for the reason above, one step sharper: a dropped requirement costs a caller the
+	 * right agent, and a refused compile costs the tenant every route in the artifact. The entry is
+	 * dropped, named in the message, and the rest of the list still applies — so a queue that asks
+	 * for two skills and was handed one typo still asks for the other.
+	 */
+	"invalid-queue-skills",
 	/** A queue has an exit key and no exit destination, so pressing it hangs the caller up. */
 	"queue-exit-key-without-destination",
 	/**
@@ -230,6 +239,10 @@ export const DIAGNOSTIC_CODES = [
 	"emergency-call",
 	/** A translation ruleset rewrote a number, or would have and was refused for over-running. */
 	"number-translated",
+	/** An outbound call was given a STIR/SHAKEN attestation level, and on what basis. */
+	"attestation-decided",
+	/** An outbound call was refused on compliance grounds — an unvouched caller id, or KYC. */
+	"attestation-refused",
 ] as const;
 
 export type DiagnosticCode = (typeof DIAGNOSTIC_CODES)[number];

@@ -21,6 +21,7 @@
  * reproduced, and "why did this call go to the night service at 4pm?" is a question that gets asked.
  */
 
+import { decideAttestation } from "./attestation";
 import { PlanNodeNotFoundError } from "./errors";
 import { matchFeatureCode } from "./feature-codes";
 import { applyDigitManipulation, matchPattern } from "./patterns";
@@ -36,6 +37,13 @@ import type {
 	RoutingArtifact,
 	RoutingContext,
 } from "./artifact";
+import type {
+	AttestationDecision,
+	AttestationLevel,
+	CallerIdRightToUse,
+	CompiledAttestationPolicy,
+	OutboundComplianceRefusal,
+} from "./attestation";
 import type { Diagnostic } from "./diagnostics";
 import type { ExecutionPlan, PlanNode, PlanNodeId } from "./plan";
 import type {
@@ -115,6 +123,26 @@ export interface ResolvedRoute {
 	/** Regex capture groups from the matching pattern, `$1` first. */
 	readonly captures?: readonly string[];
 	readonly recordEnabled?: boolean;
+	/**
+	 * The STIR/SHAKEN level this platform asserts for the call, and the fact behind it. Outbound
+	 * only, and absent on the emergency path for the reason {@link callerIdPresentation} is absent
+	 * there: a 911 call presents the ELIN and is not a caller-id claim anybody attests.
+	 *
+	 * Absent also on an artifact compiled before the attestation block existed, which is what makes
+	 * this an additive field rather than a behaviour change for an old cache entry.
+	 */
+	readonly expectedAttestation?: AttestationLevel;
+	readonly callerIdRightToUse?: CallerIdRightToUse;
+	/**
+	 * Why an otherwise-routable outbound call was refused on compliance grounds.
+	 *
+	 * Set together with `matched: false` and the organization's denied terminal, so a caller that
+	 * knows nothing about attestation still behaves correctly — the refusal reaches the engine
+	 * through the same `deniedNodeId` path the toll-class gate and the kill switch already use, and
+	 * this field is the NAME of the cause for the CDR and the support ticket rather than a second
+	 * mechanism.
+	 */
+	readonly complianceRefusal?: OutboundComplianceRefusal;
 	/** Set when a call-block rule matched, whatever its action. */
 	readonly blocked?: BlockOutcome;
 	/** One line for the "why did this call go there?" ticket; mirrors the rpc contract's `reason`. */
@@ -880,6 +908,36 @@ export function resolveOutbound(
 			continue;
 		}
 
+		const presentedCallerId =
+			rule.callerIdNumberOverride ??
+			caller?.outboundCallerIdNumber ??
+			artifact.settings.outboundCallerIdNumber;
+		// The attestation seam sits HERE and not earlier, because this is the first line at which the
+		// effective caller id exists: the route override, the extension and the org default have all
+		// had their say by now, and deciding a level against any of them individually would attest a
+		// number the call is not going to present. The emergency path returned long before this.
+		const attestation = outboundAttestation(
+			artifact.settings.attestation,
+			presentedCallerId,
+			artifact.settings.outboundCallerIdNumber,
+			diagnostics,
+		);
+		if (attestation?.refusal !== undefined) {
+			return compactRoute({
+				matched: false,
+				context: "outbound",
+				plan: planFrom(artifact, artifact.outbound.deniedNodeId),
+				matchedRuleId: rule.id,
+				matchedRuleName: rule.name,
+				expectedAttestation: attestation.attestation,
+				callerIdRightToUse: attestation.rightToUse,
+				callerIdNumber: attestation.callerIdNumber,
+				complianceRefusal: attestation.refusal,
+				reason: attestation.reason,
+				diagnostics,
+			});
+		}
+
 		return compactRoute({
 			matched: true,
 			context: "outbound",
@@ -889,10 +947,9 @@ export function resolveOutbound(
 			dialedNumber,
 			captures: match.captures.length > 0 ? match.captures : undefined,
 			recordEnabled: rule.recordEnabled,
-			callerIdNumber:
-				rule.callerIdNumberOverride ??
-				caller?.outboundCallerIdNumber ??
-				artifact.settings.outboundCallerIdNumber,
+			callerIdNumber: attestation?.callerIdNumber ?? presentedCallerId,
+			expectedAttestation: attestation?.attestation,
+			callerIdRightToUse: attestation?.rightToUse,
 			callerIdName: caller?.outboundCallerIdName ?? artifact.settings.outboundCallerIdName,
 			// The standing setting only. A per-call `*67`/`*82` overrides it further down, on the leg
 			// itself, because the code is dialled by the caller and the resolver never sees it.
@@ -924,6 +981,33 @@ export function resolveOutbound(
 		reason: `no outbound route matched ${input.dialed}`,
 		diagnostics,
 	});
+}
+
+/**
+ * The attestation decision, on an artifact that may predate the block, with the diagnostics logged.
+ *
+ * `undefined` in and `undefined` out: an artifact compiled before the attestation block existed
+ * decides nothing and refuses nothing, which is exactly what every release before this one did and
+ * is why the block being optional is not an artifact-version bump. The pure decision itself lives in
+ * `attestation.ts` with no artifact and no diagnostic bag, so it can be re-run months later against
+ * the same compiled table to reproduce the answer.
+ */
+function outboundAttestation(
+	policy: CompiledAttestationPolicy | undefined,
+	presented: string | undefined,
+	mainNumber: string | undefined,
+	diagnostics: Diagnostic[],
+): AttestationDecision | undefined {
+	if (policy === undefined) {
+		return undefined;
+	}
+	const decision = decideAttestation(policy, presented, mainNumber);
+	diagnostics.push({
+		severity: decision.refusal === undefined ? "info" : "warning",
+		code: decision.refusal === undefined ? "attestation-decided" : "attestation-refused",
+		message: `Outbound attestation ${decision.attestation}: ${decision.reason}.`,
+	});
+	return decision;
 }
 
 /** Runs a matched route's shared ruleset over the already-manipulated number. */

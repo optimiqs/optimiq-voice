@@ -20,6 +20,7 @@ import {
 	aPagingGroup,
 	aParkLot,
 	aPhoneNumber,
+	aPrompt,
 	aQueue,
 	aRingGroup,
 	aRingGroupMember,
@@ -38,6 +39,7 @@ import {
 	ORG_ID,
 } from "./fixtures";
 import { planNodeReferences } from "./plan";
+import { DEFAULT_ALL_PARTY_REGIONS } from "./recording-consent";
 import { emptySnapshot } from "./snapshot";
 import type { RoutingArtifact } from "./artifact";
 import type {
@@ -2191,6 +2193,130 @@ describe("compile — queue contact-centre settings", () => {
 		expect(queueOf(artifact).priority).toBe(10);
 	});
 
+	/**
+	 * Skills reach the artifact the same way a priority does — on the EDGE — because "press 2 for
+	 * Spanish" is a property of the IVR option and not of the queue. The queue's own requirements
+	 * travel on the roster, so nothing here should appear on a queue nobody pointed at with any.
+	 */
+	it("leaves a queue nobody asked a skill of with no requirements at all", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue()] }));
+		expect(queueOf(artifact)).not.toHaveProperty("requiredSkills");
+	});
+
+	it("compiles an entrance's skill requirements onto its own node", () => {
+		const artifact = compiled(
+			aSnapshot({
+				queues: [aQueue()],
+				inboundRoutes: [
+					anInboundRoute({
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { skills: "spanish:3:60" } },
+					}),
+				],
+			}),
+		);
+		const node = queueOf(artifact, "queue:q-1:sspanish-3-60");
+		expect(node.requiredSkills).toEqual([{ skill: "spanish", minLevel: 3, relaxAfterSeconds: 60 }]);
+		// Same identity rule the priority override has: a second door, one queue.
+		expect(node.queueId).toBe("q-1");
+	});
+
+	/** A tag typed into a spreadsheet is the common producer, and it means level 1, never relaxed. */
+	it("reads a bare tag as level 1 with no relaxation", () => {
+		const artifact = compiled(
+			aSnapshot({
+				queues: [aQueue()],
+				inboundRoutes: [
+					anInboundRoute({
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { skills: "Spanish " } },
+					}),
+				],
+			}),
+		);
+		expect(queueOf(artifact, "queue:q-1:sspanish-1-0").requiredSkills).toEqual([
+			{ skill: "spanish", minLevel: 1, relaxAfterSeconds: 0 },
+		]);
+	});
+
+	/**
+	 * One bad entry costs the caller that one requirement. Refusing the compile would cost the
+	 * tenant every route in the artifact, which is the trade `invalid-queue-priority` already makes.
+	 */
+	it("drops a malformed entry with a warning and keeps the rest of the list", () => {
+		const artifact = compiled(
+			aSnapshot({
+				queues: [aQueue()],
+				inboundRoutes: [
+					anInboundRoute({
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { skills: "billing,spanish:99" } },
+					}),
+				],
+			}),
+		);
+		expect(artifact.diagnostics.map((entry) => entry.code)).toContain("invalid-queue-skills");
+		expect(queueOf(artifact, "queue:q-1:sbilling-1-0").requiredSkills).toEqual([
+			{ skill: "billing", minLevel: 1, relaxAfterSeconds: 0 },
+		]);
+	});
+
+	/**
+	 * A list that is entirely unusable must be indistinguishable from no list at all, or the node
+	 * would carry an empty requirement set that reads as "this entrance asks for nothing" when what
+	 * happened is that nobody could tell what it asked for.
+	 */
+	it("falls back to the queue's own requirements when every entry is malformed", () => {
+		const artifact = compiled(
+			aSnapshot({
+				queues: [aQueue()],
+				inboundRoutes: [
+					anInboundRoute({
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { skills: "not a tag" } },
+					}),
+				],
+			}),
+		);
+		expect(artifact.diagnostics.map((entry) => entry.code)).toContain("invalid-queue-skills");
+		expect(Object.keys(artifact.nodes).filter((id) => id.startsWith("queue:q-1"))).toEqual([
+			"queue:q-1",
+		]);
+	});
+
+	it("gives two entrances asking for the same skills one node", () => {
+		const artifact = compiled(
+			aSnapshot({
+				queues: [aQueue()],
+				inboundRoutes: [
+					anInboundRoute({
+						id: "in-1",
+						matchPattern: "+15551230001",
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { skills: "spanish" } },
+					}),
+					anInboundRoute({
+						id: "in-2",
+						matchPattern: "+15551230002",
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { skills: "spanish" } },
+					}),
+				],
+			}),
+		);
+		expect(
+			Object.keys(artifact.nodes)
+				.filter((id) => id.startsWith("queue:q-1"))
+				.sort(),
+		).toEqual(["queue:q-1", "queue:q-1:sspanish-1-0"]);
+	});
+
 	it("carries the abandoned-resume window onto the node", () => {
 		const artifact = compiled(
 			aSnapshot({
@@ -2264,6 +2390,222 @@ describe("compile — conference depth", () => {
 		const on = canonicalJson(compiled(aSnapshot({ conferences: [aConference()] })));
 		const off = canonicalJson(
 			compiled(aSnapshot({ conferences: [aConference({ entryToneEnabled: false })] })),
+		);
+		expect(on).not.toBe(off);
+	});
+});
+
+/**
+ * Recording consent is the one settings block a fresh compile always writes, and every field in it
+ * defaults — so the interesting assertions are about what the compiler does with a tenant who has
+ * configured NOTHING, and about the two places an override may beat the org.
+ */
+describe("compile — recording consent", () => {
+	it("defaults the whole block for a tenant that has set nothing", () => {
+		const artifact = compiled(emptySnapshot(ORG_ID));
+		expect(artifact.settings.recording).toEqual({
+			consentPolicy: "none",
+			acceptDigit: "1",
+			declineDigit: "2",
+			allPartyRegions: [...DEFAULT_ALL_PARTY_REGIONS],
+			autoPauseOnDtmf: false,
+		});
+		// Absent rather than a fabricated row id: the engine reads its own seeded stem, and an id
+		// invented here would be a dangling reference the media plane fails on.
+		expect(artifact.settings.recording).not.toHaveProperty("consentPromptId");
+	});
+
+	it("keeps an explicitly empty region list, which is a tenant switching the safety net off", () => {
+		const artifact = compiled(aSnapshot({ settings: { recordingAllPartyRegions: [] } }));
+		expect(artifact.settings.recording?.allPartyRegions).toEqual([]);
+	});
+
+	it("carries the org policy, the digits and the pause default", () => {
+		const artifact = compiled(
+			aSnapshot({
+				settings: {
+					recordingConsentPolicy: "announce-and-require-keypress",
+					recordingConsentAcceptDigit: "5",
+					recordingConsentDeclineDigit: "#",
+					recordingAutoPauseOnDtmf: true,
+				},
+			}),
+		);
+		expect(artifact.settings.recording).toMatchObject({
+			consentPolicy: "announce-and-require-keypress",
+			acceptDigit: "5",
+			declineDigit: "#",
+			autoPauseOnDtmf: true,
+		});
+	});
+
+	it("falls back to the documented digits when the row holds something no keypad produces", () => {
+		const artifact = compiled(
+			aSnapshot({
+				settings: { recordingConsentAcceptDigit: "yes", recordingConsentDeclineDigit: "  " },
+			}),
+		);
+		expect(artifact.settings.recording?.acceptDigit).toBe("1");
+		expect(artifact.settings.recording?.declineDigit).toBe("2");
+	});
+
+	it("lets a DID raise the organization's policy, and leaves every other DID inheriting", () => {
+		const artifact = compiled(
+			aSnapshot({
+				settings: { recordingConsentPolicy: "announce" },
+				extensions: [anExtension()],
+				phoneNumbers: [
+					aPhoneNumber({
+						recordingConsentPolicy: "announce-and-require-keypress",
+						recordingConsentPromptId: "prompt-1",
+					}),
+					aPhoneNumber({ id: "did-2", e164: "+15551230002" }),
+				],
+				prompts: [aPrompt()],
+			}),
+		);
+		expect(artifact.inbound.didDefaults["+15551230001"]).toMatchObject({
+			recordingConsentPolicy: "announce-and-require-keypress",
+			recordingConsentPromptId: "prompt-1",
+		});
+		// Inherit is expressed by ABSENCE, so the org policy is the only thing left to read.
+		expect(artifact.inbound.didDefaults["+15551230002"]).not.toHaveProperty(
+			"recordingConsentPolicy",
+		);
+	});
+
+	it("drops a DID override that is null, which is the column saying 'inherit'", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				phoneNumbers: [
+					aPhoneNumber({ recordingConsentPolicy: null, recordingConsentPromptId: null }),
+				],
+			}),
+		);
+		expect(artifact.inbound.didDefaults["+15551230001"]).not.toHaveProperty(
+			"recordingConsentPolicy",
+		);
+		expect(artifact.inbound.didDefaults["+15551230001"]).not.toHaveProperty(
+			"recordingConsentPromptId",
+		);
+	});
+
+	it("carries an inbound route's override onto its rule", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				phoneNumbers: [aPhoneNumber()],
+				inboundRoutes: [anInboundRoute({ recordingConsentPolicy: "announce" })],
+			}),
+		);
+		expect(artifact.inbound.rules[0]).toMatchObject({ recordingConsentPolicy: "announce" });
+	});
+
+	/**
+	 * The prompt rule this field breaks with, and the only one in the compiler that does: a dangling
+	 * consent prompt is dropped as well as reported, because the engine's seeded announcement is a
+	 * working substitute and a dead id would replace it with silence.
+	 */
+	it("warns about a consent prompt that is not in the snapshot, and drops it", () => {
+		const snapshot = aSnapshot({
+			settings: { recordingConsentPromptId: "gone" },
+			prompts: [aPrompt()],
+		});
+		expect(codesOf(compileAttempt(snapshot))).toContain("dangling-prompt");
+		expect(compiled(snapshot).settings.recording).not.toHaveProperty("consentPromptId");
+	});
+
+	it("keeps a consent prompt the library actually has", () => {
+		const artifact = compiled(
+			aSnapshot({ settings: { recordingConsentPromptId: "prompt-1" }, prompts: [aPrompt()] }),
+		);
+		expect(artifact.settings.recording?.consentPromptId).toBe("prompt-1");
+	});
+
+	it("drops a dangling override prompt on a DID too", () => {
+		const snapshot = aSnapshot({
+			extensions: [anExtension()],
+			phoneNumbers: [aPhoneNumber({ recordingConsentPromptId: "gone" })],
+			prompts: [aPrompt()],
+		});
+		expect(codesOf(compileAttempt(snapshot))).toContain("dangling-prompt");
+		expect(compiled(snapshot).inbound.didDefaults["+15551230001"]).not.toHaveProperty(
+			"recordingConsentPromptId",
+		);
+	});
+});
+
+/**
+ * The PCI pause is written only when it is ON, at all three places that carry it. Absent already
+ * means "do not pause", so a `false` in the artifact would be a republished artifact and an
+ * invalidated cache for a behaviour that did not change — which is what the last test here asserts.
+ */
+describe("compile — auto-pause on DTMF", () => {
+	function withoutHash(artifact: RoutingArtifact): Omit<RoutingArtifact, "snapshotHash"> {
+		const { snapshotHash, ...rest } = artifact;
+		void snapshotHash;
+		return rest;
+	}
+
+	it("writes the extension flag on both the node and the index when it is on", () => {
+		const artifact = compiled(
+			aSnapshot({ extensions: [anExtension({ recordAutoPauseOnDtmf: true })] }),
+		);
+		expect((artifact.nodes["extension:ext-1"] as ExtensionPlanNode).recordAutoPauseOnDtmf).toBe(
+			true,
+		);
+		expect(artifact.extensionsByNumber["1001"]?.recordAutoPauseOnDtmf).toBe(true);
+	});
+
+	it("writes the queue flag when it is on", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue({ recordAutoPauseOnDtmf: true })] }));
+		expect((artifact.nodes["queue:q-1"] as QueuePlanNode).recordAutoPauseOnDtmf).toBe(true);
+	});
+
+	it("omits the key entirely for false, null and a loader that does not select the column", () => {
+		for (const value of [false, null, undefined] as const) {
+			const artifact = compiled(
+				aSnapshot({
+					extensions: [anExtension({ recordAutoPauseOnDtmf: value })],
+					queues: [aQueue({ recordAutoPauseOnDtmf: value })],
+				}),
+			);
+			expect(artifact.nodes["extension:ext-1"]).not.toHaveProperty("recordAutoPauseOnDtmf");
+			expect(artifact.nodes["queue:q-1"]).not.toHaveProperty("recordAutoPauseOnDtmf");
+			expect(artifact.extensionsByNumber["1001"]).not.toHaveProperty("recordAutoPauseOnDtmf");
+		}
+	});
+
+	/**
+	 * The rollout claim, stated as a test: a tenant whose loader learns to select the four new
+	 * columns and finds them unset compiles to the SAME artifact they had. Only `snapshotHash`
+	 * moves, and it moves because the INPUT literally gained keys — that is a recompile the cache
+	 * contract already handles, and it publishes an artifact the engine cannot tell from the last
+	 * one, which is the whole point of writing nothing for a `false`.
+	 */
+	it("leaves the artifact of a tenant that set none of the new fields byte-identical", () => {
+		const before = aSnapshot({
+			extensions: [anExtension()],
+			phoneNumbers: [aPhoneNumber()],
+			queues: [aQueue()],
+		});
+		const after = aSnapshot({
+			extensions: [anExtension({ recordAutoPauseOnDtmf: false })],
+			phoneNumbers: [
+				aPhoneNumber({ recordingConsentPolicy: null, recordingConsentPromptId: null }),
+			],
+			queues: [aQueue({ recordAutoPauseOnDtmf: null })],
+		});
+		expect(canonicalJson(withoutHash(compiled(after)))).toBe(
+			canonicalJson(withoutHash(compiled(before))),
+		);
+	});
+
+	it("changes the artifact the moment a tenant switches the pause on", () => {
+		const off = canonicalJson(compiled(aSnapshot({ extensions: [anExtension()] })));
+		const on = canonicalJson(
+			compiled(aSnapshot({ extensions: [anExtension({ recordAutoPauseOnDtmf: true })] })),
 		);
 		expect(on).not.toBe(off);
 	});

@@ -146,6 +146,21 @@ export interface ExtensionPlanNode extends PlanNodeBase {
 	 * only says whether the tenant asked for the feature.
 	 */
 	readonly callScreening?: boolean;
+	/**
+	 * Pause a running recording of this extension's call while the caller is pressing digits, and
+	 * resume it once they stop — the PCI-DSS "don't record the card number" rule.
+	 *
+	 * Present and `true` means the engine pauses on the first digit and arms a quiet-window timer
+	 * that resumes when the digits stop. Absent means it does not, which is what every extension did
+	 * before the flag existed and is why it is optional rather than a required boolean: a reader that
+	 * ignores it records straight through, which is the pre-existing behaviour rather than a silently
+	 * truncated recording. Not an artifact-version bump for the same reason `callScreening` was not.
+	 *
+	 * The pause is of the RECORDING, never of the call: the digits still reach the IVR or the far
+	 * end, because a payment page that stopped receiving them would be a broken feature rather than a
+	 * compliant one.
+	 */
+	readonly recordAutoPauseOnDtmf?: boolean;
 	readonly mohClassId?: string;
 	/** The class's NAME, resolved from `mohClassId`. Absent means "the media server's default". */
 	readonly mohClass?: string;
@@ -333,6 +348,24 @@ export interface QueueCallbackPlan {
 	readonly expiresAfterSeconds: number;
 }
 
+/**
+ * One skill an entrance asks of the agent, and how long it keeps asking.
+ *
+ * The scale is 1-5 and the tag shape is `packages/pbx-db`'s; this is the compiled copy. See
+ * {@link QueuePlanNode.requiredSkills} for why an entrance may carry requirements at all, and
+ * `queue-strategy.ts` for what `relaxAfterSeconds` does to a caller who has been waiting.
+ */
+export interface QueueSkillRequirementPlan {
+	readonly skill: string;
+	readonly minLevel: number;
+	/** Seconds of waiting per one-level drop in the bar. `0` never relaxes. */
+	readonly relaxAfterSeconds: number;
+}
+
+/** The bounds a compiled requirement is validated against. Mirrors `pbx-db`'s check constraint. */
+export const QUEUE_SKILL_LEVEL_MIN = 1;
+export const QUEUE_SKILL_LEVEL_MAX = 5;
+
 export interface QueuePlanNode extends PlanNodeBase {
 	readonly kind: "queue";
 	readonly queueId: string;
@@ -373,6 +406,16 @@ export interface QueuePlanNode extends PlanNodeBase {
 	 */
 	readonly recordPolicy: RecordPolicy;
 	/**
+	 * Pause a running recording of a call this queue distributed while digits are being pressed.
+	 *
+	 * The same rule {@link ExtensionPlanNode.recordAutoPauseOnDtmf} states, carried on the queue as
+	 * well because the digits that must not be recorded are as often typed to the queue's own payment
+	 * IVR, or while the caller is still holding, as to the agent who eventually answers. Absent means
+	 * no pause — what every queue did before — so an old reader ignoring it records through the
+	 * digits exactly as it always has, and the field is therefore not a version bump.
+	 */
+	readonly recordAutoPauseOnDtmf?: boolean;
+	/**
 	 * The single DTMF digit a WAITING caller may press to leave the line for {@link exitNodeId}.
 	 *
 	 * Absent means the queue has no exit key, which is what every queue had before. Present without
@@ -393,6 +436,28 @@ export interface QueuePlanNode extends PlanNodeBase {
 	 * not be a priority.
 	 */
 	readonly priority: number;
+	/**
+	 * Skills a caller entering THROUGH THIS NODE needs from the agent who takes them.
+	 *
+	 * The same `destination_data.args` mechanism as {@link priority}, and on the node for the same
+	 * reason: "press 2 for Spanish" is a property of the IVR OPTION, not of the queue, and the same
+	 * queue reached from the main menu asks for nothing. A DID that serves one language is the
+	 * other common case and it is the same edge fact, written on the inbound route instead.
+	 *
+	 * Spelled on the wire as one string — `"spanish:3:60,billing"` — because `args` values are
+	 * scalars and the node-dedup key `String()`s them; see `RoutingCompiler.queueSkillsOverride`.
+	 *
+	 * These are MERGED with the queue's own requirements, which travel on the roster
+	 * (`queueMembershipSchema.skillRequirements`) rather than here — a requirement is matched
+	 * against seats and the seats are not in the artifact. Where both name the same skill the
+	 * HIGHER `minLevel` wins, because a queue that insists on level 3 and a door that insists on
+	 * level 4 have both been told something the other has not, and taking the lower would let an
+	 * entrance quietly weaken the queue's own bar.
+	 *
+	 * Absent means this entrance adds nothing, which is what every queue node had before the field
+	 * existed and what an old reader will keep doing with it.
+	 */
+	readonly requiredSkills?: readonly QueueSkillRequirementPlan[];
 	/**
 	 * Virtual hold, when this queue offers it. See {@link QueueCallbackPlan}.
 	 *

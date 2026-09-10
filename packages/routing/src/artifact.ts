@@ -25,10 +25,12 @@
  */
 
 import { RoutingArtifactShapeError, RoutingArtifactVersionError } from "./errors";
+import type { CompiledAttestationPolicy } from "./attestation";
 import type { Diagnostic } from "./diagnostics";
 import type { CompiledFeatureCode } from "./feature-codes";
 import type { CompiledPattern } from "./patterns";
 import type { PlanNodeId, PlanNodeTable } from "./plan";
+import type { RecordingConsentPolicy } from "./recording-consent";
 import type {
 	CallBlockAction,
 	CallBlockDirection,
@@ -120,6 +122,19 @@ export interface InboundRule {
 	readonly failoverNodeId?: PlanNodeId;
 	/** Prefixed onto the inbound caller-id name, from the DID. */
 	readonly callerIdNamePrefix?: string;
+	/**
+	 * This rule's own recording-consent policy, when the tenant set one on the route.
+	 *
+	 * Absent means INHERIT — the DID's override if it has one, otherwise
+	 * {@link CompiledRoutingSettings.recording}. Absent is what every artifact compiled before this
+	 * field carries and what every route that has not been given an override carries, so a reader
+	 * that ignores it falls back to the org policy, which before this field was the only policy
+	 * there was. That is why this is not an artifact-version bump: an old reader that never looks at
+	 * the key behaves exactly as it did.
+	 */
+	readonly recordingConsentPolicy?: RecordingConsentPolicy;
+	/** The prompt this rule announces with. Absent means the DID's, or the org's, or the seeded one. */
+	readonly recordingConsentPromptId?: string;
 }
 
 /**
@@ -155,6 +170,16 @@ export interface InboundDidDefault {
 	readonly recordEnabled: boolean;
 	readonly callerIdNamePrefix?: string;
 	readonly destinationNodeId: PlanNodeId;
+	/**
+	 * This DID's own recording-consent policy, when the tenant set one on the number.
+	 *
+	 * The same inherit-when-absent contract {@link InboundRule.recordingConsentPolicy} carries, and
+	 * present on the DID default as well as on the rule because a call that matched no rule still
+	 * reaches this row and still has to be told what it owes the caller.
+	 */
+	readonly recordingConsentPolicy?: RecordingConsentPolicy;
+	/** The prompt this DID announces with. Absent means the org's, or the engine's seeded one. */
+	readonly recordingConsentPromptId?: string;
 }
 
 /** What an internal number resolves to, and which entity claimed it. */
@@ -378,6 +403,21 @@ export interface ExtensionIndexEntry {
 	 * phone lights the right shared-line key. Absent means the extension is on no shared line.
 	 */
 	readonly sharedLineAppearances?: readonly ExtensionSharedLineAppearance[];
+	/**
+	 * Pause this extension's recording while digits are being pressed — the PCI rule.
+	 *
+	 * On the index as well as on the node for the reason `pickupGroup` is on both, with the roles
+	 * reversed: the DTMF handler holds the DIALLED number and needs the flag before it has walked to
+	 * a node, and this map is the only number→extension-fact lookup the engine has without a
+	 * database.
+	 *
+	 * Written only when it is `true`. Absent means "do not pause", which is what every extension did
+	 * before the flag existed, so an artifact compiled without it and an artifact compiled for a
+	 * tenant that never set it are the same bytes — and a reader that ignores the key keeps
+	 * recording through the digits exactly as it always has. Not an artifact-version bump for that
+	 * reason.
+	 */
+	readonly recordAutoPauseOnDtmf?: boolean;
 	readonly nodeId: PlanNodeId;
 }
 
@@ -407,6 +447,16 @@ export interface CompiledPhrase {
 export interface CompiledRoutingSettings {
 	readonly defaultTimezone: string;
 	readonly outboundEnabled: boolean;
+	/**
+	 * Hold TLS-registered handsets to SDES-SRTP. See
+	 * {@link import("./snapshot").RoutingSettingsInput.requireSrtpForTlsPhones}.
+	 *
+	 * Optional here rather than defaulted, unlike its neighbours, because absent has to keep meaning
+	 * exactly what it meant before the field existed — the media plane's own floor decides — and
+	 * writing `false` into every artifact would change the compiled bytes for every tenant on the
+	 * platform to say what their engine already did.
+	 */
+	readonly requireSrtpForTlsPhones?: boolean;
 	readonly outboundCallerIdNumber?: string;
 	readonly outboundCallerIdName?: string;
 	/**
@@ -433,6 +483,117 @@ export interface CompiledRoutingSettings {
 	 * engine's problem and is documented where it counts.
 	 */
 	readonly maxConcurrentCalls?: number;
+	/**
+	 * The organization's recording-consent policy, already defaulted.
+	 *
+	 * Absent ONLY in an artifact compiled before this block existed — a fresh compile always writes
+	 * it, because every field in it has a compiler default and a half-written policy is worse than
+	 * none. A reader that finds it absent records without announcing, which is what every release
+	 * before this one did; that is why the block is optional and why adding it is not an
+	 * artifact-version bump.
+	 *
+	 * It is a nested object rather than six flat siblings because it is read as a unit: the engine's
+	 * consent gate wants the policy, the prompt and both digits at the same instant, and a
+	 * `declineDigit` that outlived its `consentPolicy` is not a setting anybody can act on.
+	 */
+	readonly recording?: CompiledRecordingPolicy;
+	/**
+	 * The organization's toll-fraud spend and velocity controls, enforced by the engine at DIAL time.
+	 *
+	 * Absent means the tenant has no policy row, which is what every artifact compiled before this
+	 * field existed carries — so a reader that finds it missing places every call it would have
+	 * placed before. That is why this is not an artifact-version bump, the same argument
+	 * {@link CompiledRoutingSettings.maxConcurrentCalls} and {@link CompiledRoutingSettings.realm}
+	 * both make.
+	 *
+	 * It is on the artifact rather than behind an RPC because the engine holds no database handle and
+	 * this is a per-org fact — the same reason the realm and the concurrency ceiling are here. What
+	 * is NOT here is the per-EXTENSION override and the rolling usage: an override belongs to one
+	 * extension and rides `ExtensionIndexEntry` when it lands, and usage is state that changes
+	 * between compiles by definition. The engine reads the ceilings from here and the counters from
+	 * the shared window (`shared_rate_window`), which is what keeps the artifact a description of
+	 * CONFIGURATION and never of the present moment.
+	 */
+	readonly tollFraud?: CompiledTollFraudPolicy;
+	/**
+	 * The outbound attestation policy, and the caller-id right-to-use table it decides against.
+	 *
+	 * Always written by a fresh compile, for the reason {@link CompiledRoutingSettings.recording} is:
+	 * every field in it has a compiler default, and a half-written policy is worse than none. Absent
+	 * means an artifact compiled before this block existed, and a reader that finds it absent decides
+	 * no attestation and refuses nothing — exactly what every release before this one did, which is
+	 * why adding it is not an artifact-version bump.
+	 *
+	 * It rides `settings` rather than sitting beside it for the mechanical reason
+	 * {@link CompiledRoutingSettings.maxConcurrentCalls} records: `canonicalizeSnapshot` hashes
+	 * `settings` on an explicit line, so a field here is covered by `snapshotHash` for free while a
+	 * new top-level sibling would silently not be.
+	 */
+	readonly attestation?: CompiledAttestationPolicy;
+}
+
+/**
+ * Spend, velocity and geo controls on international calling, as the engine reads them.
+ *
+ * Every ceiling is optional and an absent one means "no ceiling on that axis" — deliberately NOT
+ * defaulted to a number, because there is no number that is right for every tenant and a compiler
+ * that invented one would start refusing calls for organizations that never configured anything.
+ * `enabled: false` lifts all of them at once without losing what they were set to.
+ *
+ * The lists are ISO-3166 alpha-2, upper case, already de-duplicated and sorted by the compiler so
+ * two compiles of one snapshot produce the same bytes. An EMPTY list is dropped rather than carried:
+ * an empty allow list would refuse every international call, which is never what clearing a field
+ * meant.
+ */
+export interface CompiledTollFraudPolicy {
+	readonly enabled: boolean;
+	/** Simultaneous international legs across the organization. */
+	readonly maxConcurrentInternationalCalls?: number;
+	/** Whole minutes of international talk time in a rolling hour, and in a rolling day. */
+	readonly maxInternationalMinutesPerHour?: number;
+	readonly maxInternationalMinutesPerDay?: number;
+	/** When present and non-empty, a destination country NOT on this list is refused. */
+	readonly allowedCountries?: readonly string[];
+	/** When present and non-empty, a destination country ON this list is refused. */
+	readonly deniedCountries?: readonly string[];
+	/** Hold the first call this organization has ever placed to a given country. */
+	readonly holdFirstCallToNewCountry?: boolean;
+	/** Refuse international calls inside the window below. */
+	readonly offHoursInternationalLock?: boolean;
+	/**
+	 * The window, as minutes since local midnight. `start > end` is the ordinary case and WRAPS
+	 * midnight (20:00 → 07:00), which is the shape every office actually wants; a reader that
+	 * compares without allowing for the wrap will lock the wrong half of the day.
+	 */
+	readonly offHoursStartMinute?: number;
+	readonly offHoursEndMinute?: number;
+	/** The zone those two are read in. Absent means {@link CompiledRoutingSettings.defaultTimezone}. */
+	readonly offHoursTimezone?: string;
+}
+
+/**
+ * The org-wide recording-consent settings, defaulted, as the engine reads them.
+ *
+ * Every field is REQUIRED here even though every input was optional: defaulting is the compiler's
+ * job precisely so the engine — which has no database, no settings page and no opinion — never has
+ * to decide what an absent accept digit means in the middle of a call. The one exception is
+ * `consentPromptId`, whose absence is meaningful rather than undecided: it names the engine's own
+ * seeded prompt, and inventing a row id here for a row the tenant does not have would be a dangling
+ * reference the media plane would fail on.
+ */
+export interface CompiledRecordingPolicy {
+	readonly consentPolicy: RecordingConsentPolicy;
+	/** Absent means the engine plays its seeded `sound:recording-consent` stem. */
+	readonly consentPromptId?: string;
+	readonly acceptDigit: string;
+	readonly declineDigit: string;
+	/**
+	 * The jurisdictions that force all-party treatment, upgrading `none` to an announcement and
+	 * announcing to BOTH sides. Empty is a tenant that has deliberately switched the safety net off.
+	 */
+	readonly allPartyRegions: readonly string[];
+	/** The org-wide default for the PCI pause; the extension and the queue may override it. */
+	readonly autoPauseOnDtmf: boolean;
 }
 
 /**

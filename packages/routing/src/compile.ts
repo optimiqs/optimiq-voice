@@ -32,6 +32,7 @@ import {
 	RETRYABLE_HANGUP_CAUSES,
 } from "@optimiq-voice/telephony";
 import { ROUTING_ARTIFACT_VERSION } from "./artifact";
+import { attestationKey, isUnverifiedCallerIdPolicy } from "./attestation";
 import { snapshotHash } from "./cache";
 import { destinationShapeIssues, isDestinationType } from "./destinations";
 import { DiagnosticBag } from "./diagnostics";
@@ -61,7 +62,8 @@ import {
 	patternSubsumes,
 	validateDigitManipulation,
 } from "./patterns";
-import { planNodeReferences } from "./plan";
+import { planNodeReferences, QUEUE_SKILL_LEVEL_MAX, QUEUE_SKILL_LEVEL_MIN } from "./plan";
+import { DEFAULT_ALL_PARTY_REGIONS, isRecordingConsentPolicy } from "./recording-consent";
 import { checkCallBlock } from "./resolve";
 import {
 	isOptionalSnapshotCollection,
@@ -78,6 +80,8 @@ import { voicemailPinHashIssue } from "./voicemail-pin";
 import type {
 	CompiledCallBlockRule,
 	CompiledPhrase,
+	CompiledRecordingPolicy,
+	CompiledTollFraudPolicy,
 	CompiledRoutingSettings,
 	EmergencyMatchTable,
 	EmergencyRule,
@@ -97,6 +101,7 @@ import type {
 	SpeedDialEntry,
 	VoicemailPrefixEntry,
 } from "./artifact";
+import type { CallerIdRightToUse, CompiledAttestationPolicy } from "./attestation";
 import type { Destination } from "./destinations";
 import type { Diagnostic, DiagnosticSubject } from "./diagnostics";
 import type { CompiledFeatureCode } from "./feature-codes";
@@ -111,10 +116,12 @@ import type {
 	IvrOption,
 	PlanNode,
 	QueueCallbackPlan,
+	QueueSkillRequirementPlan,
 	PlanNodeId,
 	RingGroupMember,
 	SharedLineAppearance,
 } from "./plan";
+import type { RecordingConsentPolicy } from "./recording-consent";
 import type {
 	AudioStreamInput,
 	CallBlockAction,
@@ -135,6 +142,8 @@ import type {
 	PinSetInput,
 	PromptInput,
 	RingGroupDestinationInput,
+	RoutingSettingsInput,
+	TollFraudPolicyInput,
 	SharedLineInput,
 	TimeConditionRuleInput,
 	TranslationRuleInput,
@@ -556,6 +565,9 @@ class Compiler {
 		return compact({
 			defaultTimezone: timezone,
 			outboundEnabled: input.outboundEnabled ?? true,
+			// `compact()` drops it when the tenant has not set it, which is what keeps an artifact
+			// compiled before this setting existed byte-identical to one compiled after.
+			requireSrtpForTlsPhones: input.requireSrtpForTlsPhones === true ? true : undefined,
 			outboundCallerIdNumber: this.e164Field(
 				input.outboundCallerIdNumber,
 				"Organization outbound caller id",
@@ -568,7 +580,184 @@ class Compiler {
 			// what every tenant with no realm set carries, keeping their snapshot byte-identical.
 			realm: normaliseRealm(input.realm),
 			maxConcurrentCalls: this.concurrentCallCeiling(input.maxConcurrentCalls),
+			recording: this.compileRecordingPolicy(input),
+			tollFraud: this.compileTollFraudPolicy(input.tollFraud),
+			attestation: this.compileAttestationPolicy(input),
 		}) as CompiledRoutingSettings;
+	}
+
+	/**
+	 * The organization's outbound attestation block, fully defaulted.
+	 *
+	 * Always written, on the same argument {@link compileRecordingPolicy} makes: the values derive
+	 * from the inputs alone, so two compiles of one snapshot still produce the same bytes, and a
+	 * tenant that has set none of the fields gets the same block every time rather than a key that
+	 * comes and goes.
+	 *
+	 * ## Where `rightToUse` comes from
+	 *
+	 * The `owned` half is DERIVED from `phoneNumbers` rather than sent by the loader, and that is the
+	 * point: a DID this platform assigned is already a row in that collection, and asking the loader
+	 * to send the same numbers twice would create a second copy that can disagree with the first.
+	 * The A criterion in the April 2026 FNPRM is that the provider knows the customer has the right
+	 * to use the calling number, and for an assigned DID that IS the `phone_number` row.
+	 *
+	 * A DISABLED number is included on purpose. `enabled` is a routing switch — it stops the DID
+	 * receiving calls — and it says nothing about who owns the number. A tenant who parks an inbound
+	 * DID but still presents it outbound has not lost the right to use it, and downgrading their
+	 * calls to C on a switch that means something else would be wrong in the direction that matters.
+	 *
+	 * The `verified` half is the loader's, already filtered for expiry — the compiler reads no clock,
+	 * so a lapsed document has to arrive as an absent entry rather than as a row with a date on it.
+	 * `owned` wins a collision, because a number the platform assigned needs no document behind it.
+	 */
+	private compileAttestationPolicy(input: RoutingSettingsInput): CompiledAttestationPolicy {
+		const rightToUse: Record<string, CallerIdRightToUse> = {};
+		for (const e164 of input.verifiedCallerIds ?? []) {
+			const key = attestationKey(e164);
+			if (key !== "") {
+				rightToUse[key] = "verified";
+			}
+		}
+		for (const number of this.snapshot.phoneNumbers) {
+			const key = attestationKey(number.e164);
+			if (key !== "") {
+				rightToUse[key] = "owned";
+			}
+		}
+		const policy = input.unverifiedCallerIdPolicy ?? "allow";
+		return {
+			// A value the settings row carries that is NOT one of the three falls back to `allow`
+			// rather than to the strictest reading, for the reason `compileRecordingPolicy` drops an
+			// unknown consent policy to `none`: `org_setting` is jsonb, the value arrives as whatever
+			// was written, and a typo must not start refusing a tenant's calls.
+			unverifiedCallerIdPolicy: isUnverifiedCallerIdPolicy(policy) ? policy : "allow",
+			rightToUse,
+			kycApproved: input.kycApproved ?? false,
+			kycRequiredForOutbound: input.requireKycForOutbound ?? false,
+		};
+	}
+
+	/**
+	 * The organization's toll-fraud controls, or `undefined` when it has no policy row.
+	 *
+	 * Unlike {@link ArtifactCompiler.compileRecordingPolicy} this is NOT always written, and the
+	 * difference is what the absence means. An absent recording block is ambiguous — a tenant who
+	 * has configured nothing and an artifact compiled before the block existed look the same, and
+	 * the engine has to pick digits either way. An absent toll-fraud block is unambiguous: there is
+	 * nothing to enforce, which is exactly what an old artifact meant too. Writing an empty block
+	 * for every tenant would put a key in every artifact on the platform to say "no".
+	 *
+	 * Nothing here is a diagnostic. A ceiling that reached the database as a negative or a fraction
+	 * is DROPPED rather than reported, on the same reasoning
+	 * {@link ArtifactCompiler.concurrentCallCeiling} gives for warning instead of erroring: the
+	 * artifact is perfectly routable without that ceiling, and refusing the compile would take every
+	 * call in the tenant down to report a control nobody is currently hitting. Unlike that one it
+	 * does not warn either — these columns are integers with a DTO in front of them, so a bad value
+	 * cannot arrive from the ordinary path, and a warning per compile for a row nobody can produce
+	 * is noise in every diagnostic bag on the platform.
+	 */
+	private compileTollFraudPolicy(
+		input: TollFraudPolicyInput | null | undefined,
+	): CompiledTollFraudPolicy | undefined {
+		if (input === null || input === undefined) {
+			return undefined;
+		}
+		return compact({
+			// The only REQUIRED field, and it defaults to true: a row that exists is a tenant that
+			// asked for controls, and reading a missing flag as "off" would silently disarm them.
+			enabled: input.enabled ?? true,
+			maxConcurrentInternationalCalls: ceiling(input.maxConcurrentInternationalCalls),
+			maxInternationalMinutesPerHour: ceiling(input.maxInternationalMinutesPerHour),
+			maxInternationalMinutesPerDay: ceiling(input.maxInternationalMinutesPerDay),
+			allowedCountries: countryList(input.allowedCountries),
+			deniedCountries: countryList(input.deniedCountries),
+			// Written only when true, so a tenant that has never touched them keeps the same bytes.
+			holdFirstCallToNewCountry: input.holdFirstCallToNewCountry === true ? true : undefined,
+			offHoursInternationalLock: input.offHoursInternationalLock === true ? true : undefined,
+			// Carried only alongside the lock they configure. A window on an artifact whose lock is
+			// off is two keys the engine must read to learn nothing.
+			offHoursStartMinute:
+				input.offHoursInternationalLock === true
+					? minuteOfDay(input.offHoursStartMinute)
+					: undefined,
+			offHoursEndMinute:
+				input.offHoursInternationalLock === true ? minuteOfDay(input.offHoursEndMinute) : undefined,
+			offHoursTimezone:
+				input.offHoursInternationalLock === true && isKnownTimezone(input.offHoursTimezone ?? "")
+					? (input.offHoursTimezone ?? undefined)
+					: undefined,
+		}) as CompiledTollFraudPolicy;
+	}
+
+	/**
+	 * The organization's recording-consent block, fully defaulted.
+	 *
+	 * Always written, unlike every other optional field on the settings — the block is absent only in
+	 * an artifact compiled before it existed, and a fresh compile that omitted it would hand the
+	 * engine a settings object it could not tell apart from an old one. That costs nothing in
+	 * stability terms: the values are derived from the inputs alone, so two compiles of one snapshot
+	 * still produce the same bytes, and a tenant that has set none of the fields gets the same block
+	 * every time rather than a key that comes and goes.
+	 *
+	 * A policy string the settings row carries that is NOT one of the three is dropped to `"none"`
+	 * rather than compiled: `org_setting` is jsonb, so the value reaches here as whatever was
+	 * written, and `none` is the reading that leaves the tenant exactly where they were instead of
+	 * inventing an obligation from a typo.
+	 */
+	private compileRecordingPolicy(input: RoutingSettingsInput): CompiledRecordingPolicy {
+		const policy = input.recordingConsentPolicy ?? "none";
+		return compact({
+			consentPolicy: isRecordingConsentPolicy(policy) ? policy : "none",
+			consentPromptId: this.consentPromptRef(
+				input.recordingConsentPromptId,
+				undefined,
+				"settings.recordingConsentPromptId",
+			),
+			acceptDigit: consentDigit(input.recordingConsentAcceptDigit, "1"),
+			declineDigit: consentDigit(input.recordingConsentDeclineDigit, "2"),
+			// An explicitly empty array is a tenant switching the safety net off and is respected;
+			// absent is a tenant who has never seen the setting, and they get the seeded list.
+			allPartyRegions: input.recordingAllPartyRegions ?? [...DEFAULT_ALL_PARTY_REGIONS],
+			autoPauseOnDtmf: input.recordingAutoPauseOnDtmf ?? false,
+		}) as CompiledRecordingPolicy;
+	}
+
+	/**
+	 * A consent prompt id, carried through only when the prompt library actually has it.
+	 *
+	 * The one place a dangling prompt id is DROPPED rather than emitted, and the difference from
+	 * {@link promptRef} is the difference in what happens next. An IVR greeting that vanished has no
+	 * substitute, so the id is kept and the diagnostic is the whole remedy — dropping it would
+	 * silently change the menu's shape. A consent announcement does have a substitute: the engine
+	 * falls back to its seeded `sound:recording-consent` stem. Carrying a dead id here would replace
+	 * a working announcement with silence on exactly the calls the tenant switched the feature on to
+	 * protect, so the id goes and the warning stays.
+	 */
+	private consentPromptRef(
+		promptId: string | null | undefined,
+		subject: DiagnosticSubject | undefined,
+		path: string,
+	): string | undefined {
+		const id = this.promptRef(promptId, subject, path);
+		if (id === undefined) {
+			return undefined;
+		}
+		return this.snapshot.prompts !== undefined && !this.promptsById.has(id) ? undefined : id;
+	}
+
+	/**
+	 * The consent policy a DID or an inbound route overrides the organization's with.
+	 *
+	 * `null` and absent both mean inherit and both compile to no key at all, which is what keeps a
+	 * tenant that has set no override byte-identical across a loader that learns to select the
+	 * column. A value outside the vocabulary is dropped for the reason
+	 * {@link compileRecordingPolicy} gives — inheriting the org is the reading that changes nothing.
+	 */
+	private consentPolicyOverride(
+		policy: RecordingConsentPolicy | null | undefined,
+	): RecordingConsentPolicy | undefined {
+		return policy != null && isRecordingConsentPolicy(policy) ? policy : undefined;
 	}
 
 	/**
@@ -1071,6 +1260,7 @@ class Compiler {
 			// key at all — which is what makes the field's absence and `false` the same artifact, and
 			// therefore what keeps the hash stable across a loader that learns to select the column.
 			callScreening: extension.callScreening ?? undefined,
+			recordAutoPauseOnDtmf: autoPauseFlag(extension.recordAutoPauseOnDtmf),
 			mohClassId: extension.mohClassId ?? undefined,
 			mohClass: this.mohClassName(extension.mohClassId, subject, "mohClassId"),
 			forwardAllNodeId: extension.forwardAllEnabled
@@ -1674,7 +1864,11 @@ class Compiler {
 		if (!entry.enabled) {
 			return this.disabledTarget("queue", entry.name, subject, path);
 		}
-		return this.queueNode(entry, this.queuePriorityOverride(from, entry, subject, path));
+		return this.queueNode(
+			entry,
+			this.queuePriorityOverride(from, entry, subject, path),
+			this.queueSkillsOverride(from, entry, subject, path),
+		);
 	}
 
 	/**
@@ -1722,6 +1916,83 @@ class Compiler {
 	}
 
 	/**
+	 * The per-entrance skill requirements a `queue` destination may carry, as
+	 * `destination_data.args.skills`.
+	 *
+	 * ## Why a STRING and not a list of objects
+	 *
+	 * Because `DestinationData.args` is `Record<string, string | number | boolean>` and that is not
+	 * an accident: `destinationKey` builds a node-dedup key by `String()`-ing every value, so a
+	 * value that is an object or an array keys as `[object Object]` and two entrances asking for
+	 * different skills would silently collapse into one node. Widening the type to fix the spelling
+	 * would break the deduplication, so the requirements are spelled in the vocabulary `args`
+	 * already has.
+	 *
+	 * The grammar is one comma-separated list of `skill[:minLevel[:relaxAfterSeconds]]` —
+	 * `"spanish:3:60,billing"` is "level 3 Spanish, coming down a level a minute, and any Billing at
+	 * all". A bare tag means level 1 and no relaxation, which is the reading an operator typing a
+	 * list of tags into a form intends and the shape a spreadsheet import produces.
+	 *
+	 * ## Why a malformed entry is a WARNING and not an error
+	 *
+	 * `queuePriorityOverride`'s argument, one step sharper. A dropped priority costs a caller their
+	 * place in the line; a dropped REQUIREMENT costs them the right agent, and a REFUSED compile
+	 * costs the tenant every route in the artifact. Between "this caller may reach an agent who does
+	 * not speak their language" and "nobody in this organization can be called at all", the first is
+	 * recoverable by the person reading the warning and the second is an outage. So the malformed
+	 * entry is dropped, named in the diagnostic, and the rest of the list still compiles.
+	 *
+	 * A list that is entirely unusable returns `undefined` rather than an empty array, so the node
+	 * is identical to one with no override at all and the queue's own requirements are what apply.
+	 */
+	private queueSkillsOverride(
+		from: Destination | null,
+		entry: OrgRoutingSnapshot["queues"][number],
+		subject: DiagnosticSubject,
+		path: string,
+	): readonly QueueSkillRequirementPlan[] | undefined {
+		const raw = from?.destinationData?.args?.skills;
+		if (raw === undefined) {
+			return undefined;
+		}
+		if (typeof raw !== "string") {
+			this.bag.warning(
+				"invalid-queue-skills",
+				`Queue "${entry.name}" was pointed at with ${JSON.stringify(raw)} as its skill requirements, which is not a "skill:level:relax,…" list. Callers arriving this way are matched against the queue's own requirements instead.`,
+				subject,
+				path,
+			);
+			return undefined;
+		}
+
+		const bySkill = new Map<string, QueueSkillRequirementPlan>();
+		for (const item of raw.split(",")) {
+			if (item.trim() === "") {
+				continue;
+			}
+			const parsed = parseSkillRequirement(item);
+			if (parsed === undefined) {
+				this.bag.warning(
+					"invalid-queue-skills",
+					`Queue "${entry.name}" was pointed at with ${JSON.stringify(item.trim())} among its skill requirements, which is not a skill tag optionally followed by \`:minLevel\` between ${String(QUEUE_SKILL_LEVEL_MIN)} and ${String(QUEUE_SKILL_LEVEL_MAX)} and \`:relaxAfterSeconds\`. That entry was dropped; the rest still apply.`,
+					subject,
+					path,
+				);
+				continue;
+			}
+			// Last write wins on a repeated tag rather than the higher level: a list that names one
+			// skill twice is a typo in one form, and picking the stricter half of a typo is a rule
+			// nobody can predict from reading their own configuration.
+			bySkill.set(parsed.skill, parsed);
+		}
+
+		if (bySkill.size === 0) {
+			return undefined;
+		}
+		return [...bySkill.values()].sort((left, right) => left.skill.localeCompare(right.skill));
+	}
+
+	/**
 	 * One queue, at one entry priority.
 	 *
 	 * ## Why the priority is in the node ID
@@ -1741,12 +2012,12 @@ class Compiler {
 	private queueNode(
 		entry: OrgRoutingSnapshot["queues"][number],
 		priorityOverride?: number,
+		skillsOverride?: readonly QueueSkillRequirementPlan[],
 	): PlanNodeId {
 		const priority = priorityOverride ?? entry.defaultPriority ?? QUEUE_PRIORITY_MIN;
-		const id =
-			priorityOverride === undefined
-				? `queue:${entry.id}`
-				: `queue:${entry.id}:p${String(priorityOverride)}`;
+		const id = `queue:${entry.id}${
+			priorityOverride === undefined ? "" : `:p${String(priorityOverride)}`
+		}${skillsOverride === undefined ? "" : `:s${skillsKeyOf(skillsOverride)}`}`;
 		if (this.claimed.has(id)) {
 			return id;
 		}
@@ -1794,10 +2065,12 @@ class Compiler {
 			announcePositionEnabled: entry.announcePositionEnabled,
 			announceFrequencySeconds: entry.announceFrequencySeconds,
 			recordPolicy: entry.recordPolicy ?? "none",
+			recordAutoPauseOnDtmf: autoPauseFlag(entry.recordAutoPauseOnDtmf),
 			exitKey,
 			exitNodeId,
 			callback: this.queueCallback(entry, exitKey, subject),
 			priority,
+			requiredSkills: skillsOverride,
 			abandonedResumeAllowed: entry.abandonedResumeAllowed ?? false,
 			discardAbandonedAfterSeconds: entry.discardAbandonedAfterSeconds ?? 0,
 			timeoutNodeId: this.namedDestinationNode(entry, "timeout", subject) ?? undefined,
@@ -2725,7 +2998,7 @@ class Compiler {
 	 */
 	private promptRef(
 		promptId: string | null | undefined,
-		subject: DiagnosticSubject,
+		subject: DiagnosticSubject | undefined,
 		path: string,
 	): string | undefined {
 		const id = promptId ?? undefined;
@@ -3826,6 +4099,14 @@ class Compiler {
 					destinationNodeId,
 					failoverNodeId: failoverNodeId ?? undefined,
 					callerIdNamePrefix: did?.callerIdNamePrefix ?? undefined,
+					// Inherit-when-absent, so a route with no override carries no key and its tenant's
+					// artifact is the same bytes it was before the columns existed.
+					recordingConsentPolicy: this.consentPolicyOverride(route.recordingConsentPolicy),
+					recordingConsentPromptId: this.consentPromptRef(
+						route.recordingConsentPromptId,
+						subject,
+						"recordingConsentPromptId",
+					),
 				}) as InboundRule,
 			);
 		}
@@ -3863,6 +4144,12 @@ class Compiler {
 				recordEnabled: did.recordEnabled,
 				callerIdNamePrefix: did.callerIdNamePrefix ?? undefined,
 				destinationNodeId,
+				recordingConsentPolicy: this.consentPolicyOverride(did.recordingConsentPolicy),
+				recordingConsentPromptId: this.consentPromptRef(
+					did.recordingConsentPromptId,
+					subject,
+					"recordingConsentPromptId",
+				),
 			}) as InboundDidDefault;
 		}
 
@@ -4507,6 +4794,8 @@ class Compiler {
 					extension.outboundCallerIdPresentation === "restricted" ? "restricted" : undefined,
 				emergencyCallerIdNumber: extension.emergencyCallerIdNumber ?? undefined,
 				pickupGroup: pickupGroupOf(extension),
+				// The DTMF handler reads it off this map, from the dialled number, before it has a node.
+				recordAutoPauseOnDtmf: autoPauseFlag(extension.recordAutoPauseOnDtmf),
 				sharedLineAppearances:
 					sharedLineAppearances !== undefined && sharedLineAppearances.length > 0
 						? sharedLineAppearances
@@ -4790,6 +5079,71 @@ function sortRecordKeys<T>(record: Readonly<Record<string, T>>): Readonly<Record
  * same value to a consumer but different to `JSON.stringify` — and therefore to the artifact hash.
  */
 /**
+ * One `skill[:minLevel[:relaxAfterSeconds]]` entry, parsed, or `undefined` when it is not usable.
+ *
+ * The tag is trimmed and lower-cased rather than refused, because `"Spanish "` from a spreadsheet
+ * import means the same skill as `spanish` and dropping it would leave the caller unmatched for a
+ * reason nobody can see in their own form. The SHAPE is still enforced: a tag with a space in the
+ * middle is a different tag from the one on any agent, so it fails the same check `pbx-db` applies
+ * at write time and is dropped with a warning.
+ */
+function parseSkillRequirement(value: string): QueueSkillRequirementPlan | undefined {
+	const [rawSkill, rawLevel, rawRelax, ...rest] = value.split(":");
+	if (rest.length > 0 || rawSkill === undefined) {
+		return undefined;
+	}
+	const skill = normalizeSkillTag(rawSkill);
+	if (skill === undefined) {
+		return undefined;
+	}
+	const minLevel = fieldOf(rawLevel, QUEUE_SKILL_LEVEL_MIN);
+	if (
+		minLevel === undefined ||
+		minLevel < QUEUE_SKILL_LEVEL_MIN ||
+		minLevel > QUEUE_SKILL_LEVEL_MAX
+	) {
+		return undefined;
+	}
+	const relax = fieldOf(rawRelax, 0);
+	if (relax === undefined || relax < 0 || relax > MAX_SKILL_RELAX_SECONDS) {
+		return undefined;
+	}
+	return { skill, minLevel, relaxAfterSeconds: relax };
+}
+
+/** An omitted or blank field takes the default; anything that is not a whole number is a refusal. */
+function fieldOf(raw: string | undefined, fallback: number): number | undefined {
+	if (raw === undefined || raw.trim() === "") {
+		return fallback;
+	}
+	const value = Number(raw);
+	return Number.isInteger(value) ? value : undefined;
+}
+
+/** The same tag shape `pbx-db`'s `queue_agent_skill_shape_check` enforces, applied to the artifact. */
+function normalizeSkillTag(value: string): string | undefined {
+	const tag = value.trim().toLowerCase();
+	return /^[a-z0-9][a-z0-9_-]{0,62}$/.test(tag) ? tag : undefined;
+}
+
+/** Matches `queue_skill_requirement_relax_range_check`. An hour of relaxation is already a queue that gave up. */
+const MAX_SKILL_RELAX_SECONDS = 3600;
+
+/**
+ * The node-id fragment a skills override folds into `queue:<id>`.
+ *
+ * Same property `queueNode`'s priority suffix needs and for the same reason: same override, same
+ * id; different override, different node. The list is already sorted by skill when it reaches here,
+ * so the fragment is a pure function of the requirement set and a recompile of an unchanged
+ * snapshot produces the same artifact hash.
+ */
+function skillsKeyOf(requirements: readonly QueueSkillRequirementPlan[]): string {
+	return requirements
+		.map((entry) => `${entry.skill}-${String(entry.minLevel)}-${String(entry.relaxAfterSeconds)}`)
+		.join("_");
+}
+
+/**
  * A queue exit key, or `undefined` when the column says the queue has none.
  *
  * Upper-cased before the membership test so a tenant who typed `d` gets the DTMF `D` rather than a
@@ -4807,6 +5161,80 @@ function normalizeExitKey(value: string | null | undefined): string | undefined 
 		return undefined;
 	}
 	return (QUEUE_EXIT_KEYS as readonly string[]).includes(trimmed) ? trimmed : undefined;
+}
+
+/**
+ * A consent accept/decline digit, falling back to the documented default.
+ *
+ * The same DTMF vocabulary a queue exit key is checked against, and it falls back silently rather
+ * than warning: the engine cannot wait for a keypress that no keypad can produce, and a tenant left
+ * with the documented `1`/`2` has a gate that works. A settings row is not a place a typo survives
+ * review the way a per-queue key is, which is why that one earns a diagnostic and this one does not.
+ */
+function consentDigit(value: string | null | undefined, fallback: string): string {
+	return normalizeExitKey(value) ?? fallback;
+}
+
+/**
+ * The PCI auto-pause flag, written only when it is on.
+ *
+ * `false`, `null` and absent all collapse to no key, and that is the point rather than tidiness: a
+ * `false` written into the artifact would make the snapshot of every tenant who never touched the
+ * setting differ from the one they had, which is a cache invalidation and a republished artifact for
+ * a behaviour that did not change. Absent already means "do not pause".
+ */
+function autoPauseFlag(value: boolean | null | undefined): true | undefined {
+	return value === true ? true : undefined;
+}
+
+/**
+ * A non-negative whole ceiling, or `undefined` for every other input.
+ *
+ * Zero is dropped along with NULL, and that reading is deliberate and matches
+ * {@link ArtifactCompiler.concurrentCallCeiling}: a tenant who typed a zero into a limit field meant
+ * "no limit", and the other interpretation — refuse every international call — takes their overseas
+ * calling down on a keystroke. An extension that genuinely may not call internationally is expressed
+ * by its toll class, which is the control designed to say so.
+ */
+function ceiling(value: number | null | undefined): number | undefined {
+	if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+		return undefined;
+	}
+	return value;
+}
+
+/** A minute-of-day offset, or `undefined`. Out-of-range values are dropped, not clamped. */
+function minuteOfDay(value: number | null | undefined): number | undefined {
+	if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > 1_439) {
+		return undefined;
+	}
+	return value;
+}
+
+/**
+ * ISO-3166 alpha-2 codes, upper-cased, de-duplicated and sorted; `undefined` when nothing survives.
+ *
+ * Sorted because the artifact is hashed: a tenant who reorders the same three countries in the UI
+ * must not produce a different artifact, republish it and invalidate every engine's cache for a
+ * change that is not one. An empty result collapses to absent for the reason the schema column
+ * records — an empty ALLOW list would refuse every international call, and clearing a field never
+ * meant that.
+ */
+function countryList(value: readonly string[] | null | undefined): readonly string[] | undefined {
+	if (!Array.isArray(value)) {
+		return undefined;
+	}
+	const codes = new Set<string>();
+	for (const entry of value) {
+		if (typeof entry !== "string") {
+			continue;
+		}
+		const code = entry.trim().toUpperCase();
+		if (/^[A-Z]{2}$/.test(code)) {
+			codes.add(code);
+		}
+	}
+	return codes.size === 0 ? undefined : [...codes].sort();
 }
 
 function compact<T extends Record<string, unknown>>(value: T): T {

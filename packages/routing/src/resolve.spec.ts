@@ -1029,3 +1029,108 @@ describe("resolvers — determinism", () => {
 		);
 	});
 });
+
+describe("resolveOutbound — attestation and the compliance gate", () => {
+	const OWNED = "+15551230000";
+	const EXTERNAL = "+442079460000";
+
+	function artifactWith(
+		settings: Record<string, unknown> = {},
+		numbers = [aPhoneNumber({ id: "did-1", e164: OWNED })],
+	): RoutingArtifact {
+		return compiled(
+			aSnapshot({
+				settings: { outboundCallerIdNumber: OWNED, ...settings },
+				phoneNumbers: numbers,
+				extensions: [
+					anExtension(),
+					anExtension({ id: "ext-2", number: "1002", outboundCallerIdNumber: EXTERNAL }),
+				],
+				trunks: [aTrunk()],
+				outboundRoutes: [anOutboundRoute({ matchKind: "any", dialPatterns: [] })],
+			}),
+		);
+	}
+
+	it("attests A for a caller id the organization owns", () => {
+		const route = resolveOutbound(artifactWith(), {
+			from: "1001",
+			dialed: "5551239999",
+			now: NOW,
+		});
+		expect(route.matched).toBe(true);
+		expect(route.expectedAttestation).toBe("A");
+		expect(route.callerIdRightToUse).toBe("owned");
+	});
+
+	it("attests B for an externally verified caller id", () => {
+		const route = resolveOutbound(artifactWith({ verifiedCallerIds: [EXTERNAL] }), {
+			from: "1002",
+			dialed: "5551239999",
+			now: NOW,
+		});
+		expect(route.expectedAttestation).toBe("B");
+		expect(route.callerIdRightToUse).toBe("verified");
+	});
+
+	it("attests C and still places the call under the default allow policy", () => {
+		const route = resolveOutbound(artifactWith(), {
+			from: "1002",
+			dialed: "5551239999",
+			now: NOW,
+		});
+		expect(route.matched).toBe(true);
+		expect(route.expectedAttestation).toBe("C");
+		expect(route.callerIdNumber).toBe(EXTERNAL);
+		expect(route.complianceRefusal).toBeUndefined();
+	});
+
+	it("replaces an unvouched caller id with the organization's main number", () => {
+		const route = resolveOutbound(artifactWith({ unverifiedCallerIdPolicy: "replace" }), {
+			from: "1002",
+			dialed: "5551239999",
+			now: NOW,
+		});
+		expect(route.matched).toBe(true);
+		expect(route.callerIdNumber).toBe(OWNED);
+		expect(route.expectedAttestation).toBe("A");
+	});
+
+	it("refuses an unvouched caller id with a named cause and the denied terminal", () => {
+		const artifact = artifactWith({ unverifiedCallerIdPolicy: "refuse" });
+		const route = resolveOutbound(artifact, { from: "1002", dialed: "5551239999", now: NOW });
+		expect(route.matched).toBe(false);
+		expect(route.complianceRefusal).toBe("unverified-caller-id");
+		expect(route.plan?.entryNodeId).toBe(artifact.outbound.deniedNodeId);
+		expect(route.diagnostics.map((entry) => entry.code)).toContain("attestation-refused");
+	});
+
+	it("blocks outbound PSTN while the KYC file is not approved", () => {
+		const route = resolveOutbound(artifactWith({ requireKycForOutbound: true }), {
+			from: "1001",
+			dialed: "5551239999",
+			now: NOW,
+		});
+		expect(route.matched).toBe(false);
+		expect(route.complianceRefusal).toBe("kyc-not-approved");
+	});
+
+	it("places the call once the KYC file is approved", () => {
+		const route = resolveOutbound(
+			artifactWith({ requireKycForOutbound: true, kycApproved: true }),
+			{ from: "1001", dialed: "5551239999", now: NOW },
+		);
+		expect(route.matched).toBe(true);
+		expect(route.complianceRefusal).toBeUndefined();
+	});
+
+	it("never applies the gate to an emergency call", () => {
+		const route = resolveOutbound(
+			artifactWith({ requireKycForOutbound: true, unverifiedCallerIdPolicy: "refuse" }),
+			{ from: "1002", dialed: "911", now: NOW },
+		);
+		expect(route.matched).toBe(true);
+		expect(route.complianceRefusal).toBeUndefined();
+		expect(route.expectedAttestation).toBeUndefined();
+	});
+});

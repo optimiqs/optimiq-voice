@@ -14,6 +14,23 @@
  */
 
 export {
+	ATTESTATION_LEVELS,
+	attestationKey,
+	CALLER_ID_RIGHT_TO_USE,
+	decideAttestation,
+	isAttestationLevel,
+	isCallerIdRightToUse,
+	isUnverifiedCallerIdPolicy,
+	OUTBOUND_COMPLIANCE_REFUSALS,
+	UNVERIFIED_CALLER_ID_POLICIES,
+	type AttestationDecision,
+	type AttestationLevel,
+	type CallerIdRightToUse,
+	type CompiledAttestationPolicy,
+	type OutboundComplianceRefusal,
+	type UnverifiedCallerIdPolicy,
+} from "./attestation";
+export {
 	contextReachesTrunks,
 	isRoutingArtifact,
 	isRoutingContext,
@@ -22,7 +39,9 @@ export {
 	ROUTING_CONTEXTS,
 	type CompiledCallBlockRule,
 	type CompiledPhrase,
+	type CompiledRecordingPolicy,
 	type CompiledRoutingSettings,
+	type CompiledTollFraudPolicy,
 	type EmergencyMatchTable,
 	type EmergencyRule,
 	type ExtensionIndexEntry,
@@ -200,8 +219,11 @@ export {
 	type PlanNodeOf,
 	type PlanNodeTable,
 	type PlaybackPlanNode,
+	QUEUE_SKILL_LEVEL_MAX,
+	QUEUE_SKILL_LEVEL_MIN,
 	type QueueCallbackPlan,
 	type QueuePlanNode,
+	type QueueSkillRequirementPlan,
 	type CallFlowPlanNode,
 	type CompiledPinEntry,
 	type CompiledPinSet,
@@ -218,6 +240,17 @@ export {
 	type VoicemailMode,
 	type VoicemailPlanNode,
 } from "./plan";
+export {
+	DEFAULT_ALL_PARTY_REGIONS,
+	isRecordingConsentPolicy,
+	RECORDING_CONSENT_METHODS,
+	RECORDING_CONSENT_OUTCOMES,
+	RECORDING_CONSENT_POLICIES,
+	type RecordingConsentMethod,
+	type RecordingConsentOutcome,
+	type RecordingConsentPolicy,
+	type RecordingConsentRecord,
+} from "./recording-consent";
 export {
 	checkCallBlock,
 	MAX_GATE_DEPTH,
@@ -291,6 +324,7 @@ export {
 	type RouteMatchKind,
 	type RoutingEntityInput,
 	type RoutingSettingsInput,
+	type TollFraudPolicyInput,
 	type SharedLineAppearanceInput,
 	type SharedLineInput,
 	type SharedLineStrategy,
