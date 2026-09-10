@@ -1,5 +1,5 @@
 import { z } from "zod/v4";
-import { ROUTE_MATCH_KINDS } from "@optimiq-voice/pbx-db";
+import { RECORDING_CONSENT_POLICIES, ROUTE_MATCH_KINDS } from "@optimiq-voice/pbx-db";
 import {
 	destinationShape,
 	displayName,
@@ -22,6 +22,14 @@ export const createInboundRouteDto = z.strictObject({
 	/** A gate: the route only applies while the condition's rules match. */
 	timeConditionId: z.uuid().nullish(),
 	recordEnabled: z.boolean().optional(),
+	/**
+	 * The same override {@link createPhoneNumberDto.shape.recordingConsentPolicy} carries, one level
+	 * more specific: a route that matches a pattern rather than a single number, and that therefore
+	 * beats the DID's answer for the calls it claims. `null` inherits — from the DID if the route
+	 * names one, from the organization otherwise.
+	 */
+	recordingConsentPolicy: z.enum(RECORDING_CONSENT_POLICIES).nullish(),
+	recordingConsentPromptId: z.uuid().nullish(),
 	enabled: z.boolean().optional(),
 });
 

@@ -87,6 +87,14 @@ const MAPPED_KEYS = new Set([
 	"sipVerstat",
 	"sipOrigId",
 	"sipCallId",
+	"recordingConsent",
+	"recordingConsentMethod",
+	"recordingConsentAt",
+	"recordingConsentRegions",
+	"expectedAttestation",
+	"callerIdRightToUse",
+	"trunkRef",
+	"signalingAddress",
 ]);
 
 /**
@@ -193,6 +201,30 @@ export interface CallLegInsertValues {
 	readonly sipOrigId: string | null;
 	/** The SIP `Call-ID` of the leg's dialog. Null on a leg that had no dialog. */
 	readonly sipCallId: string | null;
+	/**
+	 * What this platform decided the outbound call was entitled to assert, and on what basis.
+	 *
+	 * The mirror of `sipAttestation`, which is what somebody ELSE said about an inbound call. Null on
+	 * every inbound leg and on every producer that has not learned to send them.
+	 */
+	readonly expectedAttestation: string | null;
+	readonly callerIdRightToUse: string | null;
+	/** The trunk the leg crossed and the signalling peer at the far end. Both for the traceback. */
+	readonly trunkRef: string | null;
+	readonly signalingAddress: string | null;
+	/**
+	 * The consent this leg was recorded under, flattened into four columns.
+	 *
+	 * Explicitly `null` rather than optional, like the queue verdict above and for the same reason:
+	 * these are INSERT values, and spelling the absence keeps "nobody asked this caller anything" a
+	 * fact the type can be asked about rather than a key that happens not to be there. It is the
+	 * common case by a wide margin — four nulls on every leg of every tenant who has never switched
+	 * consent on, which is nearly all of them.
+	 */
+	readonly recordingConsent: string | null;
+	readonly recordingConsentMethod: string | null;
+	readonly recordingConsentAt: Date | null;
+	readonly recordingConsentRegions: string[] | null;
 	readonly raw: Record<string, unknown>;
 }
 
@@ -218,6 +250,47 @@ function asString(value: unknown): string | undefined {
 function asUuid(value: unknown): string | null {
 	const text = asString(value);
 	return text !== undefined && UUID_PATTERN.test(text) ? text : null;
+}
+
+/**
+ * The four consent columns, all null on the vast majority of legs.
+ *
+ * ## Why the outcome is not narrowed to the four words it should be
+ *
+ * `call_legs` carries no check constraint on any of these, and its schema says why at length: the
+ * table is append-only and partitioned, so a write that fails is a call record that is simply gone,
+ * with no path back to a hangup that happened once. A newer engine writing an outcome this build has
+ * never heard of during a rolling deploy must reach a row and be read as unknown later. Narrowing it
+ * here — coercing an unrecognised outcome to null — would throw away the only trace of what actually
+ * happened, in order to satisfy a constraint the column deliberately does not have. That is the
+ * opposite of what the rest of this file does for `disposition` and `hangupCause`, and the
+ * difference is exactly that those columns DO have check constraints and this one does not.
+ *
+ * ## Absent writes null, never a placeholder
+ *
+ * All four are missing from nearly every payload, and a missing one is `null` — not `"none"`, not an
+ * empty array. `none` is a real consent METHOD, meaning "the outcome was reached without asking
+ * anybody", and a leg that never went near the consent gate must not claim it. Likewise `[]` for
+ * regions would assert that the jurisdiction net ran and matched nothing, on a leg where it never
+ * ran at all.
+ */
+function mapRecordingConsent(payload: Record<string, unknown>): {
+	recordingConsent: string | null;
+	recordingConsentMethod: string | null;
+	recordingConsentAt: Date | null;
+	recordingConsentRegions: string[] | null;
+} {
+	const regions = Array.isArray(payload.recordingConsentRegions)
+		? payload.recordingConsentRegions.filter((entry): entry is string => typeof entry === "string")
+		: undefined;
+	return {
+		recordingConsent: asString(payload.recordingConsent)?.slice(0, 64) ?? null,
+		recordingConsentMethod: asString(payload.recordingConsentMethod)?.slice(0, 64) ?? null,
+		recordingConsentAt: asDate(payload.recordingConsentAt),
+		// An empty array from a producer is kept as an empty array: it says the net ran and matched
+		// nothing, which is a different fact from the absence above.
+		recordingConsentRegions: regions === undefined ? null : regions.slice(0, 16),
+	};
 }
 
 function asDate(value: unknown): Date | null {
@@ -457,10 +530,46 @@ export function mapCdrLegWrite(
 	if (attestationRaw !== undefined && sipAttestation === null) {
 		record("sipAttestation", payload.sipAttestation, "null");
 	}
+	/**
+	 * OUR attestation decision, validated the same way and dropped the same way.
+	 *
+	 * Same vocabulary, same refusal, and for a sharper reason than the carrier's: this level is the
+	 * one an enforcement inquiry reads as OUR assertion, so a value the platform cannot itself
+	 * interpret must not be in the column claiming to be one. `caller_id_right_to_use` is validated
+	 * against the two facts that produce A and B — anything else is not a weaker basis, it is a
+	 * basis this build does not recognise, and a null there reads correctly as "nothing vouched for
+	 * it".
+	 */
+	const expectedRaw = asString(payload.expectedAttestation);
+	const expectedAttestation =
+		expectedRaw === "A" || expectedRaw === "B" || expectedRaw === "C" ? expectedRaw : null;
+	if (expectedRaw !== undefined && expectedAttestation === null) {
+		record("expectedAttestation", payload.expectedAttestation, "null");
+	}
+	const rightToUseRaw = asString(payload.callerIdRightToUse);
+	const callerIdRightToUse =
+		rightToUseRaw === "owned" || rightToUseRaw === "verified" ? rightToUseRaw : null;
+	if (rightToUseRaw !== undefined && callerIdRightToUse === null) {
+		record("callerIdRightToUse", payload.callerIdRightToUse, "null");
+	}
 	const attestation = {
 		sipAttestation,
 		sipVerstat: asString(payload.sipVerstat)?.slice(0, 64) ?? null,
 		sipOrigId: asString(payload.sipOrigId)?.slice(0, 128) ?? null,
+		expectedAttestation,
+		callerIdRightToUse,
+	};
+	/**
+	 * The trunk and the signalling peer, which are what a traceback answers WITH.
+	 *
+	 * `trunkRef` goes through `asUuid` and lands null on anything that is not one, like every other
+	 * `*_ref` here. `signalingAddress` is truncated rather than refused, on the same argument
+	 * `sipOrigId` makes: an over-long or malformed address from a peer is a bad header, not a reason
+	 * to lose a billing record — and on a traceback a malformed address is itself evidence.
+	 */
+	const traceback = {
+		trunkRef: asUuid(payload.trunkRef),
+		signalingAddress: asString(payload.signalingAddress)?.slice(0, 128) ?? null,
 	};
 	/**
 	 * The dialog's `Call-ID`, which is what a carrier traceback is keyed on.
@@ -471,6 +580,7 @@ export function mapCdrLegWrite(
 	 * producer.
 	 */
 	const sipCallId = asString(payload.sipCallId)?.slice(0, 256) ?? null;
+	const consent = mapRecordingConsent(payload);
 
 	return {
 		values: {
@@ -507,6 +617,8 @@ export function mapCdrLegWrite(
 			...authorization,
 			...attestation,
 			sipCallId,
+			...traceback,
+			...consent,
 			raw,
 		},
 		coercions,

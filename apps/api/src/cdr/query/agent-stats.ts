@@ -35,6 +35,26 @@ import type { CdrDatabaseTransaction, SQL } from "@optimiq-voice/cdr-db";
  * useful and because a report that silently lacks it invites somebody to compute it downstream from
  * the raw CDR with no cap at all.
  *
+ * ## The disposition breakdown is a MEASUREMENT, and the contrast is the point
+ *
+ * `dispositions` is not the wrap-up field's cousin. `call_legs.queue_disposition_code` records what
+ * an agent CHOSE — a person pressed a button, or the wrap-up deadline passed and recorded `unset`,
+ * and both of those are events the platform observed rather than inferred. There is no ceiling on
+ * it, no sample count to distrust and no argument about what it approximates, because it
+ * approximates nothing. "Fourteen calls closed as `escalated`" is fourteen calls closed as
+ * escalated.
+ *
+ * `unset` appears in the breakdown as a code like any other, and it should: a floor where half the
+ * calls close as `unset` is a floor where the question is not being answered, which is the single
+ * most useful thing this list can tell a supervisor. Legs with a NULL code are simply absent — that
+ * is a queue which asks no question at all, and counting it as an outcome would put every
+ * unconfigured queue's traffic in the same bucket as every ignored prompt.
+ *
+ * It costs a SECOND query over the same index rather than a third grouping key on the first. A
+ * `group by (agent, queue, code)` would multiply the group count by the vocabulary size and spend
+ * {@link MAX_AGENT_STATS_GROUPS} on rows the caller then has to fold twice; the breakdown is per
+ * AGENT and not per (agent, queue), so it does not belong in that grouping to begin with.
+ *
  * ## The cost, and the ceiling
  *
  * One scan of `call_legs_queue_agent_idx` — a PARTIAL index on `queue_agent_ref is not null`, which
@@ -122,8 +142,23 @@ export interface AgentStatsRow {
 	readonly averageWrapUpMs: number;
 	/** How many gaps went into the two fields above, so a reader can distrust a small sample. */
 	readonly wrapUpSamples: number;
+	/**
+	 * What this agent's calls CLOSED as, commonest first. A measurement — see the module header.
+	 *
+	 * Empty when none of their calls carried a code, which is every agent on a queue that asks no
+	 * wrap-up question. The counts do NOT have to sum to {@link answered}: a leg the agent
+	 * dispositioned after the CDR consumer had already filed it keeps its NULL, and a queue that
+	 * started asking halfway through the window has both kinds in it.
+	 */
+	readonly dispositions: readonly AgentDispositionCount[];
 	/** Per-queue breakdown, busiest queue first. */
 	readonly queues: readonly AgentQueueStatsRow[];
+}
+
+/** One wrap-up outcome and how often this agent reached it. `unset` is one of them. */
+export interface AgentDispositionCount {
+	readonly code: string;
+	readonly count: number;
 }
 
 export interface AgentStatsQuery {
@@ -137,6 +172,13 @@ export interface AgentStatsQuery {
 	readonly queueId?: string;
 	/** The group ceiling. See {@link MAX_AGENT_STATS_GROUPS}. */
 	readonly limit: number;
+}
+
+/** The shape the disposition SELECT returns, before the per-agent fold. */
+interface AgentDispositionGroup {
+	readonly agentId: string | null;
+	readonly code: string | null;
+	readonly count: number;
 }
 
 /** The shape the grouped SELECT returns, before the per-agent fold. */
@@ -167,24 +209,7 @@ export function agentStatsQuery(
 	transaction: CdrDatabaseTransaction,
 	query: AgentStatsQuery,
 ): { toSQL(): { sql: string; params: unknown[] } } {
-	const filters: SQL[] = [
-		// The partition bounds first, unconditionally, so the planner can prune before it reads.
-		gte(callLegs.startedAt, query.from),
-		lte(callLegs.startedAt, query.to),
-		// Matches `call_legs_queue_agent_idx`, a partial index over exactly this predicate. It is
-		// also the definition of the population: a leg with no agent was not handled by one.
-		isNotNull(callLegs.queueAgentRef),
-		// `queue_outcome = 'answered'` and not `disposition = 'answered'`: a caller the queue timed
-		// out into a voicemail box has a leg that ended answered, and crediting that to the agent
-		// whose seat the call last rang is how a queue nobody staffs reports a full team.
-		eq(callLegs.queueOutcome, "answered"),
-	] as SQL[];
-	if (query.agentId !== undefined) {
-		filters.push(eq(callLegs.queueAgentRef, query.agentId) as SQL);
-	}
-	if (query.queueId !== undefined) {
-		filters.push(eq(callLegs.queueRef, query.queueId) as SQL);
-	}
+	const filters = agentStatsFilters(query);
 
 	const legs = transaction
 		.select({
@@ -240,6 +265,60 @@ export function agentStatsQuery(
 	);
 }
 
+/**
+ * The disposition breakdown, per agent. Exported unexecuted for the reason the aggregate above is.
+ *
+ * One level, not two: there is no window function here, only a count. The extra predicate is
+ * `queue_disposition_code is not null` — a leg with no code is not an outcome, it is a queue that
+ * asks no question, and folding the two together would report every unconfigured queue as if its
+ * agents had ignored a prompt.
+ *
+ * The limit is the same ceiling applied to a different grouping. Agents × their distinct codes is
+ * bounded by configuration exactly as agents × queues is, and reaching it means something is wrong
+ * rather than that somebody needs a page.
+ */
+export function agentDispositionsQuery(
+	transaction: CdrDatabaseTransaction,
+	query: AgentStatsQuery,
+): { toSQL(): { sql: string; params: unknown[] } } {
+	const filters = agentStatsFilters(query);
+	filters.push(isNotNull(callLegs.queueDispositionCode) as SQL);
+	return transaction
+		.select({
+			agentId: callLegs.queueAgentRef,
+			code: callLegs.queueDispositionCode,
+			count: sql<number>`count(*)`.mapWith(Number),
+		})
+		.from(callLegs)
+		.where(and(...filters))
+		.groupBy(callLegs.queueAgentRef, callLegs.queueDispositionCode)
+		.orderBy(sql`count(*) desc`, callLegs.queueAgentRef, callLegs.queueDispositionCode)
+		.limit(query.limit) as never;
+}
+
+/** The population every agent statistic is computed over, shared by both aggregates above. */
+function agentStatsFilters(query: AgentStatsQuery): SQL[] {
+	const filters: SQL[] = [
+		// The partition bounds first, unconditionally, so the planner can prune before it reads.
+		gte(callLegs.startedAt, query.from),
+		lte(callLegs.startedAt, query.to),
+		// Matches `call_legs_queue_agent_idx`, a partial index over exactly this predicate. It is
+		// also the definition of the population: a leg with no agent was not handled by one.
+		isNotNull(callLegs.queueAgentRef),
+		// `queue_outcome = 'answered'` and not `disposition = 'answered'`: a caller the queue timed
+		// out into a voicemail box has a leg that ended answered, and crediting that to the agent
+		// whose seat the call last rang is how a queue nobody staffs reports a full team.
+		eq(callLegs.queueOutcome, "answered"),
+	] as SQL[];
+	if (query.agentId !== undefined) {
+		filters.push(eq(callLegs.queueAgentRef, query.agentId) as SQL);
+	}
+	if (query.queueId !== undefined) {
+		filters.push(eq(callLegs.queueRef, query.queueId) as SQL);
+	}
+	return filters;
+}
+
 export interface AgentStatsResult {
 	readonly rows: readonly AgentStatsRow[];
 	/** The group cap was reached, so an agent's per-queue breakdown may be incomplete. */
@@ -259,9 +338,33 @@ export async function readAgentStats(
 	transaction: CdrDatabaseTransaction,
 	query: AgentStatsQuery,
 ): Promise<AgentStatsResult> {
-	const groups = (await (agentStatsQuery(transaction, query) as unknown as Promise<
-		readonly AgentStatsGroup[]
-	>)) as readonly AgentStatsGroup[];
+	// Both aggregates read the same partitions under the same predicate, so they are issued together
+	// rather than one after the other: the second is a count over an index the first has just warmed,
+	// and serialising them would double the report's latency for no reason.
+	const [groups, dispositionGroups] = await Promise.all([
+		agentStatsQuery(transaction, query) as unknown as Promise<readonly AgentStatsGroup[]>,
+		agentDispositionsQuery(transaction, query) as unknown as Promise<
+			readonly AgentDispositionGroup[]
+		>,
+	]);
+
+	const dispositionsByAgent = new Map<string, AgentDispositionCount[]>();
+	for (const group of dispositionGroups) {
+		// The NULL cases the predicates already exclude, dropped rather than coerced — the same rule
+		// the agent fold below applies, and for the same reason: the columns are nullable. Tested
+		// against `typeof` rather than `=== null` so a row that carries neither key (a caller's fake,
+		// or a driver that omits nulls) falls out here instead of keying a bucket on `undefined`.
+		if (typeof group.agentId !== "string" || typeof group.code !== "string") {
+			continue;
+		}
+		const bucket = dispositionsByAgent.get(group.agentId);
+		const entry = { code: group.code, count: group.count };
+		if (bucket === undefined) {
+			dispositionsByAgent.set(group.agentId, [entry]);
+		} else {
+			bucket.push(entry);
+		}
+	}
 
 	const byAgent = new Map<
 		string,
@@ -335,6 +438,9 @@ export async function readAgentStats(
 			averageWrapUpMs:
 				agent.wrapUpSamples === 0 ? 0 : Math.round(agent.wrapUpMs / agent.wrapUpSamples),
 			wrapUpSamples: agent.wrapUpSamples,
+			// Already commonest-first from the query's own ORDER BY; the empty array is the honest
+			// answer for an agent whose queues ask no wrap-up question.
+			dispositions: dispositionsByAgent.get(agent.agentId) ?? [],
 			queues: [...agent.queues].sort((left, right) => right.answered - left.answered),
 		}))
 		.sort(

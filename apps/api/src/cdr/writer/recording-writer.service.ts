@@ -7,8 +7,10 @@ import {
 } from "@nestjs/common";
 import { connect, type NatsConnection } from "nats";
 import {
+	and,
 	buildCallLegEnrichmentQuery,
 	eq,
+	isNull,
 	recordings,
 	sql,
 	withCdrWriterScope,
@@ -356,6 +358,7 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 		data: RecordEventData,
 	): Promise<void> {
 		const retentionUntil = await this.retentionUntil(organizationId);
+		const consent = recordingConsentRow(data.consent);
 		await withCdrWriterScope(this.database.adminDb, organizationId, async (transaction) => {
 			const written = await transaction
 				.insert(recordings)
@@ -367,15 +370,47 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 					objectKey: data.objectKey,
 					durationMs: 0,
 					sizeBytes: 0,
+					// Absent rather than null when the producer sent none: `consent` is null on every
+					// row written before consent existed and on every recording no consent was required
+					// for, and the insert must not distinguish the two — see the column's own comment.
+					...(consent === undefined ? {} : { consent }),
 					retentionUntil,
 				})
 				.onConflictDoNothing()
 				.returning({ id: recordings.id });
 			if (written.length > 0) {
 				this.started += 1;
-			} else {
-				this.duplicates += 1;
+				return;
 			}
+			this.duplicates += 1;
+			/**
+			 * The row was already there, and the insert above therefore wrote NOTHING — including the
+			 * consent. Usually that is a redelivery of a `started` whose consent is already filed, and
+			 * this update finds nothing to do. The case it exists for is the other one: `stopped` can
+			 * legitimately arrive first (see {@link CdrRecordingWriter.recordStopped}) and creates the
+			 * row with no consent at all, because `channel.record.stopped` does not carry one. Without
+			 * this, a call whose consent was announced would file a recording that says nothing about
+			 * it purely because two messages arrived out of order.
+			 *
+			 * `is null` in the predicate is what makes it FORWARD-ONLY, and that is the whole
+			 * discipline: an event with no consent never reaches this line, and one that does can only
+			 * fill an empty column. A later delivery can never blank or rewrite a consent record that
+			 * is already filed — a recording's authorisation is evidence, and evidence that a
+			 * redelivery can edit is not evidence.
+			 */
+			if (consent === undefined) {
+				return;
+			}
+			await transaction
+				.update(recordings)
+				.set({ consent, updatedAt: new Date() })
+				.where(
+					and(
+						eq(recordings.organizationId, organizationId),
+						eq(recordings.objectKey, data.objectKey),
+						isNull(recordings.consent),
+					),
+				);
 		});
 	}
 
@@ -555,6 +590,50 @@ interface RecordEventData {
 	readonly bytes?: number;
 	readonly reason?: string;
 	readonly pauses?: readonly { readonly startMs: number; readonly endMs: number }[];
+	/** Present only on `channel.record.started`, and only from an engine that runs the consent gate. */
+	readonly consent?: ConsentRow;
+}
+
+/**
+ * The shape `recordings.consent` holds, restated here rather than imported.
+ *
+ * `cdr-db` declares it as `RecordingConsentRow` on the column but does not re-export the type from
+ * its index, and the column is `jsonb` — so what crosses the boundary is a SHAPE, and a structurally
+ * identical local declaration is exactly as strong a guarantee as a nominal import would be. The
+ * schema's own comment makes the same argument one level down, where it mirrors the vocabulary out
+ * of `packages/routing` rather than depending on it.
+ */
+interface ConsentRow {
+	readonly outcome: "not-required" | "announced" | "accepted" | "declined";
+	readonly method: "none" | "announcement" | "keypress";
+	readonly policy: "none" | "announce" | "announce-and-require-keypress";
+	readonly at: string;
+	readonly parties: readonly ("caller" | "callee")[];
+	readonly regions?: readonly string[];
+	readonly promptId?: string;
+}
+
+/**
+ * The consent record as a plain object, or `undefined` when the event carried none.
+ *
+ * Copied field by field rather than passed through, exactly as `pauses` is: what the parse hands
+ * back is a zod result over a `looseObject` envelope, and putting it straight into a jsonb column
+ * would file whatever else the producer attached to it. This is the place that guarantees the row
+ * holds the seven declared fields and nothing else.
+ */
+export function recordingConsentRow(consent: RecordEventData["consent"]): ConsentRow | undefined {
+	if (consent === undefined) {
+		return undefined;
+	}
+	return {
+		outcome: consent.outcome,
+		method: consent.method,
+		policy: consent.policy,
+		at: consent.at,
+		parties: [...consent.parties],
+		...(consent.regions === undefined ? {} : { regions: [...consent.regions] }),
+		...(consent.promptId === undefined ? {} : { promptId: consent.promptId }),
+	};
 }
 
 interface RecordEnvelope {

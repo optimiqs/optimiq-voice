@@ -18,13 +18,29 @@ import { listQuerySchema } from "../shared/pagination";
 import { QueueCallbacksClient } from "./queue-callbacks.client";
 import {
 	createQueueAgentDto,
+	createQueueAgentSkillDto,
+	createQueueDispositionCodeDto,
 	createQueueDto,
+	createQueueSkillRequirementDto,
+	createQueueSurveyQuestionDto,
 	createQueueTierDto,
 	updateQueueAgentDto,
+	updateQueueAgentSkillDto,
+	updateQueueDispositionCodeDto,
 	updateQueueDto,
+	updateQueueSkillRequirementDto,
+	updateQueueSurveyQuestionDto,
 	updateQueueTierDto,
 } from "./queues.dto";
-import { QueueAgentsService, QueueTiersService, QueuesService } from "./queues.service";
+import {
+	QueueAgentSkillsService,
+	QueueAgentsService,
+	QueueDispositionCodesService,
+	QueueSkillRequirementsService,
+	QueueSurveyQuestionsService,
+	QueueTiersService,
+	QueuesService,
+} from "./queues.service";
 import type { AppSession } from "@optimiq-voice/auth";
 
 /**
@@ -40,6 +56,12 @@ export class QueuesController {
 	constructor(
 		@Inject(QueuesService) private readonly queues: QueuesService,
 		@Inject(QueueTiersService) private readonly tiers: QueueTiersService,
+		@Inject(QueueDispositionCodesService)
+		private readonly dispositionCodes: QueueDispositionCodesService,
+		@Inject(QueueSkillRequirementsService)
+		private readonly skillRequirements: QueueSkillRequirementsService,
+		@Inject(QueueSurveyQuestionsService)
+		private readonly surveyQuestions: QueueSurveyQuestionsService,
 		@Optional()
 		@Inject(QueueCallbacksClient)
 		private readonly callbacks?: QueueCallbacksClient,
@@ -138,6 +160,173 @@ export class QueuesController {
 	) {
 		return await this.tiers.remove(session, id, tierId);
 	}
+
+	// --- disposition codes ---------------------------------------------------------------------
+	//
+	// `queues.write` to mutate and `queues.read` to list, NOT the tiers' `queues.manage-agents`:
+	// the vocabulary is what the queue asks about its own calls, which is the same kind of decision
+	// as its announcements. Who staffs the floor is the other permission and the other collection.
+
+	@Get(":id/disposition-codes")
+	@RequirePermissions("queues.read")
+	async listDispositionCodes(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+	) {
+		return await this.dispositionCodes.list(session, id);
+	}
+
+	@Post(":id/disposition-codes")
+	@RequirePermissions("queues.write")
+	async createDispositionCode(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+		@Body() body: unknown,
+	) {
+		return await this.dispositionCodes.create(
+			session,
+			id,
+			parseDto(createQueueDispositionCodeDto, body),
+		);
+	}
+
+	@Patch(":id/disposition-codes/:codeId")
+	@RequirePermissions("queues.write")
+	async updateDispositionCode(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+		@Param("codeId", ParseUUIDPipe) codeId: string,
+		@Body() body: unknown,
+	) {
+		return await this.dispositionCodes.update(
+			session,
+			id,
+			codeId,
+			parseDto(updateQueueDispositionCodeDto, body),
+		);
+	}
+
+	@Delete(":id/disposition-codes/:codeId")
+	@RequirePermissions("queues.write")
+	async removeDispositionCode(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+		@Param("codeId", ParseUUIDPipe) codeId: string,
+	) {
+		return await this.dispositionCodes.remove(session, id, codeId);
+	}
+
+	// --- skill requirements --------------------------------------------------------------------
+
+	@Get(":id/skill-requirements")
+	@RequirePermissions("queues.read")
+	async listSkillRequirements(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+	) {
+		return await this.skillRequirements.list(session, id);
+	}
+
+	@Post(":id/skill-requirements")
+	@RequirePermissions("queues.write")
+	async createSkillRequirement(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+		@Body() body: unknown,
+	) {
+		return await this.skillRequirements.create(
+			session,
+			id,
+			parseDto(createQueueSkillRequirementDto, body),
+		);
+	}
+
+	@Patch(":id/skill-requirements/:requirementId")
+	@RequirePermissions("queues.write")
+	async updateSkillRequirement(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+		@Param("requirementId", ParseUUIDPipe) requirementId: string,
+		@Body() body: unknown,
+	) {
+		return await this.skillRequirements.update(
+			session,
+			id,
+			requirementId,
+			parseDto(updateQueueSkillRequirementDto, body),
+		);
+	}
+
+	@Delete(":id/skill-requirements/:requirementId")
+	@RequirePermissions("queues.write")
+	async removeSkillRequirement(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+		@Param("requirementId", ParseUUIDPipe) requirementId: string,
+	) {
+		return await this.skillRequirements.remove(session, id, requirementId);
+	}
+
+	// --- survey questions ----------------------------------------------------------------------
+
+	@Get(":id/survey-questions")
+	@RequirePermissions("queues.read")
+	async listSurveyQuestions(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+	) {
+		return await this.surveyQuestions.list(session, id);
+	}
+
+	/**
+	 * At most three, at positions 1 to 3.
+	 *
+	 * The ceiling is the database's — the position check and the unique index on
+	 * `(organization_id, queue_id, position)` between them make a fourth question impossible to
+	 * insert, whatever this handler believes. So there is no count read here: a check-then-insert
+	 * would be a race two supervisors could both win, and the constraint refuses one of them
+	 * regardless. The DTO's own `position` bound is what turns the common case into a 400 with a
+	 * field on it rather than a constraint name.
+	 */
+	@Post(":id/survey-questions")
+	@RequirePermissions("queues.write")
+	async createSurveyQuestion(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+		@Body() body: unknown,
+	) {
+		return await this.surveyQuestions.create(
+			session,
+			id,
+			parseDto(createQueueSurveyQuestionDto, body),
+		);
+	}
+
+	@Patch(":id/survey-questions/:questionId")
+	@RequirePermissions("queues.write")
+	async updateSurveyQuestion(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+		@Param("questionId", ParseUUIDPipe) questionId: string,
+		@Body() body: unknown,
+	) {
+		return await this.surveyQuestions.update(
+			session,
+			id,
+			questionId,
+			parseDto(updateQueueSurveyQuestionDto, body),
+		);
+	}
+
+	@Delete(":id/survey-questions/:questionId")
+	@RequirePermissions("queues.write")
+	async removeSurveyQuestion(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+		@Param("questionId", ParseUUIDPipe) questionId: string,
+	) {
+		return await this.surveyQuestions.remove(session, id, questionId);
+	}
 }
 
 /**
@@ -148,7 +337,10 @@ export class QueuesController {
  */
 @Controller("api/v1/queue-agents")
 export class QueueAgentsController {
-	constructor(@Inject(QueueAgentsService) private readonly agents: QueueAgentsService) {}
+	constructor(
+		@Inject(QueueAgentsService) private readonly agents: QueueAgentsService,
+		@Inject(QueueAgentSkillsService) private readonly skills: QueueAgentSkillsService,
+	) {}
 
 	@Get()
 	@RequirePermissions("queues.read")
@@ -182,5 +374,48 @@ export class QueueAgentsController {
 	@RequirePermissions("queues.manage-agents")
 	async remove(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
 		return await this.agents.remove(session, id);
+	}
+
+	// --- skills --------------------------------------------------------------------------------
+	//
+	// `queues.manage-agents` to mutate, matching the rest of this controller and the tiers: what a
+	// person can do is a staffing fact, and it decides who is offered which caller once a queue
+	// carries a skill requirement.
+
+	@Get(":id/skills")
+	@RequirePermissions("queues.read")
+	async listSkills(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
+		return await this.skills.list(session, id);
+	}
+
+	@Post(":id/skills")
+	@RequirePermissions("queues.manage-agents")
+	async createSkill(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+		@Body() body: unknown,
+	) {
+		return await this.skills.create(session, id, parseDto(createQueueAgentSkillDto, body));
+	}
+
+	@Patch(":id/skills/:skillId")
+	@RequirePermissions("queues.manage-agents")
+	async updateSkill(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+		@Param("skillId", ParseUUIDPipe) skillId: string,
+		@Body() body: unknown,
+	) {
+		return await this.skills.update(session, id, skillId, parseDto(updateQueueAgentSkillDto, body));
+	}
+
+	@Delete(":id/skills/:skillId")
+	@RequirePermissions("queues.manage-agents")
+	async removeSkill(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+		@Param("skillId", ParseUUIDPipe) skillId: string,
+	) {
+		return await this.skills.remove(session, id, skillId);
 	}
 }

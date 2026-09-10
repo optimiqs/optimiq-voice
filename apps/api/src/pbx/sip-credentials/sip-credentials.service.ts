@@ -175,6 +175,28 @@ export class SipCredentialsService {
 
 		const ha1 =
 			line.storedHa1 ?? this.derive(rootKey, organizationId, line.secretRef, username, realm);
+		/**
+		 * The digest of the outgoing password, while its grace window is still open.
+		 *
+		 * The clock is read HERE and on every lookup, and the reply is marked uncacheable while a
+		 * grace holds — see `cacheable` below. That pair is what makes the window actually close: a
+		 * cached reply computed while the grace was open would keep the edge accepting the old
+		 * credential for as long as the cache lived, which is the one way a bounded window becomes an
+		 * unbounded one.
+		 *
+		 * A stored HA1 is NOT consulted for the previous secret and that is deliberate: the stored
+		 * digest is a single value with no history, so a line whose credential was set by hand has
+		 * exactly one password and nothing to grace. Rotation of a hand-set credential is a hand-set
+		 * credential being replaced, which is the operator's own decision to make at the handset.
+		 */
+		const graceOpen =
+			line.previousSecretRef !== undefined &&
+			line.graceUntil !== undefined &&
+			line.graceUntil.getTime() > Date.now();
+		const ha1Previous =
+			graceOpen && line.storedHa1 === undefined
+				? this.derive(rootKey, organizationId, line.previousSecretRef as string, username, realm)
+				: undefined;
 		if (ha1 === undefined) {
 			// The renderer refuses to emit a config without the root key, so a deployment in this
 			// state has no provisioned phones to authenticate anyway. Say which variable it is.
@@ -218,6 +240,7 @@ export class SipCredentialsService {
 				deviceId: line.deviceId ?? undefined,
 				extensionId: line.extensionId ?? undefined,
 				maxRegistrations: line.maxRegistrations,
+				...(ha1Previous === undefined ? {} : { ha1Previous }),
 				...(appearance === undefined
 					? {}
 					: {
@@ -227,7 +250,11 @@ export class SipCredentialsService {
 							appearanceIndex: appearance.appearanceIndex,
 						}),
 			},
-			cacheable: true,
+			// Not cacheable while a rotation's grace is open: this reply is only correct until
+			// `graceUntil`, and a cache has no way to know that. Rotations are rare and their windows
+			// are minutes, so the cost is a per-REGISTER lookup for a handful of lines for a few
+			// minutes — against a cached reply that would keep an expired credential working.
+			cacheable: !graceOpen,
 		};
 	}
 
@@ -452,6 +479,10 @@ export class SipCredentialsService {
 				lineSecretRef: deviceLine.sipSecretRef,
 				extensionEnabled: extension.enabled,
 				extensionSecretRef: extension.sipSecretRef,
+				extensionPreviousSecretRef: extension.sipSecretRefPrevious,
+				extensionGraceUntil: extension.sipSecretGraceUntil,
+				linePreviousSecretRef: deviceLine.sipSecretRefPrevious,
+				lineGraceUntil: deviceLine.sipSecretGraceUntil,
 				storedHa1: extension.sipPasswordHa1,
 				maxRegistrations: extension.maxRegistrations,
 			})
@@ -484,11 +515,21 @@ export class SipCredentialsService {
 			return undefined;
 		}
 
+		// The grace pair follows whichever side supplied the CURRENT handle, exactly as `secretRef`
+		// does. Taking the extension's previous handle while using the line's current one would
+		// accept a password that never authenticated this line.
+		const rotated =
+			row.extensionSecretRef === null || row.extensionSecretRef === undefined
+				? { previous: row.linePreviousSecretRef, until: row.lineGraceUntil }
+				: { previous: row.extensionPreviousSecretRef, until: row.extensionGraceUntil };
+
 		return {
 			// A disabled extension disables its line, and a disabled line disables itself.
 			enabled: row.lineEnabled && (row.extensionEnabled ?? true),
 			secretRef,
 			storedHa1: row.storedHa1 ?? undefined,
+			previousSecretRef: rotated.previous ?? undefined,
+			graceUntil: rotated.until ?? undefined,
 			deviceId: row.deviceId,
 			extensionId: row.extensionId,
 			maxRegistrations: row.maxRegistrations ?? undefined,
@@ -505,6 +546,8 @@ export class SipCredentialsService {
 				enabled: extension.enabled,
 				secretRef: extension.sipSecretRef,
 				storedHa1: extension.sipPasswordHa1,
+				previousSecretRef: extension.sipSecretRefPrevious,
+				graceUntil: extension.sipSecretGraceUntil,
 				maxRegistrations: extension.maxRegistrations,
 			})
 			.from(extension)
@@ -519,6 +562,8 @@ export class SipCredentialsService {
 			enabled: row.enabled,
 			secretRef: row.secretRef,
 			storedHa1: row.storedHa1 ?? undefined,
+			previousSecretRef: row.previousSecretRef ?? undefined,
+			graceUntil: row.graceUntil ?? undefined,
 			deviceId: null,
 			extensionId: row.id,
 			maxRegistrations: row.maxRegistrations,
@@ -531,6 +576,12 @@ interface LineIdentity {
 	readonly enabled: boolean;
 	readonly secretRef: string;
 	readonly storedHa1: string | undefined;
+	/**
+	 * The handle this line authenticated with before its last rotation, and the instant that stops
+	 * being accepted. Both absent on every line that has never been rotated, which is most of them.
+	 */
+	readonly previousSecretRef: string | undefined;
+	readonly graceUntil: Date | undefined;
 	readonly deviceId: string | null;
 	readonly extensionId: string | null;
 }

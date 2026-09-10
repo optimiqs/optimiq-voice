@@ -279,10 +279,37 @@ export const cdrEnvSchema = z.object({
 	/**
 	 * How many months of call records the PLATFORM keeps, `0` to keep them for ever.
 	 *
-	 * Zero by default, and it will stay zero: this is the number behind a `DROP TABLE` against the
-	 * billing ledger, and no upgrade may start destroying a deployment's call history because a
-	 * release shipped a scheduler for it. An operator turns it on deliberately, reads a dry run,
-	 * and only then clears `CDR_RETENTION_DRY_RUN`.
+	 * ## Twenty-four months by default, and why the default moved off `0`
+	 *
+	 * This used to default to `0` — keep for ever — on the reasoning that no upgrade may start
+	 * destroying a deployment's call history because a release shipped a scheduler for it. The
+	 * caution was right and the default was wrong, because `0` is not neutral: a never-expiring
+	 * default silently makes every deployment an indefinite store of call metadata — who called
+	 * whom, from where, for how long, for the life of the installation — which is precisely what
+	 * GDPR's storage-limitation principle and CCPA's minimisation duty exist to prevent. "We kept
+	 * it because nobody set a number" is not a retention policy anyone can defend; it is the
+	 * absence of one, shipped as a default and inherited by every operator who never read this
+	 * file.
+	 *
+	 * Twenty-four months is the shortest window that does not break the two things call metadata
+	 * is legitimately needed for after the fact: a billing dispute, which follows an invoice cycle
+	 * and can reasonably reach back a year or more, and a regulatory traceback on a suspected
+	 * illegal-call campaign, whose industry practice is likewise measured in months rather than
+	 * years. Past that, a call leg from two years ago answers no operational question and is only
+	 * a liability in a breach.
+	 *
+	 * ## The safety the old default was really providing has not been removed
+	 *
+	 * `CDR_RETENTION_DRY_RUN` still defaults to TRUE, and that — not the zero — is the interlock
+	 * that stops an upgrade destroying anything. With this window set and the dry run on, the
+	 * sweep computes the plan, logs the partitions and the per-organization row counts, and drops
+	 * nothing; an operator reads that artefact and clears the flag deliberately. So the change
+	 * here alters what a deployment is DEFAULTED TO INTEND, which is the part that was wrong,
+	 * without altering what it does before somebody looks.
+	 *
+	 * A deployment that genuinely must keep call records for ever — an escrow obligation, a
+	 * jurisdiction that mandates it — sets `CDR_LEG_RETENTION_MONTHS=0` and gets exactly the old
+	 * behaviour. `0` still means "keep indefinitely"; it just has to be asked for now.
 	 *
 	 * Months rather than days because the unit of deletion is a monthly PARTITION —
 	 * `packages/cdr-db`'s `DEFAULT_CDR_RETENTION_MONTHS` is 13 for the reason it states, a full
@@ -297,7 +324,7 @@ export const cdrEnvSchema = z.object({
 	 * expressible at all. The per-tenant window that DOES exist is `recordings.retentionDays`,
 	 * which governs the audio, is stamped per row, and is enforced by the recording sweep.
 	 */
-	CDR_LEG_RETENTION_MONTHS: z.coerce.number().int().min(0).max(240).default(0),
+	CDR_LEG_RETENTION_MONTHS: z.coerce.number().int().min(0).max(240).default(24),
 
 	/**
 	 * Whether the retention sweep only REPORTS what it would drop. Default true.

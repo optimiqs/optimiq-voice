@@ -48,6 +48,7 @@ function row(overrides: Partial<TrunkDirectoryRow> = {}): TrunkDirectoryRow {
 		authUser: "optimiq-outbound",
 		sipSecretRef: "secret://pbx/trunk/telnyx",
 		transport: "udp",
+		srtpPolicy: null,
 		registerExpiresSeconds: 300,
 		maxChannels: null,
 		callerIdNumberOverride: null,
@@ -325,5 +326,16 @@ describe("TrunkDirectoryPublisher.reconcile", () => {
 		expect(bucket.deletes).to.deep.equal([key]);
 		expect(result.deleted).to.equal(1);
 		expect(result.failed).to.equal(0);
+	});
+});
+
+describe("the trunk SRTP policy on the projected entry", () => {
+	it("carries the policy when set and OMITS it when null, so an old entry is unchanged", () => {
+		expect(projectTrunkDirectoryEntry(ORG, row({ srtpPolicy: "require" })).srtpPolicy).to.equal(
+			"require",
+		);
+		// Absent, not `null`: the schema's optionals are `.optional()` and a `null` fails the parse on
+		// the way back in — the same rule every other nullable column here follows.
+		expect(Object.hasOwn(projectTrunkDirectoryEntry(ORG, row()), "srtpPolicy")).to.equal(false);
 	});
 });

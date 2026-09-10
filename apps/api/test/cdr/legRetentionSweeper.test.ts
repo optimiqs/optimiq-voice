@@ -1,5 +1,6 @@
 import { expect } from "chai";
 import { CdrLegRetentionSweeper } from "../../src/cdr/retention/leg-retention-sweeper.service";
+import { cdrEnvSchema } from "../../src/cdr/shared/cdr-env";
 import type {
 	CdrLegRetentionAudit,
 	DroppedPartitionAuditEntry,
@@ -225,6 +226,30 @@ describe("CdrLegRetentionSweeper", () => {
 			sweeper.onApplicationShutdown();
 			expect(sweeper.stats.swept).to.equal(0);
 		}
+	});
+
+	/**
+	 * The default moved off `0`, and the reason is not a preference. `0` is not neutral: a
+	 * never-expiring default silently makes every deployment an indefinite store of call metadata,
+	 * which is the opposite of what data minimisation asks for. What kept an upgrade safe was never
+	 * the zero — it is the dry run, which still defaults to true.
+	 */
+	it("defaults to a 24-month window with the dry run still on", () => {
+		const parsed = cdrEnvSchema.parse({
+			CDR_DATABASE_URL: "postgres://localhost/cdr",
+		});
+		expect(parsed.CDR_LEG_RETENTION_MONTHS).to.equal(24);
+		expect(parsed.CDR_RETENTION_DRY_RUN).to.equal(true);
+	});
+
+	it("still lets a deployment ask for `keep for ever` explicitly", () => {
+		const parsed = cdrEnvSchema.parse({
+			CDR_DATABASE_URL: "postgres://localhost/cdr",
+			CDR_LEG_RETENTION_MONTHS: "0",
+		});
+		// An escrow obligation or a jurisdiction that mandates it gets exactly the old behaviour —
+		// it just has to be asked for now.
+		expect(parsed.CDR_LEG_RETENTION_MONTHS).to.equal(0);
 	});
 
 	it("stops sweeping after shutdown", async () => {

@@ -16,7 +16,7 @@ import {
 import { PublicRoute } from "../../auth/public-route.decorator";
 import { RequirePermissions } from "../../auth/require-permissions.decorator";
 import { Session } from "../../auth/session.decorator";
-import { applyMediaResponse, readRangeHeader } from "../../media/media-http";
+import { applyMediaResponse, readMediaClient, readRangeHeader } from "../../media/media-http";
 import { parseDto } from "../shared/dto";
 import {
 	deleteVoicemailMessageQuerySchema,
@@ -95,7 +95,13 @@ export class VoicemailMessagesController {
 	) {
 		return applyMediaResponse(
 			reply,
-			await this.messages.openSignedMedia(token ?? "", readRangeHeader(request)),
+			// The client facts go with the request: the ledger row for an anonymous fetch has no
+			// person to name, so the address and user-agent are all it can honestly record.
+			await this.messages.openSignedMedia(
+				token ?? "",
+				readRangeHeader(request),
+				readMediaClient(request),
+			),
 		);
 	}
 

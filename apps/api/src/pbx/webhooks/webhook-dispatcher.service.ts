@@ -7,6 +7,7 @@ import {
 } from "@nestjs/common";
 import { AckPolicy, connect, DeliverPolicy, type NatsConnection } from "nats";
 import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
+import { encryptSecret, loadSecretKey, openStoredSecret } from "@optimiq-voice/db";
 import { getLogger } from "@optimiq-voice/logging";
 import { and, eq, sql, webhookSubscription } from "@optimiq-voice/pbx-db";
 import { PBX_DATABASE, PBX_ENV } from "../shared/pbx.tokens";
@@ -27,11 +28,11 @@ const logger = getLogger("api.webhooks");
  * One durable per STREAM, all feeding one delivery queue.
  *
  * A JetStream consumer belongs to exactly one stream, so "one consumer for the API" is not
- * expressible across four families that live on four streams — what IS expressible, and what this
+ * expressible across six families that live on six streams — what IS expressible, and what this
  * is, is one consumer per stream rather than one per subscription. The distinction matters: the
  * thing to avoid is a broker-side consumer whose lifetime is a tenant's configuration row, which
  * would put subscription CRUD in the path of JetStream asset management and leave orphaned durables
- * behind every delete. Here the broker sees four durables on a running deployment and four on an
+ * behind every delete. Here the broker sees six durables on a running deployment and six on an
  * idle one, whatever the tenants do.
  *
  * The filters are the family roots, so the consumers deliver every tenant's events and the
@@ -68,6 +69,18 @@ const WEBHOOK_CONSUMERS: readonly {
 		durable: "pbx-webhook-cdr",
 		filter: `${WEBHOOK_FAMILY_ROOTS.cdr}.*`,
 	},
+	{
+		family: "security",
+		stream: "SECURITY",
+		durable: "pbx-webhook-security",
+		filter: `${WEBHOOK_FAMILY_ROOTS.security}.>`,
+	},
+	{
+		family: "messaging",
+		stream: "MESSAGING",
+		durable: "pbx-webhook-messaging",
+		filter: `${WEBHOOK_FAMILY_ROOTS.messaging}.>`,
+	},
 ];
 
 /**
@@ -85,6 +98,7 @@ const MAX_DELIVER = 3;
 interface CachedSubscription {
 	readonly id: string;
 	readonly url: string;
+	/** OPENED at fill time — the column is a `v1.` envelope; an HMAC needs the key itself. */
 	readonly secret: string;
 	/** Parsed once at cache-fill time; the dispatcher's hot path never re-parses a string. */
 	readonly selectors: readonly ParsedSelector[];
@@ -615,12 +629,40 @@ export class WebhookDispatcher implements OnModuleInit, OnApplicationShutdown {
 				)
 				.limit(200);
 		});
-		const subscriptions = rows.map((row) => ({
-			id: row.id,
-			url: row.url,
-			secret: row.secret,
-			selectors: parseWebhookSelectors(Array.isArray(row.eventSelectors) ? row.eventSelectors : []),
-		}));
+		const key = loadSecretKey();
+		const subscriptions: CachedSubscription[] = [];
+		for (const row of rows) {
+			const { plaintext, wasEncrypted } = openStoredSecret(row.secret, key);
+			// The lazy half of the migration, and this is the right place for it: the fill already runs
+			// once per cache window rather than once per delivery, so both the unwrap and this write are
+			// amortised across every event the tenant produces. Best-effort for the reason the SSO
+			// reader states — a read-only replica must not stop a tenant's webhooks to finish a
+			// migration `scripts/` can also do. A row with NO key configured is signed with as-is: a
+			// deployment that never set PLATFORM_SECRET_ENCRYPTION_KEY keeps working.
+			if (!wasEncrypted && key) {
+				try {
+					await this.database.withTenantScope(organizationId, async (transaction) => {
+						await transaction
+							.update(webhookSubscription)
+							.set({ secret: encryptSecret(plaintext, key) })
+							.where(eq(webhookSubscription.id, row.id));
+					});
+				} catch (error) {
+					logger.warn(
+						{ err: error, organizationId, subscriptionId: row.id },
+						"could not seal a legacy webhook secret",
+					);
+				}
+			}
+			subscriptions.push({
+				id: row.id,
+				url: row.url,
+				secret: plaintext,
+				selectors: parseWebhookSelectors(
+					Array.isArray(row.eventSelectors) ? row.eventSelectors : [],
+				),
+			});
+		}
 		this.cache.set(organizationId, { subscriptions, readAt: now });
 		// Oldest first, because a Map iterates in insertion order and every hit above re-inserts.
 		while (this.cache.size > CACHE_MAX_ORGANIZATIONS) {

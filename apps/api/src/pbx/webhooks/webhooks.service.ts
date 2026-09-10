@@ -1,4 +1,5 @@
 import { BadRequestException, Inject, Injectable, Optional } from "@nestjs/common";
+import { encryptSecret, requireSecretKey } from "@optimiq-voice/db";
 import { PbxResourceService } from "../shared/pbx-resource.service";
 import { PBX_EFFECT_RUNTIME, PBX_ENV } from "../shared/pbx.tokens";
 import { WebhookDispatcher } from "./webhook-dispatcher.service";
@@ -27,6 +28,18 @@ import type { AppSession } from "@optimiq-voice/auth";
  * and `update` all go through the generic redaction, so a secret that was not copied at creation
  * time is unrecoverable and has to be rotated. That is the correct trade — the alternative is an
  * endpoint that hands out every tenant's signing keys to anybody holding `webhooks.read`.
+ *
+ * ## The stored column is a ciphertext, and only the dispatcher opens it
+ *
+ * The key cannot be hashed — the platform is the signer — but it can be SEALED, and the envelope
+ * built for SSO client secrets is the same shape: a value the platform must present again. Both
+ * write paths therefore store `encryptSecret(secret, requireSecretKey())`, so a dump of
+ * `webhook_subscription` yields no usable signing key. `requireSecretKey` and not `loadSecretKey`,
+ * because a write is the one moment where a missing key can still be fixed without losing anything:
+ * failing the request is strictly better than minting a key that lands in the table in the clear.
+ *
+ * The plaintext returned by `create` is the one below, before sealing — the caller has to receive
+ * the value they will configure the far end with, not the envelope around it.
  *
  * ## `update` clears the failure state when a subscription is switched back on
  *
@@ -98,7 +111,10 @@ export class WebhooksService extends PbxResourceService {
 	): Promise<MutationEnvelope<Record<string, unknown>>> {
 		this.assertUrlAllowed(values);
 		const secret = typeof values.secret === "string" ? values.secret : generateWebhookSecret();
-		const created = await super.create(session, { ...values, secret });
+		const created = await super.create(session, {
+			...values,
+			secret: encryptSecret(secret, requireSecretKey()),
+		});
 		this.dispatcher?.invalidate(this.organizationId(session));
 		// Re-attached AFTER the generic redaction has run, so the exception is visible here rather
 		// than being a hole in `redactRow`.
@@ -115,7 +131,13 @@ export class WebhooksService extends PbxResourceService {
 			values.enabled === true
 				? { consecutiveFailures: 0, lastFailureReason: null, autoDisabledAt: null }
 				: {};
-		const updated = await super.update(session, id, { ...values, ...revived });
+		// A rotation arrives here as an ordinary field and has to be sealed exactly as a new one is;
+		// every other key on the patch is configuration and is written verbatim.
+		const rotated =
+			typeof values.secret === "string"
+				? { secret: encryptSecret(values.secret, requireSecretKey()) }
+				: {};
+		const updated = await super.update(session, id, { ...values, ...rotated, ...revived });
 		this.dispatcher?.invalidate(this.organizationId(session));
 		return updated;
 	}

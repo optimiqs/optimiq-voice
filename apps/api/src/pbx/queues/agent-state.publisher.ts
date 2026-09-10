@@ -150,6 +150,61 @@ export class AgentStatePublisher implements OnModuleInit, OnApplicationShutdown 
 	}
 
 	/**
+	 * The agent whose live entry names this call, within one organization.
+	 *
+	 * ## A scan, and why that is acceptable here
+	 *
+	 * The bucket is keyed by AGENT, so "who is on call X" has no key to `get`. The keys are
+	 * organization-first by construction (`kvKeyFor.agentState`), so the scan is bounded by the
+	 * tenant's agent count rather than by the platform's — tens, sometimes hundreds — and it runs on
+	 * a supervisor pressing a button, not on the call path. A per-call index would be a second
+	 * bucket two processes write and one of them (the engine) is not this change's to alter, and an
+	 * index that disagreed with the entries would point a supervisor at the wrong conversation.
+	 *
+	 * Entries are read in parallel for the reason `QueueMembershipPublisher.readOrganization` gives:
+	 * serially, a tenant with 200 agents pays 200 round trips of latency before anything is
+	 * resolved. The tenancy check on each entry is the one every KV read on this surface makes — a
+	 * value naming another organization under this one's key is a bug, and acting on it would let a
+	 * supervisor listen to another tenant's call.
+	 */
+	async findByCall(organizationId: string, callId: string): Promise<AgentStateEntry | undefined> {
+		const bucket = this.bucket;
+		if (bucket === undefined) {
+			return undefined;
+		}
+		let keys: string[];
+		try {
+			const iterator = await bucket.keys(`${organizationId}.*`);
+			keys = [];
+			for await (const key of iterator) {
+				keys.push(key);
+			}
+		} catch (error) {
+			logger.warn({ organizationId, error }, "could not list agent-state keys");
+			return undefined;
+		}
+		const entries = await Promise.all(
+			keys.map(async (key) => {
+				try {
+					const value = await bucket.get(key);
+					if (value === null || value.value.length === 0) {
+						return undefined;
+					}
+					return agentStateEntrySchema.parse(
+						JSON.parse(new TextDecoder().decode(value.value)) as unknown,
+					);
+				} catch {
+					// One unreadable entry must not hide the agent who IS on the call.
+					return undefined;
+				}
+			}),
+		);
+		return entries.find(
+			(entry) => entry !== undefined && entry.orgId === organizationId && entry.callId === callId,
+		);
+	}
+
+	/**
 	 * Writes one transition and publishes the `agent.state` event for it.
 	 *
 	 * The guard belongs to the caller: `queue-agent-session.service.ts` runs
@@ -205,6 +260,64 @@ export class AgentStatePublisher implements OnModuleInit, OnApplicationShutdown 
 	}
 
 	/**
+	 * Stamps a chosen wrap-up code onto the agent's live entry, leaving everything else alone.
+	 *
+	 * ## Read-modify-write, and why it is not {@link write}
+	 *
+	 * `write` is the SHIFT writer: it deliberately drops `callId`, `legId`, `queueId`,
+	 * `availableAt` and `noAnswerCount`, because a login or a break ends whatever call context the
+	 * entry held. A disposition is the opposite kind of event — the agent is still in wrap-up, still
+	 * owes that context to the next distribution pass, and a writer that reset `availableAt` would
+	 * put them back on the floor early and hand them a caller mid-typing. So this reads the entry
+	 * and puts it back with two fields changed and nothing else touched.
+	 *
+	 * **The status is not among them.** The engine owns `status` — it is what moves an agent out of
+	 * `wrap-up` when the deadline passes — and a control-plane writer that decided the after-call
+	 * work was over would be the second implementation of a rule that only works if there is one.
+	 *
+	 * ## The race, and the bound on it
+	 *
+	 * `put` is unconditional here for exactly the reason the class header gives for `write`: the
+	 * loser of a race with the engine survives for one distribution pass, and a CAS loop would turn
+	 * that second into a retry storm at precisely the moment both writers are busiest. What is
+	 * DIFFERENT, and is why this is worth stating separately, is which way the loss falls. The
+	 * engine's competing write is the one that ends wrap-up — and an entry that lost to it has had
+	 * the disposition dropped from a state the agent has already left, which is the harmless
+	 * direction. The durable record of the choice is the `queue_call_disposition` row, written
+	 * before this is reached; this entry is what the console reads back, and a console that
+	 * re-reads a moved-on agent renders their new state rather than a stale code.
+	 *
+	 * Returns `undefined` when the bucket has no entry for the agent at all. That is a real state —
+	 * an agent whose wrap-up ended and whose entry the engine has since rewritten — and it is not an
+	 * error: the caller has already stored the choice.
+	 */
+	async writeDisposition(input: AgentStateDispositionWrite): Promise<AgentStateEntry | undefined> {
+		const bucket = this.bucket;
+		if (bucket === undefined) {
+			throw new AgentStateUnavailableError();
+		}
+		const current = await this.read(input.organizationId, input.agentId);
+		if (current === undefined) {
+			return undefined;
+		}
+		const entry = agentStateEntrySchema.parse({
+			...current,
+			dispositionCode: input.code,
+			// The call the code belongs to is restated rather than assumed: an entry whose
+			// `dispositionCallId` the engine has already moved on would otherwise carry a code for one
+			// call filed against another.
+			dispositionCallId: input.callId,
+			source: "api",
+		} satisfies AgentStateEntry);
+		await bucket.put(
+			kvKeyFor.agentState(input.organizationId, input.agentId),
+			new TextEncoder().encode(JSON.stringify(entry)),
+		);
+		this.written += 1;
+		return entry;
+	}
+
+	/**
 	 * Publishes the transition on the org-wide queue scope.
 	 *
 	 * `QUEUE_SCOPE_ALL` rather than one subject per queue the agent serves: an agent has ONE status
@@ -242,6 +355,15 @@ export class AgentStatePublisher implements OnModuleInit, OnApplicationShutdown 
 			});
 		this.published += 1;
 	}
+}
+
+export interface AgentStateDispositionWrite {
+	readonly organizationId: string;
+	readonly agentId: string;
+	/** The call being closed out — `agentStateEntrySchema.dispositionCallId`. */
+	readonly callId: string;
+	/** The `queue_disposition_code.code`. `unset` is never written here; see the schema. */
+	readonly code: string;
 }
 
 export interface AgentStateWrite {

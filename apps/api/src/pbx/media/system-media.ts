@@ -54,7 +54,7 @@ import { MEDIA_KEY_PREFIXES } from "./media-storage";
  * seeds the additions on its next boot without an operator step. It is not a checksum: the seeder
  * compares those per asset, and this only decides whether the manifest is worth re-reading.
  */
-export const SYSTEM_MEDIA_VERSION = 1;
+export const SYSTEM_MEDIA_VERSION = 2;
 
 /** Where the manifest of what was seeded lives, relative to the object root. */
 export const SYSTEM_MEDIA_MANIFEST_KEY = "system-media.json";
@@ -169,6 +169,25 @@ export const SYSTEM_MEDIA_ASSETS: readonly SystemMediaAsset[] = [
 		stem: "vm-incorrect",
 		description: "that PIN was wrong",
 		segments: [beep(420, 400), gap(100), beep(330, 400)],
+	},
+	{
+		/**
+		 * The recording-consent announcement — "this call may be recorded".
+		 *
+		 * The only stem in this catalogue a caller hears for a LEGAL reason rather than an
+		 * operational one, and the one an operator is most likely to replace, because a tone cannot
+		 * say what a jurisdiction requires be said. It is seeded anyway, on the argument the header
+		 * makes: the alternative to a placeholder is silence, and a consent gate that announces
+		 * silence is a gate that records the call while telling the caller nothing — worse than the
+		 * defect, not better than it. Three rising tones, deliberately unlike any acknowledgement in
+		 * the catalogue, so an operator listening to a test call can hear that the gate fired.
+		 *
+		 * `call-control.ts` plays it as `sound:recording-consent` whenever the tenant names no prompt
+		 * of their own, and the seeder leaves an operator's own file at this key alone forever.
+		 */
+		stem: "recording-consent",
+		description: "this call may be recorded",
+		segments: [beep(520, 260), gap(90), beep(650, 260), gap(90), beep(820, 340)],
 	},
 	{
 		stem: "vm-rec-name",

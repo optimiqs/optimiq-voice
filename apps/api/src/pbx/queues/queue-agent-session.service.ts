@@ -1,14 +1,28 @@
-import { Inject, Injectable } from "@nestjs/common";
+import { Inject, Injectable, Optional } from "@nestjs/common";
 import { hasPermission, requireActiveOrganizationId } from "@optimiq-voice/auth";
 import {
 	ABSENT_AGENT_STATUS,
+	isEngineBenched,
 	planAgentSessionAction,
 	type AgentSessionAction,
 	type AgentStateEntry,
 	type AgentStatus,
 } from "@optimiq-voice/events/schemas";
 import { getLogger } from "@optimiq-voice/logging";
-import { eq, queueAgent, queueTier } from "@optimiq-voice/pbx-db";
+import {
+	and,
+	eq,
+	queueAgent,
+	queueCallDisposition,
+	queueDispositionCode,
+	QUEUE_DISPOSITION_UNSET,
+	QUEUE_SURVEY_MAX_ANSWER,
+	QUEUE_SURVEY_MIN_ANSWER,
+	queueSurveyQuestion,
+	queueSurveyResponse,
+	queueTier,
+	inArray,
+} from "@optimiq-voice/pbx-db";
 import { PBX_DATABASE } from "../shared/pbx.tokens";
 import { AgentStatePublisher, AgentStateUnavailableError } from "./agent-state.publisher";
 import {
@@ -16,7 +30,11 @@ import {
 	AgentTransitionRefusedException,
 	QueueAgentNotFoundException,
 	QueueAgentSessionForbiddenException,
+	QueueDispositionCodeUnknownException,
+	QueueDispositionNoLiveCallException,
 } from "./queue-agent-session.errors";
+import { QUEUE_DISPOSITION_LEDGER } from "./queue-disposition-cdr.port";
+import type { QueueDispositionLedger } from "./queue-disposition-cdr.port";
 import type { AppSession } from "@optimiq-voice/auth";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
@@ -63,6 +81,9 @@ export class QueueAgentSessionService {
 	constructor(
 		@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient,
 		@Inject(AgentStatePublisher) private readonly agentState: AgentStatePublisher,
+		@Optional()
+		@Inject(QUEUE_DISPOSITION_LEDGER)
+		private readonly ledger?: QueueDispositionLedger,
 	) {}
 
 	/**
@@ -171,6 +192,355 @@ export class QueueAgentSessionService {
 		};
 	}
 
+	/**
+	 * Records the wrap-up code an agent picked for the call they are finishing.
+	 *
+	 * ## Why it is on this service and not its own
+	 *
+	 * Because it is guarded by the same sentence: `queues.join` or `queues.manage-agents` for
+	 * anybody's seat, `queues.join.own` for your own. {@link assertMayAct} IS that sentence, and a
+	 * second copy of an OR-over-a-row is how the two spellings eventually disagree about which one
+	 * an unlinked seat falls under. The route's floor stays `queues.read`, for the reason the class
+	 * header gives.
+	 *
+	 * ## The queue comes from the live entry, not from the caller
+	 *
+	 * The `agent-state` entry names the queue that distributed the call (`queueId`) and the call
+	 * still owed a code (`dispositionCallId`). Both are read here rather than accepted, because a
+	 * body that could name a queue would let an agent file a code from one queue's vocabulary
+	 * against another queue's call — and every report groups by exactly that pair. An agent with no
+	 * live entry, or one whose entry names no queue, is a 409: the wrap-up they are trying to close
+	 * out is over or never happened, and there is nothing to attribute the code to.
+	 *
+	 * `callId` IS taken from the body and then checked against the entry. Restating it is what makes
+	 * a late submission for the PREVIOUS call refusable instead of silently landing on the current
+	 * one — the console reads it off the same entry, so a mismatch means the agent has moved on.
+	 *
+	 * ## Three writes, in this order, and only the first may fail the request
+	 *
+	 * 1. `queue_call_disposition`, upserted on `(call, agent)`. This is the durable record and the
+	 *    only one whose failure the caller hears about. A correction inside the wrap-up window
+	 *    overwrites rather than appends, which is what the unique index is for: an agent who picked
+	 *    the wrong code and fixed it has chosen once.
+	 * 2. The `agent-state` entry, so the console can read back what it just sent without waiting for
+	 *    anything. The status is untouched — the engine owns it.
+	 * 3. The CDR leg, best-effort and possibly absent entirely. See `queue-disposition-cdr.port.ts`.
+	 */
+	async submitDisposition(
+		session: AppSession,
+		agentId: string,
+		input: { readonly callId: string; readonly code: string },
+	): Promise<{ readonly data: QueueDispositionView }> {
+		const organizationId = requireActiveOrganizationId(session);
+		const row = await this.requireAgent(organizationId, agentId);
+		this.assertMayAct(session, row);
+
+		const live = await this.agentState.read(organizationId, agentId);
+		const queueId = live?.queueId;
+		if (live === undefined || queueId === undefined) {
+			throw new QueueDispositionNoLiveCallException(input.callId);
+		}
+		// The entry may legitimately name no call at all — an agent whose wrap-up ended between the
+		// console rendering the form and the submit — so an absent `dispositionCallId` is the same
+		// refusal as a mismatched one rather than a pass.
+		if (live.dispositionCallId !== input.callId) {
+			throw new QueueDispositionNoLiveCallException(input.callId);
+		}
+
+		const recorded = await this.recordDisposition({
+			organizationId,
+			queueId,
+			queueAgentId: agentId,
+			callId: input.callId,
+			code: input.code,
+			auto: false,
+		});
+
+		try {
+			await this.agentState.writeDisposition({
+				organizationId,
+				agentId,
+				callId: input.callId,
+				code: recorded.code,
+			});
+		} catch (error) {
+			// The choice is already durable. Refusing the request now would tell the agent their code
+			// was not recorded when it was, and they would pick it again on a call that has moved on.
+			logger.warn(
+				{ organizationId, agentId, callId: input.callId, error },
+				"a wrap-up code was recorded but could not be written to the live agent-state entry; " +
+					"the console will show it after its next read",
+			);
+		}
+
+		await this.stampLedger(organizationId, agentId, input.callId, recorded.code);
+
+		logger.info(
+			{
+				organizationId,
+				agentId,
+				queueId,
+				callId: input.callId,
+				code: recorded.code,
+				actor: session.user.id,
+				self: row.userId === session.user.id,
+			},
+			"a queue call disposition was recorded",
+		);
+		return { data: { ...recorded, queueId, agentId, callId: input.callId } };
+	}
+
+	/**
+	 * The ENGINE's auto-wrap report: the deadline passed with nobody choosing.
+	 *
+	 * No session, and no {@link assertMayAct}: the caller is the distributor, reached over the
+	 * broker, and the fact it is reporting is one only it can know. What replaces the permission
+	 * check is the shape of what it may say — {@link QUEUE_DISPOSITION_UNSET} and nothing else. An
+	 * engine that could name a real code here would be a second, unauthenticated way to write an
+	 * agent's answer, and the whole point of `unset` is that it is the ABSENCE of one.
+	 *
+	 * Idempotent by the same unique index the agent's path uses, and deliberately LOSES to it: a
+	 * report that arrives after the agent chose must not overwrite their choice with `unset`, which
+	 * is why this upsert is conditional on the existing row being auto. The engine retrying a report
+	 * it already delivered writes the same row twice, which is the same row.
+	 *
+	 * The KV entry is NOT stamped: `agentStateEntrySchema.dispositionCode` documents that `unset` is
+	 * never written there, and a console showing "unset" as if it were a choice would be reporting
+	 * the system's giving up as the agent's answer.
+	 */
+	async recordAutoDisposition(input: {
+		readonly organizationId: string;
+		readonly queueId: string;
+		readonly agentId: string;
+		readonly callId: string;
+	}): Promise<{ readonly recorded: boolean }> {
+		const written = await this.database.withTenantScope(
+			input.organizationId,
+			async (transaction) => {
+				const result = await transaction
+					.insert(queueCallDisposition)
+					.values({
+						organizationId: input.organizationId,
+						queueId: input.queueId,
+						queueAgentId: input.agentId,
+						callId: input.callId,
+						codeId: null,
+						code: QUEUE_DISPOSITION_UNSET,
+						auto: true,
+					})
+					.onConflictDoNothing()
+					.returning({ id: queueCallDisposition.id });
+				return result.length > 0;
+			},
+		);
+		await this.stampLedger(
+			input.organizationId,
+			input.agentId,
+			input.callId,
+			QUEUE_DISPOSITION_UNSET,
+		);
+		logger.info(
+			{ ...input, recorded: written },
+			written
+				? "the wrap-up deadline recorded an unset disposition"
+				: "an auto-wrap report arrived for a call the agent had already dispositioned",
+		);
+		return { recorded: written };
+	}
+
+	/**
+	 * Files what one caller pressed in the post-call survey.
+	 *
+	 * ## One row per answer, and the unique index is the whole idempotence story
+	 *
+	 * `queue_survey_response` is unique on `(organization_id, call_id, question_id)`, and this writes
+	 * `onConflictDoNothing` against it. So a report the engine delivered twice — a timeout on the
+	 * first attempt that in fact arrived, a restart mid-detach — counts a caller's rating once. Doing
+	 * it the other way (an upsert that overwrote) would be the same thing for a replay and wrong for
+	 * everything else: there is no second opinion to record, because the caller pressed once.
+	 *
+	 * `recorded` is therefore the number of rows this call actually inserted, and a report that
+	 * writes fewer rows than it carried is a replay rather than an error. The engine logs the
+	 * difference and does not retry.
+	 *
+	 * ## An answer for a question this queue does not have is REFUSED, not stored
+	 *
+	 * The questions are read first, inside the same transaction as the write, and every `questionId`
+	 * is checked against that queue's own set. A caller cannot press a digit for a question they were
+	 * never asked, so such a report is one of two bugs — a stale membership artifact naming a deleted
+	 * question, or a report addressed to the wrong queue — and storing it would put a rating against
+	 * a question nobody can interpret in the only table the scores are read from. The same goes for a
+	 * digit outside 1-5, which `queue_survey_response`'s own check constraint would reject as a
+	 * database error rather than as an answer. Both come back in `reason`, where the engine's log
+	 * puts them in front of somebody.
+	 *
+	 * The refusal is per ANSWER and not per report: two good answers and one impossible one write
+	 * two rows and say so, for the reason `runQueueSurvey` returns the answers it has when it stops
+	 * early — a partial survey is more data than none.
+	 */
+	async recordSurveyAnswers(input: {
+		readonly organizationId: string;
+		readonly queueId: string;
+		readonly agentId: string;
+		readonly callId: string;
+		readonly answers: readonly { readonly questionId: string; readonly answer: number }[];
+	}): Promise<{ readonly recorded: number; readonly reason?: string }> {
+		const answeredAt = new Date();
+		const result = await this.database.withTenantScope(
+			input.organizationId,
+			async (transaction) => {
+				const questionIds = [...new Set(input.answers.map((answer) => answer.questionId))];
+				const known = new Set(
+					(
+						await transaction
+							.select({ id: queueSurveyQuestion.id })
+							.from(queueSurveyQuestion)
+							.where(
+								and(
+									eq(queueSurveyQuestion.queueId, input.queueId),
+									inArray(queueSurveyQuestion.id, questionIds),
+								),
+							)
+					).map((row) => row.id),
+				);
+
+				const refusals: string[] = [];
+				const values = input.answers.filter((answer) => {
+					if (!known.has(answer.questionId)) {
+						refusals.push(`${answer.questionId}: not a question of this queue`);
+						return false;
+					}
+					if (
+						!Number.isInteger(answer.answer) ||
+						answer.answer < QUEUE_SURVEY_MIN_ANSWER ||
+						answer.answer > QUEUE_SURVEY_MAX_ANSWER
+					) {
+						refusals.push(`${answer.questionId}: answer ${String(answer.answer)} is out of range`);
+						return false;
+					}
+					return true;
+				});
+
+				if (values.length === 0) {
+					return { recorded: 0, refusals };
+				}
+				const written = await transaction
+					.insert(queueSurveyResponse)
+					.values(
+						values.map((answer) => ({
+							organizationId: input.organizationId,
+							queueId: input.queueId,
+							questionId: answer.questionId,
+							callId: input.callId,
+							queueAgentId: input.agentId,
+							answer: answer.answer,
+							answeredAt,
+						})),
+					)
+					.onConflictDoNothing()
+					.returning({ id: queueSurveyResponse.id });
+				return { recorded: written.length, refusals };
+			},
+		);
+
+		const reason =
+			result.refusals.length > 0 ? result.refusals.join("; ").slice(0, 256) : undefined;
+		logger.info(
+			{
+				organizationId: input.organizationId,
+				queueId: input.queueId,
+				agentId: input.agentId,
+				callId: input.callId,
+				sent: input.answers.length,
+				recorded: result.recorded,
+				...(reason === undefined ? {} : { reason }),
+			},
+			reason === undefined
+				? "recorded a post-call survey"
+				: "a post-call survey report carried answers this queue could not accept",
+		);
+		return { recorded: result.recorded, ...(reason === undefined ? {} : { reason }) };
+	}
+
+	/**
+	 * Resolves the code against the queue's ENABLED vocabulary and upserts the row.
+	 *
+	 * The lookup and the write share one transaction, so a code retired between the two cannot
+	 * produce a row naming a code the queue no longer offers. `codeId` is stored beside the
+	 * denormalised `code` because they answer different questions once somebody deletes a retired
+	 * code: the id goes to NULL and the text is what the history is for.
+	 */
+	private async recordDisposition(input: {
+		readonly organizationId: string;
+		readonly queueId: string;
+		readonly queueAgentId: string;
+		readonly callId: string;
+		readonly code: string;
+		readonly auto: boolean;
+	}): Promise<{ readonly code: string; readonly codeId: string | null; readonly auto: boolean }> {
+		return await this.database.withTenantScope(input.organizationId, async (transaction) => {
+			const rows = await transaction
+				.select({ id: queueDispositionCode.id })
+				.from(queueDispositionCode)
+				.where(
+					and(
+						eq(queueDispositionCode.queueId, input.queueId),
+						eq(queueDispositionCode.code, input.code),
+						eq(queueDispositionCode.enabled, true),
+					),
+				)
+				.limit(1);
+			const codeId = rows[0]?.id;
+			if (codeId === undefined) {
+				throw new QueueDispositionCodeUnknownException(input.code, input.queueId);
+			}
+			await transaction
+				.insert(queueCallDisposition)
+				.values({
+					organizationId: input.organizationId,
+					queueId: input.queueId,
+					queueAgentId: input.queueAgentId,
+					callId: input.callId,
+					codeId,
+					code: input.code,
+					auto: input.auto,
+				})
+				.onConflictDoUpdate({
+					target: [
+						queueCallDisposition.organizationId,
+						queueCallDisposition.callId,
+						queueCallDisposition.queueAgentId,
+					],
+					set: { codeId, code: input.code, auto: input.auto, updatedAt: new Date() },
+				});
+			return { code: input.code, codeId, auto: input.auto };
+		});
+	}
+
+	/** The reporting copy. Absent port, absent CDR database and a leg still in flight all no-op. */
+	private async stampLedger(
+		organizationId: string,
+		queueAgentId: string,
+		callId: string,
+		code: string,
+	): Promise<void> {
+		if (this.ledger === undefined) {
+			return;
+		}
+		const stamped = await this.ledger.recordDisposition({
+			organizationId,
+			callId,
+			queueAgentId,
+			code,
+		});
+		if (stamped === 0) {
+			logger.debug(
+				{ organizationId, queueAgentId, callId, code },
+				"no CDR leg carried the wrap-up code yet; the ledger copy will be missing for this call",
+			);
+		}
+	}
+
 	private async requireAgent(organizationId: string, agentId: string): Promise<QueueAgentRow> {
 		const row = await this.database.withTenantScope(organizationId, async (transaction) => {
 			const rows = await transaction
@@ -266,6 +636,15 @@ export class QueueAgentSessionService {
 		const granted = session.permissions ?? [];
 		const managesOthers =
 			hasPermission(granted, "queues.join") || hasPermission(granted, "queues.manage-agents");
+		const self = row.userId !== null && row.userId === session.user.id;
+		/**
+		 * The call and disposition fields are the same live state the `agent-state` socket topic
+		 * carries, and that topic is gated on `queues.monitor`. Repeating them here for a caller who
+		 * only holds `queues.read` would hand out over HTTP what the socket refuses — so they are
+		 * carried for a supervisor, or for the agent asking about their own seat.
+		 */
+		const seesLiveCall = self || hasPermission(granted, "queues.monitor");
+		const call = seesLiveCall ? live : undefined;
 		return {
 			agentId: row.id,
 			name: row.name,
@@ -280,16 +659,45 @@ export class QueueAgentSessionService {
 			since: live?.since ?? row.statusChangedAt?.toISOString() ?? null,
 			reason: live?.reason ?? null,
 			availableAt: live?.availableAt ?? null,
+			/**
+			 * The free-text reason narrowed to the two the DISTRIBUTOR writes, so a supervisor can
+			 * tell a phone nobody is answering from a person who typed "back at 3". Null for every
+			 * human-set reason, which is still carried whole on `reason`.
+			 */
+			unavailableReason: live !== undefined && isEngineBenched(live) ? (live.reason ?? null) : null,
 			/** Which process last wrote it. `null` when only the column has ever been written. */
 			source: live?.source ?? null,
+			/**
+			 * The call fields the live socket already carries, repeated here so the wallboard's
+			 * supervise button and the console's wrap-up panel work on a cold or unpermitted socket.
+			 * All four are `null` off a call: the bucket omits them rather than writing a null.
+			 */
+			callId: call?.callId ?? null,
+			/** The queue that distributed {@link callId}; a supervise request needs both. */
+			queueId: call?.queueId ?? null,
+			dispositionCallId: call?.dispositionCallId ?? null,
+			dispositionCode: call?.dispositionCode ?? null,
+			dispositionRequired: call?.dispositionRequired ?? false,
 			/** Whether the bucket has an entry at all, so a UI can say "live" rather than "last known". */
 			live: live !== undefined,
-			self: row.userId !== null && row.userId === session.user.id,
+			self,
 			/** What the caller may do, so a console renders the buttons it will not be refused for. */
 			canManage: managesOthers,
 			canManageSelf: managesOthers || hasPermission(granted, "queues.join.own"),
 		};
 	}
+}
+
+/** What the disposition endpoint answers with. Mirrored in `apps/web`'s `lib/pbx/contracts.ts`. */
+export interface QueueDispositionView {
+	readonly queueId: string;
+	readonly agentId: string;
+	readonly callId: string;
+	readonly code: string;
+	/** The `queue_disposition_code` row, or `null` when the deadline chose. */
+	readonly codeId: string | null;
+	/** False when a person picked it. See `packages/pbx-db`'s `queue_call_disposition.auto`. */
+	readonly auto: boolean;
 }
 
 /** What a session endpoint answers with. Mirrored in `apps/web`'s `lib/pbx/contracts.ts`. */
@@ -301,8 +709,15 @@ export interface AgentSessionView {
 	readonly status: AgentStatus;
 	readonly since: string | null;
 	readonly reason: string | null;
+	/** `reason`, but only when the distributor benched the agent. See `ENGINE_UNAVAILABLE_REASONS`. */
+	readonly unavailableReason: string | null;
 	readonly availableAt: string | null;
 	readonly source: "engine" | "api" | null;
+	readonly callId: string | null;
+	readonly queueId: string | null;
+	readonly dispositionCallId: string | null;
+	readonly dispositionCode: string | null;
+	readonly dispositionRequired: boolean;
 	readonly live: boolean;
 	readonly self: boolean;
 	readonly canManage: boolean;

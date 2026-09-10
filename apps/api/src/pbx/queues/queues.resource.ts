@@ -1,4 +1,12 @@
-import { queue, queueAgent, queueTier } from "@optimiq-voice/pbx-db";
+import {
+	queue,
+	queueAgent,
+	queueAgentSkill,
+	queueDispositionCode,
+	queueSkillRequirement,
+	queueSurveyQuestion,
+	queueTier,
+} from "@optimiq-voice/pbx-db";
 import type { PbxChildResource, PbxResource } from "../shared/pbx-resource";
 
 /**
@@ -64,4 +72,87 @@ export const QUEUE_TIER_RESOURCE: PbxChildResource = {
 	parentTable: queue,
 	// No `ordinalColumn`: a tier's place is `(level, position)`, which the caller sets explicitly
 	// because it decides who is offered the call first. It is not a drag handle over one list.
+};
+
+/**
+ * The wrap-up vocabulary one queue offers.
+ *
+ * A queue's child, like the tiers, and behind `queues.write` rather than `queues.manage-agents`:
+ * the codes are what the queue asks about its own calls, which is the same kind of decision as its
+ * announcements and its overflow branch. Staffing the floor is the other permission and the other
+ * collection.
+ *
+ * No `ordinalColumn`, so there is no `PUT …/reorder`: `position` is a number the caller sets on the
+ * row, ties fall back to the code, and a drag handle over a list a console renders alphabetically
+ * as often as by position would be a reorder endpoint nothing calls. `enabled` IS declared, because
+ * retiring a code without deleting it is the normal way one leaves the vocabulary — the history
+ * that references it is the reason the table exists.
+ */
+export const QUEUE_DISPOSITION_CODE_RESOURCE: PbxChildResource = {
+	kind: "queue-disposition-code",
+	tableName: "queue_disposition_code",
+	table: queueDispositionCode,
+	searchColumns: [queueDispositionCode.code, queueDispositionCode.label],
+	orderBy: [queueDispositionCode.position, queueDispositionCode.code, queueDispositionCode.id],
+	enabledColumn: queueDispositionCode.enabled,
+	destinations: [],
+	destinationType: null,
+	parentColumn: queueDispositionCode.queueId,
+	parentKind: "queue",
+	parentTable: queue,
+};
+
+/** What a queue's callers need from an agent. See `packages/pbx-db` for why relaxation is the point. */
+export const QUEUE_SKILL_REQUIREMENT_RESOURCE: PbxChildResource = {
+	kind: "queue-skill-requirement",
+	tableName: "queue_skill_requirement",
+	table: queueSkillRequirement,
+	searchColumns: [queueSkillRequirement.skill],
+	orderBy: [queueSkillRequirement.skill, queueSkillRequirement.id],
+	destinations: [],
+	destinationType: null,
+	parentColumn: queueSkillRequirement.queueId,
+	parentKind: "queue",
+	parentTable: queue,
+};
+
+/**
+ * The post-call survey's questions — at most three, at positions 1 to 3.
+ *
+ * Ordered by `position` and no `ordinalColumn`, for a stronger reason than the disposition codes
+ * have: the position IS the question's identity in every report, so a reorder that renumbered rows
+ * would silently re-file last month's answers under a different question.
+ */
+export const QUEUE_SURVEY_QUESTION_RESOURCE: PbxChildResource = {
+	kind: "queue-survey-question",
+	tableName: "queue_survey_question",
+	table: queueSurveyQuestion,
+	searchColumns: [queueSurveyQuestion.label],
+	orderBy: [queueSurveyQuestion.position, queueSurveyQuestion.id],
+	destinations: [],
+	destinationType: null,
+	parentColumn: queueSurveyQuestion.queueId,
+	parentKind: "queue",
+	parentTable: queue,
+};
+
+/**
+ * What one AGENT is good at — the only child collection here whose parent is not the queue.
+ *
+ * It hangs off `queue_agent` for the reason that table is top-level to begin with: a skill is a
+ * property of the person and the same agent carries it into every queue they staff. Mounting it
+ * under a queue would make one fact look like N, and editing "spanish: 4" on the Sales queue would
+ * either change it everywhere (a lie about the URL) or not (a lie about the data).
+ */
+export const QUEUE_AGENT_SKILL_RESOURCE: PbxChildResource = {
+	kind: "queue-agent-skill",
+	tableName: "queue_agent_skill",
+	table: queueAgentSkill,
+	searchColumns: [queueAgentSkill.skill],
+	orderBy: [queueAgentSkill.skill, queueAgentSkill.id],
+	destinations: [],
+	destinationType: null,
+	parentColumn: queueAgentSkill.queueAgentId,
+	parentKind: "queue-agent",
+	parentTable: queueAgent,
 };

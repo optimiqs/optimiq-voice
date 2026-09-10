@@ -1,5 +1,6 @@
 import { ForbiddenException, Inject, Injectable } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
+import { EmergencyAddressesService } from "../../pbx/emergency-addresses/emergency-addresses.service";
 import { PbxChildResourceService, PbxResourceService } from "../../pbx/shared/pbx-resource.service";
 import { PBX_DATABASE, PBX_EFFECT_RUNTIME } from "../../pbx/shared/pbx.tokens";
 import { assertOwnsRow, holdsUnscoped, ownedDeviceIds } from "../../pbx/shared/self-ownership";
@@ -158,8 +159,56 @@ export class DevicesService extends PbxResourceService {
 		@Inject(PBX_EFFECT_RUNTIME) runtime: PbxRepositoryRuntime,
 		@Inject(PROVISIONING_ENV) private readonly env: ProvisioningEnv,
 		@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient,
+		@Inject(EmergencyAddressesService)
+		private readonly emergencyAddresses: EmergencyAddressesService,
 	) {
 		super(runtime, DEVICE_RESOURCE);
+	}
+
+	override async create(
+		session: AppSession,
+		values: Record<string, unknown>,
+	): ReturnType<PbxResourceService["create"]> {
+		await this.assertEmergencyAddressAssignable(session, values);
+		return await super.create(session, values);
+	}
+
+	override async update(
+		session: AppSession,
+		id: string,
+		values: Record<string, unknown>,
+	): ReturnType<PbxResourceService["update"]> {
+		await this.assertEmergencyAddressAssignable(session, values);
+		return await super.update(session, id, values);
+	}
+
+	/**
+	 * A handset gets the same E911 gate a DID gets: an address a carrier has not confirmed is a
+	 * dispatchable location may not be attached to it.
+	 *
+	 * `PhoneNumbersService` refuses `EMERGENCY_ADDRESS_NOT_VALIDATED` on the DID path for the reason
+	 * RAY BAUM's Act cares about — an unvalidated address reads as compliant on the screen and sends
+	 * an ambulance to a door that does not exist. A device carries its own dispatchable location, so
+	 * the gate has to be here too or the DID gate is trivially bypassed by pointing a phone at the
+	 * address instead.
+	 *
+	 * Only when the write NAMES the column, and never for a cleared one — same rule and same reason
+	 * as the DID path: an unrelated rename must not fail because of a grandfathered address, and
+	 * detaching one must stay possible whatever its state.
+	 */
+	private async assertEmergencyAddressAssignable(
+		session: AppSession,
+		values: Record<string, unknown>,
+	): Promise<void> {
+		if (!Object.hasOwn(values, "emergencyAddressId")) {
+			return;
+		}
+		const addressId = values.emergencyAddressId;
+		await this.emergencyAddresses.assertAssignable(
+			session,
+			typeof addressId === "string" ? addressId : null,
+			typeof values.macAddress === "string" ? `device ${values.macAddress}` : "this device",
+		);
 	}
 
 	override async list(

@@ -11,6 +11,7 @@ import {
 } from "./auth/auth-bootstrap";
 import { assertCdrPreflight, isCdrAreaEnabled } from "./cdr/cdr-bootstrap";
 import { CdrModule } from "./cdr/cdr.module";
+import { ComplianceModule } from "./compliance/compliance.module";
 import { httpLoggerOptions } from "./core/http/log-redaction";
 import { observeHttpRequest } from "./core/metrics/metrics";
 import { startMetricsServer, type MetricsServer } from "./core/metrics/metrics-server";
@@ -18,6 +19,7 @@ import { HTTP_BRIDGE_PORT } from "./envs";
 import { registerLiveTransport } from "./live/live-bootstrap";
 import { LiveModule } from "./live/live.module";
 import { assertMailPreflight, loadMailEnv, selectMailTransport } from "./mail";
+import { MessagingModule } from "./messaging/messaging.module";
 import { isPbxAreaEnabled, registerPbxTransport } from "./pbx/pbx-bootstrap";
 import { PbxCdrPortsModule } from "./pbx/pbx-cdr-ports.module";
 import { PbxModule } from "./pbx/pbx.module";
@@ -202,10 +204,19 @@ async function bootstrap() {
 	 * answers nothing asks for; with only the CDR area it could not construct them; in both cases
 	 * the CDR consumers inject the tokens `@Optional()` and degrade to the platform env values.
 	 */
+	/**
+	 * `ComplianceModule` mounts on the same condition and for the same reason. Its KYC file and its
+	 * verified caller ids are `pbx-db` rows; its traceback and its attestation summary read `cdr-db`;
+	 * and it is the one area that needs both at once, which is why it sits above them rather than
+	 * inside either. It is also `@Global()`, for one provider: the CDR leg writer injects
+	 * `CDR_ATTESTATION_STAMP` `@Optional()` and files legs unstamped without it.
+	 */
 	const extraModules = [
-		...(pbxAreaEnabled ? [PbxModule, ProvisioningModule, LiveModule, SessionModule] : []),
+		...(pbxAreaEnabled
+			? [PbxModule, ProvisioningModule, LiveModule, SessionModule, MessagingModule]
+			: []),
 		...(cdrAreaEnabled ? [CdrModule] : []),
-		...(pbxAreaEnabled && cdrAreaEnabled ? [PbxCdrPortsModule] : []),
+		...(pbxAreaEnabled && cdrAreaEnabled ? [PbxCdrPortsModule, ComplianceModule] : []),
 	];
 	const rootModule: Type<unknown> = authSliceEnabled
 		? createApiRootModule([AppModule], extraModules)

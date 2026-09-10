@@ -333,6 +333,83 @@ export const pbxEnvSchema = z.object({
 	 */
 	PBX_HOT_DESK_SWEEP_INTERVAL_MS: z.coerce.number().int().min(0).max(3_600_000).default(60_000),
 	/**
+	 * How often the toll-fraud anomaly detector looks backwards over the last hour of call records.
+	 *
+	 * An hour, matching the window it reads, so consecutive passes tile rather than overlap. A
+	 * shorter interval would re-examine the same calls and re-raise the same signals; JetStream's
+	 * duplicate window would swallow some of them and not others, which is worse than either.
+	 *
+	 * `0` disables the timer, for a deployment that runs the pass from somewhere else — or for one
+	 * that has decided it does not want backward-looking detection. Warned about at boot, because a
+	 * tenant with no configured spend ceilings then has no toll-fraud detection at all.
+	 */
+	PBX_FRAUD_DETECTOR_INTERVAL_MS: z.coerce.number().int().min(0).max(86_400_000).default(3_600_000),
+
+	/**
+	 * How long `audit_log` rows are kept, in days. `0` keeps them for ever.
+	 *
+	 * ## A PLATFORM env, and it must never become a tenant setting
+	 *
+	 * Every other retention window on this platform is the tenant's to choose — how long their
+	 * recordings live, how long their voicemail lives — because the data is theirs and the
+	 * minimisation duty is theirs. The change ledger is the one that inverts: it is the record of
+	 * what the tenant's own administrators DID, and the parties it protects are the tenant's users,
+	 * their customers, and any regulator or auditor arriving afterwards. An organization that could
+	 * set this would be able to shorten the evidence of its own actions, which is not a retention
+	 * policy — it is a cover-up with a settings screen. So there is no `org_setting` for it, there
+	 * is no `.own` scope for it, and the only party who can move this number is the operator running
+	 * the deployment. `security-schema.ts` makes the same argument in privileges: the tenant role
+	 * holds `SELECT, INSERT` on this table and no `UPDATE` or `DELETE` at all, so a tenant cannot
+	 * rewrite history either.
+	 *
+	 * ## Four hundred days
+	 *
+	 * Over a year, deliberately, so an ANNUAL review can still look back at the year it is
+	 * reviewing. A 365-day window is the trap that looks right: an audit run in February over the
+	 * previous calendar year finds January already gone. Four hundred days gives a full year plus
+	 * five weeks of slack for the review to actually happen, which is the shortest window that
+	 * makes the ledger usable for the thing ledgers are read for.
+	 *
+	 * `0` for a deployment under an obligation to keep the ledger indefinitely.
+	 */
+	AUDIT_LOG_RETENTION_DAYS: z.coerce.number().int().min(0).max(3_650).default(400),
+
+	/**
+	 * How often the audit-log purge runs in this process. `0` disables it.
+	 *
+	 * Daily. A window measured in hundreds of days gains nothing from a finer interval, and the
+	 * delete is a plain ranged `DELETE` on an append-only table rather than a partition drop.
+	 */
+	AUDIT_LOG_SWEEP_INTERVAL_MS: z.coerce.number().int().min(0).max(604_800_000).default(86_400_000),
+
+	/** How many ledger rows one purge pass deletes. Bounded so a first pass cannot lock the table. */
+	AUDIT_LOG_SWEEP_BATCH: z.coerce.number().int().min(1).max(50_000).default(1_000),
+
+	/**
+	 * How often expired voicemail messages are purged in this process. `0` disables the timer.
+	 *
+	 * Hourly. The window is measured in days, so the interval only bounds how long a message
+	 * outlives its window — an hour of slack on a policy of days is not a policy anyone can
+	 * perceive, and a finer interval would put a settings scan and a per-tenant mailbox query on
+	 * the database for nothing.
+	 */
+	PBX_VOICEMAIL_RETENTION_SWEEP_INTERVAL_MS: z.coerce
+		.number()
+		.int()
+		.min(0)
+		.max(86_400_000)
+		.default(3_600_000),
+
+	/**
+	 * How many expired messages one organization gives up per pass.
+	 *
+	 * Bounded because each one is an object delete against a store that may be S3: a tenant
+	 * enabling a short window for the first time has a backlog of years, and a pass that tried to
+	 * clear all of it would hold a transaction open across thousands of network round trips. The
+	 * remainder is still expired and is picked up on the next pass.
+	 */
+	PBX_VOICEMAIL_RETENTION_SWEEP_BATCH: z.coerce.number().int().min(1).max(10_000).default(200),
+	/**
 	 * Consecutive failures before a subscription is switched off on the tenant's behalf.
 	 *
 	 * Twenty, which at the default retry budget is sixty failed POSTs to an endpoint that has never

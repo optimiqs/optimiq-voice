@@ -1,6 +1,8 @@
 import { Inject, Injectable, Optional } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { getLogger } from "@optimiq-voice/logging";
+import { actorFromSession, insertAuditLog } from "../shared/audit-log";
+import { PBX_DATABASE } from "../shared/pbx.tokens";
 import { CallControlClient } from "./call-control.client";
 import {
 	CallNotControllableException,
@@ -11,6 +13,7 @@ import {
 import { ControlledCalls } from "./controlled-calls";
 import type { AppSession } from "@optimiq-voice/auth";
 import type { CallControlResponse, CallControlVerb } from "@optimiq-voice/events/schemas";
+import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
 const logger = getLogger("api.calls");
 
@@ -76,7 +79,78 @@ export class CallRecordingService {
 		 * the subject existed.
 		 */
 		@Optional() @Inject(CallControlClient) private readonly engine?: CallControlClient,
+		/**
+		 * The change ledger.
+		 *
+		 * Optional on the same terms as the engine subject above — a spec about the session path
+		 * needs neither a broker nor a database — and the deployed module always provides it.
+		 */
+		@Optional() @Inject(PBX_DATABASE) private readonly database?: PbxDatabaseClient,
 	) {}
+
+	/**
+	 * Records a pause or a resume in `audit_log`.
+	 *
+	 * ## Why a log line was not enough
+	 *
+	 * This surface wrote `logger.info(… "paused a call recording")` and nothing else, which puts the
+	 * one control on this platform that DELIBERATELY CREATES A GAP IN A RECORDING in the same place
+	 * as a health check. A pause is the exact operation an investigation has to be able to
+	 * reconstruct — a card number was read aloud and the recorder was silenced, or a conversation
+	 * went off the record for ninety seconds and the ledger has no idea. Application logs are
+	 * rotated, are not tenant-scoped, are not append-only by privilege, and are not what anyone is
+	 * handed during a dispute. `audit_log` is all four.
+	 *
+	 * ## `pause` and `resume` as two actions, not one with a flag
+	 *
+	 * `call-recording.pause` and `call-recording.resume` rather than `call-recording.set-paused`
+	 * with a boolean, because the question asked of this ledger is always "when did the recording
+	 * stop and when did it start again?", and a reader answering it from a jsonb field inside a
+	 * single action name is doing string work the `action` column exists to spare them.
+	 *
+	 * ## The row is written AFTER the engine acknowledged
+	 *
+	 * A refused pause changed nothing about the recorder, and a ledger row for it would claim a gap
+	 * in the audio that does not exist — which is a worse error than the missing row, because it is
+	 * one somebody would act on. Refusals stay on the log line they already had.
+	 *
+	 * `resourceRef` is the CALL id: `resource_ref` is a uuid column, the call is the resource whose
+	 * recording changed state, and the leg is in `after` where a reader needs it but nothing joins
+	 * on it. Failure never fails the request — the recorder is already paused, and refusing to
+	 * report that because an insert would not take is trading a gap in the ledger for a control
+	 * that appears broken.
+	 */
+	private async audit(
+		session: AppSession,
+		organizationId: string,
+		callId: string,
+		legId: string,
+		paused: boolean,
+		instanceId: string,
+	): Promise<void> {
+		const database = this.database;
+		if (database === undefined) {
+			return;
+		}
+		try {
+			await database.withTenantScope(organizationId, async (transaction) => {
+				await insertAuditLog(transaction, {
+					organizationId,
+					actor: actorFromSession(session),
+					action: paused ? "call-recording.pause" : "call-recording.resume",
+					resourceType: "call",
+					resourceRef: callId,
+					before: null,
+					after: { callId, legId, paused, instanceId },
+				});
+			});
+		} catch (cause) {
+			logger.error(
+				{ organizationId, callId, legId, paused, cause },
+				"a recording pause could not be recorded in the audit ledger",
+			);
+		}
+	}
 
 	/**
 	 * Pauses or resumes the recording on one live call.
@@ -134,6 +208,7 @@ export class CallRecordingService {
 			},
 			paused ? "paused a call recording" : "resumed a call recording",
 		);
+		await this.audit(session, organizationId, callId, call.legId, paused, response.instanceId);
 		return {
 			callId,
 			legId: call.legId,
@@ -216,12 +291,23 @@ export class CallRecordingService {
 			},
 			paused ? "paused a call recording" : "resumed a call recording",
 		);
+		// The ENGINE's answer again, for the same reason it is what the response carries: a resume
+		// that landed on an already-running recorder must not be recorded as a state change.
+		const settled = last.paused ?? paused;
+		await this.audit(
+			session,
+			organizationId,
+			callId,
+			last.legId ?? callId,
+			settled,
+			last.instanceId,
+		);
 		return {
 			callId,
 			legId: last.legId ?? callId,
 			// The ENGINE's answer, not the request. A resume that landed on an already-running
 			// recorder must report what the recorder is doing, because that is what the button draws.
-			paused: last.paused ?? paused,
+			paused: settled,
 			instanceId: last.instanceId,
 		};
 	}

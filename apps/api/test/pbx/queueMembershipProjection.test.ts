@@ -33,6 +33,10 @@ function queueRow(overrides: Partial<QueueRosterQueueRow> = {}): QueueRosterQueu
 		tierRulesApply: true,
 		tierRuleWaitSeconds: 30,
 		tierRuleNoAgentNoWait: false,
+		ronaEnabled: false,
+		dispositionRequired: false,
+		surveyEnabled: false,
+		surveyIntroPromptId: null,
 		...overrides,
 	};
 }
@@ -55,6 +59,7 @@ function tierRow(overrides: Partial<QueueRosterTierRow> = {}): QueueRosterTierRo
 		busyDelaySeconds: 60,
 		rejectDelaySeconds: 60,
 		enabled: true,
+		skills: [],
 		...overrides,
 	};
 }
@@ -268,5 +273,169 @@ describe("per-tier agent announcements", () => {
 		});
 		const seat = projection.memberships[0]?.agents[0];
 		expect(seat).to.not.have.property("announcePromptId");
+	});
+});
+
+/**
+ * The new roster fields, and the one property that matters more than any of them.
+ *
+ * The engine's older readers are keyed off ABSENCE — an `undefined` `dispositionCodes` means "this
+ * queue asks nothing", and an empty array means the same thing in bytes those readers never saw.
+ * `isSameRoster` in the publisher compares serialised values, so a projection that started writing
+ * `[]` would republish every roster in every tenant on the first write after a deploy and would make
+ * "asks nothing" and "asks for an empty list" two different states. Hence the first test here: a
+ * queue configured with none of this must serialise EXACTLY as it did before the columns existed.
+ */
+describe("projectQueueMemberships — dispositions, skills and the survey", () => {
+	const CODE = "019fd3c2-8888-76be-a6b3-b0f1914e39b6";
+	const QUESTION = "019fd3c2-9999-76be-a6b3-b0f1914e39b6";
+
+	it("publishes a roster byte-identical to the old one when nothing is configured", () => {
+		const { memberships } = projectQueueMemberships(ORG, [queueRow()], [tierRow()], options);
+		const roster = memberships[0];
+		expect(roster).to.not.equal(undefined);
+		expect(Object.keys(roster ?? {})).to.not.include("ronaEnabled");
+		expect(Object.keys(roster ?? {})).to.not.include("dispositionRequired");
+		expect(Object.keys(roster ?? {})).to.not.include("dispositionCodes");
+		expect(Object.keys(roster ?? {})).to.not.include("skillRequirements");
+		expect(Object.keys(roster ?? {})).to.not.include("survey");
+		expect(Object.keys(roster?.agents[0] ?? {})).to.not.include("skills");
+	});
+
+	it("omits an empty child collection rather than writing an empty array", () => {
+		const { memberships } = projectQueueMemberships(ORG, [queueRow()], [tierRow()], {
+			...options,
+			dispositionCodes: [],
+			skillRequirements: [],
+			surveyQuestions: [],
+		});
+		expect(memberships[0]).to.not.have.property("dispositionCodes");
+		expect(memberships[0]).to.not.have.property("skillRequirements");
+	});
+
+	it("carries the queue's flags only when they are on", () => {
+		const { memberships } = projectQueueMemberships(
+			ORG,
+			[queueRow({ ronaEnabled: true, dispositionRequired: true })],
+			[tierRow()],
+			options,
+		);
+		expect(memberships[0]?.ronaEnabled).to.equal(true);
+		expect(memberships[0]?.dispositionRequired).to.equal(true);
+	});
+
+	it("orders the wrap-up vocabulary by position, then by code", () => {
+		const { memberships } = projectQueueMemberships(ORG, [queueRow()], [tierRow()], {
+			...options,
+			dispositionCodes: [
+				{ queueId: QUEUE_A, id: CODE, code: "sale", label: "Sale", position: 2 },
+				{ queueId: QUEUE_A, id: QUESTION, code: "escalated", label: "Escalated", position: 1 },
+			],
+		});
+		expect(memberships[0]?.dispositionCodes?.map((entry) => entry.code)).to.deep.equal([
+			"escalated",
+			"sale",
+		]);
+	});
+
+	/**
+	 * A code belongs to ONE queue, and the projection is handed the whole tenant's rows. A grouping
+	 * bug here would offer Sales' vocabulary to the Nights queue's agents, which is a report nobody
+	 * could unpick afterwards.
+	 */
+	it("does not leak one queue's codes onto another", () => {
+		const { memberships } = projectQueueMemberships(
+			ORG,
+			[queueRow(), queueRow({ id: QUEUE_B, name: "Nights" })],
+			[tierRow()],
+			{
+				...options,
+				dispositionCodes: [
+					{ queueId: QUEUE_A, id: CODE, code: "sale", label: "Sale", position: 1 },
+				],
+			},
+		);
+		expect(memberships[0]?.dispositionCodes).to.have.length(1);
+		expect(memberships[1]).to.not.have.property("dispositionCodes");
+	});
+
+	it("puts an agent's skills on the seat, ordered", () => {
+		const { memberships } = projectQueueMemberships(
+			ORG,
+			[queueRow()],
+			[
+				tierRow({
+					skills: [
+						{ skill: "spanish", level: 4 },
+						{ skill: "billing", level: 2 },
+					],
+				}),
+			],
+			options,
+		);
+		expect(memberships[0]?.agents[0]?.skills).to.deep.equal([
+			{ skill: "spanish", level: 4 },
+			{ skill: "billing", level: 2 },
+		]);
+	});
+
+	it("carries the queue's skill requirements", () => {
+		const { memberships } = projectQueueMemberships(ORG, [queueRow()], [tierRow()], {
+			...options,
+			skillRequirements: [
+				{ queueId: QUEUE_A, skill: "spanish", minLevel: 3, relaxAfterSeconds: 60 },
+			],
+		});
+		expect(memberships[0]?.skillRequirements).to.deep.equal([
+			{ skill: "spanish", minLevel: 3, relaxAfterSeconds: 60 },
+		]);
+	});
+
+	/**
+	 * Both halves are required. `surveyEnabled` with no questions would publish a survey whose plan
+	 * `queueSurveyPlanSchema` refuses (`questions` is `.min(1)`), so the parse that guards every
+	 * roster would throw and take the WHOLE tenant's publish with it.
+	 */
+	it("publishes no survey when the flag is on but no question is configured", () => {
+		const { memberships } = projectQueueMemberships(
+			ORG,
+			[queueRow({ surveyEnabled: true })],
+			[tierRow()],
+			options,
+		);
+		expect(memberships[0]).to.not.have.property("survey");
+	});
+
+	it("publishes no survey when questions exist but the flag is off", () => {
+		const { memberships } = projectQueueMemberships(ORG, [queueRow()], [tierRow()], {
+			...options,
+			surveyQuestions: [
+				{ queueId: QUEUE_A, id: QUESTION, position: 1, promptId: null, label: "Resolved?" },
+			],
+		});
+		expect(memberships[0]).to.not.have.property("survey");
+	});
+
+	it("publishes the survey in position order, with the intro when the queue has one", () => {
+		const { memberships } = projectQueueMemberships(
+			ORG,
+			[queueRow({ surveyEnabled: true, surveyIntroPromptId: PROMPT })],
+			[tierRow()],
+			{
+				...options,
+				surveyQuestions: [
+					{ queueId: QUEUE_A, id: CODE, position: 2, promptId: null, label: "Politeness" },
+					{ queueId: QUEUE_A, id: QUESTION, position: 1, promptId: PROMPT, label: "Resolved?" },
+				],
+			},
+		);
+		expect(memberships[0]?.survey?.introPromptId).to.equal(PROMPT);
+		expect(memberships[0]?.survey?.questions.map((question) => question.position)).to.deep.equal([
+			1, 2,
+		]);
+		// `promptId` absent rather than null: the schema's field is optional and the roster's parse
+		// refuses a null, so a question with no audio must simply not carry the key.
+		expect(memberships[0]?.survey?.questions[0]).to.have.property("promptId");
+		expect(memberships[0]?.survey?.questions[1]).to.not.have.property("promptId");
 	});
 });

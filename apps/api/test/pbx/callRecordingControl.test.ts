@@ -18,6 +18,7 @@ import type {
 	SessionVerbName,
 	SessionVerbResponse,
 } from "@optimiq-voice/events/schemas";
+import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
 /**
  * `POST /api/v1/calls/:id/recording/{pause,resume}` — the PCI pause, minus the broker.
@@ -236,6 +237,64 @@ describe("pausing and resuming a live recording", () => {
 		}
 	});
 
+	/**
+	 * The PCI pause is the one control on this platform that deliberately creates a gap in a
+	 * recording, and until now it left only a log line. `audit_log` is tenant-scoped, append-only
+	 * by privilege and is what somebody is handed in a dispute; application logs are none of those.
+	 */
+	it("appends a ledger row for a pause and a resume, naming the call and the actor", async () => {
+		const controlled = new ControlledCalls();
+		registerCall(controlled, () => ok("pauseRecord"));
+		const ledger = fakeLedger();
+		const service = new CallRecordingService(controlled, undefined, ledger.database);
+
+		await service.setPaused(sessionFor(), CALL, true);
+		await service.setPaused(sessionFor(), CALL, false);
+
+		expect(ledger.rows.map((row) => row.action)).to.deep.equal([
+			"call-recording.pause",
+			"call-recording.resume",
+		]);
+		// Two actions rather than one with a boolean: "when did the recording stop and start again"
+		// is the only question asked of these rows, and it should not be jsonb string work.
+		expect(ledger.rows[0]?.organizationId).to.equal(ORG);
+		expect(ledger.rows[0]?.resourceType).to.equal("call");
+		expect(ledger.rows[0]?.resourceRef).to.equal(CALL);
+		expect(ledger.rows[0]?.actor.type).to.equal("user");
+		expect(ledger.rows[0]?.actor.userId).to.equal(USER);
+		expect(ledger.rows[0]?.after).to.deep.equal({
+			callId: CALL,
+			legId: LEG,
+			paused: true,
+			instanceId: "engine-1",
+		});
+	});
+
+	it("writes NO ledger row for a refused pause, because nothing changed about the audio", async () => {
+		const controlled = new ControlledCalls();
+		registerCall(controlled, () => refusal("pauseRecord", "not-permitted"));
+		const ledger = fakeLedger();
+		const service = new CallRecordingService(controlled, undefined, ledger.database);
+
+		await statusOf(async () => await service.setPaused(sessionFor(), CALL, true));
+
+		// A row here would claim a gap in the recording that does not exist — an error somebody
+		// would act on, which is worse than the missing row.
+		expect(ledger.rows).to.have.length(0);
+	});
+
+	it("does not fail the pause when the ledger refuses the row", async () => {
+		const controlled = new ControlledCalls();
+		registerCall(controlled, () => ok("pauseRecord"));
+		const ledger = fakeLedger(true);
+		const service = new CallRecordingService(controlled, undefined, ledger.database);
+
+		// The recorder is already paused; refusing to report that because an insert would not take
+		// trades a gap in the ledger for a control that appears broken.
+		const state = await service.setPaused(sessionFor(), CALL, true);
+		expect(state.paused).to.equal(true);
+	});
+
 	it("carries the engine's reason in the body, so a client switches on a string", async () => {
 		const controlled = new ControlledCalls();
 		registerCall(controlled, () => refusal("pauseRecord", "not-permitted"));
@@ -445,3 +504,55 @@ describe("the recording-control request body", () => {
 		expect(emptyCallControlDto.safeParse({ paused: false }).success).to.equal(false);
 	});
 });
+
+/** What one `insertAuditLog` call looked like, captured without a database. */
+interface LedgerRow {
+	readonly organizationId: string;
+	readonly action: string;
+	readonly resourceType: string;
+	readonly resourceRef: string | null;
+	readonly actor: { readonly type: string; readonly userId: string | null };
+	readonly after: unknown;
+}
+
+/**
+ * A `PbxDatabaseClient` that is one `withTenantScope` and a fake transaction whose `insert`
+ * captures the row. `insertAuditLog` is four lines of Drizzle; what is worth proving here is what
+ * reaches it, which is a decision this service makes.
+ */
+function fakeLedger(refuse = false): {
+	readonly database: PbxDatabaseClient;
+	readonly rows: LedgerRow[];
+} {
+	const rows: LedgerRow[] = [];
+	const database = {
+		withTenantScope: async (
+			organizationId: string,
+			run: (transaction: unknown) => Promise<unknown>,
+		) => {
+			if (refuse) {
+				throw new Error("the pbx database is unreachable");
+			}
+			const transaction = {
+				insert: () => ({
+					values: async (row: Record<string, unknown>) => {
+						rows.push({
+							organizationId: row.organizationId as string,
+							action: row.action as string,
+							resourceType: row.resourceType as string,
+							resourceRef: row.resourceRef as string | null,
+							actor: {
+								type: row.actorType as string,
+								userId: row.actorUserId as string | null,
+							},
+							after: row.after,
+						});
+						await Promise.resolve();
+					},
+				}),
+			};
+			return await run(transaction);
+		},
+	} as unknown as PbxDatabaseClient;
+	return { database, rows };
+}

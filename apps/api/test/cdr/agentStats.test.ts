@@ -1,6 +1,7 @@
 import { expect } from "chai";
 import { QueryBuilder } from "drizzle-orm/pg-core";
 import {
+	agentDispositionsQuery,
 	agentStatsQuery,
 	readAgentStats,
 	DEFAULT_AGENT_STATS_GROUPS,
@@ -55,18 +56,39 @@ function predicatesOf(sql: string): string {
  * what has to resolve — and `.as()` has to return something the outer builder can select from, so
  * it returns the builder too.
  */
-function fakeTransaction(rows: readonly Record<string, unknown>[] = []): CdrDatabaseTransaction {
-	const builder: Record<string, unknown> = {
-		toSQL: () => ({ sql: "", params: [] }),
-		select: () => builder,
-		from: () => builder,
-		where: () => builder,
-		as: () => builder,
-		groupBy: () => builder,
-		orderBy: () => builder,
-		limit: () => Promise.resolve(rows),
+function fakeTransaction(
+	rows: readonly Record<string, unknown>[] = [],
+	dispositionRows: readonly Record<string, unknown>[] = [],
+): CdrDatabaseTransaction {
+	// `readAgentStats` now issues TWO statements against this fake, and they are told apart by the
+	// one structural difference between them: the aggregate builds a derived table with `.as()`, the
+	// disposition count does not. Keying on that rather than on call order keeps the fake honest if
+	// the two are ever reordered or run in parallel — which they are.
+	// `readAgentStats` issues TWO statements against this fake, so the chain is keyed on what each
+	// one PROJECTS rather than on call order: the aggregate selects `answered`, the disposition count
+	// selects `code`. Order would be the wrong key — the two run in parallel.
+	const chain = (projection?: Record<string, unknown>): Record<string, unknown> => {
+		const wanted =
+			projection !== undefined && "code" in projection
+				? dispositionRows
+				: projection !== undefined && "answered" in projection
+					? rows
+					: [];
+		const builder: Record<string, unknown> = {
+			toSQL: () => ({ sql: "", params: [] }),
+			select: (next?: Record<string, unknown>) => chain(next),
+			from: () => builder,
+			where: () => builder,
+			as: () => builder,
+			groupBy: () => builder,
+			orderBy: () => builder,
+			limit: () => Promise.resolve(wanted),
+		};
+		return builder;
 	};
-	return builder as unknown as CdrDatabaseTransaction;
+	return {
+		select: (projection?: Record<string, unknown>) => chain(projection),
+	} as unknown as CdrDatabaseTransaction;
 }
 
 const GROUP = {
@@ -251,5 +273,127 @@ describe("the agent-stats query dto", () => {
 
 	it("refuses an unknown parameter rather than silently ignoring a typo", () => {
 		expect(() => agentStatsQuerySchema.parse({ organizationId: AGENT })).to.throw();
+	});
+});
+
+/**
+ * The disposition breakdown — the one number on this report that is a MEASUREMENT rather than a
+ * proxy, and the module header says so plainly. Nothing here is capped, sampled or approximated:
+ * an agent pressed a button, or the wrap-up deadline recorded `unset`, and both were observed.
+ */
+describe("the disposition breakdown", () => {
+	it("counts by agent and code and never predicates on the tenant", () => {
+		const { sql } = agentDispositionsQuery(realish(), BASE).toSQL();
+		expect(predicatesOf(sql)).to.not.include("organization_id");
+		expect(sql).to.include("group by");
+		expect(sql).to.include('"queue_disposition_code"');
+	});
+
+	/**
+	 * A NULL code is a queue that asks no wrap-up question, not an agent who ignored a prompt.
+	 * Folding the two together would put every unconfigured queue's traffic in the same bucket as
+	 * every unanswered one, which is the single most misleading thing this list could do.
+	 */
+	it("excludes legs with no code at all", () => {
+		const { sql } = agentDispositionsQuery(realish(), BASE).toSQL();
+		expect(predicatesOf(sql)).to.include('"queue_disposition_code" is not null');
+	});
+
+	it("keeps the same population as the aggregate beside it", () => {
+		const predicates = predicatesOf(agentDispositionsQuery(realish(), BASE).toSQL().sql);
+		// Answered queue legs only, and the window bounds unconditional so partitions can be pruned.
+		expect(predicates).to.include('"queue_outcome"');
+		expect(predicates).to.include('"queue_agent_ref" is not null');
+		expect(predicates).to.include('"started_at"');
+	});
+
+	it("narrows to one agent and to one queue, exactly as the aggregate does", () => {
+		const forOne = predicatesOf(
+			agentDispositionsQuery(realish(), { ...BASE, agentId: AGENT, queueId: QUEUE }).toSQL().sql,
+		);
+		expect(forOne).to.include('"queue_agent_ref" =');
+		expect(forOne).to.include('"queue_ref" =');
+	});
+
+	it("attaches each agent's codes to their row, commonest first", async () => {
+		const result = await readAgentStats(
+			fakeTransaction(
+				[
+					{
+						agentId: AGENT,
+						queueId: QUEUE,
+						answered: 10,
+						talkTimeMs: 1_000,
+						averageTalkTimeMs: 100,
+						longestTalkTimeMs: 200,
+						averageAnswerWaitMs: 0,
+						averageRingTimeMs: 0,
+						wrapUpMs: 0,
+						wrapUpSamples: 0,
+					},
+				],
+				[
+					{ agentId: AGENT, code: "sale", count: 6 },
+					{ agentId: AGENT, code: "unset", count: 3 },
+					{ agentId: OTHER_AGENT, code: "escalated", count: 1 },
+				],
+			),
+			BASE,
+		);
+		expect(result.rows[0]?.dispositions).to.deep.equal([
+			{ code: "sale", count: 6 },
+			{ code: "unset", count: 3 },
+		]);
+	});
+
+	/**
+	 * The counts do NOT have to sum to `answered`: a leg dispositioned after the CDR consumer filed
+	 * it keeps its NULL, and a queue that started asking halfway through the window has both kinds
+	 * in it. Reconciling them here would mean inventing a code for the difference.
+	 */
+	it("does not require the codes to account for every answered call", async () => {
+		const result = await readAgentStats(
+			fakeTransaction(
+				[
+					{
+						agentId: AGENT,
+						queueId: QUEUE,
+						answered: 10,
+						talkTimeMs: 1_000,
+						averageTalkTimeMs: 100,
+						longestTalkTimeMs: 200,
+						averageAnswerWaitMs: 0,
+						averageRingTimeMs: 0,
+						wrapUpMs: 0,
+						wrapUpSamples: 0,
+					},
+				],
+				[{ agentId: AGENT, code: "sale", count: 2 }],
+			),
+			BASE,
+		);
+		expect(result.rows[0]?.answered).to.equal(10);
+		expect(result.rows[0]?.dispositions).to.deep.equal([{ code: "sale", count: 2 }]);
+	});
+
+	it("gives an agent on a queue that asks nothing an empty list, not a missing key", async () => {
+		const result = await readAgentStats(
+			fakeTransaction([
+				{
+					agentId: AGENT,
+					queueId: QUEUE,
+					answered: 1,
+					talkTimeMs: 10,
+					averageTalkTimeMs: 10,
+					longestTalkTimeMs: 10,
+					averageAnswerWaitMs: 0,
+					averageRingTimeMs: 0,
+					wrapUpMs: 0,
+					wrapUpSamples: 0,
+				},
+			]),
+			BASE,
+		);
+		expect(result.rows[0]?.dispositions).to.deep.equal([]);
 	});
 });

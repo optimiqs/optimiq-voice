@@ -1012,7 +1012,14 @@ async function main(): Promise<void> {
 				// `0` so a cleanup handle can never start a timer.
 				PBX_HOT_DESK_SESSION_SECONDS: 9 * 3600,
 				PBX_HOT_DESK_SWEEP_INTERVAL_MS: 0,
+				AUDIT_LOG_RETENTION_DAYS: 0,
+				AUDIT_LOG_SWEEP_INTERVAL_MS: 0,
+				AUDIT_LOG_SWEEP_BATCH: 1_000,
+				PBX_VOICEMAIL_RETENTION_SWEEP_INTERVAL_MS: 0,
+				PBX_VOICEMAIL_RETENTION_SWEEP_BATCH: 200,
 				PBX_ORIGINATE_RATE_LIMIT_PER_MINUTE: 60,
+				// No timer in a verification script: the process must be able to exit.
+				PBX_FRAUD_DETECTOR_INTERVAL_MS: 0,
 			});
 			if (organizationId.length > 0) {
 				await pbx.withTenantScope(organizationId, async (transaction) => {

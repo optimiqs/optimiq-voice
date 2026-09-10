@@ -4,6 +4,7 @@ import { Session } from "../../auth/session.decorator";
 import { parseDto } from "../shared/dto";
 import { emptyAgentSessionDto, pauseAgentSessionDto } from "./queue-agent-session.dto";
 import { QueueAgentSessionService } from "./queue-agent-session.service";
+import { submitQueueDispositionDto } from "./queues.dto";
 import type { AppSession } from "@optimiq-voice/auth";
 
 /**
@@ -108,5 +109,33 @@ export class QueueAgentSessionController {
 	) {
 		parseDto(emptyAgentSessionDto, body ?? {});
 		return await this.sessions.apply(session, id, "resume");
+	}
+
+	/**
+	 * The wrap-up code for the call this agent is finishing.
+	 *
+	 * On the session surface rather than under the queue, because it is the same OR over the same
+	 * row as the four actions above — `queues.join` or `queues.manage-agents` for anybody's seat,
+	 * `queues.join.own` for your own — and the service decides it with the one implementation of
+	 * that sentence. The queue is NOT in the path: it is read off the agent's live `agent-state`
+	 * entry, which is what stops a code from one queue's vocabulary being filed against another
+	 * queue's call.
+	 *
+	 * `POST` and not `PUT`, even though a correction inside the window overwrites: the resource is
+	 * not addressable — the caller does not know the `queue_call_disposition` id and has no reason
+	 * to — and the idempotency is the unique index's, not the verb's.
+	 */
+	@Post(":id/session/disposition")
+	@RequirePermissions("queues.read")
+	async submitDisposition(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+		@Body() body: unknown,
+	) {
+		return await this.sessions.submitDisposition(
+			session,
+			id,
+			parseDto(submitQueueDispositionDto, body ?? {}),
+		);
 	}
 }

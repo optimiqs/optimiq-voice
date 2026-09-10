@@ -1,4 +1,4 @@
-import { Inject, Injectable } from "@nestjs/common";
+import { Inject, Injectable, Optional } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { purgedRecordingSoftDeleteQuery } from "@optimiq-voice/cdr-db";
 import { getLogger } from "@optimiq-voice/logging";
@@ -18,12 +18,14 @@ import {
 	CdrSigningUnavailableException,
 } from "../shared/cdr.errors";
 import { CDR_DATABASE, CDR_ENV, CDR_RECORDING_STORE } from "../shared/cdr.tokens";
+import { RECORDING_ACCESS_AUDIT } from "./access-audit";
 import { mintRecordingToken, recordingMediaPath, verifyRecordingToken } from "./recording-token";
 import type { MediaResponse } from "../../media/media-response";
 import type { ObjectStore } from "../../storage";
 import type { RecordingListQuery } from "../query/cdr.dto";
 import type { RecordingListRow } from "../query/cdr.repository";
 import type { CdrEnv } from "../shared/cdr-env";
+import type { RecordingAccessAudit, RecordingAccessActor } from "./access-audit";
 import type { AppSession } from "@optimiq-voice/auth";
 import type { CdrDatabaseClient } from "@optimiq-voice/cdr-db";
 
@@ -96,7 +98,54 @@ export class RecordingsService {
 		@Inject(CDR_ENV) private readonly env: CdrEnv,
 		@Inject(CDR_DATABASE) private readonly database: CdrDatabaseClient,
 		@Inject(CDR_RECORDING_STORE) private readonly store: ObjectStore,
+		/**
+		 * The access ledger, implemented on the PBX side and therefore OPTIONAL on exactly the terms
+		 * `purge-audit.ts` sets out for its sibling: a deployment without the PBX area has no
+		 * `audit_log` to write, and recording playback must keep working regardless.
+		 *
+		 * The consequence is stated plainly rather than hidden: with the port absent, reads are not
+		 * audited. That is a deployment shape (CDR without PBX) rather than a failure, and the
+		 * alternative — refusing to serve media because a ledger in another database is unreachable
+		 * — would turn an audit outage into a customer-facing one.
+		 */
+		@Optional()
+		@Inject(RECORDING_ACCESS_AUDIT)
+		private readonly accessAudit?: RecordingAccessAudit,
 	) {}
+
+	/**
+	 * Appends one access row, and never fails the read for it.
+	 *
+	 * The listen has already been authorised and is about to happen (or has just happened), and it
+	 * is not undone by a ledger that would not take the row — so the honest failure mode is a read
+	 * that occurred and was not recorded, logged loudly here. The mirror — refusing a listen
+	 * because `pbx-db` is down — trades a gap in the ledger for an outage in the product, which is
+	 * the same trade `recording-retention-sweeper.service.ts` refuses for its purge rows.
+	 */
+	private async audit(
+		organizationId: string,
+		recordingId: string,
+		event: "download-url" | "play",
+		actor: RecordingAccessActor,
+		detail: Record<string, unknown>,
+	): Promise<void> {
+		if (this.accessAudit === undefined) {
+			return;
+		}
+		try {
+			await this.accessAudit.recordAccess(organizationId, {
+				recordingId,
+				event,
+				actor,
+				detail,
+			});
+		} catch (error) {
+			logger.error(
+				{ organizationId, recordingId, event, err: String(error) },
+				"a recording access could not be recorded in the audit ledger",
+			);
+		}
+	}
 
 	private organizationId(session: AppSession): string {
 		return requireActiveOrganizationId(session);
@@ -174,6 +223,26 @@ export class RecordingsService {
 		const ttl = this.env.CDR_RECORDING_URL_TTL_SECONDS;
 		const expiresAt = Math.floor(Date.now() / 1000) + ttl;
 		const token = mintRecordingToken({ r: row.id, o: organizationId, e: expiresAt }, secret);
+
+		// The authorisation, recorded at the moment it is granted rather than when it is used — see
+		// `access-audit.ts` for why the mint and the fetch are two rows and not one.
+		await this.audit(
+			organizationId,
+			row.id,
+			"download-url",
+			{
+				kind: "user",
+				userId: session.user.id,
+				ref: null,
+				ipAddress: session.session.ipAddress ?? null,
+				userAgent: session.session.userAgent ?? null,
+			},
+			{
+				objectKey: row.objectKey,
+				expiresAt: new Date(expiresAt * 1000).toISOString(),
+				expiresInSeconds: ttl,
+			},
+		);
 
 		return {
 			data: {
@@ -258,6 +327,7 @@ export class RecordingsService {
 	async openSignedMedia(
 		token: string,
 		rangeHeader?: string | undefined,
+		client?: { readonly ipAddress?: string | undefined; readonly userAgent?: string | undefined },
 	): Promise<ResolvedRecordingMedia> {
 		const secret = this.env.CDR_RECORDING_URL_SECRET;
 		if (secret === undefined) {
@@ -304,6 +374,29 @@ export class RecordingsService {
 			// is what lets it say so.
 			throw new CdrMediaGoneException();
 		}
+
+		// Recorded once the read is certain to be served and not before: every refusal above answers
+		// a request that never reached any audio, and a ledger row for each of them would drown the
+		// listens — the events this table exists to hold — in noise a WAF already logs.
+		await this.audit(
+			payload.o,
+			row.id,
+			"play",
+			{
+				kind: "token",
+				userId: null,
+				// The token's own subject. No person is named, because none is known — `access-audit.ts`
+				// argues why attributing this to the minter would be a fabrication.
+				ref: `recording-token:${payload.r}`,
+				ipAddress: client?.ipAddress ?? null,
+				userAgent: client?.userAgent ?? null,
+			},
+			{
+				objectKey: row.objectKey,
+				sizeBytes: stat.sizeBytes,
+				ranged: rangeHeader !== undefined && rangeHeader.length > 0,
+			},
+		);
 
 		return await openMediaResponse(this.store, row.objectKey, stat.sizeBytes, {
 			contentType: objectContentType(row.objectKey),

@@ -1,6 +1,8 @@
 import { Inject, Module, type OnApplicationShutdown } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logging";
 import { createObjectStore, describeObjectStore, loadStorageEnv } from "../storage";
+import { CdrErasureController } from "./erasure/erasure.controller";
+import { CdrErasureService } from "./erasure/erasure.service";
 import { CdrExportWorker } from "./exports/cdr-export-worker.service";
 import { CdrExportsController } from "./exports/cdr-exports.controller";
 import { CdrExportsService } from "./exports/cdr-exports.service";
@@ -61,6 +63,11 @@ const logger = getLogger("api.cdr");
 		 */
 		CdrExportsController,
 		CdrRecordingsController,
+		/**
+		 * `/api/v1/erasure` — its own prefix, mounted from this module because the data it destroys
+		 * is this area's. See `erasure/erasure.controller.ts` for why it is not a recordings route.
+		 */
+		CdrErasureController,
 		/**
 		 * `*69`, answered from the ledger this area already owns.
 		 *
@@ -124,6 +131,7 @@ const logger = getLogger("api.cdr");
 		CdrExportsService,
 		LastCallerService,
 		RecordingsService,
+		CdrErasureService,
 		CdrLegWriter,
 		CdrRecordingWriter,
 		CdrRecordingRetentionSweeper,
@@ -139,6 +147,7 @@ const logger = getLogger("api.cdr");
 		CdrExportsService,
 		LastCallerService,
 		RecordingsService,
+		CdrErasureService,
 		CdrRecordingRetentionSweeper,
 		CdrLegRetentionSweeper,
 		CdrExportWorker,
@@ -146,7 +155,9 @@ const logger = getLogger("api.cdr");
 })
 export class CdrModule implements OnApplicationShutdown {
 	constructor(@Inject(CDR_DATABASE) private readonly database: CdrDatabaseClient) {
-		logger.info("CDR area mounted on /api/v1/cdr, /api/v1/cdr/exports and /api/v1/recordings");
+		logger.info(
+			"CDR area mounted on /api/v1/cdr, /api/v1/cdr/exports, /api/v1/recordings and /api/v1/erasure",
+		);
 	}
 
 	/** The area owns its Postgres pool, so shutdown is deterministic rather than process-exit. */

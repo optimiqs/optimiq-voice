@@ -4,6 +4,7 @@ import {
 	HttpStatus,
 	NotFoundException,
 	ServiceUnavailableException,
+	UnprocessableEntityException,
 } from "@nestjs/common";
 import type {
 	AgentSessionAction,
@@ -29,6 +30,10 @@ import type {
  *   "reason": "not-adjacent", "action": "pause" }
  * // 503 — no broker, so the change would not affect distribution and was not made
  * { "statusCode": 503, "code": "AGENT_STATE_UNAVAILABLE", "message": "…" }
+ * // 409 — a wrap-up code arrived for a call this agent is no longer finishing
+ * { "statusCode": 409, "code": "QUEUE_DISPOSITION_NO_LIVE_CALL", "callId": "…" }
+ * // 422 — the code is not in this queue's enabled vocabulary
+ * { "statusCode": 422, "code": "QUEUE_DISPOSITION_CODE_UNKNOWN", "queueId": "…", "queueCode": "…" }
  * ```
  */
 
@@ -101,6 +106,51 @@ export class AgentStateStoreUnavailableException extends ServiceUnavailableExcep
 			message:
 				"Availability could not be changed: the live agent-state store is unreachable, so this " +
 				"would not affect how calls are distributed. Nothing was recorded.",
+		});
+	}
+}
+
+/**
+ * The agent is not finishing the call the body names.
+ *
+ * 409 and not 404: nothing is missing — the agent exists, the call existed, and the request was
+ * well-formed. What refuses it is the CURRENT state, which is that the wrap-up window closed or
+ * moved on to another caller. A console that got this should re-read the agent's session and
+ * re-render; the deadline will have recorded `unset` on its own.
+ */
+export class QueueDispositionNoLiveCallException extends ConflictException {
+	constructor(callId: string) {
+		super({
+			statusCode: HttpStatus.CONFLICT,
+			code: "QUEUE_DISPOSITION_NO_LIVE_CALL",
+			message:
+				"This agent is not finishing that call any more, so the wrap-up code was not recorded. " +
+				"The wrap-up deadline records one automatically when it passes.",
+			callId,
+		});
+	}
+}
+
+/**
+ * The code is not one this queue offers.
+ *
+ * 422 rather than the 400 a DTO failure gets, and the distinction is worth keeping: the body was
+ * shaped correctly and every field passed its own validation. What is wrong is the RELATIONSHIP
+ * between the code and the queue, which the DTO cannot see because the queue is not in the body —
+ * it is read off the agent's live entry. That is the same line `pbx.errors.ts` draws for a
+ * destination that names a row in another tenant.
+ *
+ * A retired code lands here too, and the message says so: an agent whose console was open across
+ * the retirement is the common way to reach this, and "pick another" is the whole fix.
+ */
+export class QueueDispositionCodeUnknownException extends UnprocessableEntityException {
+	constructor(code: string, queueId: string) {
+		super({
+			statusCode: HttpStatus.UNPROCESSABLE_ENTITY,
+			code: "QUEUE_DISPOSITION_CODE_UNKNOWN",
+			message: `"${code}" is not one of this queue's wrap-up codes, or it has been retired.`,
+			queueCode: code,
+			queueId,
 		});
 	}
 }

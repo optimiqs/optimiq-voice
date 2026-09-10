@@ -7,6 +7,7 @@ import { ORIGINATE_RPC } from "@optimiq-voice/events/schemas";
 import { subjectFor } from "@optimiq-voice/events/subjects";
 import { getLogger } from "@optimiq-voice/logging";
 import { PBX_ENV } from "../shared/pbx.tokens";
+import { SharedRateWindowService } from "../shared/shared-rate-window";
 import { originateRateLimitedException, originateUnavailableException } from "./calls.errors";
 import { OriginateRateLimiter } from "./originate-rate-limit";
 import { interpretOriginateReply } from "./originate-reply";
@@ -63,8 +64,11 @@ export class CallsService implements OnModuleInit, OnApplicationShutdown {
 	private originated = 0;
 	private refused = 0;
 
-	constructor(@Inject(PBX_ENV) private readonly env: PbxEnv) {
-		this.limiter = new OriginateRateLimiter(env.PBX_ORIGINATE_RATE_LIMIT_PER_MINUTE);
+	constructor(
+		@Inject(PBX_ENV) private readonly env: PbxEnv,
+		windows: SharedRateWindowService,
+	) {
+		this.limiter = new OriginateRateLimiter(env.PBX_ORIGINATE_RATE_LIMIT_PER_MINUTE, windows);
 	}
 
 	get stats(): {
@@ -136,7 +140,7 @@ export class CallsService implements OnModuleInit, OnApplicationShutdown {
 			throw originateUnavailableException("the control plane has no broker connection");
 		}
 
-		const verdict = this.limiter.consume(organizationId);
+		const verdict = await this.limiter.consume(organizationId);
 		if (!verdict.allowed) {
 			this.refused += 1;
 			throw originateRateLimitedException(verdict.retryAfterSeconds);

@@ -22,11 +22,11 @@ import type { EventFamily } from "@optimiq-voice/events/subjects";
  * `type`, with the organization taken from the delivered subject and compared against the
  * subscription's own tenant by the dispatcher. A selector is a filter on WHAT, never on WHOSE.
  *
- * ## Why these four families and not the other six
+ * ## Why these six families and not the other six
  *
- * `call`, `queue`, `voicemail` and `cdr` are the ones an integrator has a use for: a screen-pop, a
- * wallboard, a missed-message alert, a billing export. The six that are absent are absent for
- * reasons rather than for effort:
+ * `call`, `queue`, `voicemail`, `cdr`, `security` and `messaging` are the ones an integrator has a
+ * use for: a screen-pop, a wallboard, a missed-message alert, a billing export, a fraud alert, an
+ * inbound text. The six that are absent are absent for reasons rather than for effort:
  *
  * - `media` is the RTP plane's own lifecycle (`apps/mediad` session ended, playback finished). It
  *   is engine plumbing, it is meaningless without the engine's internal session ids, and a consumer
@@ -59,10 +59,46 @@ import type { EventFamily } from "@optimiq-voice/events/subjects";
  *   be built as alerts (damped, paired, resendable), not as this event with a URL on it.
  *
  * Adding one later is one entry in {@link WEBHOOK_FAMILIES} plus its stream in the dispatcher.
+ *
+ * ## `security` and `messaging` are the two the reasoning above ARGUES FOR
+ *
+ * `security.evt.v1` carries `fraud-signal` — the toll-fraud gate refusing a dial, and the anomaly
+ * detector's hourly findings. It is served, and every objection raised against the six above fails
+ * against it:
+ *
+ * - it is not engine plumbing (`media`, `sipDialog`) — a fraud alert names an extension, a
+ *   destination and a threshold, all of them things the tenant configured;
+ * - it is not a second vocabulary for something already served — nothing in `call` or `cdr` says
+ *   "we refused this because it looked like fraud";
+ * - it is not the raw-transition problem `trunk` has. The event is already an ALERT rather than a
+ *   state change: it is damped by construction (the detector runs hourly, the gate fires once per
+ *   refused call), it carries a severity a consumer can route on, and there is nothing to pair a
+ *   resolution with because a refusal does not resolve;
+ * - and unlike `audit`, streaming it to an endpoint is not a loop — the endpoint's own configuration
+ *   is not a fraud signal.
+ *
+ * It is also the family with the strongest case for existing at all: an alert nobody sees until they
+ * open a screen is an alert that arrives after the invoice.
+ *
+ * `messaging.evt.v1` carries `message.received` and `message.delivered`, and it is served for the
+ * same reasons. An inbound SMS is a customer-originated fact addressed to the tenant, named in the
+ * tenant's own vocabulary (a number they own, a conversation, a body) with nothing of the media or
+ * signalling plane in it — a text has no dialog and never reaches `mediad` at all. It is served by
+ * nothing else in this list: `call` says nothing about a text. And the payload is already the shape
+ * a notification wants — thin by construction, the body capped and the media bytes absent, so the
+ * content is fetched back through the API under `messaging.read` rather than fanned out to an
+ * arbitrary endpoint. See `apps/api/src/messaging/messaging-event.publisher.ts`.
  */
 
-/** The families a subscription may select. See the note above for the four that are missing. */
-export const WEBHOOK_FAMILIES = ["call", "queue", "voicemail", "cdr"] as const;
+/** The families a subscription may select. See the note above for the six that are missing. */
+export const WEBHOOK_FAMILIES = [
+	"call",
+	"queue",
+	"voicemail",
+	"cdr",
+	"security",
+	"messaging",
+] as const;
 export type WebhookFamily = (typeof WEBHOOK_FAMILIES)[number];
 
 /** The subject root each selectable family is written as. `cdr` is `cdr.leg.v1`, not `cdr.evt.v1`. */
@@ -71,6 +107,8 @@ export const WEBHOOK_FAMILY_ROOTS: Readonly<Record<WebhookFamily, string>> = {
 	queue: SUBJECT_ROOTS.queue,
 	voicemail: SUBJECT_ROOTS.voicemail,
 	cdr: SUBJECT_ROOTS.cdrLeg,
+	security: SUBJECT_ROOTS.security,
+	messaging: SUBJECT_ROOTS.messaging,
 };
 
 const ROOT_TO_FAMILY: ReadonlyMap<string, WebhookFamily> = new Map(
@@ -187,7 +225,7 @@ export function isWebhookFamily(family: string): family is WebhookFamily {
 /**
  * The families this platform knows about that webhooks deliberately do NOT serve.
  *
- * Exported so a spec can assert the list is a decision rather than an oversight: when a ninth family
+ * Exported so a spec can assert the list is a decision rather than an oversight: when a thirteenth family
  * is added to the taxonomy it lands here until somebody argues it onto the other list.
  */
 export function unservedEventFamilies(): readonly EventFamily[] {

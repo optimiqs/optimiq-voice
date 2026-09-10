@@ -69,6 +69,11 @@ const LEG_LIST_COLUMNS = {
 	sipAttestation: callLegs.sipAttestation,
 	sipVerstat: callLegs.sipVerstat,
 	sipOrigId: callLegs.sipOrigId,
+	// And ours, on the same argument and with more force. The three above are what a CARRIER said
+	// about a call that arrived; these two are what this platform DECIDED about a call it sent, and
+	// "which of our outbound calls went out as C" is the screening review, not a footnote to one.
+	expectedAttestation: callLegs.expectedAttestation,
+	callerIdRightToUse: callLegs.callerIdRightToUse,
 } as const;
 
 /** The detail view adds the media-quality block and the passthrough jsonb. */
@@ -93,6 +98,11 @@ const LEG_DETAIL_COLUMNS = {
 	// name as it stood when the call was placed and a later rename does not rewrite history.
 	authPinOrdinal: callLegs.authPinOrdinal,
 	authPinLabel: callLegs.authPinLabel,
+	// Detail and not list, unlike the attestation pair above: a trunk id and a peer address are what
+	// somebody answering a traceback needs about ONE call they have already found, and neither is a
+	// value anybody scans a page for.
+	trunkRef: callLegs.trunkRef,
+	signalingAddress: callLegs.signalingAddress,
 	raw: callLegs.raw,
 	createdAt: callLegs.createdAt,
 } as const;

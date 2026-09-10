@@ -5,10 +5,13 @@ import {
 	CATEGORY_PERMISSIONS,
 	categoryPermissions,
 	findSetting,
+	COMPLIANCE_SETTINGS,
+	COMPLIANCE_SETTINGS_CATEGORY,
 	NOTIFICATION_SETTINGS,
 	NOTIFICATION_SETTINGS_CATEGORY,
 	RECORDING_RETENTION_SETTING,
 	RECORDING_SETTINGS_CATEGORY,
+	VOICEMAIL_RETENTION_SETTING,
 	resolveCategory,
 	resolveForUser,
 	SETTING_CATALOG,
@@ -25,7 +28,10 @@ import {
 } from "../../src/pbx/org-settings/org-settings.dto";
 import { ORG_SETTING_RESOURCE } from "../../src/pbx/org-settings/org-settings.resource";
 import {
+	readRecordingSettings,
 	readRoutingSettings,
+	recordAutoPause,
+	recordingConsentOverride,
 	resolveSipRealm,
 	ROUTING_SETTINGS_CATEGORY,
 } from "../../src/pbx/routing/snapshot-loader";
@@ -107,12 +113,54 @@ describe("org settings catalogue", () => {
 	 */
 	it("lists the catalogued categories", () => {
 		expect([...CATALOGUED_CATEGORIES].sort()).to.deep.equal([
+			"compliance",
 			"notifications",
 			"provision",
 			"recordings",
 			"routing",
 			"sip",
 		]);
+	});
+
+	/**
+	 * The compliance category, which is the newest and the one with the sharpest failure mode.
+	 *
+	 * Both defaults are the permissive answer on purpose — turning either on for an existing
+	 * deployment stops calls that work today — so the assertions below pin the defaults as hard as
+	 * they pin the value domains. A default that drifted to `refuse` or to `true` would take a
+	 * platform off the air on an upgrade, silently, with no migration to point at.
+	 */
+	it("catalogues the two compliance settings the attestation policy compiles", () => {
+		expect(COMPLIANCE_SETTINGS.map((entry) => entry.name)).to.deep.equal([
+			"unverifiedCallerIdPolicy",
+			"requireKycForOutbound",
+		]);
+		expect(COMPLIANCE_SETTINGS_CATEGORY).to.equal("compliance");
+	});
+
+	it("defaults an unverified caller id to allow, and refuses a policy it has no meaning for", () => {
+		const entry = findSetting(COMPLIANCE_SETTINGS_CATEGORY, "unverifiedCallerIdPolicy");
+		expect(entry?.valueType).to.equal("string");
+		expect(entry?.defaultValue).to.equal("allow");
+		expect(entry?.scope).to.equal("organization");
+		for (const good of ["allow", "replace", "refuse"]) {
+			expect(entry?.schema.safeParse(good).success, good).to.equal(true);
+		}
+		expect(entry?.schema.safeParse("block").success).to.equal(false);
+	});
+
+	it("defaults the KYC gate to off, so an upgrade never blocks a working tenant", () => {
+		const entry = findSetting(COMPLIANCE_SETTINGS_CATEGORY, "requireKycForOutbound");
+		expect(entry?.valueType).to.equal("boolean");
+		expect(entry?.defaultValue).to.equal(false);
+		expect(entry?.schema.safeParse(true).success).to.equal(true);
+		expect(entry?.schema.safeParse("yes").success).to.equal(false);
+	});
+
+	it("resolves both compliance settings for a tenant with no rows", () => {
+		const resolved = resolveCategory(COMPLIANCE_SETTINGS_CATEGORY, []);
+		expect(resolved.unverifiedCallerIdPolicy).to.equal("allow");
+		expect(resolved.requireKycForOutbound).to.equal(false);
 	});
 
 	it("exposes a zod-free catalogue to clients", () => {
@@ -260,6 +308,27 @@ describe("the recordings category and the per-category permission map", () => {
 		expect(entry?.schema.safeParse(-1).success).to.equal(false);
 		expect(entry?.schema.safeParse(30.5).success).to.equal(false);
 		expect(entry?.scope).to.equal("organization");
+	});
+
+	/**
+	 * The voicemail window is deliberately the recording window's twin. Two retention settings on
+	 * one screen in two vocabularies is how an administrator sets 30 meaning days and gets weeks.
+	 */
+	it("catalogues the voicemail window in the SAME vocabulary and bounds as the recording one", () => {
+		const voicemail = findSetting(RECORDING_SETTINGS_CATEGORY, VOICEMAIL_RETENTION_SETTING);
+		const recording = findSetting(RECORDING_SETTINGS_CATEGORY, RECORDING_RETENTION_SETTING);
+		expect(voicemail?.valueType).to.equal(recording?.valueType);
+		// 0 = keep indefinitely, exactly as beside it. A sweeper shipped by an upgrade must not
+		// start destroying messages for a tenant that never opened the settings screen.
+		expect(voicemail?.defaultValue).to.equal(0);
+		expect(voicemail?.schema.safeParse(0).success).to.equal(true);
+		expect(voicemail?.schema.safeParse(3_650).success).to.equal(true);
+		expect(voicemail?.schema.safeParse(3_651).success).to.equal(false);
+		expect(voicemail?.schema.safeParse(-1).success).to.equal(false);
+		expect(voicemail?.schema.safeParse(30.5).success).to.equal(false);
+		// Organization-scoped, never user-scoped: no individual's preference may shorten or extend
+		// how long the organization keeps a mailbox.
+		expect(voicemail?.scope).to.equal("organization");
 	});
 
 	/**
@@ -582,5 +651,115 @@ describe("the SIP realm in the routing snapshot", () => {
 			"pbx.acme.example",
 		);
 		expect(Object.hasOwn(readRoutingSettings([], undefined, undefined), "realm")).to.equal(false);
+	});
+});
+
+/**
+ * The recording-consent settings on their way into the routing snapshot.
+ *
+ * The property every case here defends is the same one `maxConcurrentCalls` and `realm` rely on and
+ * that the first test states outright: a tenant who has configured nothing must produce the same
+ * snapshot object it produced before this code existed. `canonicalizeSnapshot` hashes what is
+ * present, so an emitted default would move every organization's `snapshotHash` and recompile the
+ * whole estate into artifacts identical to the ones already cached.
+ */
+describe("the recording-consent settings in the routing snapshot", () => {
+	const enabled = (name: string, value: unknown) => ({ name, value, enabled: true });
+
+	it("reads them from their own category, not the routing one", () => {
+		expect(RECORDING_SETTINGS_CATEGORY).to.equal("recordings");
+		expect(RECORDING_SETTINGS_CATEGORY).to.not.equal(ROUTING_SETTINGS_CATEGORY);
+	});
+
+	it("emits nothing at all for a tenant with no recordings rows", () => {
+		expect(readRecordingSettings([])).to.deep.equal({});
+		// The snapshot such a tenant produces is byte-identical to the one it produced before this
+		// projection existed, which is what makes shipping it a no-op rather than a mass recompile.
+		expect(JSON.stringify({ ...readRoutingSettings([]), ...readRecordingSettings([]) })).to.equal(
+			JSON.stringify(readRoutingSettings([])),
+		);
+	});
+
+	it("round-trips every one of the six settings", () => {
+		expect(
+			readRecordingSettings([
+				enabled("consentPolicy", "announce-and-require-keypress"),
+				enabled("consentPromptId", "0195c0f0-1c2f-7000-8000-00000000a010"),
+				enabled("consentAcceptDigit", "3"),
+				enabled("consentDeclineDigit", "4"),
+				enabled("allPartyRegions", ["US-CA", "EU"]),
+				enabled("autoPauseOnDtmf", true),
+			]),
+		).to.deep.equal({
+			recordingConsentPolicy: "announce-and-require-keypress",
+			recordingConsentPromptId: "0195c0f0-1c2f-7000-8000-00000000a010",
+			recordingConsentAcceptDigit: "3",
+			recordingConsentDeclineDigit: "4",
+			recordingAllPartyRegions: ["US-CA", "EU"],
+			recordingAutoPauseOnDtmf: true,
+		});
+	});
+
+	it("treats a disabled row as absent, the way the whole settings cascade does", () => {
+		expect(
+			readRecordingSettings([
+				{ name: "consentPolicy", value: "announce", enabled: false },
+				{ name: "autoPauseOnDtmf", value: true, enabled: false },
+			]),
+		).to.deep.equal({});
+	});
+
+	it("ignores a policy string it does not recognise rather than compiling it", () => {
+		expect(readRecordingSettings([enabled("consentPolicy", "announce-in-latin")])).to.deep.equal(
+			{},
+		);
+		expect(readRecordingSettings([enabled("consentPolicy", 7)])).to.deep.equal({});
+	});
+
+	it("keeps a cleared prompt id as an explicit null, and a missing one as no key", () => {
+		expect(readRecordingSettings([enabled("consentPromptId", null)])).to.deep.equal({
+			recordingConsentPromptId: null,
+		});
+		expect(Object.hasOwn(readRecordingSettings([]), "recordingConsentPromptId")).to.equal(false);
+	});
+
+	it("keeps an empty region list, because switching the net off is not the same as never setting it", () => {
+		expect(readRecordingSettings([enabled("allPartyRegions", [])])).to.deep.equal({
+			recordingAllPartyRegions: [],
+		});
+		expect(readRecordingSettings([enabled("allPartyRegions", ["US-CA", 7, null])])).to.deep.equal({
+			recordingAllPartyRegions: ["US-CA"],
+		});
+	});
+
+	it("carries a DID's and a route's override, and inherits by omitting the key", () => {
+		expect(
+			recordingConsentOverride({
+				recordingConsentPolicy: "announce",
+				recordingConsentPromptId: "0195c0f0-1c2f-7000-8000-00000000a011",
+			}),
+		).to.deep.equal({
+			recordingConsentPolicy: "announce",
+			recordingConsentPromptId: "0195c0f0-1c2f-7000-8000-00000000a011",
+		});
+		expect(
+			recordingConsentOverride({
+				recordingConsentPolicy: null,
+				recordingConsentPromptId: null,
+			}),
+		).to.deep.equal({});
+		expect(
+			recordingConsentOverride({
+				recordingConsentPolicy: "announce-in-latin",
+				recordingConsentPromptId: null,
+			}),
+		).to.deep.equal({});
+	});
+
+	it("emits the auto-pause flag only when it is on", () => {
+		expect(recordAutoPause(true)).to.deep.equal({ recordAutoPauseOnDtmf: true });
+		// `false` is what every extension and every queue row on the platform already holds, so
+		// emitting it would move each of their hashes for no change in the compiled artifact.
+		expect(recordAutoPause(false)).to.deep.equal({});
 	});
 });

@@ -94,6 +94,16 @@ export const createExtensionDto = z.strictObject({
 		})
 		.nullish(),
 	recordPolicy: z.enum(RECORD_POLICIES).optional(),
+	/**
+	 * Whether a recording on this extension pauses itself while the party types digits — the PCI
+	 * knob, so a card number spoken into a keypad never reaches the object store.
+	 *
+	 * A plain optional boolean and not `nullish`, unlike the consent overrides on a DID: the column
+	 * is `not null default false` and there is no third state to inherit. An extension that has not
+	 * been thought about does not auto-pause, which is the behaviour every extension had before this
+	 * existed.
+	 */
+	recordAutoPauseOnDtmf: z.boolean().optional(),
 	mohClassId: z.uuid().nullish(),
 	/**
 	 * The anti-toll-fraud gate: an extension may only take an outbound route whose class its own

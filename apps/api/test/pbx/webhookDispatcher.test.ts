@@ -1,5 +1,14 @@
 import { expect } from "chai";
+import {
+	encryptSecret,
+	isEncryptedSecret,
+	SECRET_ENCRYPTION_KEY_VARIABLE,
+} from "@optimiq-voice/db";
 import { WebhookDispatcher } from "../../src/pbx/webhooks/webhook-dispatcher.service";
+import {
+	verifyWebhookSignature,
+	WEBHOOK_SIGNATURE_HEADER,
+} from "../../src/pbx/webhooks/webhook-signature";
 import type { PbxEnv } from "../../src/pbx/shared/pbx-env";
 import type { WebhookFetch } from "../../src/pbx/webhooks/webhook-delivery";
 import type { DispatchMessage } from "../../src/pbx/webhooks/webhook-dispatcher.service";
@@ -19,6 +28,18 @@ const ORG = "0195c0f0-1c2f-7000-8000-000000000001";
 const OTHER_ORG = "0195c0f0-1c2f-7000-8000-000000000002";
 const CALL = "0195c0f0-1c2f-7000-8000-0000000000c1";
 const SUBSCRIPTION = "0195c0f0-1c2f-7000-8000-0000000000a1";
+
+/**
+ * The platform key, set on the process because that is where `loadSecretKey` reads it.
+ *
+ * Set for the whole file rather than per test so the DEFAULT posture under test is the configured
+ * one; the single spec that proves an unconfigured deployment still signs deletes it and restores
+ * it, which is also the only spec that cares.
+ */
+const KEY_HEX = "a".repeat(64);
+process.env[SECRET_ENCRYPTION_KEY_VARIABLE] = KEY_HEX;
+
+const PLAINTEXT_SECRET = "whsec_test";
 
 function env(overrides: Partial<PbxEnv> = {}): PbxEnv {
 	return {
@@ -152,12 +173,16 @@ function envelope(subject: string, type = "channel.answered"): Record<string, un
 function recordingFetch(status = 200): {
 	readonly fetchImpl: WebhookFetch;
 	readonly urls: string[];
+	readonly sent: { readonly headers: Record<string, string>; readonly body: string }[];
 } {
 	const urls: string[] = [];
+	const sent: { headers: Record<string, string>; body: string }[] = [];
 	return {
 		urls,
-		fetchImpl: async (url) => {
+		sent,
+		fetchImpl: async (url, init) => {
 			urls.push(url);
+			sent.push({ headers: init.headers, body: init.body });
 			return { status };
 		},
 	};
@@ -166,7 +191,9 @@ function recordingFetch(status = 200): {
 const SUBSCRIPTION_ROW: SubscriptionRow = {
 	id: SUBSCRIPTION,
 	url: "https://example.test/hook",
-	secret: "whsec_test",
+	// Stored as it really is: a sealed envelope. A row written before encryption shipped is the
+	// LEGACY case, and it has its own specs below.
+	secret: encryptSecret(PLAINTEXT_SECRET, Buffer.from(KEY_HEX, "hex")),
 	eventSelectors: ["calls.evt.v1.>"],
 };
 
@@ -309,6 +336,77 @@ describe("the webhook dispatcher", () => {
 
 		expect(Object.keys(database.updates[0] ?? {})).to.not.include("enabled");
 		expect(Object.keys(database.updates[0] ?? {})).to.include("consecutiveFailures");
+	});
+
+	it("opens the sealed secret once per fill, and signs with the ORIGINAL plaintext", async () => {
+		const database = fakeDatabase({ rows: [SUBSCRIPTION_ROW] });
+		const transport = recordingFetch();
+		const dispatcher = new WebhookDispatcher(env(), database.client, transport.fetchImpl);
+		const subject = callSubject(ORG);
+
+		await dispatcher.dispatch(message(subject, envelope(subject)), "call");
+
+		// The receiver holds the plaintext the create response handed out; the envelope in the column
+		// is an implementation detail that must never reach an HMAC.
+		const sent = transport.sent[0]!;
+		expect(
+			verifyWebhookSignature(
+				PLAINTEXT_SECRET,
+				sent.body,
+				sent.headers[WEBHOOK_SIGNATURE_HEADER]!,
+				Math.floor(Date.now() / 1000),
+			),
+		).to.equal(true);
+		// A sealed row is already at rest correctly, so the fill re-writes no secret. (The success
+		// bookkeeping still writes, which is why this looks for the COLUMN and not the count.)
+		expect(database.updates.some((values) => "secret" in values)).to.equal(false);
+	});
+
+	it("still signs a legacy plaintext row, and re-seals it in place", async () => {
+		const legacy = { ...SUBSCRIPTION_ROW, secret: PLAINTEXT_SECRET };
+		const database = fakeDatabase({ rows: [legacy] });
+		const transport = recordingFetch();
+		const dispatcher = new WebhookDispatcher(env(), database.client, transport.fetchImpl);
+		const subject = callSubject(ORG);
+
+		await dispatcher.dispatch(message(subject, envelope(subject)), "call");
+
+		const sent = transport.sent[0]!;
+		expect(
+			verifyWebhookSignature(
+				PLAINTEXT_SECRET,
+				sent.body,
+				sent.headers[WEBHOOK_SIGNATURE_HEADER]!,
+				Math.floor(Date.now() / 1000),
+			),
+		).to.equal(true);
+		// The lazy half of the migration ran while the value was already in hand.
+		const written = database.updates.find((values) => "secret" in values) as
+			| { secret?: string }
+			| undefined;
+		expect(typeof written?.secret).to.equal("string");
+		expect(written?.secret).to.not.equal(PLAINTEXT_SECRET);
+		expect(isEncryptedSecret(written!.secret!)).to.equal(true);
+	});
+
+	it("leaves a legacy row alone when no key is configured, rather than losing the webhook", async () => {
+		delete process.env[SECRET_ENCRYPTION_KEY_VARIABLE];
+		try {
+			const legacy = { ...SUBSCRIPTION_ROW, secret: PLAINTEXT_SECRET };
+			const database = fakeDatabase({ rows: [legacy] });
+			const transport = recordingFetch();
+			const dispatcher = new WebhookDispatcher(env(), database.client, transport.fetchImpl);
+			const subject = callSubject(ORG);
+
+			await dispatcher.dispatch(message(subject, envelope(subject)), "call");
+
+			expect(transport.urls).to.deep.equal([legacy.url]);
+			// Nothing to seal it WITH, so the secret is not re-written — a deployment that has never set
+			// the key keeps delivering instead of failing every event on a migration it cannot perform.
+			expect(database.updates.some((values) => "secret" in values)).to.equal(false);
+		} finally {
+			process.env[SECRET_ENCRYPTION_KEY_VARIABLE] = KEY_HEX;
+		}
 	});
 
 	it("caches a tenant's subscriptions for the configured window", async () => {

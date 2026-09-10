@@ -10,6 +10,7 @@ import {
 	loadTranscriptionEnv,
 } from "../transcription";
 import { AuditLogQueryService } from "./audit-log/audit-log-query.service";
+import { AuditLogRetentionSweeper } from "./audit-log/audit-log-retention-sweeper.service";
 import { AuditLogController } from "./audit-log/audit-log.controller";
 import { BrandingLogoUploadService } from "./branding-logo/branding-logo-upload.service";
 import { BrandingLogoController } from "./branding-logo/branding-logo.controller";
@@ -102,12 +103,24 @@ import { AgentStatePublisher } from "./queues/agent-state.publisher";
 import { QueueAgentSessionController } from "./queues/queue-agent-session.controller";
 import { QueueAgentSessionService } from "./queues/queue-agent-session.service";
 import { QueueCallbacksClient } from "./queues/queue-callbacks.client";
+import { QueueDispositionRpcController } from "./queues/queue-disposition-rpc.controller";
 import {
 	affectsQueueMembership,
 	QueueMembershipPublisher,
 } from "./queues/queue-membership.publisher";
+import { QueueSupervisionController } from "./queues/queue-supervision.controller";
+import { QueueSupervisionService } from "./queues/queue-supervision.service";
+import { QueueSurveyRpcController } from "./queues/queue-survey-rpc.controller";
 import { QueueAgentsController, QueuesController } from "./queues/queues.controller";
-import { QueueAgentsService, QueueTiersService, QueuesService } from "./queues/queues.service";
+import {
+	QueueAgentSkillsService,
+	QueueAgentsService,
+	QueueDispositionCodesService,
+	QueueSkillRequirementsService,
+	QueueSurveyQuestionsService,
+	QueueTiersService,
+	QueuesService,
+} from "./queues/queues.service";
 import { ResellerTelephonyUsageController } from "./reseller-usage/reseller-telephony-usage.controller";
 import { ResellerTelephonyUsageService } from "./reseller-usage/reseller-telephony-usage.service";
 import { RingGroupsController } from "./ring-groups/ring-groups.controller";
@@ -144,6 +157,9 @@ import {
 } from "./shared/pbx.tokens";
 import { dischargeProjection } from "./shared/projection-outbox";
 import { ProjectionOutboxSweeper } from "./shared/projection-outbox.service";
+import { SharedRateWindowService } from "./shared/shared-rate-window";
+import { SipCredentialRotationController } from "./sip-credentials/sip-credential-rotation.controller";
+import { SipCredentialRotationService } from "./sip-credentials/sip-credential-rotation.service";
 import {
 	SipCredentialCache,
 	affectsSipCredentials,
@@ -157,6 +173,11 @@ import {
 	TimeConditionRulesService,
 	TimeConditionsService,
 } from "./time-conditions/time-conditions.service";
+import { FraudAnomalyDetector } from "./toll-fraud/fraud-anomaly-detector.service";
+import { FraudSignalPublisher } from "./toll-fraud/fraud-signal.publisher";
+import { TollFraudController } from "./toll-fraud/toll-fraud.controller";
+import { TollFraudResponder } from "./toll-fraud/toll-fraud.responder";
+import { TollFraudService } from "./toll-fraud/toll-fraud.service";
 import { TranslationRulesetsController } from "./translations/translations.controller";
 import {
 	TranslationRulesetsService,
@@ -178,6 +199,7 @@ import { VoicemailMessagesController } from "./voicemail-boxes/voicemail-message
 import { VoicemailMessagesService } from "./voicemail-boxes/voicemail-messages.service";
 import { VoicemailMwiPublisher } from "./voicemail-boxes/voicemail-mwi.publisher";
 import { VoicemailPinService } from "./voicemail-boxes/voicemail-pin.service";
+import { VoicemailRetentionSweeper } from "./voicemail-boxes/voicemail-retention-sweeper.service";
 import { VoicemailRpcController } from "./voicemail-boxes/voicemail-rpc.controller";
 import { VoicemailTranscriptionSweeper } from "./voicemail-boxes/voicemail-transcription-sweeper.service";
 import { VoicemailTranscriptionService } from "./voicemail-boxes/voicemail-transcription.service";
@@ -272,6 +294,9 @@ const logger = getLogger("api.pbx");
 		QueuesController,
 		QueueAgentsController,
 		QueueAgentSessionController,
+		QueueSupervisionController,
+		QueueDispositionRpcController,
+		QueueSurveyRpcController,
 		ConferencesController,
 		ConferenceModerationController,
 		ParkLotsController,
@@ -288,6 +313,8 @@ const logger = getLogger("api.pbx");
 		// rather than inside the admin block's own grants. See the controller's header.
 		PhrasesController,
 		OrgLimitsController,
+		TollFraudController,
+		SipCredentialRotationController,
 		/**
 		 * `GET /api/v1/reseller/telephony-usage` — the reseller's cross-child telephony roll-up.
 		 *
@@ -833,7 +860,12 @@ const logger = getLogger("api.pbx");
 		QueuesService,
 		QueueAgentsService,
 		QueueTiersService,
+		QueueDispositionCodesService,
+		QueueSkillRequirementsService,
+		QueueSurveyQuestionsService,
+		QueueAgentSkillsService,
 		QueueAgentSessionService,
+		QueueSupervisionService,
 		ConferencesService,
 		ConferencePinService,
 		ConferenceControlClient,
@@ -859,6 +891,19 @@ const logger = getLogger("api.pbx");
 		DialByNameDirectoriesService,
 		SpeedDialsService,
 		OrgLimitsService,
+		SharedRateWindowService,
+		SipCredentialRotationService,
+		TollFraudService,
+		TollFraudResponder,
+		FraudSignalPublisher,
+		/**
+		 * The backward-looking half of toll-fraud defence.
+		 *
+		 * Registered unconditionally, like the emergency consumer below and for the same reason:
+		 * without a CDR database it logs once and stands down, which is a deployment discovering that
+		 * its detection is not wired rather than a provider silently absent from the container.
+		 */
+		FraudAnomalyDetector,
 		PromptsService,
 		SystemMediaService,
 		PhrasesService,
@@ -888,6 +933,8 @@ const logger = getLogger("api.pbx");
 		VoicemailEmailService,
 		VoicemailTranscriptionService,
 		VoicemailTranscriptionSweeper,
+		VoicemailRetentionSweeper,
+		AuditLogRetentionSweeper,
 		VoicemailConsumer,
 		RoutingService,
 		SipAclEntriesService,
@@ -958,9 +1005,14 @@ const logger = getLogger("api.pbx");
 		VoicemailMessagesService,
 		VoicemailMwiPublisher,
 		VoicemailTranscriptionSweeper,
+		VoicemailRetentionSweeper,
+		AuditLogRetentionSweeper,
 		TrunkStatusConsumer,
 		PromptsService,
 		ControlledCalls,
+		SharedRateWindowService,
+		TollFraudService,
+		EmergencyAddressesService,
 	],
 })
 export class PbxModule implements OnApplicationShutdown {

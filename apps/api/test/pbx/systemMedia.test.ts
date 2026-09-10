@@ -79,6 +79,10 @@ describe("system media", () => {
 			"vm-password",
 			"vm-incorrect",
 			"vm-rec-name",
+			// `CallControlSettings.consentPrompt` in `apps/engine/src/calls/call-control.ts`, played
+			// to both parties before a tap exists. Absent, the consent gate announces silence and
+			// records the call anyway, which is worse than the defect this catalogue exists to close.
+			"recording-consent",
 			"priv-callerintros",
 			"agent-pass",
 			"auth-incorrect",
@@ -103,6 +107,15 @@ describe("system media", () => {
 		for (const stem of required) {
 			expect(stems.has(stem), `system media is missing "${stem}"`).to.equal(true);
 		}
+	});
+
+	it("bumps the catalogue version when the catalogue gains a stem", () => {
+		// The version does not decide anything on its own — `inspect()` compares a per-asset checksum,
+		// so `recording-consent` is seeded on the next boot because its key is ABSENT and an
+		// operator's own file at that key is preserved because its bytes are neither this release's
+		// nor any recorded in the manifest. The number is the manifest's record of which catalogue
+		// wrote it, and a catalogue change that left it alone would make that record a lie.
+		expect(SYSTEM_MEDIA_VERSION).to.equal(2);
 	});
 
 	it("renders audio the upload policy itself would accept, at the one safe format", () => {

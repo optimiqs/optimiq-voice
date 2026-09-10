@@ -1,5 +1,6 @@
 import { Inject, Injectable, Optional } from "@nestjs/common";
 import { hasPermission, requireActiveOrganizationId } from "@optimiq-voice/auth";
+import { getLogger } from "@optimiq-voice/logging";
 import {
 	CdrInvalidCursorException,
 	CdrNotFoundException,
@@ -19,6 +20,7 @@ import {
 	listRecordingsForLegs,
 } from "./cdr.repository";
 import { readQueueStats } from "./queue-stats";
+import { CDR_QUEUE_SURVEY } from "./queue-survey.port";
 import { CDR_SELF_PARTIES } from "./self-parties";
 import type { AgentStatsRow } from "./agent-stats";
 import type { CallVolumeDestinationRow, CallVolumeRow } from "./call-volume";
@@ -34,6 +36,11 @@ import type {
 } from "./cdr.dto";
 import type { CallLegDetailRow, CallLegListRow, RecordingListRow } from "./cdr.repository";
 import type { QueueStatsRow } from "./queue-stats";
+import type {
+	QueueSurveyCallAnswer,
+	QueueSurveySource,
+	QueueSurveySummary,
+} from "./queue-survey.port";
 import type { CdrSelfParties } from "./self-parties";
 import type { AppSession } from "@optimiq-voice/auth";
 import type { CdrDatabaseClient } from "@optimiq-voice/cdr-db";
@@ -61,11 +68,24 @@ import type { CdrDatabaseClient } from "@optimiq-voice/cdr-db";
  * without bound. A shared envelope would have made the wrong query cheap to write.
  */
 
+const logger = getLogger("api.cdr");
+
 export interface QueueStatsEnvelope {
-	readonly data: readonly QueueStatsRow[];
+	readonly data: readonly QueueStatsReportRow[];
 	/** Echoed so a widget can label its own percentage without re-reading its own query string. */
 	readonly slaSeconds: number;
 	readonly range: { readonly from: string; readonly to: string };
+}
+
+/**
+ * A queue's service level, with its post-call survey attached when it has one.
+ *
+ * `survey` is ABSENT rather than an empty summary for a queue nobody rated, which is the same
+ * discipline the roster projection keeps: "no survey configured" and "a survey nobody answered" are
+ * different facts, and a UI that had to tell them apart from a zero would guess wrong.
+ */
+export interface QueueStatsReportRow extends QueueStatsRow {
+	readonly survey?: QueueSurveySummary;
 }
 
 export interface AgentStatsEnvelope {
@@ -108,6 +128,8 @@ export interface CdrCallEnvelope {
 		readonly callId: string;
 		readonly legs: readonly CallLegListRow[];
 		readonly recordings: readonly RecordingListRow[];
+		/** What the caller answered after the agent hung up. Empty for a call with no survey. */
+		readonly survey: readonly QueueSurveyCallAnswer[];
 	};
 }
 
@@ -123,6 +145,15 @@ export class CdrService {
 		 * means to a caller who holds only the scoped grant.
 		 */
 		@Optional() @Inject(CDR_SELF_PARTIES) private readonly selfParties?: CdrSelfParties,
+		/**
+		 * Post-call survey answers, when the PBX area is mounted beside this one.
+		 *
+		 * `@Optional()` like its neighbour, and its absence is silent rather than an exception: a
+		 * report with no survey on it is a report, whereas a `.own` reader with no extension link is
+		 * a question that cannot be answered honestly. See {@link
+		 * import("./queue-survey.port").CDR_QUEUE_SURVEY}.
+		 */
+		@Optional() @Inject(CDR_QUEUE_SURVEY) private readonly survey?: QueueSurveySource,
 	) {}
 
 	private organizationId(session: AppSession): string {
@@ -198,8 +229,16 @@ export class CdrService {
 				}),
 		);
 
+		// AFTER the aggregate and outside its transaction, because it is a different database with a
+		// different tenant scope. Attached to the rows by queue id here rather than joined in SQL —
+		// see the port for why no statement can name both tables.
+		const surveys = await this.queueSurveys(organizationId, range, query.queueId);
+
 		return {
-			data: rows,
+			data: rows.map((row) => {
+				const survey = surveys.get(row.queueId);
+				return survey === undefined ? row : { ...row, survey };
+			}),
 			slaSeconds: query.slaSeconds,
 			range: { from: range.from.toISOString(), to: range.to.toISOString() },
 		};
@@ -380,7 +419,58 @@ export class CdrService {
 		if (found === undefined) {
 			throw new CdrNotFoundException("call", callId);
 		}
-		return { data: found };
+		// Only once the call has been found AND the `.own` check above has let this reader see it:
+		// the answers are keyed by call id alone, so asking first would leak the existence of a
+		// survey on a call this session may not read.
+		return { data: { ...found, survey: await this.callSurvey(organizationId, callId) } };
+	}
+
+	/** Every queue's survey over the window, keyed by queue id. Empty when the port is absent. */
+	private async queueSurveys(
+		organizationId: string,
+		range: ResolvedTimeRange,
+		queueId: string | undefined,
+	): Promise<ReadonlyMap<string, QueueSurveySummary>> {
+		if (this.survey === undefined) {
+			return new Map();
+		}
+		try {
+			const summaries = await this.survey.summaries({
+				organizationId,
+				from: range.from,
+				to: range.to,
+				...(queueId === undefined ? {} : { queueId }),
+			});
+			return new Map(summaries.map((summary) => [summary.queueId, summary]));
+		} catch (error) {
+			// Never fatal. The service level is the answer this endpoint exists for and the survey is
+			// an addition to it; a queue report that 500s because the other database is unreachable
+			// would take the supervisor's whole screen with it.
+			logger.warn(
+				{ organizationId, err: String(error) },
+				"the post-call survey summary could not be read; the queue report was served without it",
+			);
+			return new Map();
+		}
+	}
+
+	/** What this call's caller answered. Empty when nothing was asked or the port is absent. */
+	private async callSurvey(
+		organizationId: string,
+		callId: string,
+	): Promise<readonly QueueSurveyCallAnswer[]> {
+		if (this.survey === undefined) {
+			return [];
+		}
+		try {
+			return await this.survey.answersForCalls({ organizationId, callIds: [callId] });
+		} catch (error) {
+			logger.warn(
+				{ organizationId, callId, err: String(error) },
+				"the post-call survey answers could not be read; the call was served without them",
+			);
+			return [];
+		}
 	}
 }
 

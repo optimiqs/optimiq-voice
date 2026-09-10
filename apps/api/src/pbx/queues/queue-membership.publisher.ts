@@ -4,11 +4,25 @@ import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import { queueMembershipSchema } from "@optimiq-voice/events/schemas";
 import { ensureKvBuckets, kvKeyFor, QUEUE_MEMBERSHIP_KV } from "@optimiq-voice/events/streams";
 import { getLogger } from "@optimiq-voice/logging";
-import { extension, inArray, queue, queueAgent, queueTier } from "@optimiq-voice/pbx-db";
+import {
+	eq,
+	extension,
+	inArray,
+	queue,
+	queueAgent,
+	queueAgentSkill,
+	queueDispositionCode,
+	queueSkillRequirement,
+	queueSurveyQuestion,
+	queueTier,
+} from "@optimiq-voice/pbx-db";
 import { PBX_DATABASE, PBX_ENV } from "../shared/pbx.tokens";
 import {
 	projectQueueMemberships,
+	type QueueRosterDispositionCodeRow,
 	type QueueRosterQueueRow,
+	type QueueRosterSkillRequirementRow,
+	type QueueRosterSurveyQuestionRow,
 	type QueueRosterTierRow,
 	type UnreachableSeat,
 } from "./queue-membership.projection";
@@ -41,7 +55,7 @@ const logger = getLogger("api.pbx");
  * `on delete cascade`, so deleting ONE agent silently changes the roster of every queue they served
  * — and the delete statement does not say which. Working out the affected set would mean reading
  * the tiers before the write and diffing, in a transaction this publisher deliberately runs after.
- * Reading four unjoined tables for the tenant and reconciling every key is one round trip more and
+ * Reading the tenant's roster tables unjoined and reconciling every key is one round trip more and
  * cannot miss a queue. Same trade `did-index` makes with its full key scan, and the same ceiling:
  * at ten thousand queues per tenant this becomes a per-queue projection with a tier-level trigger.
  *
@@ -194,6 +208,9 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 			{
 				extensionDialTemplate: this.env.PBX_EXTENSION_DIAL_TEMPLATE,
 				previousRevisions,
+				dispositionCodes: rows.dispositionCodes,
+				skillRequirements: rows.skillRequirements,
+				surveyQuestions: rows.surveyQuestions,
 			},
 		);
 
@@ -326,25 +343,60 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 	}
 }
 
-/** The four tables a roster is built from, read unjoined per `snapshot-loader.ts`'s rule. */
+/** The tables a roster is built from, read unjoined per `snapshot-loader.ts`'s rule. */
 export interface QueueRosterRows {
 	readonly queues: readonly QueueRosterQueueRow[];
 	readonly tiers: readonly QueueRosterTierRow[];
+	/** Enabled codes only — a retired one is history, not a button. */
+	readonly dispositionCodes: readonly QueueRosterDispositionCodeRow[];
+	readonly skillRequirements: readonly QueueRosterSkillRequirementRow[];
+	/** Every question in the tenant; the projection narrows to the queues whose survey is on. */
+	readonly surveyQuestions: readonly QueueRosterSurveyQuestionRow[];
 }
 
 /**
  * Reads the roster inputs for the tenant the transaction is scoped to.
  *
- * Four unjoined selects and an in-memory join, following the loader convention: RLS is the filter,
+ * Unjoined selects and an in-memory join, following the loader convention: RLS is the filter,
  * so no query here carries an `organization_id` predicate, and the join stays in TypeScript where
  * it is testable without a database.
  */
 export async function readRosterRows(
 	transaction: PbxDatabaseTransaction,
 ): Promise<QueueRosterRows> {
-	const [queues, tiers] = await Promise.all([
+	const [queues, tiers, dispositionCodes, skillRequirements, surveyQuestions] = await Promise.all([
 		transaction.select().from(queue),
 		transaction.select().from(queueTier),
+		// The `enabled` predicate is in the query rather than in the projection because a disabled
+		// code must not reach the roster at all: the console offers what it is given, and a retired
+		// code that stayed in the list would keep being picked long after somebody retired it.
+		transaction
+			.select({
+				queueId: queueDispositionCode.queueId,
+				id: queueDispositionCode.id,
+				code: queueDispositionCode.code,
+				label: queueDispositionCode.label,
+				position: queueDispositionCode.position,
+			})
+			.from(queueDispositionCode)
+			.where(eq(queueDispositionCode.enabled, true)),
+		transaction
+			.select({
+				queueId: queueSkillRequirement.queueId,
+				skill: queueSkillRequirement.skill,
+				minLevel: queueSkillRequirement.minLevel,
+				relaxAfterSeconds: queueSkillRequirement.relaxAfterSeconds,
+			})
+			.from(queueSkillRequirement),
+		transaction
+			.select({
+				queueId: queueSurveyQuestion.queueId,
+				id: queueSurveyQuestion.id,
+				position: queueSurveyQuestion.position,
+				promptId: queueSurveyQuestion.promptId,
+				label: queueSurveyQuestion.label,
+			})
+			.from(queueSurveyQuestion),
 	]);
 
 	// The two supporting reads are narrowed to what the tiers actually reference. Selecting every
@@ -359,6 +411,35 @@ export async function readRosterRows(
 			: await transaction.select().from(queueAgent).where(inArray(queueAgent.id, agentIds));
 
 	const agentsById = new Map(agents.map((row) => [row.id, row]));
+
+	// Narrowed to the seats the tiers reference, for the reason the agent read above is: this runs on
+	// every membership mutation including an agent login, and a tenant's whole skill matrix is not
+	// needed to project the handful of agents actually on a queue.
+	const skillsByAgent = new Map<string, { skill: string; level: number }[]>();
+	if (agentIds.length > 0) {
+		const skillRows = await transaction
+			.select({
+				queueAgentId: queueAgentSkill.queueAgentId,
+				skill: queueAgentSkill.skill,
+				level: queueAgentSkill.level,
+			})
+			.from(queueAgentSkill)
+			.where(inArray(queueAgentSkill.queueAgentId, agentIds));
+		for (const row of skillRows) {
+			const bucket = skillsByAgent.get(row.queueAgentId);
+			if (bucket === undefined) {
+				skillsByAgent.set(row.queueAgentId, [{ skill: row.skill, level: row.level }]);
+			} else {
+				bucket.push({ skill: row.skill, level: row.level });
+			}
+		}
+		// Ordered once per agent here rather than once per TIER in the projection: an agent on four
+		// queues would otherwise have the same list sorted four times, and the order is part of the
+		// published value — an unrelated write must not reshuffle it.
+		for (const bucket of skillsByAgent.values()) {
+			bucket.sort((a, b) => a.skill.localeCompare(b.skill));
+		}
+	}
 	const extensionIds = [
 		...new Set(agents.flatMap((row) => (row.extensionId === null ? [] : [row.extensionId]))),
 	];
@@ -397,6 +478,7 @@ export async function readRosterRows(
 			busyDelaySeconds: agent.busyDelaySeconds,
 			rejectDelaySeconds: agent.rejectDelaySeconds,
 			enabled: agent.enabled,
+			skills: skillsByAgent.get(agent.id) ?? [],
 		});
 	}
 
@@ -408,8 +490,15 @@ export async function readRosterRows(
 			tierRulesApply: row.tierRulesApply,
 			tierRuleWaitSeconds: row.tierRuleWaitSeconds,
 			tierRuleNoAgentNoWait: row.tierRuleNoAgentNoWait,
+			ronaEnabled: row.ronaEnabled,
+			dispositionRequired: row.dispositionRequired,
+			surveyEnabled: row.surveyEnabled,
+			surveyIntroPromptId: row.surveyIntroPromptId,
 		})),
 		tiers: joined,
+		dispositionCodes,
+		skillRequirements,
+		surveyQuestions,
 	};
 }
 

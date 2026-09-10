@@ -157,6 +157,20 @@ export class RoutingService {
 		readonly matchedRuleId?: string;
 		readonly matchedRuleName?: string;
 		readonly dialedNumber?: string;
+		/**
+		 * The caller id the call would actually present, and the attestation the platform would
+		 * assert for it.
+		 *
+		 * On the simulate response and not only in the diagnostics because these three are the
+		 * ANSWER to a question an administrator asks directly — "if this extension dials out, what
+		 * number does the far end see and what do we tell the carrier about it?" — and a fact buried
+		 * in a prose diagnostic is a fact nobody can put in a table. `complianceRefusal` is why the
+		 * call would not be placed at all, when it would not.
+		 */
+		readonly callerIdNumber?: string;
+		readonly expectedAttestation?: string;
+		readonly callerIdRightToUse?: string;
+		readonly complianceRefusal?: string;
 		readonly reason?: string;
 		readonly diagnostics: readonly WireDiagnostic[];
 	}> {
@@ -189,6 +203,16 @@ export class RoutingService {
 			...(route.matchedRuleId === undefined ? {} : { matchedRuleId: route.matchedRuleId }),
 			...(route.matchedRuleName === undefined ? {} : { matchedRuleName: route.matchedRuleName }),
 			...(route.dialedNumber === undefined ? {} : { dialedNumber: route.dialedNumber }),
+			...(route.callerIdNumber === undefined ? {} : { callerIdNumber: route.callerIdNumber }),
+			...(route.expectedAttestation === undefined
+				? {}
+				: { expectedAttestation: route.expectedAttestation }),
+			...(route.callerIdRightToUse === undefined
+				? {}
+				: { callerIdRightToUse: route.callerIdRightToUse }),
+			...(route.complianceRefusal === undefined
+				? {}
+				: { complianceRefusal: route.complianceRefusal }),
 			...(route.reason === undefined ? {} : { reason: route.reason }),
 			// The compiler's warnings and the resolver's decisions, in one list: "this ring group is
 			// empty" and "the time-condition gate was closed" are the same kind of answer to the same

@@ -4,6 +4,9 @@ import { QueuesController } from "../../src/pbx/queues/queues.controller";
 import type { QueueCallbacksClient } from "../../src/pbx/queues/queue-callbacks.client";
 import type {
 	QueueAgentsService,
+	QueueDispositionCodesService,
+	QueueSkillRequirementsService,
+	QueueSurveyQuestionsService,
 	QueueTiersService,
 	QueuesService,
 } from "../../src/pbx/queues/queues.service";
@@ -43,7 +46,14 @@ function controllerFor(
 		},
 	} as unknown as QueuesService;
 	return {
-		controller: new QueuesController(queues, {} as unknown as QueueTiersService, options.callbacks),
+		controller: new QueuesController(
+			queues,
+			{} as unknown as QueueTiersService,
+			{} as unknown as QueueDispositionCodesService,
+			{} as unknown as QueueSkillRequirementsService,
+			{} as unknown as QueueSurveyQuestionsService,
+			options.callbacks,
+		),
 		fetched,
 	};
 }

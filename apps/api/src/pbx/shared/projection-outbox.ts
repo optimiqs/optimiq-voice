@@ -88,11 +88,22 @@ export { PROJECTION_NAMES, type ProjectionName } from "@optimiq-voice/pbx-db";
  * `extension.number`, so renumbering an extension moves every queue that agent serves. Leaving it
  * out would publish rosters that dial the old number until something else happened to touch the
  * queue.
+ *
+ * The four child collections are here for the same class of reason: each one is projected ONTO the
+ * roster rather than into the routing artifact, so nothing else would ever republish them. A
+ * supervisor who adds a wrap-up code and sees it appear nowhere in the console — because no queue
+ * row changed — is the failure this list prevents. `queue_agent_skill` is the one whose parent is
+ * an agent rather than a queue, which does not matter here: the re-projection is whole-organization
+ * either way.
  */
 export const QUEUE_MEMBERSHIP_TABLES: readonly string[] = [
 	"queue",
 	"queue_agent",
 	"queue_tier",
+	"queue_disposition_code",
+	"queue_skill_requirement",
+	"queue_survey_question",
+	"queue_agent_skill",
 	"extension",
 ];
 

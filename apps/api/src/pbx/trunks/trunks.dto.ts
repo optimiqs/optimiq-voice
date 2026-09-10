@@ -1,5 +1,5 @@
 import { z } from "zod/v4";
-import { SIP_TRANSPORTS, TRUNK_KINDS } from "@optimiq-voice/pbx-db";
+import { SIP_TRANSPORTS, TRUNK_KINDS, TRUNK_SRTP_POLICIES } from "@optimiq-voice/pbx-db";
 import { callerIdNumber, displayName, patchOf, resettable } from "../shared/dto";
 
 /**
@@ -19,6 +19,12 @@ export const createTrunkDto = z.strictObject({
 	registerExpiresSeconds: resettable(z.int().min(30).max(86_400)),
 	transport: z.enum(SIP_TRANSPORTS).optional(),
 	codecPrefs: z.string().max(128).nullish(),
+	/**
+	 * SDES-SRTP on this trunk's legs. Absent or null leaves the media plane's own default in force,
+	 * which is what every trunk written before this field existed does; `require` refuses a carrier
+	 * that answers in plain RTP rather than carrying the call unencrypted.
+	 */
+	srtpPolicy: z.enum(TRUNK_SRTP_POLICIES).nullish(),
 	/**
 	 * Normalises the caller id ARRIVING on this trunk, before anything reads it. Nothing composes
 	 * with it — a trunk has no inline manipulation — so it runs first and alone. A ruleset that is

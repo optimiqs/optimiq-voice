@@ -1,5 +1,12 @@
 import { queueMembershipSchema } from "@optimiq-voice/events/schemas";
-import type { QueueMembership, QueueMembershipAgent } from "@optimiq-voice/events/schemas";
+import type {
+	QueueAgentSkill,
+	QueueDispositionCodeEntry,
+	QueueMembership,
+	QueueMembershipAgent,
+	QueueSkillRequirement,
+	QueueSurveyPlan,
+} from "@optimiq-voice/events/schemas";
 
 /**
  * The pure half of the `queue-membership` publisher: three tables in, one roster per queue out.
@@ -18,6 +25,43 @@ export interface QueueRosterQueueRow {
 	readonly tierRulesApply: boolean;
 	readonly tierRuleWaitSeconds: number;
 	readonly tierRuleNoAgentNoWait: boolean;
+	readonly ronaEnabled: boolean;
+	readonly dispositionRequired: boolean;
+	readonly surveyEnabled: boolean;
+	readonly surveyIntroPromptId: string | null;
+}
+
+/** One `queue_disposition_code` row. Disabled codes are filtered out before this. */
+export interface QueueRosterDispositionCodeRow {
+	readonly queueId: string;
+	readonly id: string;
+	readonly code: string;
+	readonly label: string;
+	readonly position: number;
+}
+
+/** One `queue_skill_requirement` row. */
+export interface QueueRosterSkillRequirementRow {
+	readonly queueId: string;
+	readonly skill: string;
+	readonly minLevel: number;
+	readonly relaxAfterSeconds: number;
+}
+
+/** One `queue_survey_question` row. Carried only when the queue has the survey switched on. */
+export interface QueueRosterSurveyQuestionRow {
+	readonly queueId: string;
+	readonly id: string;
+	readonly position: number;
+	readonly promptId: string | null;
+	readonly label: string;
+}
+
+/** One `queue_agent_skill` row, keyed by the AGENT — it travels on the seat, not on the queue. */
+export interface QueueRosterAgentSkillRow {
+	readonly queueAgentId: string;
+	readonly skill: string;
+	readonly level: number;
 }
 
 /** One `queue_tier` row joined to its `queue_agent`, plus the agent's extension number. */
@@ -41,6 +85,8 @@ export interface QueueRosterTierRow {
 	readonly busyDelaySeconds: number;
 	readonly rejectDelaySeconds: number;
 	readonly enabled: boolean;
+	/** `queue_agent_skill` for this agent, already ordered. Empty when they have none recorded. */
+	readonly skills: readonly QueueAgentSkill[];
 }
 
 /** A seat that could not be projected, and why. Reported rather than thrown — see below. */
@@ -71,6 +117,12 @@ export interface ProjectionOptions {
 	readonly now?: Date;
 	/** Previous revision per queue id, so the counter advances rather than restarting at 1. */
 	readonly previousRevisions?: ReadonlyMap<string, number>;
+	/** The enabled wrap-up vocabulary, per queue. Absent for a queue that asks no question. */
+	readonly dispositionCodes?: readonly QueueRosterDispositionCodeRow[];
+	/** What each queue asks of an agent. Absent for a queue anybody may take callers on. */
+	readonly skillRequirements?: readonly QueueRosterSkillRequirementRow[];
+	/** The survey questions, per queue. Already narrowed to queues whose survey is on. */
+	readonly surveyQuestions?: readonly QueueRosterSurveyQuestionRow[];
 }
 
 /** Renders `PJSIP/{number}` (or whatever the deployment configured) for one extension number. */
@@ -114,6 +166,9 @@ export function projectQueueMemberships(
 	options: ProjectionOptions,
 ): QueueMembershipProjection {
 	const updatedAt = (options.now ?? new Date()).toISOString();
+	const codesByQueue = groupBy(options.dispositionCodes ?? [], (row) => row.queueId);
+	const requirementsByQueue = groupBy(options.skillRequirements ?? [], (row) => row.queueId);
+	const questionsByQueue = groupBy(options.surveyQuestions ?? [], (row) => row.queueId);
 	const unreachable: UnreachableSeat[] = [];
 	const byQueue = new Map<string, QueueMembershipAgent[]>();
 
@@ -147,6 +202,18 @@ export function projectQueueMemberships(
 			tierRulesApply: queue.tierRulesApply,
 			tierRuleWaitSeconds: queue.tierRuleWaitSeconds,
 			tierRuleNoAgentNoWait: queue.tierRuleNoAgentNoWait,
+			// Every field below is OMITTED at its off value rather than written as `false`, `[]` or a
+			// `survey` with no questions. That is not tidiness: a queue configured with none of this
+			// must publish a roster byte-identical to the one it published before these columns
+			// existed, because `isSameRoster` in the publisher compares serialised values and the
+			// engine's older readers are keyed off absence. An empty array here would republish every
+			// roster in every tenant on the first write after deploy and would make "this queue asks
+			// nothing" and "this queue asks for a list that happens to be empty" different bytes.
+			...(queue.ronaEnabled ? { ronaEnabled: true } : {}),
+			...(queue.dispositionRequired ? { dispositionRequired: true } : {}),
+			...dispositionCodesFor(codesByQueue.get(queue.id)),
+			...skillRequirementsFor(requirementsByQueue.get(queue.id)),
+			...surveyFor(queue, questionsByQueue.get(queue.id)),
 			agents,
 			updatedAt,
 			revision: previous + 1,
@@ -182,8 +249,92 @@ function toSeat(tier: QueueRosterTierRow, template: string): QueueMembershipAgen
 		noAnswerDelaySeconds: tier.noAnswerDelaySeconds,
 		busyDelaySeconds: tier.busyDelaySeconds,
 		rejectDelaySeconds: tier.rejectDelaySeconds,
+		// Absent rather than `[]` for the reason the queue-level fields above are, and for one more:
+		// `queueMembershipAgentSchema.skills` documents absence as "no recorded skills", which a
+		// queue with no requirement reaches anyway. An empty array says the same thing in bytes the
+		// old readers never saw.
+		...(tier.skills.length === 0 ? {} : { skills: [...tier.skills] }),
 		enabled: tier.enabled,
 	};
+}
+
+function dispositionCodesFor(rows: readonly QueueRosterDispositionCodeRow[] | undefined): {
+	dispositionCodes?: QueueDispositionCodeEntry[];
+} {
+	if (rows === undefined || rows.length === 0) {
+		return {};
+	}
+	// Ordered here for the reason the seats are: the console renders this list in the order it
+	// arrives, and a vocabulary that reshuffled after an unrelated write would move the button an
+	// agent reaches for without looking.
+	const codes = [...rows]
+		.sort((a, b) => a.position - b.position || a.code.localeCompare(b.code))
+		.map((row) => ({ id: row.id, code: row.code, label: row.label, position: row.position }));
+	return { dispositionCodes: codes };
+}
+
+function skillRequirementsFor(rows: readonly QueueRosterSkillRequirementRow[] | undefined): {
+	skillRequirements?: QueueSkillRequirement[];
+} {
+	if (rows === undefined || rows.length === 0) {
+		return {};
+	}
+	const requirements = [...rows]
+		.sort((a, b) => a.skill.localeCompare(b.skill))
+		.map((row) => ({
+			skill: row.skill,
+			minLevel: row.minLevel,
+			relaxAfterSeconds: row.relaxAfterSeconds,
+		}));
+	return { skillRequirements: requirements };
+}
+
+/**
+ * The survey, when there is one to publish.
+ *
+ * Both halves are required: the queue's switch AND at least one question. `surveyEnabled` with an
+ * empty question list is a queue whose survey would play the intro and hang up, and
+ * `queueSurveyPlanSchema` refuses a zero-length `questions` anyway — so the flag alone publishes
+ * nothing rather than throwing on the parse that guards every roster this file writes.
+ */
+function surveyFor(
+	queue: QueueRosterQueueRow,
+	rows: readonly QueueRosterSurveyQuestionRow[] | undefined,
+): { survey?: QueueSurveyPlan } {
+	if (!queue.surveyEnabled || rows === undefined || rows.length === 0) {
+		return {};
+	}
+	const questions = [...rows]
+		.sort((a, b) => a.position - b.position)
+		.map((row) => ({
+			id: row.id,
+			position: row.position,
+			// `?? undefined` and not `?? null`, for the reason `announcePromptId` gives above: the
+			// field is optional on the schema and a null would be refused by the parse. A question
+			// with no prompt is asked silently by a console that has its label.
+			...(row.promptId === null ? {} : { promptId: row.promptId }),
+			label: row.label,
+		}));
+	return {
+		survey: {
+			...(queue.surveyIntroPromptId === null ? {} : { introPromptId: queue.surveyIntroPromptId }),
+			questions,
+		},
+	};
+}
+
+/** One pass, one Map. The alternative is a `.filter` per queue over every child row. */
+function groupBy<T>(rows: readonly T[], keyOf: (row: T) => string): Map<string, T[]> {
+	const byKey = new Map<string, T[]>();
+	for (const row of rows) {
+		const bucket = byKey.get(keyOf(row));
+		if (bucket === undefined) {
+			byKey.set(keyOf(row), [row]);
+		} else {
+			bucket.push(row);
+		}
+	}
+	return byKey;
 }
 
 function dialStringFor(tier: QueueRosterTierRow, template: string): string | undefined {

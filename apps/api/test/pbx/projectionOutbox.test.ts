@@ -61,6 +61,23 @@ describe("projectionsOwedBy", () => {
 	});
 
 	/**
+	 * The four child collections are projected ONTO the roster and into nothing else, so no other
+	 * write would ever republish them. A supervisor who adds a wrap-up code and sees it appear
+	 * nowhere in the console — because no `queue` row changed — is what this asserts against.
+	 */
+	it("owes a roster republish for the collections only the roster carries", () => {
+		for (const table of [
+			"queue_disposition_code",
+			"queue_skill_requirement",
+			"queue_survey_question",
+			"queue_agent_skill",
+		]) {
+			expect(affectsQueueMembership(table), table).to.equal(true);
+			expect(projectionsOwedBy(table, false), table).to.deep.equal(["queue-membership"]);
+		}
+	});
+
+	/**
 	 * `sip_acl_entry` is absent from `ROUTING_TABLE_TO_ENTITY`, so it never recompiles and
 	 * `onArtifactCompiled` never fires for it. Without its own predicate here it would owe NOTHING,
 	 * which is the failure this asserts against: a write to the toll-fraud boundary that the fast

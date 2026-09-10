@@ -13,7 +13,7 @@ import {
 } from "@optimiq-voice/pbx-db";
 import { openMediaResponse } from "../../media/media-response";
 import { ObjectKeyOutsideRootError } from "../../storage";
-import { actorFromSession, insertAuditLog } from "../shared/audit-log";
+import { asInetAddress, actorFromSession, insertAuditLog } from "../shared/audit-log";
 import { normalizePagination, paged } from "../shared/pagination";
 import { PBX_DATABASE, PBX_ENV, PBX_VOICEMAIL_STORE } from "../shared/pbx.tokens";
 import { assertOwnsRow, holdsUnscoped, ownedVoicemailBoxIds } from "../shared/self-ownership";
@@ -426,13 +426,34 @@ export class VoicemailMessagesService {
 			throw new VoicemailSigningUnavailableException();
 		}
 
-		await this.database.withTenantScope(organizationId, async (transaction) => {
-			await requireBox(transaction, boxId);
-			await requireMessage(transaction, boxId, messageId);
-		});
-
 		const ttl = this.env.PBX_VOICEMAIL_URL_TTL_SECONDS;
 		const expiresAt = Math.floor(Date.now() / 1000) + ttl;
+
+		await this.database.withTenantScope(organizationId, async (transaction) => {
+			await requireBox(transaction, boxId);
+			const message = await requireMessage(transaction, boxId, messageId);
+			// The AUTHORISATION, recorded where it is granted. Until now this ledger could say who
+			// deleted a message and not who listened to one, which inverts the two facts' weight: a
+			// voicemail is somebody's voice saying something to somebody else, and a third party
+			// hearing it is the event with a data subject attached. Written INSIDE the same
+			// transaction that proved the box and the message, so a mint that was refused — a box the
+			// caller may not reach, a message that is not in it — leaves no row claiming otherwise.
+			await insertAuditLog(transaction, {
+				organizationId,
+				actor: actorFromSession(session),
+				action: "voicemail-message.play-url",
+				resourceType: "voicemail_message",
+				resourceRef: messageId,
+				before: null,
+				after: {
+					voicemailBoxId: boxId,
+					objectKey: message.objectKey,
+					expiresAt: new Date(expiresAt * 1000).toISOString(),
+					expiresInSeconds: ttl,
+				},
+			});
+		});
+
 		return {
 			data: {
 				url: voicemailMediaPath(
@@ -455,6 +476,7 @@ export class VoicemailMessagesService {
 	async openSignedMedia(
 		token: string,
 		rangeHeader?: string | undefined,
+		client?: { readonly ipAddress?: string | undefined; readonly userAgent?: string | undefined },
 	): Promise<ResolvedVoicemailMedia> {
 		const secret = this.env.PBX_VOICEMAIL_URL_SECRET;
 		if (secret === undefined) {
@@ -506,6 +528,45 @@ export class VoicemailMessagesService {
 		if (stat === undefined) {
 			throw new VoicemailMediaGoneException();
 		}
+
+		// The LISTEN, once it is certain to be served. `system` with the token's own subject rather
+		// than a fabricated user: this route is anonymous by construction — an `<audio src>` cannot
+		// carry a session — and the party who minted the link is frequently not the party fetching
+		// it, which is exactly why the link scheme exists. Naming the minter here would turn "a
+		// bearer of this token, from this address" into a claim about a person the ledger does not
+		// know, and a ledger that guesses is worse than one that says what it saw.
+		await this.database
+			.withTenantScope(payload.o, async (transaction) => {
+				await insertAuditLog(transaction, {
+					organizationId: payload.o,
+					actor: {
+						type: "system",
+						userId: null,
+						ref: `voicemail-token:${payload.r}`,
+						ipAddress: asInetAddress(client?.ipAddress),
+						userAgent: client?.userAgent ?? null,
+						requestId: null,
+					},
+					action: "voicemail-message.play",
+					resourceType: "voicemail_message",
+					resourceRef: row.id,
+					before: null,
+					after: {
+						objectKey: row.objectKey,
+						sizeBytes: stat.sizeBytes,
+						ranged: rangeHeader !== undefined && rangeHeader.length > 0,
+					},
+				});
+			})
+			// Never fails the read: the listen is authorised and about to happen either way, so the
+			// honest failure mode of a ledger that would not take the row is a gap somebody can grep
+			// for — not a player that stops working because an insert did.
+			.catch((cause: unknown) => {
+				logger.error(
+					{ organizationId: payload.o, messageId: row.id, cause },
+					"a voicemail playback could not be recorded in the audit ledger",
+				);
+			});
 
 		return await openMediaResponse(this.store, row.objectKey, stat.sizeBytes, {
 			contentType: voicemailContentTypeFor(row.objectKey),

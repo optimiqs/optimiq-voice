@@ -2,6 +2,11 @@ import { BadRequestException } from "@nestjs/common";
 import { expect } from "chai";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import {
+	decryptSecret,
+	isEncryptedSecret,
+	SECRET_ENCRYPTION_KEY_VARIABLE,
+} from "@optimiq-voice/db";
 import { makeTestModuleRuntime } from "@optimiq-voice/effect-runtime";
 import { PbxRepository } from "../../src/pbx/shared/pbx.repository";
 import { createWebhookDto, updateWebhookDto } from "../../src/pbx/webhooks/webhooks.dto";
@@ -22,6 +27,11 @@ import type { AppSession } from "@optimiq-voice/auth";
  */
 
 const ORGANIZATION_ID = "019fd3c2-1111-76be-a6b3-b0f1914e39b6";
+
+/** The write paths call `requireSecretKey`, so the key has to be on the process for any of them. */
+const KEY_HEX = "a".repeat(64);
+process.env[SECRET_ENCRYPTION_KEY_VARIABLE] = KEY_HEX;
+const KEY = Buffer.from(KEY_HEX, "hex");
 
 function sessionFor(organizationId: string | null): AppSession {
 	return {
@@ -108,10 +118,12 @@ describe("WebhooksService", () => {
 
 		const created = await service.create(sessionFor(ORGANIZATION_ID), { ...VALID });
 
+		// What is STORED is the envelope; what is RETURNED, once, is the key the integrator configures
+		// the far end with.
 		const written = calls[0]?.args[2] as { secret: string };
-		expect(written.secret).to.match(/^whsec_/u);
-		// The one response that carries it.
-		expect(created.data.secret).to.equal(written.secret);
+		expect(isEncryptedSecret(written.secret)).to.equal(true);
+		expect(created.data.secret).to.match(/^whsec_/u);
+		expect(decryptSecret(written.secret, KEY)).to.equal(created.data.secret);
 	});
 
 	it("uses a supplied secret rather than replacing it", async () => {
@@ -122,9 +134,9 @@ describe("WebhooksService", () => {
 			secret: "whsec_supplied_by_the_integrator",
 		});
 
-		expect((calls[0]?.args[2] as { secret: string }).secret).to.equal(
-			"whsec_supplied_by_the_integrator",
-		);
+		const stored = (calls[0]?.args[2] as { secret: string }).secret;
+		expect(stored).to.not.equal("whsec_supplied_by_the_integrator");
+		expect(decryptSecret(stored, KEY)).to.equal("whsec_supplied_by_the_integrator");
 	});
 
 	it("never returns the secret on a read", async () => {
@@ -147,6 +159,19 @@ describe("WebhooksService", () => {
 			description: "renamed",
 		});
 
+		expect(updated.data).to.not.have.property("secret");
+	});
+
+	it("seals a rotated secret on PATCH, and still returns nothing", async () => {
+		const { service, calls } = serviceWith();
+
+		const updated = await service.update(sessionFor(ORGANIZATION_ID), "webhook-1", {
+			secret: "whsec_rotated_by_the_integrator",
+		});
+
+		const written = calls[0]?.args[3] as { secret: string };
+		expect(isEncryptedSecret(written.secret)).to.equal(true);
+		expect(decryptSecret(written.secret, KEY)).to.equal("whsec_rotated_by_the_integrator");
 		expect(updated.data).to.not.have.property("secret");
 	});
 

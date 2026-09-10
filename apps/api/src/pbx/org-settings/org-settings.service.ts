@@ -15,6 +15,7 @@ import {
 	settingsInCategory,
 	USER_SCOPED_CATEGORIES,
 	userScopedSettingsInCategory,
+	VOICEMAIL_RETENTION_SETTING,
 } from "./org-settings.catalog";
 import { parseCategoryPatch } from "./org-settings.dto";
 import {
@@ -404,6 +405,33 @@ export class OrgSettingsService extends PbxResourceService {
 		const descriptor = findSetting(RECORDING_SETTINGS_CATEGORY, RECORDING_RETENTION_SETTING);
 		const parsed = descriptor?.schema.safeParse(row.value);
 		return parsed?.success === true && typeof parsed.data === "number" ? parsed.data : undefined;
+	}
+
+	/**
+	 * The organization's voicemail retention window in days, `0` meaning "keep indefinitely".
+	 *
+	 * Unlike {@link readRecordingRetentionDays} this resolves through the CATALOGUE DEFAULT rather
+	 * than answering `undefined`, and the asymmetry is the point. That method feeds a policy whose
+	 * consumer has a platform floor to fall back to, so a defaulted `0` there would silently
+	 * overrule an operator. There is no platform floor for voicemail — a mailbox is a tenant's
+	 * artefact end to end — so the only two answers are "the row the tenant wrote" and "the
+	 * catalogue's 0", and 0 is `keep for ever`. A tenant that never opened the settings screen
+	 * therefore has its messages left alone, which is the only default a sweeper introduced by an
+	 * upgrade may have.
+	 *
+	 * A row whose value does not survive the descriptor's schema is treated as absent rather than
+	 * as an error: the sweeper's job is to delete on a policy it is sure of, and "I could not read
+	 * the policy" must resolve to keeping, never to deleting.
+	 */
+	async readVoicemailRetentionDays(organizationId: string): Promise<number> {
+		const rows = await this.readRows(organizationId, RECORDING_SETTINGS_CATEGORY);
+		const row = rows.find((entry) => entry.name === VOICEMAIL_RETENTION_SETTING && entry.enabled);
+		const descriptor = findSetting(RECORDING_SETTINGS_CATEGORY, VOICEMAIL_RETENTION_SETTING);
+		if (row === undefined || descriptor === undefined) {
+			return 0;
+		}
+		const parsed = descriptor.schema.safeParse(row.value);
+		return parsed.success && typeof parsed.data === "number" ? parsed.data : 0;
 	}
 
 	// -------------------------------------------------------------------------------------------

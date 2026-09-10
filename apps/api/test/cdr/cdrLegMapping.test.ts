@@ -1,6 +1,7 @@
 import { expect } from "chai";
 import { CALL_DESTINATION_TYPES } from "@optimiq-voice/cdr-db";
 import { CdrLegMappingError, mapCdrLegWrite } from "../../src/cdr/writer/cdr-leg-mapping";
+import { recordingConsentRow } from "../../src/cdr/writer/recording-writer.service";
 
 /**
  * The seam between a LOOSE event contract and a CHECKED reporting schema.
@@ -411,5 +412,180 @@ describe("the SIP Call-ID", () => {
 	it("stays out of the raw passthrough, being a mapped column now", () => {
 		const values = mapCdrLegWrite(ORG, { ...payload(), sipCallId: "abc@edge" }).values;
 		expect(values.raw).to.not.have.property("sipCallId");
+	});
+});
+
+/**
+ * The four consent columns.
+ *
+ * They are absent from nearly every payload, and the case that matters most is that one: an
+ * absence must reach the row as four nulls and never as a placeholder, because `none` is a real
+ * consent method and `[]` a real (empty) jurisdiction match.
+ */
+describe("cdr.leg.write → the consent columns", () => {
+	it("writes null for every leg that never went near the consent gate", () => {
+		const values = mapCdrLegWrite(ORG, payload()).values;
+		expect(values.recordingConsent).to.equal(null);
+		expect(values.recordingConsentMethod).to.equal(null);
+		expect(values.recordingConsentAt).to.equal(null);
+		expect(values.recordingConsentRegions).to.equal(null);
+	});
+
+	it("carries all four when the engine ran the gate", () => {
+		const values = mapCdrLegWrite(
+			ORG,
+			payload({
+				recordingConsent: "declined",
+				recordingConsentMethod: "keypress",
+				recordingConsentAt: "2026-08-05T10:00:02.000Z",
+				recordingConsentRegions: ["US-CA", "EU"],
+			}),
+		).values;
+		expect(values.recordingConsent).to.equal("declined");
+		expect(values.recordingConsentMethod).to.equal("keypress");
+		expect(values.recordingConsentAt?.toISOString()).to.equal("2026-08-05T10:00:02.000Z");
+		expect(values.recordingConsentRegions).to.deep.equal(["US-CA", "EU"]);
+	});
+
+	it("keeps an outcome this build does not recognise, because the column has no check", () => {
+		// `call_legs` is append-only and partitioned: a newer engine's vocabulary must reach a row and
+		// be read as unknown later, rather than cost the platform a billing record.
+		const values = mapCdrLegWrite(ORG, payload({ recordingConsent: "deferred" })).values;
+		expect(values.recordingConsent).to.equal("deferred");
+	});
+
+	it("distinguishes an empty region match from no match having been attempted", () => {
+		expect(
+			mapCdrLegWrite(ORG, payload({ recordingConsentRegions: [] })).values.recordingConsentRegions,
+		).to.deep.equal([]);
+		expect(
+			mapCdrLegWrite(ORG, payload({ recordingConsentRegions: null })).values
+				.recordingConsentRegions,
+		).to.equal(null);
+	});
+
+	it("keeps the four out of `raw`, because they have columns of their own", () => {
+		const values = mapCdrLegWrite(
+			ORG,
+			payload({ recordingConsent: "announced", recordingConsentMethod: "announcement" }),
+		).values;
+		expect(Object.hasOwn(values.raw, "recordingConsent")).to.equal(false);
+		expect(Object.hasOwn(values.raw, "recordingConsentMethod")).to.equal(false);
+	});
+});
+
+/**
+ * The consent record on its way to `recordings.consent`.
+ *
+ * The writer's own idempotence — an insert that conflicts writes nothing, and the follow-up update
+ * carries `consent is null` in its predicate — is decided in SQL and covered by the live CDR slice.
+ * What is decidable here is the input to it: an event with no consent must produce `undefined`, and
+ * `undefined` is precisely what makes the writer skip the update and leave a filed record alone.
+ */
+describe("channel.record.started → recordings.consent", () => {
+	const record = {
+		outcome: "accepted",
+		method: "keypress",
+		policy: "announce-and-require-keypress",
+		at: "2026-08-05T10:00:02.000Z",
+		parties: ["caller", "callee"],
+		regions: ["US-CA"],
+		promptId: "0195c0f0-1c2f-7000-8000-00000000a010",
+	} as const;
+
+	it("copies the record field by field rather than passing the parse through", () => {
+		expect(recordingConsentRow(record)).to.deep.equal(record);
+		const extra = { ...record, whoAsked: "the engine" } as unknown as typeof record;
+		expect(Object.hasOwn(recordingConsentRow(extra) ?? {}, "whoAsked")).to.equal(false);
+	});
+
+	it("omits the two optional fields rather than nulling them", () => {
+		const row = recordingConsentRow({
+			outcome: "not-required",
+			method: "none",
+			policy: "none",
+			at: record.at,
+			parties: [],
+		});
+		expect(Object.hasOwn(row ?? {}, "regions")).to.equal(false);
+		expect(Object.hasOwn(row ?? {}, "promptId")).to.equal(false);
+	});
+
+	it("produces undefined for an event that carries no consent, so nothing is written or blanked", () => {
+		expect(recordingConsentRow(undefined)).to.equal(undefined);
+	});
+});
+
+describe("cdr leg mapping — the outbound attestation decision and the traceback columns", () => {
+	const TRUNK = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a7a";
+
+	it("carries our own decision and its basis onto the row", () => {
+		const values = mapCdrLegWrite(ORG, {
+			...payload(),
+			direction: "outbound",
+			expectedAttestation: "A",
+			callerIdRightToUse: "owned",
+		}).values;
+
+		expect(values.expectedAttestation).to.equal("A");
+		expect(values.callerIdRightToUse).to.equal("owned");
+	});
+
+	it("drops a level outside A/B/C and records the coercion", () => {
+		const result = mapCdrLegWrite(ORG, { ...payload(), expectedAttestation: "D" });
+
+		expect(result.values.expectedAttestation).to.equal(null);
+		expect(result.coercions.map((entry) => entry.field)).to.include("expectedAttestation");
+	});
+
+	it("drops a right-to-use this build does not recognise rather than storing a weaker basis", () => {
+		const result = mapCdrLegWrite(ORG, { ...payload(), callerIdRightToUse: "assumed" });
+
+		expect(result.values.callerIdRightToUse).to.equal(null);
+		expect(result.coercions.map((entry) => entry.field)).to.include("callerIdRightToUse");
+	});
+
+	it("leaves both null on a leg that carried neither", () => {
+		const values = mapCdrLegWrite(ORG, payload()).values;
+
+		expect(values.expectedAttestation).to.equal(null);
+		expect(values.callerIdRightToUse).to.equal(null);
+	});
+
+	it("takes the trunk and the signalling peer the traceback answers with", () => {
+		const values = mapCdrLegWrite(ORG, {
+			...payload(),
+			trunkRef: TRUNK,
+			signalingAddress: "203.0.113.10:5060",
+		}).values;
+
+		expect(values.trunkRef).to.equal(TRUNK);
+		expect(values.signalingAddress).to.equal("203.0.113.10:5060");
+	});
+
+	it("nulls a trunk ref that is not a uuid and truncates an over-long address", () => {
+		const values = mapCdrLegWrite(ORG, {
+			...payload(),
+			trunkRef: "trunk-one",
+			signalingAddress: "9".repeat(300),
+		}).values;
+
+		expect(values.trunkRef).to.equal(null);
+		expect(values.signalingAddress).to.have.lengthOf(128);
+	});
+
+	it("keeps all four out of the raw passthrough", () => {
+		const values = mapCdrLegWrite(ORG, {
+			...payload(),
+			expectedAttestation: "B",
+			callerIdRightToUse: "verified",
+			trunkRef: TRUNK,
+			signalingAddress: "203.0.113.10",
+		}).values;
+
+		expect(values.raw).to.not.have.property("expectedAttestation");
+		expect(values.raw).to.not.have.property("callerIdRightToUse");
+		expect(values.raw).to.not.have.property("trunkRef");
+		expect(values.raw).to.not.have.property("signalingAddress");
 	});
 });

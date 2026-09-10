@@ -326,6 +326,7 @@ export interface TrunkDirectoryRow {
 	readonly authUser: string | null;
 	readonly sipSecretRef: string | null;
 	readonly transport: "udp" | "tcp" | "tls";
+	readonly srtpPolicy: "none" | "prefer" | "require" | null;
 	readonly registerExpiresSeconds: number;
 	readonly maxChannels: number | null;
 	readonly callerIdNumberOverride: string | null;
@@ -353,6 +354,7 @@ export async function readTrunkDirectoryRows(
 			authUser: trunk.authUser,
 			sipSecretRef: trunk.sipSecretRef,
 			transport: trunk.transport,
+			srtpPolicy: trunk.srtpPolicy,
 			registerExpiresSeconds: trunk.registerExpiresSeconds,
 			maxChannels: trunk.maxChannels,
 			callerIdNumberOverride: trunk.callerIdNumberOverride,
@@ -388,6 +390,7 @@ export function projectTrunkDirectoryEntry(
 		...(row.authUser === null ? {} : { authUser: row.authUser }),
 		...(row.sipSecretRef === null ? {} : { secretRef: row.sipSecretRef }),
 		transport: row.transport,
+		...(row.srtpPolicy === null ? {} : { srtpPolicy: row.srtpPolicy }),
 		registerExpiresSeconds: row.registerExpiresSeconds,
 		...(row.maxChannels === null ? {} : { maxChannels: row.maxChannels }),
 		...(row.callerIdNumberOverride === null
