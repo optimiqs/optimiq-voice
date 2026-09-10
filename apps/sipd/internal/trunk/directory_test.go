@@ -397,3 +397,26 @@ func TestTheReplayAfterAReestablishReconciles(t *testing.T) {
 		t.Fatal("the re-established replay did not reconcile the supervisor")
 	}
 }
+
+func TestRecordCarriesTheSRTPPolicyAndLeavesItEmptyWhenAbsent(t *testing.T) {
+	policy := contract.TrunkDirectoryEntrySrtpPolicyRequire
+	with := Record(contract.TrunkDirectoryEntry{
+		TrunkID: "t1", OrgID: "o1", Name: "carrier", Kind: "register",
+		SIPDomain: "carrier.example", SIPProxy: "carrier.example",
+		RegisterExpiresSeconds: 300, SrtpPolicy: &policy,
+	}).Config()
+	if with.SRTPPolicy != "require" {
+		t.Fatalf("SRTPPolicy = %q, want require", with.SRTPPolicy)
+	}
+
+	// Absent is what every entry written before the field existed carries, and it must stay empty so
+	// the media plane's own default decides rather than a silently-chosen one.
+	without := Record(contract.TrunkDirectoryEntry{
+		TrunkID: "t1", OrgID: "o1", Name: "carrier", Kind: "register",
+		SIPDomain: "carrier.example", SIPProxy: "carrier.example",
+		RegisterExpiresSeconds: 300,
+	}).Config()
+	if without.SRTPPolicy != "" {
+		t.Fatalf("SRTPPolicy = %q, want empty", without.SRTPPolicy)
+	}
+}

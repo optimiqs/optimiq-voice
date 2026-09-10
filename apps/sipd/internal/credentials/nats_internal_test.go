@@ -433,3 +433,74 @@ func TestTheRefreshTableIsBounded(t *testing.T) {
 		t.Fatalf("the refresh table holds %d entries, above the %d bound", held, store.maxEntries)
 	}
 }
+
+// A credential inside its rotation grace must not be cached: the window is minutes long and only
+// apps/api knows when it closes, so a cached answer would keep the retired secret working for a
+// whole positive TTL past the deadline the operator chose.
+func TestACredentialInItsRotationGraceIsNotCached(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	var requests atomic.Int64
+	store := &NATSStore{
+		cache:       map[string]cacheEntry{},
+		lastRefresh: map[string]time.Time{},
+		maxEntries:  16,
+		positiveTTL: 30 * time.Second,
+		negativeTTL: 10 * time.Second,
+		now:         func() time.Time { return now },
+	}
+	store.rpc = func(context.Context, string, string) (Credential, error) {
+		requests.Add(1)
+		return Credential{
+			OrgID: "org", Username: "1001", Realm: "acme.example.com",
+			HA1:         strings.Repeat("a", 32),
+			HA1Previous: strings.Repeat("b", 32),
+		}, nil
+	}
+
+	for range 3 {
+		credential, err := store.Lookup(t.Context(), "acme.example.com", "1001")
+		if err != nil {
+			t.Fatalf("Lookup: %v", err)
+		}
+		if credential.HA1Previous != strings.Repeat("b", 32) {
+			t.Fatalf("HA1Previous = %q, want the grace digest", credential.HA1Previous)
+		}
+	}
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("3 lookups issued %d requests, want 3: a credential in grace must not be cached", got)
+	}
+	if store.Len() != 0 {
+		t.Fatalf("cache holds %d entries, want none", store.Len())
+	}
+}
+
+// The grace digest travels off the wire like every other field, and is absent for the ordinary
+// account — which is what keeps `ha1Previous` additive.
+func TestCredentialFromReplyCarriesTheGraceDigest(t *testing.T) {
+	const realm, user, org = "acme.example.com", "1001", "018f4f5e-0000-7000-8000-0000000000a1"
+	previous := strings.Repeat("b", 32)
+
+	graced, err := credentialFromReply(realm, user, contract.SipCredentialResponse{
+		Found: true, Enabled: true,
+		OrgID: ptr(org), Ha1: ptr(testHA1), Ha1Previous: ptr(previous),
+		Username: ptr(user), Realm: ptr(realm),
+	})
+	if err != nil {
+		t.Fatalf("credentialFromReply: %v", err)
+	}
+	if graced.HA1Previous != previous {
+		t.Errorf("HA1Previous = %q, want %q", graced.HA1Previous, previous)
+	}
+
+	plain, err := credentialFromReply(realm, user, contract.SipCredentialResponse{
+		Found: true, Enabled: true,
+		OrgID: ptr(org), Ha1: ptr(testHA1),
+		Username: ptr(user), Realm: ptr(realm),
+	})
+	if err != nil {
+		t.Fatalf("credentialFromReply: %v", err)
+	}
+	if plain.HA1Previous != "" {
+		t.Errorf("HA1Previous = %q, want empty for an account with no grace", plain.HA1Previous)
+	}
+}

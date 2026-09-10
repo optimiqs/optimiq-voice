@@ -100,6 +100,11 @@ type Config struct {
 	ExpiresSeconds int
 	// MaxChannels is the concurrency cap, carried here for whoever enforces it.
 	MaxChannels int
+	// SRTPPolicy is this carrier's SDES-SRTP policy — `none`, `prefer` or `require` — overriding the
+	// media plane's own default. Empty means the media plane decides, which is what a trunk written
+	// before the column existed means. Carried here for whoever builds the media command; the
+	// registration state machine never reads it.
+	SRTPPolicy string
 }
 
 // Validate refuses a configuration that cannot work, at the point it is ingested rather than at the

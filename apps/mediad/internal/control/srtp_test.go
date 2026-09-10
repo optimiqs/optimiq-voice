@@ -2,9 +2,11 @@ package control_test
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/netip"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -54,6 +56,28 @@ func savpOffer() string {
 		"a=rtpmap:0 PCMU/8000",
 		"a=rtpmap:101 telephone-event/8000",
 		"a=crypto:3 AES_CM_128_HMAC_SHA1_80 inline:" + base64.StdEncoding.EncodeToString(material),
+		"a=sendrecv",
+		"",
+	}, "\r\n")
+}
+
+// savpAnswer is the callee's 200 OK to a create-offer that carried SDES: one codec, under SAVP,
+// with the key material that settles the pending generation.
+func savpAnswer() string {
+	material := make([]byte, sdp.SRTPKeyMaterial)
+	for i := range material {
+		material[i] = byte(i + 11)
+	}
+	return strings.Join([]string{
+		"v=0",
+		"o=- 77 1 IN IP4 198.51.100.7",
+		"s=-",
+		"c=IN IP4 198.51.100.7",
+		"t=0 0",
+		"m=audio 40000 RTP/SAVP 0 101",
+		"a=rtpmap:0 PCMU/8000",
+		"a=rtpmap:101 telephone-event/8000",
+		"a=crypto:1 " + sdp.SRTPSuite + " inline:" + base64.StdEncoding.EncodeToString(material),
 		"a=sendrecv",
 		"",
 	}, "\r\n")
@@ -166,5 +190,133 @@ func TestCreateOfferKeysOnlyUnderRequire(t *testing.T) {
 				t.Fatalf("offer commits to SAVP = %v, want %v:\n%s", got, tc.wantSDES, body)
 			}
 		})
+	}
+}
+
+// mediaEncryption reads the per-leg encryption state off a reply. It is decoded separately because
+// it is additive to the generated contract structs the other helpers unmarshal into.
+func mediaEncryption(t *testing.T, payload []byte) string {
+	t.Helper()
+	var reply struct {
+		MediaEncryption string `json:"mediaEncryption"`
+	}
+	if err := json.Unmarshal(payload, &reply); err != nil {
+		t.Fatalf("cannot read the reply: %v", err)
+	}
+	return reply.MediaEncryption
+}
+
+// withLegPolicy renders a command as JSON carrying the per-leg override the contract struct has no
+// field for, which is how the engine will send it.
+func withLegPolicy(t *testing.T, request any, policy config.SRTPPolicy) []byte {
+	t.Helper()
+	var fields map[string]any
+	if err := json.Unmarshal(mustJSON(t, request), &fields); err != nil {
+		t.Fatalf("cannot re-render the request: %v", err)
+	}
+	fields["srtpPolicy"] = string(policy)
+	payload, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("cannot render the request: %v", err)
+	}
+	return payload
+}
+
+// A leg the engine marks `require` is not covered by the deployment's laxer default.
+func TestAllocateUnderALegRequirePolicyRefusesAPlainOffer(t *testing.T) {
+	r := newPolicyRig(t, config.SRTPPrefer)
+
+	response := decodeAllocate(t, r.server.HandleAllocateSession(withLegPolicy(t, validAllocate(), config.SRTPRequire)))
+	if response.Ok {
+		t.Fatal("a leg pinned to require accepted a plain RTP/AVP offer")
+	}
+	if response.Reason == nil || string(*response.Reason) != control.ReasonNotSupported {
+		t.Fatalf("reason = %v, want %q", response.Reason, control.ReasonNotSupported)
+	}
+	if len(r.sessions.allocateCalls()) != 0 {
+		t.Error("a refused offer bound a port pair")
+	}
+}
+
+// And the other way: a leg the engine marks `disable` answers plain RTP on a `require` deployment.
+func TestAllocateUnderALegDisablePolicyAnswersPlainRTP(t *testing.T) {
+	r := newPolicyRig(t, config.SRTPRequire)
+
+	payload := withLegPolicy(t, validAllocate(), config.SRTPDisable)
+	response := decodeAllocate(t, r.server.HandleAllocateSession(payload))
+	if !response.Ok {
+		t.Fatalf("a leg pinned to disable was refused: %+v", response)
+	}
+	if strings.Contains(*response.SDPAnswer, "crypto") || strings.Contains(*response.SDPAnswer, "SAVP") {
+		t.Fatalf("a disabled leg was answered with SDES:\n%s", *response.SDPAnswer)
+	}
+}
+
+func TestCreateOfferUnderALegDisablePolicyOffersPlainRTP(t *testing.T) {
+	r := newPolicyRig(t, config.SRTPRequire)
+
+	response := decodeCreateOffer(t, r.server.HandleCreateOffer(withLegPolicy(t, validCreateOffer(), config.SRTPDisable)))
+	if !response.Ok {
+		t.Fatalf("create-offer refused: %+v", response)
+	}
+	if strings.Contains(*response.SDPOffer, "a=crypto:") || strings.Contains(*response.SDPOffer, " RTP/SAVP ") {
+		t.Fatalf("a disabled leg was offered SDES:\n%s", *response.SDPOffer)
+	}
+}
+
+// withoutKeyMaterial blanks the one part of a reply that is fresh per exchange, so two replies can
+// be compared byte for byte.
+var withoutKeyMaterial = regexp.MustCompile(`inline:[A-Za-z0-9+/=]+`)
+
+// The regression guard for the additive contract: a command with no `srtpPolicy` must produce the
+// reply it produced before the field existed, which is the server-wide policy's, down to the bytes.
+func TestAnAbsentLegPolicyAnswersExactlyAsTheServerPolicyDoes(t *testing.T) {
+	for _, policy := range []config.SRTPPolicy{config.SRTPPrefer, config.SRTPRequire, config.SRTPDisable} {
+		for name, offer := range map[string]string{"savp": savpOffer(), "avp": validAllocate().SDPOffer} {
+			t.Run(string(policy)+"/"+name, func(t *testing.T) {
+				baseline := newPolicyRig(t, policy).server.HandleAllocateSession(mustJSON(t, allocateWith(offer)))
+				pinned := newPolicyRig(t, policy).server.HandleAllocateSession(withLegPolicy(t, allocateWith(offer), policy))
+				want := withoutKeyMaterial.ReplaceAllString(string(baseline), "inline:")
+				got := withoutKeyMaterial.ReplaceAllString(string(pinned), "inline:")
+				if got != want {
+					t.Fatalf("naming the server's own policy per leg changed the reply:\n%s\n%s", want, got)
+				}
+			})
+		}
+	}
+}
+
+func TestTheReplyReportsWhetherTheLegIsEncrypted(t *testing.T) {
+	r := newPolicyRig(t, config.SRTPPrefer)
+
+	secure := r.server.HandleAllocateSession(mustJSON(t, allocateWith(savpOffer())))
+	if got := mediaEncryption(t, secure); got != string(control.MediaEncrypted) {
+		t.Fatalf("mediaEncryption = %q, want %q", got, control.MediaEncrypted)
+	}
+	plain := r.server.HandleAllocateSession(mustJSON(t, validAllocate()))
+	if got := mediaEncryption(t, plain); got != string(control.MediaPlaintext) {
+		t.Fatalf("mediaEncryption = %q, want %q", got, control.MediaPlaintext)
+	}
+}
+
+// A B-leg is plaintext between create-offer and accept-answer: the local key is advertised but the
+// callee's has not arrived, so nothing is protecting the socket yet.
+func TestACreatedOfferIsPlaintextUntilItsAnswerSettles(t *testing.T) {
+	r := newPolicyRig(t, config.SRTPRequire)
+
+	offered := r.server.HandleCreateOffer(mustJSON(t, validCreateOffer()))
+	if got := mediaEncryption(t, offered); got != string(control.MediaPlaintext) {
+		t.Fatalf("an unsettled B-leg reported %q, want %q", got, control.MediaPlaintext)
+	}
+	offer := decodeCreateOffer(t, offered)
+	if !offer.Ok {
+		t.Fatalf("create-offer refused: %+v", offer)
+	}
+
+	settled := r.server.HandleAcceptAnswer(mustJSON(t, contract.MediaAcceptAnswerRequest{
+		SessionID: testSession, SDPAnswer: savpAnswer(),
+	}))
+	if got := mediaEncryption(t, settled); got != string(control.MediaEncrypted) {
+		t.Fatalf("a settled SDES B-leg reported %q, want %q", got, control.MediaEncrypted)
 	}
 }

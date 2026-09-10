@@ -58,7 +58,11 @@ func (s *Server) HandleAllocateSession(data []byte) []byte {
 	if protocol == "UDP/TLS/RTP/SAVPF" {
 		return s.allocateWebRTC(request)
 	}
-	if !s.acceptsProtocol(protocol) {
+	policy, err := legPolicy(s.srtpPolicy, request.SrtpPolicy)
+	if err != nil {
+		return s.refuseAllocate(request.SessionID, ReasonBadRequest, err.Error())
+	}
+	if !acceptsProtocol(policy, protocol) {
 		return s.refuseAllocate(request.SessionID, ReasonNotSupported, "unsupported audio transport: "+protocol)
 	}
 
@@ -97,7 +101,7 @@ func (s *Server) HandleAllocateSession(data []byte) []byte {
 			)
 			if !replay {
 				var err error
-				if answerCrypto, secure, err = s.negotiateSDES(offer.Crypto); err != nil {
+				if answerCrypto, secure, err = negotiateSDES(policy, offer.Crypto); err != nil {
 					// Before any port is bound, so a refused offer still costs no capacity.
 					refusal = s.refuseAllocate(request.SessionID, ReasonNotSupported, err.Error())
 					return nil, nil, errRefusedInExchange
@@ -189,6 +193,8 @@ func (s *Server) HandleAllocateSession(data []byte) []byte {
 	if descriptor.TelephoneEventPayloadType != 0 {
 		response.TelephoneEventPayloadType = intPtr(int(descriptor.TelephoneEventPayloadType))
 	}
+	encryption := contract.MediaAllocateSessionResponseMediaEncryption(encryptionOf(negotiation))
+	response.MediaEncryption = &encryption
 	return encode(s.log, response)
 }
 
@@ -306,6 +312,10 @@ func (s *Server) HandleCreateOffer(data []byte) []byte {
 		return s.refuseCreateOffer(request.SessionID, ReasonBadRequest, "unsupported media transport")
 	}
 
+	policy, err := legPolicy(s.srtpPolicy, request.SrtpPolicy)
+	if err != nil {
+		return s.refuseCreateOffer(request.SessionID, ReasonBadRequest, err.Error())
+	}
 	direction, err := sdp.ParseDirection(string(request.Direction))
 	if err != nil {
 		return s.refuseCreateOffer(request.SessionID, ReasonBadRequest, err.Error())
@@ -324,7 +334,7 @@ func (s *Server) HandleCreateOffer(data []byte) []byte {
 			var offerCrypto sdp.Crypto
 			if !replay {
 				var err error
-				if offerCrypto, err = s.offerSDES(); err != nil {
+				if offerCrypto, err = offerSDES(policy); err != nil {
 					refusal = s.refuseCreateOffer(request.SessionID, ReasonInternal, err.Error())
 					return nil, nil, errRefusedInExchange
 				}
@@ -407,6 +417,8 @@ func (s *Server) HandleCreateOffer(data []byte) []byte {
 	if descriptor.TelephoneEventPayloadType != 0 {
 		response.TelephoneEventPayloadType = intPtr(int(descriptor.TelephoneEventPayloadType))
 	}
+	encryption := contract.MediaCreateOfferResponseMediaEncryption(encryptionOf(negotiation))
+	response.MediaEncryption = &encryption
 	return encode(s.log, response)
 }
 
@@ -450,7 +462,11 @@ func (s *Server) HandleAcceptAnswer(data []byte) []byte {
 			return s.refuseAcceptAnswer(request.SessionID, ReasonBadRequest, err.Error())
 		}
 	}
+	// A WebRTC leg is DTLS-SRTP by construction and never runs an SDES exchange, so its encryption
+	// state is not derivable from the negotiation record the SIP legs keep.
+	secured := false
 	if value, ok := s.webRTCSessions.Load(request.SessionID); ok {
+		secured = true
 		if protocol != "UDP/TLS/RTP/SAVPF" {
 			return s.refuseAcceptAnswer(request.SessionID, ReasonNotSupported, "WebRTC requires an encrypted answer")
 		}
@@ -464,8 +480,14 @@ func (s *Server) HandleAcceptAnswer(data []byte) []byte {
 		if err := transport.AcceptAnswer(request.SDPAnswer); err != nil {
 			return s.refuseAcceptAnswer(request.SessionID, ReasonNotSupported, err.Error())
 		}
-	} else if !s.acceptsProtocol(protocol) {
-		return s.refuseAcceptAnswer(request.SessionID, ReasonNotSupported, "answer changed the media transport")
+	} else {
+		policy, err := legPolicy(s.srtpPolicy, request.SrtpPolicy)
+		if err != nil {
+			return s.refuseAcceptAnswer(request.SessionID, ReasonBadRequest, err.Error())
+		}
+		if !acceptsProtocol(policy, protocol) {
+			return s.refuseAcceptAnswer(request.SessionID, ReasonNotSupported, "answer changed the media transport")
+		}
 	}
 
 	if answerErr != nil {
@@ -485,7 +507,8 @@ func (s *Server) HandleAcceptAnswer(data []byte) []byte {
 			fmt.Sprintf("the answer settled on %s, and create-offer proposed only PCMU and PCMA", answer.Codec))
 	}
 
-	if err := s.settleOfferedSDES(request.SessionID, answer.Crypto); err != nil {
+	negotiation, err := s.settleOfferedSDES(request.SessionID, answer.Crypto)
+	if err != nil {
 		return s.refuseAcceptAnswer(request.SessionID, ReasonNotSupported, err.Error())
 	}
 
@@ -519,6 +542,12 @@ func (s *Server) HandleAcceptAnswer(data []byte) []byte {
 	if descriptor.TelephoneEventPayloadType != 0 {
 		response.TelephoneEventPayloadType = intPtr(int(descriptor.TelephoneEventPayloadType))
 	}
+	state := encryptionOf(negotiation)
+	if secured {
+		state = MediaEncrypted
+	}
+	encryption := contract.MediaAcceptAnswerResponseMediaEncryption(state)
+	response.MediaEncryption = &encryption
 	return encode(s.log, response)
 }
 

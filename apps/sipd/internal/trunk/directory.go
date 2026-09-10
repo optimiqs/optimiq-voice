@@ -47,6 +47,9 @@ func (r Record) Config() Config {
 	if r.MaxChannels != nil {
 		config.MaxChannels = *r.MaxChannels
 	}
+	if r.SrtpPolicy != nil {
+		config.SRTPPolicy = strings.ToLower(string(*r.SrtpPolicy))
+	}
 	config.Register = config.Kind == "register"
 	config.Registrar = config.SIPProxy
 	config.AuthRealm = config.SIPDomain

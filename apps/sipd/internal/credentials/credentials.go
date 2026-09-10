@@ -35,6 +35,16 @@ type Credential struct {
 	Realm string
 	// HA1 is MD5(username:realm:password), lower-case hex.
 	HA1 string
+	// HA1Previous is the digest of the secret this account held BEFORE its last rotation, valid
+	// only while apps/api says the grace window is open. Empty when there is no grace, which is the
+	// ordinary case.
+	//
+	// It exists so a rotation is not an outage. A tenant with a hundred desk phones cannot reflash
+	// them in the same second, and without a grace the operator's only options are to rotate and
+	// take the fleet down or to never rotate — which is how a leaked secret stays live for years.
+	// A phone that still holds the old secret authenticates against this until the window closes;
+	// after that apps/api stops sending it and the phone is refused like any other wrong password.
+	HA1Previous string
 	// DeviceID and ExtensionID are the pbx-db rows this account maps to, when known. They travel in
 	// the registration event so the admin UI can join a live binding to inventory.
 	DeviceID    string

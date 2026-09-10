@@ -4,6 +4,7 @@ go 1.26
 
 require (
 	github.com/emiago/sipgo v1.4.3
+	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gobwas/ws v1.3.2
 	github.com/icholy/digest v1.1.0
 	github.com/nats-io/nats.go v1.52.0

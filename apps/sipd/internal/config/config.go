@@ -79,6 +79,29 @@ type Config struct {
 	// serves both; a deployment needing different certificates per port needs two processes.
 	TLSCertFile string
 	TLSKeyFile  string
+	// TLSMinVersion is the negotiated floor for every TLS listener and for outbound trunk
+	// connections. SIPD_TLS_MIN_VERSION, `1.3` (the default) or `1.2`. Lowering it is logged at
+	// boot: RFC 5630 §3.1.3 requires TLS for `sips:` but names no version, and a handful of handset
+	// stacks still cannot do 1.3, so the escape hatch stays — loudly.
+	TLSMinVersion string
+	// TLSReloadInterval is how often the certificate files are stat'd for an out-of-band renewal.
+	// SIPD_TLS_RELOAD_INTERVAL, default 30s; `0` leaves SIGHUP as the only trigger.
+	TLSReloadInterval time.Duration
+	// TLSClientCAFile is the PEM bundle a carrier's CLIENT certificate must chain to for mutual TLS
+	// on the inbound side. SIPD_TLS_CLIENT_CA_FILE. Empty asks for no client certificate at all.
+	TLSClientCAFile string
+	// TLSRequireClientCert turns VerifyClientCertIfGiven into RequireAndVerifyClientCert.
+	// SIPD_TLS_REQUIRE_CLIENT_CERT, default false, because a TLS listener shared with handsets
+	// cannot demand one. Set it on an edge that terminates carriers only.
+	TLSRequireClientCert bool
+	// TrunkTLSCertFile and TrunkTLSKeyFile are the CLIENT certificate this edge presents to
+	// carriers that ask for one. SIPD_TRUNK_TLS_CERT_FILE / SIPD_TRUNK_TLS_KEY_FILE. Per-trunk
+	// selection is by the CA list the carrier names in its CertificateRequest (RFC 8446 §4.4.2.1).
+	TrunkTLSCertFile string
+	TrunkTLSKeyFile  string
+	// TrunkTLSCAFile is the CA pin outbound carrier certificates are verified against, replacing
+	// the system roots. SIPD_TRUNK_TLS_CA_FILE.
+	TrunkTLSCAFile string
 
 	// EnableInvite turns on the INVITE surface: the dialog layer, the admission RPC, the engine's
 	// five-subject command surface, the trunk directory, the `sip-acl` watch and the claim reaper.
@@ -288,6 +311,11 @@ func Load(getenv Getenv) (Config, error) {
 		WSSListenAddr:      stringOr(getenv, "SIPD_WSS_LISTEN_ADDR", "0.0.0.0:8089"),
 		TLSCertFile:        strings.TrimSpace(getenv("SIPD_TLS_CERT_FILE")),
 		TLSKeyFile:         strings.TrimSpace(getenv("SIPD_TLS_KEY_FILE")),
+		TLSMinVersion:      stringOr(getenv, "SIPD_TLS_MIN_VERSION", "1.3"),
+		TLSClientCAFile:    strings.TrimSpace(getenv("SIPD_TLS_CLIENT_CA_FILE")),
+		TrunkTLSCertFile:   strings.TrimSpace(getenv("SIPD_TRUNK_TLS_CERT_FILE")),
+		TrunkTLSKeyFile:    strings.TrimSpace(getenv("SIPD_TRUNK_TLS_KEY_FILE")),
+		TrunkTLSCAFile:     strings.TrimSpace(getenv("SIPD_TRUNK_TLS_CA_FILE")),
 		InstanceID:         strings.TrimSpace(getenv("SIPD_INSTANCE_ID")),
 		TrunkACL:           strings.TrimSpace(getenv("SIPD_TRUNK_ACL")),
 		ExternalListenAddr: strings.TrimSpace(getenv("SIPD_EXTERNAL_LISTEN_ADDR")),
@@ -320,6 +348,12 @@ func Load(getenv Getenv) (Config, error) {
 		fail("%v", err)
 	}
 	if cfg.EnableWS, err = boolOr(getenv, "SIPD_WS", false); err != nil {
+		fail("%v", err)
+	}
+	if cfg.TLSRequireClientCert, err = boolOr(getenv, "SIPD_TLS_REQUIRE_CLIENT_CERT", false); err != nil {
+		fail("%v", err)
+	}
+	if cfg.TLSReloadInterval, err = durationOr(getenv, "SIPD_TLS_RELOAD_INTERVAL", 30*time.Second); err != nil {
 		fail("%v", err)
 	}
 	if cfg.EnableWSS, err = boolOr(getenv, "SIPD_WSS", false); err != nil {
@@ -458,6 +492,23 @@ func Load(getenv Getenv) (Config, error) {
 	if !cfg.EnableTLS && !cfg.EnableWSS && (cfg.TLSCertFile != "" || cfg.TLSKeyFile != "") {
 		fail("SIPD_TLS_CERT_FILE/SIPD_TLS_KEY_FILE are set but neither SIPD_TLS nor SIPD_WSS is on: " +
 			"this deployment is plaintext and believes it is not")
+	}
+	if version := strings.TrimSpace(cfg.TLSMinVersion); version != "1.3" && version != "1.2" {
+		fail("SIPD_TLS_MIN_VERSION must be 1.3 or 1.2, got %q", cfg.TLSMinVersion)
+	}
+	if cfg.TLSReloadInterval < 0 {
+		fail("SIPD_TLS_RELOAD_INTERVAL must not be negative")
+	}
+	// The client CA is the mutual-TLS half, so it only means anything on a listener that terminates
+	// TLS. Requiring a client certificate without one to verify it against would refuse every peer.
+	if cfg.TLSClientCAFile != "" && !cfg.EnableTLS && !cfg.EnableWSS {
+		fail("SIPD_TLS_CLIENT_CA_FILE is set but neither SIPD_TLS nor SIPD_WSS is on")
+	}
+	if cfg.TLSRequireClientCert && cfg.TLSClientCAFile == "" {
+		fail("SIPD_TLS_REQUIRE_CLIENT_CERT needs SIPD_TLS_CLIENT_CA_FILE: there would be nothing to verify against")
+	}
+	if (cfg.TrunkTLSCertFile == "") != (cfg.TrunkTLSKeyFile == "") {
+		fail("SIPD_TRUNK_TLS_CERT_FILE and SIPD_TRUNK_TLS_KEY_FILE must be set together")
 	}
 	// Two listeners on one address is a bind failure at best and a silent race at worst.
 	if duplicate, found := duplicateListener(cfg); found {

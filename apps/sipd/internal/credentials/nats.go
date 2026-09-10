@@ -169,6 +169,12 @@ func (s *NATSStore) Lookup(ctx context.Context, realm, username string) (Credent
 		}
 		credential, err := s.rpc(ctx, realm, username)
 		switch {
+		case err == nil && credential.HA1Previous != "":
+			// A credential in its rotation grace is NOT cached. The window is minutes and the
+			// responder is the only thing that knows when it closes, so caching would keep the
+			// retired secret working for a whole positive TTL past the deadline the operator set —
+			// which is the one property a grace must not have. The cost is one RPC per REGISTER for
+			// one account for a few minutes.
 		case err == nil:
 			s.store(key, cacheEntry{credential: credential, expires: s.now().Add(s.positiveTTL)})
 		case errors.Is(err, ErrNotFound), errors.Is(err, ErrDisabled):
@@ -245,6 +251,7 @@ func credentialFromReply(realm, username string, reply contract.SipCredentialRes
 		Username:         username,
 		Realm:            realm,
 		HA1:              strings.ToLower(strings.TrimSpace(*reply.Ha1)),
+		HA1Previous:      strings.ToLower(strings.TrimSpace(optional(reply.Ha1Previous))),
 		DeviceID:         optional(reply.DeviceID),
 		ExtensionID:      optional(reply.ExtensionID),
 		SharedLineNumber: reply.SharedLineNumber,

@@ -484,3 +484,69 @@ func TestPprofRequiresALoopbackHealthListener(t *testing.T) {
 		t.Error("SIPD_PPROF=true left pprof disabled")
 	}
 }
+
+func TestTLSFloorDefaultsTo13AndIsValidated(t *testing.T) {
+	cfg, err := config.Load(env(minimal(nil)))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TLSMinVersion != "1.3" {
+		t.Errorf("TLSMinVersion = %q, want the 1.3 default", cfg.TLSMinVersion)
+	}
+	if cfg.TLSReloadInterval != 30*time.Second {
+		t.Errorf("TLSReloadInterval = %v, want 30s", cfg.TLSReloadInterval)
+	}
+
+	lowered, err := config.Load(env(minimal(map[string]string{"SIPD_TLS_MIN_VERSION": "1.2"})))
+	if err != nil {
+		t.Fatalf("Load with a lowered floor: %v", err)
+	}
+	if lowered.TLSMinVersion != "1.2" {
+		t.Errorf("TLSMinVersion = %q, want 1.2", lowered.TLSMinVersion)
+	}
+
+	_, err = config.Load(env(minimal(map[string]string{"SIPD_TLS_MIN_VERSION": "1.1"})))
+	if err == nil || !strings.Contains(err.Error(), "SIPD_TLS_MIN_VERSION must be 1.3 or 1.2") {
+		t.Fatalf("a TLS 1.1 floor was accepted: %v", err)
+	}
+}
+
+func TestMutualTLSConfigurationIsCoherent(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{
+			name: "a client CA without a TLS listener",
+			env:  map[string]string{"SIPD_TLS_CLIENT_CA_FILE": "/etc/sipd/carriers.pem"},
+			want: "SIPD_TLS_CLIENT_CA_FILE is set but neither SIPD_TLS nor SIPD_WSS is on",
+		},
+		{
+			name: "requiring a client certificate with nothing to verify it against",
+			env: map[string]string{
+				"SIPD_TLS":                     "true",
+				"SIPD_TLS_CERT_FILE":           "/etc/sipd/tls.crt",
+				"SIPD_TLS_KEY_FILE":            "/etc/sipd/tls.key",
+				"SIPD_TLS_REQUIRE_CLIENT_CERT": "true",
+			},
+			want: "SIPD_TLS_REQUIRE_CLIENT_CERT needs SIPD_TLS_CLIENT_CA_FILE",
+		},
+		{
+			name: "half a trunk client certificate",
+			env:  map[string]string{"SIPD_TRUNK_TLS_CERT_FILE": "/etc/sipd/edge.crt"},
+			want: "SIPD_TRUNK_TLS_CERT_FILE and SIPD_TRUNK_TLS_KEY_FILE must be set together",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := config.Load(env(minimal(testCase.env)))
+			if err == nil || !strings.Contains(err.Error(), testCase.want) {
+				t.Fatalf("Load error = %v, want it to contain %q", err, testCase.want)
+			}
+			if err != nil && !errors.Is(err, config.ErrInvalid) {
+				t.Errorf("the error does not wrap ErrInvalid")
+			}
+		})
+	}
+}

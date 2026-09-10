@@ -1,9 +1,11 @@
 package control
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/config"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
@@ -16,16 +18,47 @@ var errSRTPRequired = errors.New(
 	"this media plane requires SDES-SRTP (RFC 4568) and the offer carried no usable " +
 		sdp.SRTPSuite + " crypto line under RTP/SAVP")
 
-// acceptedProtocols is the audio transports a SIP allocate may carry, under the configured policy.
-// RTP/SAVP is absent under `disable` and plain RTP/AVP under `require`, so an offer this instance
-// would have to answer in a transport it will not speak is refused by the existing transport check
-// rather than answered with a mismatched `m=` line.
-func (s *Server) acceptsProtocol(proto string) bool {
+// MediaEncryption is what a leg's audio is actually protected by, for a caller that wants to show
+// it. Derived from the SRTP context the packet path holds, never from the configured policy: a
+// `require` deployment whose key exchange has not settled yet is still carrying plaintext.
+type MediaEncryption string
+
+const (
+	// MediaEncrypted means an SRTPContext is installed on the session and the packets are protected.
+	MediaEncrypted MediaEncryption = "encrypted"
+	// MediaPlaintext means the leg answered plain RTP, or its key exchange has not settled.
+	MediaPlaintext MediaEncryption = "plaintext"
+)
+
+// legPolicy is the SDES policy in force for one leg: the `srtpPolicy` its command carried, or the
+// server-wide fallback when it carried none.
+//
+// Generic over the requested type because allocate-session, create-offer and accept-answer each
+// generate their own vocabulary type for the same three values. A value outside them is an error
+// rather than a silent fallback: ignoring a misspelt `require` would downgrade a leg the caller
+// asked to protect.
+func legPolicy[T ~string](fallback config.SRTPPolicy, requested *T) (config.SRTPPolicy, error) {
+	if requested == nil {
+		return fallback, nil
+	}
+	switch policy := config.SRTPPolicy(*requested); policy {
+	case "", config.SRTPPrefer, config.SRTPRequire, config.SRTPDisable:
+		return cmp.Or(policy, fallback), nil
+	default:
+		return "", fmt.Errorf("srtpPolicy must be one of prefer/require/disable, got %q", policy)
+	}
+}
+
+// acceptsProtocol is the audio transports a SIP allocate may carry, under the policy in force for
+// this leg. RTP/SAVP is absent under `disable` and plain RTP/AVP under `require`, so an offer this
+// instance would have to answer in a transport it will not speak is refused by the existing
+// transport check rather than answered with a mismatched `m=` line.
+func acceptsProtocol(policy config.SRTPPolicy, proto string) bool {
 	switch proto {
 	case sdp.ProtoAVP, "RTP/AVPF":
-		return s.srtpPolicy != config.SRTPRequire
+		return policy != config.SRTPRequire
 	case sdp.ProtoSAVP:
-		return s.srtpPolicy != config.SRTPDisable
+		return policy != config.SRTPDisable
 	default:
 		return false
 	}
@@ -36,9 +69,9 @@ func (s *Server) acceptsProtocol(proto string) bool {
 //
 // A zero Crypto and a nil context is the plain-RTP outcome, which renders exactly the body an
 // unencrypted leg has always been answered with.
-func (s *Server) negotiateSDES(offered sdp.Crypto) (sdp.Crypto, *rtp.SRTPContext, error) {
-	if s.srtpPolicy == config.SRTPDisable || !offered.IsSet() {
-		if s.srtpPolicy == config.SRTPRequire {
+func negotiateSDES(policy config.SRTPPolicy, offered sdp.Crypto) (sdp.Crypto, *rtp.SRTPContext, error) {
+	if policy == config.SRTPDisable || !offered.IsSet() {
+		if policy == config.SRTPRequire {
 			return sdp.Crypto{}, nil, errSRTPRequired
 		}
 		return sdp.Crypto{}, nil, nil
@@ -64,8 +97,8 @@ func (s *Server) negotiateSDES(offered sdp.Crypto) (sdp.Crypto, *rtp.SRTPContext
 //
 // Only `require` offers SDES. An offer names one transport, so offering RTP/SAVP forecloses the
 // fallback to plain RTP that `prefer` exists to keep for phones that speak no SRTP.
-func (s *Server) offerSDES() (sdp.Crypto, error) {
-	if s.srtpPolicy != config.SRTPRequire {
+func offerSDES(policy config.SRTPPolicy) (sdp.Crypto, error) {
+	if policy != config.SRTPRequire {
 		return sdp.Crypto{}, nil
 	}
 	return sdp.GenerateKeyMaterial()
@@ -84,8 +117,8 @@ func negotiationRequest(data []byte) string {
 //
 // The answer settles the PENDING generation — the one create-offer committed — so an answer that
 // arrives after a newer offer has been made cannot key the session with a retired local key.
-func (s *Server) settleOfferedSDES(sessionID string, answered sdp.Crypto) error {
-	_, err := s.sessions.Negotiate(sessionID, "",
+func (s *Server) settleOfferedSDES(sessionID string, answered sdp.Crypto) (rtp.Negotiation, error) {
+	return s.sessions.Negotiate(sessionID, "",
 		func(prior rtp.Negotiation, _ bool) (*rtp.Negotiation, *rtp.SRTPContext, error) {
 			if !prior.Pending {
 				return nil, nil, nil
@@ -104,5 +137,14 @@ func (s *Server) settleOfferedSDES(sessionID string, answered sdp.Crypto) error 
 			settled.Pending = false
 			return &settled, context, nil
 		})
-	return err
+}
+
+// encryptionOf reads a committed negotiation as the leg's media state. A pending generation is the
+// B-leg between create-offer and accept-answer: a local key is advertised but no context is
+// installed, so the wire is still plaintext.
+func encryptionOf(negotiation rtp.Negotiation) MediaEncryption {
+	if negotiation.Local.IsSet() && !negotiation.Pending {
+		return MediaEncrypted
+	}
+	return MediaPlaintext
 }

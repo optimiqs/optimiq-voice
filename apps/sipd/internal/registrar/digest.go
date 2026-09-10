@@ -194,6 +194,17 @@ func (g *DigestGate) Authenticate(ctx context.Context, req *sip.Request, identit
 			result.Replayed = errors.Is(err, ErrNonceReplayed)
 			return result
 		}
+		// The rotation grace: apps/api sends the pre-rotation digest alongside the current one while
+		// the window it was rotated with is still open, so a phone that has not been reflashed yet
+		// authenticates rather than being locked out. Tried before the re-ask below because it costs
+		// nothing and answers the same question.
+		if credential.HA1Previous != "" {
+			if grace := accountAuth.VerifyRequest(req, auth, credential.HA1Previous); grace == nil {
+				g.lockout.Succeed(source, account)
+				result.Credential, result.Outcome, result.Err = credential, DigestAccepted, nil
+				return result
+			}
+		}
 		// A digest that does not verify is the ONLY signal this edge gets that the HA1 it holds may
 		// be the previous one: the credential RPC is pull-only and apps/api publishes nothing when a
 		// SIP secret is rotated, so there is no invalidation to subscribe to. Re-ask once — the

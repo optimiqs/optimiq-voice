@@ -132,8 +132,8 @@ type Config struct {
 	// SRTPPolicy decides SDES-SRTP (RFC 4568) on the SIP/RTP legs. MEDIAD_SRTP_POLICY, default
 	// `prefer`. WebRTC is unaffected: that leg is DTLS-SRTP and mandatory either way.
 	//
-	// Deployment-wide because no per-org or per-device setting exists yet; when one does, the engine
-	// carries it per leg on allocate-session and this becomes the fallback.
+	// The deployment-wide fallback: a command may carry its own `srtpPolicy`, and this applies to
+	// every leg that does not.
 	SRTPPolicy SRTPPolicy
 }
 

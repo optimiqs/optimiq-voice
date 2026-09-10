@@ -97,8 +97,10 @@ func (s *Server) allocateWebRTC(request contract.MediaAllocateSessionRequest) []
 	failed = false
 	s.recordSession(request, descriptor)
 	codec := contract.MediaAllocateSessionResponseCodec(negotiated.Codec)
+	// DTLS-SRTP is mandatory on this transport, so the leg is encrypted the moment it answers.
+	encryption := contract.MediaAllocateSessionResponseMediaEncryption(MediaEncrypted)
 	return encode(s.log, contract.MediaAllocateSessionResponse{
-		Ok: true, SessionID: request.SessionID, SDPAnswer: stringPtr(answer), InstanceID: stringPtr(s.instanceID),
+		Ok: true, MediaEncryption: &encryption, SessionID: request.SessionID, SDPAnswer: stringPtr(answer), InstanceID: stringPtr(s.instanceID),
 		Address: stringPtr(descriptor.Address.String()), RtpPort: intPtr(descriptor.RTPPort), RtcpPort: intPtr(descriptor.RTCPPort),
 		Ssrc: intPtr(int(descriptor.SSRC)), Codec: &codec, TelephoneEventPayloadType: intPtr(int(negotiated.TelephoneEventPayloadType)),
 	})
@@ -126,8 +128,9 @@ func (s *Server) createWebRTCOffer(request contract.MediaCreateOfferRequest) []b
 	}
 	descriptor := entry.descriptor
 	s.recordSessionEntry(request.OrgID, request.CallID, derefString(request.LegID), descriptor)
+	encryption := contract.MediaCreateOfferResponseMediaEncryption(MediaEncrypted)
 	return encode(s.log, contract.MediaCreateOfferResponse{
-		Ok: true, SessionID: request.SessionID, SDPOffer: stringPtr(offer), InstanceID: stringPtr(s.instanceID),
+		Ok: true, MediaEncryption: &encryption, SessionID: request.SessionID, SDPOffer: stringPtr(offer), InstanceID: stringPtr(s.instanceID),
 		Address: stringPtr(descriptor.Address.String()), RtpPort: intPtr(descriptor.RTPPort), RtcpPort: intPtr(descriptor.RTCPPort),
 		Ssrc: intPtr(int(descriptor.SSRC)), TelephoneEventPayloadType: intPtr(101),
 	})

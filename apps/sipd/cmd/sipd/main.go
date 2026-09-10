@@ -192,10 +192,24 @@ func run() error {
 	// another network's authenticated phones as digest-free carrier peers.
 	arrivals := profile.NewArrivals(profile.DefaultArrivalCapacity)
 
-	userAgent, err := sipgo.NewUA(
+	// The TLS material is built before the user agent so one floor and one certificate reloader
+	// serve both directions: the listeners below and the connections this edge dials to carriers.
+	// A certificate that cannot be read fails the process here, with the path in the message,
+	// rather than inside a goroutine whose error nobody is watching.
+	tlsMaterial, err := loadTLSMaterial(ctx, cfg, log)
+	if err != nil {
+		return err
+	}
+	tlsConfig := tlsMaterial.server
+
+	userAgentOptions := []sipgo.UserAgentOption{
 		sipgo.WithUserAgent(cfg.UserAgent),
 		sipgo.WithUserAgentTransportLayerOptions(sip.WithTransportLayerReadFilter(arrivals.ReadFilter())),
-	)
+	}
+	if tlsMaterial.client != nil {
+		userAgentOptions = append(userAgentOptions, sipgo.WithUserAgenTLSConfig(tlsMaterial.client))
+	}
+	userAgent, err := sipgo.NewUA(userAgentOptions...)
 	if err != nil {
 		return fmt.Errorf("creating the SIP user agent: %w", err)
 	}
@@ -548,23 +562,8 @@ func run() error {
 		}
 	})
 
-	// The TLS material, loaded once at boot rather than per listener, so a certificate that cannot
-	// be read fails the process here with the path in the message rather than inside a goroutine
-	// whose error nobody is watching.
-	var tlsConfig *tls.Config
-	if cfg.EnableTLS || cfg.EnableWSS {
-		certificate, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
-		if err != nil {
-			return fmt.Errorf("loading the SIP TLS certificate from %s / %s: %w",
-				cfg.TLSCertFile, cfg.TLSKeyFile, err)
-		}
-		tlsConfig = &tls.Config{
-			Certificates: []tls.Certificate{certificate},
-			// TLS 1.2 is the floor: RFC 5630 §3.1.3 requires TLS for `sips:` but names no version,
-			// and several handset vendors still ship stacks that cannot do 1.3.
-			MinVersion: tls.VersionTLS12,
-		}
-	}
+	// tlsConfig was built before the user agent, so the same floor and the same reloader serve both
+	// the listeners below and the outbound trunk connections.
 
 	var readyListeners atomic.Int32
 	var expectedListeners int32

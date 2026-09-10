@@ -303,3 +303,65 @@ func TestTheGateClassifiesTheDirectorysAnswers(t *testing.T) {
 		}
 	})
 }
+
+// The rotation grace: apps/api sends the pre-rotation digest beside the current one for as long as
+// the window the operator chose is open, so a fleet that has not been reflashed yet keeps
+// registering. Without it, rotating a secret is an outage for every phone that still holds the old
+// one — which is how a leaked secret ends up never being rotated at all.
+func TestARotatedSecretsGraceIsAcceptedForEveryMethod(t *testing.T) {
+	for _, method := range []string{"REGISTER", "INVITE", "SUBSCRIBE", "REFER"} {
+		t.Run(method, func(t *testing.T) {
+			g := newGate(t, testPolicy())
+			const previous = "the-secret-the-phone-still-holds"
+			g.store.accounts[testRealm+"/"+testUser] = credentials.Credential{
+				OrgID: testOrg, Username: testUser, Realm: testRealm,
+				HA1:         credentials.HA1(testUser, testRealm, testPass),
+				HA1Previous: credentials.HA1(testUser, testRealm, previous),
+			}
+
+			result := g.run(method, "203.0.113.10:5060", testUser, previous)
+			if result.Outcome != registrar.DigestAccepted {
+				t.Fatalf("outcome = %v, want DigestAccepted against the grace digest", result.Outcome)
+			}
+			// Answered locally: the grace digest is already in hand, so nothing is re-asked.
+			if g.store.refreshs.Load() != 0 {
+				t.Errorf("refreshes = %d, want none — the grace digest was already held", g.store.refreshs.Load())
+			}
+			if _, locked := g.lockout.Locked("203.0.113.10", testRealm+"/"+testUser); locked {
+				t.Error("an accepted grace digest still counted as a failure")
+			}
+		})
+	}
+}
+
+// The window closing is the whole point: once apps/api stops sending the previous digest, the phone
+// that still holds it is refused like any other wrong password, and the failure is counted.
+func TestTheOldSecretIsRefusedOnceTheGraceIsGone(t *testing.T) {
+	g := newGate(t, testPolicy())
+	const previous = "the-secret-the-phone-still-holds"
+	// No HA1Previous — this is what the responder answers after the deadline.
+	g.store.accounts[testRealm+"/"+testUser] = credentials.Credential{
+		OrgID: testOrg, Username: testUser, Realm: testRealm,
+		HA1: credentials.HA1(testUser, testRealm, testPass),
+	}
+
+	result := g.run("REGISTER", "203.0.113.11:5060", testUser, previous)
+	if result.Outcome != registrar.DigestBadPassword {
+		t.Fatalf("outcome = %v, want DigestBadPassword once the grace has closed", result.Outcome)
+	}
+}
+
+// The current secret still wins outright, and reaches the accept without the grace being consulted.
+func TestTheCurrentSecretIsUnaffectedByAGraceBeingOpen(t *testing.T) {
+	g := newGate(t, testPolicy())
+	g.store.accounts[testRealm+"/"+testUser] = credentials.Credential{
+		OrgID: testOrg, Username: testUser, Realm: testRealm,
+		HA1:         credentials.HA1(testUser, testRealm, testPass),
+		HA1Previous: credentials.HA1(testUser, testRealm, "something-else-entirely"),
+	}
+
+	result := g.run("REGISTER", "203.0.113.12:5060", testUser, testPass)
+	if result.Outcome != registrar.DigestAccepted {
+		t.Fatalf("outcome = %v, want DigestAccepted", result.Outcome)
+	}
+}
