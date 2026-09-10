@@ -36,6 +36,29 @@ func TestAccountRealmNoncesAndDigestURIsAreIsolated(t *testing.T) {
 	}
 }
 
+// The deployment realm stands in ONLY when a request names no domain — "no tenant matched" — and
+// never in place of a domain the request did name.
+func TestTheDeploymentRealmIsOnlyTheNoTenantMatchedDefault(t *testing.T) {
+	base := newTestAuthenticator(t, time.Minute)
+
+	nameless := sip.NewRequest(sip.REGISTER, sip.Uri{Scheme: "sip", Host: authRealm})
+	if got := RequestRealm(nameless); got != "" {
+		t.Fatalf("RequestRealm = %q, want empty for a request that names no domain", got)
+	}
+	if base.ForRequest(nameless).Realm() != authRealm {
+		t.Fatal("a request naming no domain should be challenged with the deployment realm")
+	}
+
+	named := sip.NewRequest(sip.REGISTER, sip.Uri{Scheme: "sip", Host: authRealm})
+	named.AppendHeader(&sip.ToHeader{Address: sip.Uri{Scheme: "sip", User: authUser, Host: "Tenant-B.Example"}})
+	if got := RequestRealm(named); got != "tenant-b.example" {
+		t.Fatalf("RequestRealm = %q, want the To host lowercased", got)
+	}
+	if got := base.ForRequest(named).Realm(); got != "tenant-b.example" {
+		t.Fatalf("realm = %q: the deployment default displaced the tenant's own domain", got)
+	}
+}
+
 // Digest authentication unit tests. The answers are computed by github.com/icholy/digest — an
 // independent client-side implementation of RFC 2617 — so a bug in the verifier cannot cancel out
 // against a matching bug in a hand-written expectation.

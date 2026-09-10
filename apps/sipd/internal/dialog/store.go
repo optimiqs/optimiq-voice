@@ -174,6 +174,39 @@ func (s *Store) MatchRequest(req *sip.Request) (*Dialog, bool) {
 	return nil, false
 }
 
+// Membership is who an in-dialog request acts as: the identity the DIALOG carries, copied out under
+// the store's lock so no *Dialog escapes to a goroutine that does not own it.
+type Membership struct {
+	LegID string
+	OrgID string
+	// AccountAOR is the far end's address of record, empty when the dialog has no account (a trunk
+	// leg, or a bare URI).
+	AccountAOR string
+}
+
+// MatchEstablished resolves an in-dialog request against a CONFIRMED dialog and reports the identity
+// to act as. Unlike MatchRequest it does not fall back to the early index: both tags must match, and
+// they are unguessable secrets shared only with the dialog's peers, so membership of an established
+// dialog is itself the authorisation an in-dialog request needs (RFC 3261 §12.2 — such a request's
+// From is the dialog's local URI and asserts nothing).
+func (s *Store) MatchEstablished(req *sip.Request) (Membership, bool) {
+	identity, err := identityOfIncoming(req)
+	if err != nil || !identity.Established() {
+		return Membership{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	legID, found := s.byIdentity[identity.Key()]
+	if !found {
+		return Membership{}, false
+	}
+	dialog, ok := s.byLeg[legID]
+	if !ok || !dialog.state.Answered() {
+		return Membership{}, false
+	}
+	return Membership{LegID: dialog.LegID, OrgID: dialog.OrgID, AccountAOR: dialog.AccountAOR}, true
+}
+
 // MatchResponse finds the dialog a response to one of OUR requests belongs to. The first response
 // with a tag can only match on the early key; once Rebind has run, later responses match the full
 // index — hence both lookups.
@@ -390,9 +423,38 @@ func (m *MemoryClaimStore) All(_ context.Context) ([]Claim, error) {
 // Deliberately not "every expired claim": one of our own that has expired means our own heartbeat is
 // late, and reaping it would turn a broker blip into dropped calls.
 func Orphans(claims []Claim, instanceID string, now time.Time) []Claim {
+	return Reapable(claims, instanceID, now, nil)
+}
+
+// Reapable returns the claims this instance may terminate on a dead owner's behalf, judged on two
+// pieces of evidence rather than one.
+//
+// The first is the claim's own lease, which is what Orphans has always used. The second is the
+// `sip-instances` bucket: an owner with no live lease is a process that stopped renewing seconds
+// ago, and waiting out the claim's much longer lease before reaping its dialogs leaves the engine
+// holding live channels for a minute and a half after its edge died.
+//
+// liveInstances is trusted ONLY when it is non-empty. An empty or nil set means "no lease evidence
+// this sweep" — an old sipd that writes no lease, a bucket that could not be listed — and the
+// caller's own lease is always in a healthy set, so emptiness is exactly the case where the second
+// piece of evidence must be ignored rather than read as "every instance in the fleet is dead".
+func Reapable(
+	claims []Claim,
+	instanceID string,
+	now time.Time,
+	liveInstances map[string]struct{},
+) []Claim {
 	orphans := make([]Claim, 0)
 	for _, claim := range claims {
-		if claim.InstanceID == instanceID || !claim.Expired(now) {
+		if claim.InstanceID == instanceID {
+			continue
+		}
+		ownerGone := false
+		if len(liveInstances) > 0 {
+			_, alive := liveInstances[claim.InstanceID]
+			ownerGone = !alive
+		}
+		if !ownerGone && !claim.Expired(now) {
 			continue
 		}
 		orphans = append(orphans, claim)

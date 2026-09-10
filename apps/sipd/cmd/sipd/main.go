@@ -43,12 +43,15 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/events"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/invite"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/kv"
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/lease"
+	sipdmetrics "github.com/optimiqs/optimiq-voice/apps/sipd/internal/metrics"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/mwi"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/presence"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/profile"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/reaper"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/registrar"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/sipevents"
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/siplog"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/subscribe"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/transfer"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/trunk"
@@ -75,8 +78,12 @@ func run() error {
 		return err
 	}
 
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel})
+	log := slog.New(handler)
 	slog.SetDefault(log)
+	// sipgo takes its transport and transaction loggers from this one, and logs several routine
+	// per-call facts at WARN and ERROR — including the sender's raw bytes on a parse failure.
+	sip.SetDefaultLogger(slog.New(siplog.Wrap(handler)))
 	log = log.With("service", config.EventSource)
 
 	// A soft heap limit derived from the container's, so memory pressure becomes GC pressure rather
@@ -169,6 +176,35 @@ func run() error {
 		return err
 	}
 
+	// A provisioning write evicts this edge's cache on the commit rather than on the TTL. A file
+	// store caches nothing and implements no evictor, so this is skipped for the SIPp rig.
+	if evictor, ok := credentialStore.(credentials.OrgEvictor); ok {
+		if err := credentials.WatchInvalidations(ctx, conn, evictor, log); err != nil {
+			return err
+		}
+		log.Info("watching credential invalidations", "subject", credentials.InvalidationFilter)
+	}
+
+	// sipgo never stamps the destination on an inbound message, so the local listener address is
+	// captured here, before parsing, and is what `profile.Set.For` selects the trust boundary by.
+	// Without it selection falls back to the SENDER's address and a trunk ACL entry can reclassify
+	// another network's authenticated phones as digest-free carrier peers.
+	arrivals := profile.NewArrivals(profile.DefaultArrivalCapacity)
+
+	userAgent, err := sipgo.NewUA(
+		sipgo.WithUserAgent(cfg.UserAgent),
+		sipgo.WithUserAgentTransportLayerOptions(sip.WithTransportLayerReadFilter(arrivals.ReadFilter())),
+	)
+	if err != nil {
+		return fmt.Errorf("creating the SIP user agent: %w", err)
+	}
+	defer userAgent.Close()
+
+	// Built before the registrar because the registrar probes it: a WebSocket binding is only
+	// reachable over the connection that registered it (RFC 7118 §5.2), so a closed tab has to be
+	// swept rather than left to expire.
+	connections := newTransportProbe(userAgent)
+
 	authenticator, err := registrar.NewAuthenticator(cfg.Realm, []byte(cfg.NonceSecret), cfg.NonceTTL)
 	if err != nil {
 		return err
@@ -179,14 +215,31 @@ func run() error {
 			"one instance will be rejected by another.")
 	}
 
+	// The `scope=registration` half of the `sip-acl` bucket. Built here rather than in
+	// buildProfiles because the registrar is wired before the INVITE surface and serves REGISTER
+	// whether or not that surface exists; buildProfiles attaches it to the same watch when it runs,
+	// and it stays empty — admitting everything — when it does not.
+	registrationACL := profile.NewWatchedBlocklist(nil)
+
+	// One lockout for the whole process: REGISTER and INVITE share the budget, or a spray that
+	// alternated methods would get two.
+	lockout := registrar.NewLockout(cfg.AuthLockout, time.Now)
+	if lockout == nil {
+		log.Warn("SIPD_AUTH_LOCKOUT_THRESHOLD is 0; credential guessing is unthrottled and every " +
+			"attempt costs a credential lookup.")
+	}
+
 	reg, err := registrar.New(registrar.Options{
 		InstanceID:       cfg.InstanceID,
 		MaxContacts:      cfg.MaxContactsPerAOR,
 		Realm:            cfg.Realm,
 		Auth:             authenticator,
 		Expiry:           registrar.ExpiryPolicy{Min: cfg.MinExpires, Max: cfg.MaxExpires, Default: cfg.DefaultExpires},
+		RegistrationACL:  registrationACL,
+		Lockout:          lockout,
 		Credentials:      credentialStore,
 		Bindings:         bindings,
+		Connections:      connections,
 		Publisher:        events.NewJetStreamPublisher(js),
 		Logger:           log,
 		Source:           config.EventSource,
@@ -213,12 +266,6 @@ func run() error {
 		log.Info("adopted existing bindings", "count", adopted)
 	}
 
-	userAgent, err := sipgo.NewUA(sipgo.WithUserAgent(cfg.UserAgent))
-	if err != nil {
-		return fmt.Errorf("creating the SIP user agent: %w", err)
-	}
-	defer userAgent.Close()
-
 	server, err := sipgo.NewServer(userAgent, sipgo.WithServerLogger(log))
 	if err != nil {
 		return fmt.Errorf("creating the SIP server: %w", err)
@@ -233,7 +280,12 @@ func run() error {
 	}
 	defer sipClient.Close()
 
-	transfers, err := newTransferHandler(cfg, conn, sipClient, authenticator, credentialStore, bindings, ctx, log)
+	// The dialog table, built before the handlers because REFER authorises an in-dialog request by
+	// membership of it.
+	dialogs := dialog.NewStore(dialog.StoreOptions{InstanceID: cfg.InstanceID})
+
+	transfers, err := newTransferHandler(
+		cfg, conn, sipClient, authenticator, credentialStore, bindings, dialogs, ctx, log)
 	if err != nil {
 		return err
 	}
@@ -244,10 +296,29 @@ func run() error {
 		return err
 	}
 
-	server.OnRegister(reg.HandleRegister)
-	server.OnOptions(reg.HandleOptions)
-	server.OnRefer(transfers.HandleRefer)
-	server.OnSubscribe(subscriptions.HandleSubscribe)
+	// Telemetry, wrapped around every handler rather than threaded through them. There is no
+	// switch: unlike pprof — which is a denial-of-service and a memory disclosure, and is why the
+	// health listener is private in the first place — a Prometheus registry costs a handful of
+	// atomics per request and an endpoint nothing reaches unless it is scraped.
+	metrics := sipdmetrics.New()
+	server.OnRegister(metrics.Wrap("REGISTER", reg.HandleRegister))
+	server.OnOptions(metrics.Wrap("OPTIONS", reg.HandleOptions))
+	server.OnRefer(metrics.Wrap("REFER", transfers.HandleRefer))
+	server.OnSubscribe(metrics.Wrap("SUBSCRIBE", subscriptions.HandleSubscribe))
+	metrics.Gauge("subscriptions", "Active RFC 6665 subscriptions held by this instance.",
+		subscriptions.Subscriptions)
+	metrics.Counter("subscription_notifications_dropped_total",
+		"NOTIFYs dropped because a subscriber's queue was full.",
+		func() uint64 { return uint64(max(subscriptions.Dropped(), 0)) })
+	metrics.Counter("auth_lockout_failures_total",
+		"Credential failures counted by the spray throttle.",
+		func() uint64 { return lockout.Stats().Failures })
+	metrics.Counter("auth_lockouts_total",
+		"Times a source or account entered a cooling window.",
+		func() uint64 { return lockout.Stats().Lockouts })
+	metrics.Counter("auth_lockout_refusals_total",
+		"Requests refused because a cooling window was in force, regardless of credential.",
+		func() uint64 { return lockout.Stats().Refused })
 
 	var group sync.WaitGroup
 	errs := make(chan error, 8)
@@ -295,12 +366,9 @@ func run() error {
 		})
 	}
 
-	// The dialog table and its claim bucket.
-	//
-	// The claim store is the NATS one whenever the bucket can be opened. The memory one lets a
-	// single instance work but reaps nothing — a claim only one process can see is one no survivor
-	// can act on — so landing on it warns rather than downgrading silently.
-	dialogs := dialog.NewStore(dialog.StoreOptions{InstanceID: cfg.InstanceID})
+	// The dialog claim bucket. The claim store is the NATS one whenever the bucket can be opened.
+	// The memory one lets a single instance work but reaps nothing — a claim only one process can
+	// see is one no survivor can act on — so landing on it warns rather than downgrading silently.
 	var claimStore dialog.ClaimStore
 	var claims dialog.ClaimStore = dialog.NewMemoryClaimStore()
 	if cfg.EnableInvite {
@@ -314,6 +382,40 @@ func run() error {
 		}
 	}
 
+	// This instance's liveness lease. One key, renewed every few seconds, so the ENGINE can end the
+	// legs that died with this process — the case internal/reaper cannot cover, because a
+	// single-instance edge leaves no survivor to sweep. The reaper reads it too, which is what lets
+	// a dead peer's dialogs be reaped in seconds rather than at their own ninety-second lease.
+	var leaseStore lease.Store
+	if cfg.EnableInvite {
+		if store, err := lease.Open(ctx, js); err != nil {
+			log.Warn("cannot open the sip-instances bucket; if this process dies the engine will not "+
+				"learn it until each dialog claim expires",
+				"bucket", contract.SIPInstancesKV.Name, "error", err)
+		} else {
+			leaseStore = store
+			renewer, err := lease.New(lease.Options{
+				Store:      store,
+				InstanceID: cfg.InstanceID,
+				Dialogs:    func() int { return len(dialogs.Claims()) },
+				Logger:     log,
+			})
+			if err != nil {
+				return err
+			}
+			group.Go(func() {
+				if err := renewer.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					errs <- err
+				}
+			})
+			log.Info("renewing this instance's liveness lease",
+				"instanceId", cfg.InstanceID,
+				"bucket", contract.SIPInstancesKV.Name,
+				"interval", lease.RenewInterval,
+				"ttl", contract.SIPInstancesKV.TTL)
+		}
+	}
+
 	// The dialog event publisher. There is always a broker by this point, so the seam exists for the
 	// tests rather than for a degraded production mode.
 	dialogEvents := sipevents.NewJetStreamPublisher(js)
@@ -323,29 +425,33 @@ func run() error {
 	// directory and an ACL bucket already in place.
 	if cfg.EnableInvite {
 		invites, err := newInviteHandler(inviteDeps{
-			cfg:         cfg,
-			server:      server,
-			client:      sipClient,
-			conn:        conn,
-			bindings:    bindings,
-			trunks:      trunkDirectory,
-			dialogs:     dialogs,
-			claims:      claims,
-			events:      dialogEvents,
-			auth:        authenticator,
-			credentials: credentialStore,
-			ctx:         ctx,
-			log:         log,
+			cfg:             cfg,
+			server:          server,
+			client:          sipClient,
+			conn:            conn,
+			bindings:        bindings,
+			trunks:          trunkDirectory,
+			dialogs:         dialogs,
+			claims:          claims,
+			events:          dialogEvents,
+			auth:            authenticator,
+			credentials:     credentialStore,
+			lockout:         lockout,
+			registrationACL: registrationACL,
+			arrivals:        arrivals,
+			ctx:             ctx,
+			log:             log,
 		})
 		if err != nil {
 			return err
 		}
-		server.OnInvite(invites.ServeInvite)
-		server.OnAck(invites.HandleAck)
-		server.OnBye(invites.HandleBye)
-		server.OnCancel(invites.HandleCancel)
-		server.OnUpdate(invites.HandleUpdate)
-		server.OnInfo(invites.HandleInfo)
+		server.OnInvite(metrics.Wrap("INVITE", invites.ServeInvite))
+		server.OnAck(metrics.Wrap("ACK", invites.HandleAck))
+		server.OnBye(metrics.Wrap("BYE", invites.HandleBye))
+		server.OnCancel(metrics.Wrap("CANCEL", invites.HandleCancel))
+		server.OnUpdate(metrics.Wrap("UPDATE", invites.HandleUpdate))
+		server.OnInfo(metrics.Wrap("INFO", invites.HandleInfo))
+		metrics.Gauge("dialogs", "Dialogs this instance holds.", dialogs.Len)
 
 		// Attached after the SIP handlers are registered, so a command cannot arrive for a dialog
 		// whose handler is not yet installed.
@@ -382,12 +488,19 @@ func run() error {
 				Store:      claimStore,
 				Dialogs:    dialogs,
 				Events:     dialogEvents,
+				Leases:     leaseStore,
 				InstanceID: cfg.InstanceID,
 				Logger:     log,
 			})
 			if err != nil {
 				return err
 			}
+			// Before the ticker starts, and before any INVITE is admitted: this process holds no
+			// dialogs yet, so any claim carrying its own instance id belongs to an incarnation that
+			// is gone. The ordinary sweep can never take those — it must not reap its own claims —
+			// so without this a stable instance id leaves one dead dialog per crashed call in the
+			// bucket until the six-hour TTL.
+			sweeper.SweepPredecessor(ctx)
 			group.Go(func() {
 				if err := sweeper.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 					errs <- err
@@ -403,7 +516,7 @@ func run() error {
 	}
 
 	// Everything else (MESSAGE, PUBLISH, …) is refused rather than half-answered.
-	server.OnNoRoute(reg.HandleUnsupported)
+	server.OnNoRoute(metrics.Wrap("unsupported", reg.HandleUnsupported))
 
 	group.Go(func() {
 		if err := reg.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -446,7 +559,9 @@ func run() error {
 			}))
 			var err error
 			switch {
-			case strings.HasSuffix(network, "s") && tlsConfig != nil:
+			// Named rather than a "ends in s" test, which also matches the plaintext `ws` network and
+			// served it over TLS whenever a certificate was loaded for `tls`/`wss`.
+			case (network == "tls" || network == "wss") && tlsConfig != nil:
 				// ListenAndServeTLS closes its listener when ctx is done; a post-shutdown error is
 				// the close itself, not a failure.
 				err = server.ListenAndServeTLS(listenCtx, network, addr, tlsConfig)
@@ -487,7 +602,7 @@ func run() error {
 	}
 	healthServer, err := health.Start(ctx, cfg.HealthAddr, func() bool {
 		return conn.IsConnected() && expectedListeners > 0 && readyListeners.Load() == expectedListeners
-	}, health.WithPprof(cfg.PProfEnabled))
+	}, health.WithPprof(cfg.PProfEnabled), health.WithMetrics(metrics.Registry().Handler()))
 	if err != nil {
 		return err
 	}
@@ -533,8 +648,8 @@ func run() error {
 	return nil
 }
 
-// newTransferHandler wires REFER: digest against the same authenticator the registrar uses, the
-// location service as the presence check, `rpc.sip.v1.transfer` at the engine, and NOTIFY back to
+// newTransferHandler wires REFER: dialog membership for an in-dialog request and digest against the
+// same authenticator the registrar uses for the rest, the location service as the presence check, `rpc.sip.v1.transfer` at the engine, and NOTIFY back to
 // the phone. It is always wired: without the engine responder the phone is accepted, the request
 // times out and the final NOTIFY carries 503, which is more informative than a 501.
 func newTransferHandler(
@@ -544,6 +659,7 @@ func newTransferHandler(
 	authenticator *registrar.Authenticator,
 	credentialStore credentials.Store,
 	bindings kv.Store,
+	dialogs *dialog.Store,
 	ctx context.Context,
 	log *slog.Logger,
 ) (*transfer.Handler, error) {
@@ -561,6 +677,7 @@ func newTransferHandler(
 		Realm:        cfg.Realm,
 		Auth:         authenticator,
 		Credentials:  credentialStore,
+		Dialogs:      dialogs,
 		Bindings:     bindings,
 		Transfers:    requester,
 		Notifier:     notifier,
@@ -653,8 +770,16 @@ type inviteDeps struct {
 	events      sipevents.Publisher
 	auth        *registrar.Authenticator
 	credentials credentials.Store
-	ctx         context.Context
-	log         *slog.Logger
+	// lockout is the process-wide credential-guessing throttle, shared with the registrar.
+	lockout *registrar.Lockout
+	// registrationACL is filled by the same `sip-acl` watch the trunk ACL uses. Owned by the
+	// registrar, which is built first; passed through so one watch feeds both scopes.
+	registrationACL *profile.ACL
+	// arrivals is the listener-address table the transport read filter fills; the profile set
+	// selects by it, since sipgo leaves the destination unset on inbound messages.
+	arrivals *profile.Arrivals
+	ctx      context.Context
+	log      *slog.Logger
 }
 
 // newInviteHandler wires the INVITE surface: two listener profiles, the dialog table, the same
@@ -669,10 +794,11 @@ type inviteDeps struct {
 func newInviteHandler(deps inviteDeps) (*invite.Handler, error) {
 	cfg, log := deps.cfg, deps.log
 
-	profiles, aclWatcher, aclReady, err := buildProfiles(deps.ctx, cfg, deps.conn, log)
+	profiles, aclWatcher, aclReady, err := buildProfiles(deps.ctx, cfg, deps.registrationACL, deps.conn, log)
 	if err != nil {
 		return nil, err
 	}
+	profiles.TrackArrivals(deps.arrivals)
 	// buildProfiles starts the ACL watch rather than finishing it, so this is where the security
 	// boundary becomes loaded rather than merely opened. The wait is bounded: an empty ACL fails
 	// closed, and waiting for ever would stop REGISTER over a bucket that may not exist yet.
@@ -710,6 +836,7 @@ func newInviteHandler(deps inviteDeps) (*invite.Handler, error) {
 		Realm:        cfg.Realm,
 		Auth:         deps.auth,
 		Credentials:  deps.credentials,
+		Lockout:      deps.lockout,
 		Dialogs:      deps.dialogs,
 		Claims:       deps.claims,
 		Profiles:     profiles,
@@ -776,6 +903,7 @@ func waitForACL(ctx context.Context, ready <-chan struct{}, timeout time.Duratio
 func buildProfiles(
 	ctx context.Context,
 	cfg config.Config,
+	registrationACL *profile.ACL,
 	conn *nats.Conn,
 	log *slog.Logger,
 ) (*profile.Set, *acl.Watcher, <-chan struct{}, error) {
@@ -811,6 +939,9 @@ func buildProfiles(
 	watcher, err := acl.NewWatcher(carrierACL, overrides, log)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	if registrationACL != nil {
+		watcher.WithRegistrationACL(registrationACL)
 	}
 
 	// ready closes once the bucket's initial replay has landed, however many attach attempts that
@@ -856,6 +987,16 @@ func buildProfiles(
 	// An empty ACL refuses carrier traffic until the initial replay succeeds.
 
 	external := profile.External("external", carrierACL)
+	if cfg.ExternalListenAddr == "" {
+		// Without a socket of its own the external profile shares the internal one, and the only
+		// thing left to tell a carrier from a phone is the source address — so a trunk ACL entry
+		// covering an office network reclassifies that office's authenticated phones as digest-free
+		// carrier peers. Actionable, and logged once at boot rather than per call.
+		log.Warn("the external profile has no listener of its own; a trunk ACL entry will claim "+
+			"matching sources on the internal socket too. Set SIPD_EXTERNAL_LISTEN_ADDR to make the "+
+			"listener the trust boundary.",
+			"internalListenAddr", cfg.ListenAddr)
+	}
 	if cfg.ExternalListenAddr != "" {
 		// A socket of its own is the stronger separation: the profile is then chosen by the address
 		// the packet arrived on, which no sender can influence.

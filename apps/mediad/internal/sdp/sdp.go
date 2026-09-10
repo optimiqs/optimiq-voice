@@ -153,6 +153,9 @@ type Offer struct {
 	// AudioProtocol is the transport of the audio section, upper-cased, as AudioProtocol returns it.
 	// Carried here so the allocate path does not unmarshal the same offer twice.
 	AudioProtocol string
+	// Crypto is the offerer's SDES key (RFC 4568), read only for a SAVP transport. A zero value
+	// means the offer carried no suite mediad can serve, and the answer must fall back to plain RTP.
+	Crypto Crypto
 }
 
 // supportedStaticTypes maps the static payload types to their codec (RFC 3551 Table 4).
@@ -209,6 +212,14 @@ func ParseOffer(raw string) (Offer, error) {
 
 	offer.RemoteAddress = remoteAddressOf(media, &description)
 	offer.AudioProtocol = audioProtocolOf(media)
+	if IsSecureProtocol(offer.AudioProtocol) {
+		var err error
+		// Only under SAVP: a crypto line on a plain RTP/AVP offer keys nothing, and refusing the
+		// whole offer over a malformed one would break a leg that never asked for SRTP.
+		if offer.Crypto, err = parseCrypto(media.Attributes); err != nil {
+			return Offer{}, err
+		}
+	}
 	return offer, nil
 }
 
@@ -366,6 +377,9 @@ type Answer struct {
 	// OpusFmtp is echoed back when the offer carried one. Ignored for every other codec.
 	OpusFmtp  string
 	Direction Direction
+	// Crypto is OUR key, with the tag of the offered crypto line it answers (RFC 4568 §5.1.2).
+	// Zero renders a plain RTP/AVP answer, byte-for-byte as an unencrypted leg has always been.
+	Crypto Crypto
 }
 
 // Validate reports whether the answer can be rendered. Call it before [BuildAnswer], which is a
@@ -415,7 +429,8 @@ func BuildAnswer(answer Answer) string {
 	body.WriteString("s=-\r\n")
 	fmt.Fprintf(&body, "c=IN %s %s\r\n", addrType(answer.Address), addrLiteral(answer.Address))
 	body.WriteString("t=0 0\r\n")
-	fmt.Fprintf(&body, "m=audio %d RTP/AVP %s\r\n", port, formats)
+	fmt.Fprintf(&body, "m=audio %d %s %s\r\n", port, mediaProto(answer.Crypto), formats)
+	writeCrypto(&body, answer.Crypto)
 	if answer.Codec == CodecOpus {
 		// RFC 7587 §7: the Opus rtpmap channel count is fixed at 2 whatever the stream carries; mono
 		// is signalled through `stereo=0` in the fmtp instead.
@@ -455,6 +470,8 @@ type OfferParams struct {
 	TelephoneEventPayloadType uint8
 	// Direction is the media direction to offer, defaulting to sendrecv.
 	Direction Direction
+	// Crypto is OUR key to offer under SAVP. Zero offers plain RTP/AVP.
+	Crypto Crypto
 }
 
 // BuildOffer renders an offer body for a leg mediad is originating. Unlike an answer, it lists every
@@ -482,7 +499,8 @@ func BuildOffer(offer OfferParams) string {
 	body.WriteString("s=-\r\n")
 	fmt.Fprintf(&body, "c=IN %s %s\r\n", addrType(offer.Address), addrLiteral(offer.Address))
 	body.WriteString("t=0 0\r\n")
-	fmt.Fprintf(&body, "m=audio %d RTP/AVP %s\r\n", offer.Port, strings.Join(formats, " "))
+	fmt.Fprintf(&body, "m=audio %d %s %s\r\n", offer.Port, mediaProto(offer.Crypto), strings.Join(formats, " "))
+	writeCrypto(&body, offer.Crypto)
 	// Spelled out even for the static types, since endpoints exist that read rtpmap and never the
 	// static table. Opus is not originated here, so there is no channel-count special case.
 	for _, codec := range offer.Codecs {
@@ -545,4 +563,21 @@ func addrType(address netip.Addr) string {
 // form, so `IN IP4 ::ffff:203.0.113.10` — an addrtype and a literal that disagree — cannot happen.
 func addrLiteral(address netip.Addr) string {
 	return address.Unmap().String()
+}
+
+// mediaProto is the `m=audio` transport for a body that may or may not commit to SRTP.
+func mediaProto(crypto Crypto) string {
+	if crypto.IsSet() {
+		return ProtoSAVP
+	}
+	return ProtoAVP
+}
+
+// writeCrypto renders the one `a=crypto` line a committed SDES body carries, and nothing at all
+// otherwise: RFC 4568 §5.1.2 allows exactly one crypto attribute in an answer.
+func writeCrypto(body *strings.Builder, crypto Crypto) {
+	if !crypto.IsSet() {
+		return
+	}
+	fmt.Fprintf(body, "a=crypto:%d %s inline:%s\r\n", crypto.Tag, SRTPSuite, crypto.Inline())
 }

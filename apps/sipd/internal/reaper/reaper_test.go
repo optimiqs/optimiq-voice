@@ -348,3 +348,140 @@ func TestTheReapListingDoesNotRunOnEverySweep(t *testing.T) {
 		t.Errorf("listed %d times, want the reap to have run again", store.lists)
 	}
 }
+
+// fakeLeases is the read half of the sip-instances bucket, so a test can say who is alive.
+type fakeLeases struct {
+	live map[string]struct{}
+	err  error
+}
+
+func (f fakeLeases) Live(context.Context, time.Time) (map[string]struct{}, error) {
+	return f.live, f.err
+}
+
+func newTestReaperWithLeases(
+	t *testing.T,
+	store Claims,
+	events sipevents.Publisher,
+	leases Leases,
+) *Reaper {
+	t.Helper()
+	reaper, err := New(Options{
+		Store:      store,
+		Dialogs:    fakeLive{},
+		Events:     events,
+		Leases:     leases,
+		InstanceID: "sipd-alive",
+		Now:        func() time.Time { return testNow },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return reaper
+}
+
+// The reason the sip-instances bucket exists. The claim's own ninety-second lease has NOT lapsed,
+// but its owner stopped renewing its instance lease seconds ago — so the call is reaped now rather
+// than after a minute and a half of the engine holding a channel for a dead edge.
+func TestAClaimWhoseOwnerHasNoInstanceLeaseIsReapedBeforeItsClaimExpires(t *testing.T) {
+	store := newFakeClaims(claim("leg-theirs", "sipd-other", testNow.Add(time.Minute)))
+	events := sipevents.NewRecordingPublisher()
+	leases := fakeLeases{live: map[string]struct{}{"sipd-alive": {}}}
+	newTestReaperWithLeases(t, store, events, leases).Sweep(t.Context())
+
+	terminated := events.TerminatedEvents()
+	if len(terminated) != 1 || terminated[0].Data.LegID != "leg-theirs" {
+		t.Fatalf("published %d terminations, want 1 for leg-theirs", len(terminated))
+	}
+	if deleted := store.deletedLegs(); len(deleted) != 1 || deleted[0] != "leg-theirs" {
+		t.Fatalf("deleted = %v, want [leg-theirs]", deleted)
+	}
+}
+
+// A live lease protects an unexpired claim, which is the ordinary steady state of a two-instance
+// fleet: neither instance may touch the other's calls.
+func TestALiveInstanceLeaseKeepsItsClaims(t *testing.T) {
+	store := newFakeClaims(claim("leg-theirs", "sipd-other", testNow.Add(time.Minute)))
+	events := sipevents.NewRecordingPublisher()
+	leases := fakeLeases{live: map[string]struct{}{"sipd-alive": {}, "sipd-other": {}}}
+	newTestReaperWithLeases(t, store, events, leases).Sweep(t.Context())
+
+	if events.Len() != 0 {
+		t.Fatalf("published %d events for a live instance's claim, want 0", events.Len())
+	}
+}
+
+// The safety property of the lease evidence. A bucket that cannot be listed — or one an older sipd
+// never writes into — must fall back to judging each claim on its own lease, NOT read the absence
+// of every lease as the death of every instance and reap the whole fleet's calls.
+func TestNoLeaseEvidenceFallsBackToTheClaimLease(t *testing.T) {
+	for name, leases := range map[string]Leases{
+		"unreadable": fakeLeases{err: errors.New("bucket unavailable")},
+		"empty":      fakeLeases{live: map[string]struct{}{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := newFakeClaims(
+				claim("leg-live", "sipd-other", testNow.Add(time.Minute)),
+				claim("leg-dead", "sipd-gone", testNow.Add(-time.Minute)),
+			)
+			events := sipevents.NewRecordingPublisher()
+			newTestReaperWithLeases(t, store, events, leases).Sweep(t.Context())
+
+			terminated := events.TerminatedEvents()
+			if len(terminated) != 1 || terminated[0].Data.LegID != "leg-dead" {
+				t.Fatalf("published %d terminations, want only leg-dead", len(terminated))
+			}
+		})
+	}
+}
+
+// Our own claims stay ours whatever the lease bucket says. A renewal we lost to a slow broker is
+// not a death, and the process reading the bucket is plainly alive — it is running the sweep.
+func TestOurOwnClaimsSurviveAMissingLeaseOfOurOwn(t *testing.T) {
+	store := newFakeClaims(claim("leg-mine", "sipd-alive", testNow.Add(time.Minute)))
+	events := sipevents.NewRecordingPublisher()
+	leases := fakeLeases{live: map[string]struct{}{"sipd-other": {}}}
+	newTestReaperWithLeases(t, store, events, leases).Sweep(t.Context())
+
+	if events.Len() != 0 {
+		t.Fatalf("published %d events for our own claim, want 0", events.Len())
+	}
+}
+
+// The hole the ordinary sweep cannot cover. A sipd restarted with the SAME instance id — which is
+// every orchestrator that names a pod deterministically, and every deployment that sets
+// SIPD_INSTANCE_ID — leaves claims that look like its own for ever, so nothing publishes the
+// terminations for the calls that died with the previous process. Observed live as 25 claims
+// against zero live channels.
+func TestABootSweepReapsThisInstanceIDsPreviousClaims(t *testing.T) {
+	store := newFakeClaims(
+		claim("leg-mine-old", "sipd-alive", testNow.Add(time.Minute)),
+		claim("leg-theirs", "sipd-other", testNow.Add(time.Minute)),
+	)
+	events := sipevents.NewRecordingPublisher()
+	newTestReaper(t, store, fakeLive{}, events).SweepPredecessor(t.Context())
+
+	terminated := events.TerminatedEvents()
+	if len(terminated) != 1 || terminated[0].Data.LegID != "leg-mine-old" {
+		t.Fatalf("published %d terminations, want 1 for leg-mine-old", len(terminated))
+	}
+	if deleted := store.deletedLegs(); len(deleted) != 1 || deleted[0] != "leg-mine-old" {
+		t.Fatalf("deleted = %v, want [leg-mine-old]", deleted)
+	}
+}
+
+// The guard that keeps it safe. Run late — after this process has admitted a call — it would be
+// reaping its own LIVE dialogs, which is the one thing a reaper must never do.
+func TestTheBootSweepRefusesOnceTheInstanceIsServing(t *testing.T) {
+	store := newFakeClaims(claim("leg-mine-old", "sipd-alive", testNow.Add(time.Minute)))
+	events := sipevents.NewRecordingPublisher()
+	live := fakeLive{claims: []dialog.Claim{claim("leg-live", "sipd-alive", testNow.Add(time.Minute))}}
+	newTestReaper(t, store, live, events).SweepPredecessor(t.Context())
+
+	if events.Len() != 0 {
+		t.Fatalf("published %d events while serving, want 0", events.Len())
+	}
+	if deleted := store.deletedLegs(); len(deleted) != 0 {
+		t.Fatalf("deleted %v while serving", deleted)
+	}
+}

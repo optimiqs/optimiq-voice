@@ -77,20 +77,24 @@ type stubSessions struct {
 	recordingErr    error
 	recordingStarts []recordingCall
 	recordingStops  []string
+	recordingPauses []recordingPauseCall
 	recording       map[string]string
+	paused          map[string]bool
 	tenancy         map[string][2]string
 
 	// The renegotiation record and the tap pair.
-	directions []directionCall
+	directions    []directionCall
+	seededRemotes []seedCall
 	// The B-leg's accept-answer settle record. `settleErr` forces a failure; `settlePort` fixes the
 	// descriptor's port so a create-offer→accept-answer flow can assert on a stable value.
-	settles    []settleCall
-	settleErr  error
-	settlePort int
-	tapErr     error
-	taps       []rtp.TapOptions
-	untaps     []string
-	tapped     map[string]string
+	settles     []settleCall
+	srtpSettles []string
+	settleErr   error
+	settlePort  int
+	tapErr      error
+	taps        []rtp.TapOptions
+	untaps      []string
+	tapped      map[string]string
 
 	// `muted` is a pair of flags per session because a mute is ADDITIVE and a stub that replaced them
 	// would let a handler bug pass: the handler reads the state back because it cannot derive it.
@@ -125,6 +129,12 @@ type joinCall struct {
 	conferenceID string
 	sessionID    string
 	opts         rtp.JoinOptions
+}
+
+// seedCall is one SeedRemote call: the session and the advertised address it was seeded with.
+type seedCall struct {
+	sessionID string
+	addr      netip.AddrPort
 }
 
 type directionCall struct {
@@ -327,6 +337,28 @@ func (s *stubSessions) StopRecording(recordingRef string) (string, bool) {
 	return sessionID, true
 }
 
+// `PauseRecording` is a flag per live reference: the handler only ever reports it back.
+
+type recordingPauseCall struct {
+	ref    string
+	paused bool
+}
+
+func (s *stubSessions) PauseRecording(recordingRef string, paused bool) (string, bool, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recordingPauses = append(s.recordingPauses, recordingPauseCall{recordingRef, paused})
+	sessionID, ok := s.recording[recordingRef]
+	if !ok {
+		return "", false, false
+	}
+	if s.paused == nil {
+		s.paused = map[string]bool{}
+	}
+	s.paused[recordingRef] = paused
+	return sessionID, true, paused
+}
+
 // `ApplyDirection` records what a renegotiation asked for, so the allocate tests can assert that a
 // `sendonly` offer actually moved the gate rather than merely being accepted.
 
@@ -343,6 +375,36 @@ func (s *stubSessions) ApplyDirection(sessionID string, muteIn, muteOut bool) er
 // SettleAnswer stands in for the packet path's `accept-answer` half: it records the settle and,
 // like the real one, refuses an unknown session and otherwise reports the codec back through the
 // descriptor so a handler that failed to read the settled value would fail these tests.
+// SeedRemote records the address a handler seeded a session's far end with, so the allocate and
+// accept-answer tests can assert that the negotiated `c=`/`m=` reached the packet path.
+func (s *stubSessions) SeedRemote(sessionID string, addr netip.AddrPort) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seededRemotes = append(s.seededRemotes, seedCall{sessionID, addr})
+	if !s.live[sessionID] {
+		return rtp.ErrUnknownSession
+	}
+	return nil
+}
+
+// seeds reports the SeedRemote calls made so far.
+func (s *stubSessions) seeds() []seedCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.seededRemotes)
+}
+
+func (s *stubSessions) SettleSRTP(sessionID string, ctx *rtp.SRTPContext) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.srtpSettles = append(s.srtpSettles, sessionID)
+	if !s.live[sessionID] {
+		return fmt.Errorf("%w: %s", rtp.ErrUnknownSession, sessionID)
+	}
+	_ = ctx
+	return nil
+}
+
 func (s *stubSessions) SettleAnswer(
 	sessionID string,
 	format audio.Format,

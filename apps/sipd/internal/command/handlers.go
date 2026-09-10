@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
@@ -60,10 +61,10 @@ func commandContext() (context.Context, context.CancelFunc) {
 
 // HandleRing answers `rpc.sip.v1.ring`: a provisional response on a leg we have not answered.
 //
-// `180 Ringing` without a body is the whole of it. A `183` carrying an answer is refused
-// `not_supported` rather than half-built, because such a 183 commits the offer/answer exchange and
-// the subsequent 200 OK must repeat that answer (RFC 3261 §13.2.1); getting it wrong is a call that
-// connects with no audio.
+// `180 Ringing` carries no body. A `183` may carry an answer, which commits the offer/answer
+// exchange: the dialog records it so the subsequent 200 OK repeats it byte for byte
+// (RFC 3261 §13.2.1). A body on anything but a 183 is refused — an uncommitted provisional response
+// cannot answer an offer.
 func (s *Server) HandleRing(data []byte) []byte {
 	var request contract.SipRingRequest
 	if err := json.Unmarshal(data, &request); err != nil {
@@ -82,17 +83,19 @@ func (s *Server) HandleRing(data []byte) []byte {
 		return s.refuseRing(request.LegID, ReasonBadRequest,
 			fmt.Sprintf("%d is not a provisional response this edge sends (180-183)", status))
 	}
-	if request.SDPAnswer != nil && *request.SDPAnswer != "" {
-		return s.refuseRing(request.LegID, ReasonNotSupported,
-			"early media is not implemented: a 183 carrying an answer commits the offer/answer "+
-				"exchange and the 200 OK must then repeat it byte for byte (RFC 3261 §13.2.1), and a "+
-				"half-built early media path is a call that connects with no audio")
+	answer := ""
+	if request.SDPAnswer != nil {
+		answer = *request.SDPAnswer
+	}
+	if answer != "" && status != 183 {
+		return s.refuseRing(request.LegID, ReasonBadRequest,
+			fmt.Sprintf("a %d carries no answer: only a 183 commits the offer/answer exchange", status))
 	}
 
 	ctx, cancel := commandContext()
 	defer cancel()
 
-	if err := s.dialogs.Ring(ctx, request.LegID, status, ""); err != nil {
+	if err := s.dialogs.Ring(ctx, request.LegID, status, answer); err != nil {
 		reason, detail := refusalFor(err)
 		s.log.Warn("refusing a ring", "legId", request.LegID, "status", status, "reason", reason, "error", err)
 		return s.refuseRing(request.LegID, reason, detail)
@@ -197,7 +200,14 @@ func (s *Server) HandleHangup(data []byte) []byte {
 	method, err := s.dialogs.Hangup(ctx, request.LegID, cause, detail)
 	if err != nil {
 		reason, message := refusalFor(err)
-		s.log.Warn("refusing a hangup", "legId", request.LegID, "reason", reason, "error", err)
+		// A hangup for a leg this edge never established is the ECHO of an earlier refusal — the
+		// engine tears down what it thinks it dialled — so it says nothing the originate refusal has
+		// not already said. Debug, or a stale binding costs three warnings for one fact.
+		level := levelFor(reason)
+		if reason == ReasonUnknownDialog {
+			level = slog.LevelDebug
+		}
+		s.log.Log(ctx, level, "refusing a hangup", "legId", request.LegID, "reason", reason, "error", err)
 		return s.refuseHangup(request.LegID, reason, message)
 	}
 	if !method.Valid() {
@@ -353,7 +363,7 @@ func (s *Server) HandleOriginate(data []byte) []byte {
 	requestURI, sipCallID, err := s.dialogs.Originate(ctx, request)
 	if err != nil {
 		reason, detail := refusalFor(err)
-		s.log.Warn("refusing an originate",
+		s.log.Log(ctx, levelFor(reason), "refusing an originate",
 			"legId", request.LegID, "orgId", request.OrgID, "callId", request.CallID,
 			"targetKind", string(request.Target.Kind), "reason", reason, "error", err)
 		return s.refuseOriginate(request.LegID, reason, detail)
@@ -414,6 +424,27 @@ func (s *Server) refuseOriginate(legID, reason, message string) []byte {
 // branches on the code and never on it. The default is `internal`: an error this table does not
 // recognise is a failure nobody classified, and `capacity` or `no_route` would be a guess that sends
 // the engine retrying elsewhere.
+// expectedRefusals are the outcomes a healthy platform produces on its own: a phone that closed its
+// tab, a leg the engine has already torn down, a drain. They are recorded as facts about the call,
+// not as warnings about this process, because a warning nobody can act on trains operators to
+// ignore the ones they can.
+var expectedRefusals = map[string]bool{
+	ReasonUnknownDialog:      true,
+	ReasonDialogGone:         true,
+	ReasonInvalidState:       true,
+	ReasonUnregisteredTarget: true,
+	ReasonNoRoute:            true,
+	ReasonShuttingDown:       true,
+}
+
+// levelFor is how loudly a refusal is reported.
+func levelFor(reason string) slog.Level {
+	if expectedRefusals[reason] {
+		return slog.LevelInfo
+	}
+	return slog.LevelWarn
+}
+
 func refusalFor(err error) (reason, detail string) {
 	if err == nil {
 		return ReasonInternal, "no error"

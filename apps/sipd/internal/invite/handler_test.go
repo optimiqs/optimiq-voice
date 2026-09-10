@@ -3,6 +3,7 @@ package invite_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -88,6 +89,7 @@ type harnessOptions struct {
 	profiles    *profile.Set
 	timers      dialog.TimerPolicy
 	lookup      credentials.Store
+	lockout     *registrar.Lockout
 }
 
 func newHarness(t *testing.T, opts harnessOptions) *harness {
@@ -136,6 +138,7 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 		Realm:       testRealm,
 		Auth:        authenticator,
 		Credentials: opts.lookup,
+		Lockout:     opts.lockout,
 		Dialogs:     h.dialogs,
 		Claims:      h.claims,
 		Profiles:    opts.profiles,
@@ -400,6 +403,62 @@ func TestInviteWithAnUnknownAccountIsForbidden(t *testing.T) {
 
 	if got := lastStatus(t, h.send(h.handler.HandleInvite, h.invite(challenge))); got != 403 {
 		t.Errorf("status = %d, want 403", got)
+	}
+}
+
+// The INVITE half of the credential-spray lockout. It shares one Lockout with the registrar, so a
+// spray that alternated methods gets one budget rather than two.
+func TestARepeatedlyRefusedInviteStopsReachingTheCredentialStore(t *testing.T) {
+	lookups := 0
+	lock := registrar.NewLockout(registrar.LockoutPolicy{
+		Threshold: 3, Base: time.Minute, Max: time.Minute, Window: time.Hour, MaxTracked: 64,
+	}, time.Now)
+	h := newHarness(t, harnessOptions{
+		lockout: lock,
+		lookup: countingStore{onLookup: func() { lookups++ }, credential: credentials.Credential{
+			OrgID: testOrg, Username: testUser, Realm: testRealm,
+			HA1: credentials.HA1(testUser, testRealm, "the-real-password"),
+		}},
+	})
+
+	for attempt := range 20 {
+		first := h.send(h.handler.HandleInvite, h.invite(nil))
+		challenge := challengeFrom(t, first[len(first)-1])
+		if got := lastStatus(t, h.send(h.handler.HandleInvite, h.invite(challenge))); got != 403 {
+			t.Fatalf("attempt %d: status = %d, want 403", attempt, got)
+		}
+	}
+	if lookups > 4 {
+		t.Fatalf("20 wrong passwords cost %d credential lookups, want at most 4", lookups)
+	}
+	if stats := lock.Stats(); stats.Refused == 0 {
+		t.Fatalf("the lockout never refused an INVITE: %+v", stats)
+	}
+	if len(h.port.Requests()) != 0 {
+		t.Error("a refused caller reached the broker")
+	}
+}
+
+// countingStore is staticCredentials with a call counter.
+type countingStore struct {
+	credential credentials.Credential
+	onLookup   func()
+}
+
+func (c countingStore) Lookup(context.Context, string, string) (credentials.Credential, error) {
+	c.onLookup()
+	return c.credential, nil
+}
+
+func TestInviteWhenTheCredentialRPCIsUnavailable(t *testing.T) {
+	h := newHarness(t, harnessOptions{
+		lookup: staticCredentials{err: fmt.Errorf("%w: context deadline exceeded", credentials.ErrLookupFailed)},
+	})
+	first := h.send(h.handler.HandleInvite, h.invite(nil))
+	challenge := challengeFrom(t, first[len(first)-1])
+
+	if got := lastStatus(t, h.send(h.handler.HandleInvite, h.invite(challenge))); got != 503 {
+		t.Errorf("status = %d, want 503: no answer from the credential RPC is not a claim about the caller", got)
 	}
 }
 

@@ -44,6 +44,15 @@ func decodeStopRecording(t *testing.T, raw []byte) contract.MediaStopRecordingRe
 	return response
 }
 
+func decodePauseRecording(t *testing.T, raw []byte) contract.MediaPauseRecordingResponse {
+	t.Helper()
+	var response contract.MediaPauseRecordingResponse
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatalf("the pause-recording reply is not the contract: %v", err)
+	}
+	return response
+}
+
 func intPtrOf(value int) *int { return &value }
 
 func TestSendDtmfStartsAnInjectionAndReportsHowLongItWillTake(t *testing.T) {
@@ -492,6 +501,56 @@ func TestStopRecordingRefusesAnEmptyReference(t *testing.T) {
 	}
 }
 
+func TestPauseRecordingReportsTheStateAfterTheCommand(t *testing.T) {
+	// PCI: the agent pauses while the caller reads a card number, and the FILE survives it — which
+	// is why `resume` is a bit on this subject rather than a stop followed by a start.
+	rig := newRig(t)
+	allocateSession(t, rig)
+	rig.server.HandleStartRecording(mustJSON(t,
+		contract.MediaStartRecordingRequest{SessionID: testSession, RecordingRef: "rec-1"}))
+
+	paused := decodePauseRecording(t, rig.server.HandlePauseRecording(mustJSON(t,
+		contract.MediaPauseRecordingRequest{RecordingRef: "rec-1"})))
+	if !paused.Ok || !paused.Applied || !paused.Paused {
+		t.Fatalf("pause-recording = %+v, want ok, applied and paused", paused)
+	}
+	if paused.SessionID == nil || *paused.SessionID != testSession {
+		t.Errorf("sessionId = %v, want the session mediad looked up for itself", paused.SessionID)
+	}
+
+	resumed := decodePauseRecording(t, rig.server.HandlePauseRecording(mustJSON(t,
+		contract.MediaPauseRecordingRequest{RecordingRef: "rec-1", Resume: true})))
+	if !resumed.Ok || !resumed.Applied || resumed.Paused {
+		t.Fatalf("resume = %+v, want ok, applied and not paused", resumed)
+	}
+}
+
+func TestPauseRecordingOfAFinishedRecordingIsASuccess(t *testing.T) {
+	// The same SUCCESS `stop-recording` reports for the same reason: the recording may have
+	// finalised itself before the command arrived.
+	rig := newRig(t)
+
+	response := decodePauseRecording(t, rig.server.HandlePauseRecording(mustJSON(t,
+		contract.MediaPauseRecordingRequest{RecordingRef: "long-gone"})))
+
+	if !response.Ok {
+		t.Error("pausing a finished recording answered a failure")
+	}
+	if response.Applied || response.Paused {
+		t.Errorf("pause of a reference nothing is recording = %+v, want applied and paused false",
+			response)
+	}
+}
+
+func TestPauseRecordingRefusesAnEmptyReference(t *testing.T) {
+	rig := newRig(t)
+	response := decodePauseRecording(t, rig.server.HandlePauseRecording(mustJSON(t,
+		contract.MediaPauseRecordingRequest{})))
+	if response.Ok || response.Reason == nil || string(*response.Reason) != "bad_request" {
+		t.Errorf("an empty recordingRef answered %+v, want a bad_request refusal", response)
+	}
+}
+
 func TestRecordingHandlersAreOnTheSubscriptionTable(t *testing.T) {
 	// The subject constants come from packages/events-go, so a rename in the Zod source is a compile
 	// error here rather than a subject nothing answers on.
@@ -499,6 +558,7 @@ func TestRecordingHandlersAreOnTheSubscriptionTable(t *testing.T) {
 		contract.SubjectMediaSendDtmfRPC,
 		contract.SubjectMediaStartRecordingRPC,
 		contract.SubjectMediaStopRecordingRPC,
+		contract.SubjectMediaPauseRecordingRPC,
 	} {
 		if !strings.HasPrefix(subject, "rpc.media.v1.") {
 			t.Errorf("subject %q is not in the media command family", subject)

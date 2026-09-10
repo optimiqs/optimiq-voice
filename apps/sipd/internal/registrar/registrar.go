@@ -6,6 +6,7 @@
 package registrar
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/emiago/sipgo/sip"
 	location "github.com/optimiqs/optimiq-voice/apps/sipd/internal/aor"
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/profile"
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/credentials"
@@ -33,6 +35,7 @@ const (
 	statusNotImplemented   = 501
 	statusServerError      = 500
 	statusIntervalTooBrief = 423
+	statusUnavailable      = 503
 )
 
 // allowedMethods is the Allow header. It lists only methods this edge actually answers: a phone
@@ -49,10 +52,19 @@ type Options struct {
 	Auth  *Authenticator
 	// Expiry clamps the interval a device asks for.
 	Expiry ExpiryPolicy
+	// RegistrationACL is the `scope=registration` blocklist, consulted before anything else on the
+	// REGISTER path. Nil disables the check, which is what a deployment with no such entries wants.
+	RegistrationACL *profile.ACL
+	// Lockout throttles credential guessing. Shared with every other handler that authenticates, so
+	// a spray cannot get one budget per method. Nil disables it.
+	Lockout *Lockout
 	// Credentials resolves the account behind an AOR.
 	Credentials credentials.Store
 	// Bindings is the location service (the registrations KV bucket in production).
 	Bindings kv.Store
+	// Connections probes the transport layer for a connection-bound binding's socket. Nil disables
+	// the unreachable sweep entirely, which is what a process with no WebSocket listener wants.
+	Connections ConnectionProbe
 	// Publisher emits the transition events. Failures here never fail a REGISTER — see bind().
 	Publisher events.Publisher
 
@@ -83,8 +95,11 @@ type Registrar struct {
 	realm       string
 	auth        *Authenticator
 	expiry      ExpiryPolicy
+	sourceACL   *profile.ACL
+	lockout     *Lockout
 	creds       credentials.Store
 	bindings    kv.Store
+	connections ConnectionProbe
 	publisher   events.Publisher
 
 	log           *slog.Logger
@@ -95,6 +110,9 @@ type Registrar struct {
 	baseCtx       context.Context
 	opTimeout     time.Duration
 	now           func() time.Time
+
+	// authFailures bounds how often a refused REGISTER is reported. See AuthFailureInterval.
+	authFailures *authFailureLimiter
 
 	// mu guards tracked. Bindings granted by this instance are tracked locally so their exact
 	// deadline is known; see Run for why the KV bucket's TTL is not that deadline.
@@ -130,8 +148,11 @@ func New(opts Options) (*Registrar, error) {
 		realm:         opts.Realm,
 		auth:          opts.Auth,
 		expiry:        opts.Expiry,
+		sourceACL:     opts.RegistrationACL,
+		lockout:       opts.Lockout,
 		creds:         opts.Credentials,
 		bindings:      opts.Bindings,
+		connections:   opts.Connections,
 		publisher:     opts.Publisher,
 		log:           opts.Logger,
 		source:        opts.Source,
@@ -141,6 +162,7 @@ func New(opts Options) (*Registrar, error) {
 		baseCtx:       opts.BaseContext,
 		opTimeout:     opts.OperationTimeout,
 		now:           opts.Now,
+		authFailures:  newAuthFailureLimiter(AuthFailureInterval),
 		tracked:       make(map[string]kv.Binding),
 	}
 	if registrar.log == nil {
@@ -180,6 +202,10 @@ func (r *Registrar) HandleRegister(req *sip.Request, tx sip.ServerTransaction) {
 
 	log := &requestLog{base: r.log, req: req}
 
+	if !r.admitSource(req, tx, log) {
+		return
+	}
+
 	aor, user, ok := addressOfRecord(req)
 	if !ok {
 		log.Info("rejecting a REGISTER with no usable To address")
@@ -188,7 +214,7 @@ func (r *Registrar) HandleRegister(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	log.aor = aor
 
-	credential, authorized := r.authorize(ctx, req, tx, user, log)
+	credential, authorized := r.authorize(ctx, req, tx, aor, user, log)
 	if !authorized {
 		return
 	}
@@ -208,6 +234,29 @@ func (r *Registrar) HandleRegister(req *sip.Request, tx sip.ServerTransaction) {
 	}
 
 	r.updateRegistration(ctx, req, tx, credential, aor, aorHash, contacts, log)
+}
+
+// admitSource evaluates the `scope=registration` ACL against the OBSERVED transport source, before
+// the AOR is parsed, before a credential is looked up and before a challenge is minted.
+//
+// First rather than after authentication, because that is the whole value of the rule: a blocked
+// network's REGISTER storm costs one longest-prefix match instead of a credential lookup and a
+// nonce per packet. It is a blocklist in front of the digest and never a substitute for it — see
+// profile.NewWatchedBlocklist.
+func (r *Registrar) admitSource(req *sip.Request, tx sip.ServerTransaction, log *requestLog) bool {
+	if r.sourceACL == nil {
+		return true
+	}
+	entry, allowed := r.sourceACL.Match(req.Source())
+	if allowed {
+		return true
+	}
+	// 403 and not 401: the address is refused whatever credential it holds, and a challenge would
+	// invite the retry loop the rule exists to stop.
+	log.Info("refusing a REGISTER from a source outside the registration ACL",
+		"rule", entry.Label, "network", entry.Prefix.String())
+	r.respond(tx, req, statusForbidden, "Forbidden")
+	return false
 }
 
 // HandleOptions answers the liveness keepalive. It is unconditional and unauthenticated, so a slow
@@ -239,14 +288,24 @@ func (r *Registrar) HandleUnsupported(req *sip.Request, tx sip.ServerTransaction
 // retry. Everything else gets a final 403: re-challenging a wrong password loops some phones for
 // ever, and wrong password, unknown account and disabled account are answered identically so the
 // response cannot be used to enumerate extensions.
+//
+// The failures reported as `auth-failed` are exactly those reached AFTER the credential lookup, so
+// the organization on the event's subject is one the directory answered with rather than one this
+// edge guessed from a header an attacker wrote.
 func (r *Registrar) authorize(
 	ctx context.Context,
 	req *sip.Request,
 	tx sip.ServerTransaction,
-	aorUser string,
+	aor, aorUser string,
 	log *requestLog,
 ) (credentials.Credential, bool) {
 	accountAuth := r.auth.ForRequest(req)
+	if RequestRealm(req) == "" {
+		// No tenant matched: the request named no domain, so the challenge carries the deployment
+		// default. Logged because a fleet serving several tenants should see none of these.
+		log.Info("challenging with the deployment default realm: the request named no domain",
+			"realm", accountAuth.Realm())
+	}
 	auth, err := ParseAuthorization(headerValue(req, "Authorization"))
 	if err != nil {
 		if errors.Is(err, ErrNoAuthorization) {
@@ -276,32 +335,85 @@ func (r *Registrar) authorize(
 		return credentials.Credential{}, false
 	}
 
+	// Before the lookup, and answered exactly as an unknown account is: a spray that could tell a
+	// locked account from an absent one would have an enumeration oracle, and one that reached the
+	// directory at all would cost an RPC per packet.
+	if refusal, locked := r.lockout.Locked(req.Source(), auth.Username); locked {
+		log.Info("refusing a REGISTER from a locked source",
+			"username", auth.Username, "retryAfterSeconds", int(refusal.RetryAfter.Seconds()),
+			"scope", lockoutScope(refusal))
+		r.publishAuthFailure(ctx, req, refusal.OrgID, cmp.Or(refusal.AOR, aor), auth.Username,
+			contract.RegistrationAuthFailedReasonBadCredentials, true)
+		r.respond(tx, req, statusForbidden, "Forbidden")
+		return credentials.Credential{}, false
+	}
+
 	credential, err := r.creds.Lookup(ctx, accountAuth.Realm(), auth.Username)
 	if err != nil {
-		// Unknown and disabled are logged apart and answered the same.
+		status, reason := statusForbidden, "Forbidden"
 		switch {
 		case errors.Is(err, credentials.ErrNotFound):
+			// A guess at an account that exists nowhere still counts: a spray that walked extension
+			// numbers rather than passwords would otherwise never trip the source cap.
+			r.lockout.Fail(req.Source(), auth.Username, "", "")
 			log.Info("rejecting an unknown account", "username", auth.Username)
 		case errors.Is(err, credentials.ErrDisabled):
 			log.Info("rejecting a disabled account", "username", auth.Username)
 		default:
+			// No answer from the credential RPC is not a claim about this account: a 403 tells the
+			// phone its credentials are wrong and most handsets stop retrying, so a burst that
+			// exceeds the responder's deadline would black out a fleet until somebody re-provisions
+			// it. 503 is the retriable answer (RFC 3261 §21.5.4).
 			log.Error("cannot look up the account", "username", auth.Username, "error", err)
+			status, reason = statusUnavailable, "Service Unavailable"
 		}
-		r.respond(tx, req, statusForbidden, "Forbidden")
+		r.respond(tx, req, status, reason)
 		return credentials.Credential{}, false
 	}
 
 	if err := accountAuth.VerifyRequest(req, auth, credential.HA1); err != nil {
 		if errors.Is(err, ErrNonceStale) {
+			// A replayed nonce count is a captured credential being re-sent, not the honest expiry
+			// the rest of this branch handles, so it is the only stale case worth recording.
+			if errors.Is(err, ErrNonceReplayed) {
+				r.publishAuthFailure(ctx, req, credential.OrgID, aor, auth.Username,
+					contract.RegistrationAuthFailedReasonStaleNonce, false)
+			}
 			r.challenge(req, tx, true, log)
 			return credentials.Credential{}, false
 		}
+		// A digest that does not verify is the ONLY signal this edge gets that the HA1 it holds may
+		// be the previous one: the credential RPC is pull-only and apps/api publishes nothing when a
+		// SIP secret is rotated, so there is no invalidation to subscribe to. Re-ask once — the
+		// store rate-bounds it — and re-verify, or a rotation refuses a correctly re-REGISTERing
+		// phone for a whole positive TTL.
+		if fresh, refreshed := r.refresh(ctx, accountAuth.Realm(), auth.Username, credential); refreshed {
+			if retry := accountAuth.VerifyRequest(req, auth, fresh.HA1); retry == nil {
+				log.Info("accepting a REGISTER against a re-fetched credential; the cached one was stale",
+					"username", auth.Username)
+				r.lockout.Succeed(req.Source(), auth.Username)
+				return fresh, true
+			}
+		}
+		r.lockout.Fail(req.Source(), auth.Username, credential.OrgID, aor)
 		log.Warn("rejecting a failed digest", "username", auth.Username, "reason", err)
+		r.publishAuthFailure(ctx, req, credential.OrgID, aor, auth.Username,
+			contract.RegistrationAuthFailedReasonBadCredentials, false)
 		r.respond(tx, req, statusForbidden, "Forbidden")
 		return credentials.Credential{}, false
 	}
 
+	r.lockout.Succeed(req.Source(), auth.Username)
 	return credential, true
+}
+
+// lockoutScope names which counter refused, for the log line an operator reads when a whole office
+// stops registering.
+func lockoutScope(refusal LockoutRefusal) string {
+	if refusal.Source {
+		return "source"
+	}
+	return "account"
 }
 
 func (r *Registrar) respondWithCurrentBinding(
@@ -345,6 +457,9 @@ func (r *Registrar) Run(ctx context.Context) error {
 		case <-ticker.C:
 			if swept := r.Sweep(ctx); swept > 0 {
 				r.log.Info("swept lapsed bindings", "count", swept)
+			}
+			if swept := r.SweepUnreachable(ctx); swept > 0 {
+				r.log.Info("swept bindings whose connection closed", "count", swept)
 			}
 		}
 	}

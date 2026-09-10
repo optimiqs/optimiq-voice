@@ -2,6 +2,7 @@ package registrar_test
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -113,7 +114,11 @@ func (s staticCredentials) Lookup(_ context.Context, _, _ string) (credentials.C
 	return s.credential, nil
 }
 
-func newHarness(t *testing.T, lookup credentials.Store) *harness {
+// harnessOption adjusts the registrar the harness builds, for the tests that need a source ACL or
+// a connection probe.
+type harnessOption func(*registrar.Options)
+
+func newHarness(t *testing.T, lookup credentials.Store, options ...harnessOption) *harness {
 	t.Helper()
 
 	authenticator, err := registrar.NewAuthenticator(testRealm, []byte("test-nonce-secret"), time.Minute)
@@ -145,7 +150,7 @@ func newHarness(t *testing.T, lookup credentials.Store) *harness {
 		}}
 	}
 
-	reg, err := registrar.New(registrar.Options{
+	opts := registrar.Options{
 		Realm:       testRealm,
 		Auth:        authenticator,
 		Expiry:      registrar.ExpiryPolicy{Min: 60 * time.Second, Max: time.Hour, Default: 300 * time.Second},
@@ -156,7 +161,11 @@ func newHarness(t *testing.T, lookup credentials.Store) *harness {
 		Source:      "sipd",
 		BaseContext: t.Context(),
 		Now:         func() time.Time { return h.now },
-	})
+	}
+	for _, option := range options {
+		option(&opts)
+	}
+	reg, err := registrar.New(opts)
 	if err != nil {
 		t.Fatalf("registrar.New: %v", err)
 	}
@@ -786,6 +795,15 @@ func TestUnknownAccountAndForeignAORAreRefused(t *testing.T) {
 		if res.StatusCode != 403 {
 			t.Errorf("status = %d, want the same 403 an unknown account gets, so the response "+
 				"cannot be used to enumerate extensions", res.StatusCode)
+		}
+	})
+
+	t.Run("credential RPC unavailable", func(t *testing.T) {
+		h := newHarness(t, staticCredentials{err: fmt.Errorf("%w: context deadline exceeded", credentials.ErrLookupFailed)})
+		res := h.register(contactHeader("sip:1001@203.0.113.9:5060"))
+		if res.StatusCode != 503 {
+			t.Errorf("status = %d, want 503: no answer from the credential RPC is not a claim about "+
+				"the account, and a 403 stops most handsets retrying", res.StatusCode)
 		}
 	})
 

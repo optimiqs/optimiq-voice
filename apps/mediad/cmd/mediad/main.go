@@ -29,6 +29,7 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/control"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/directory"
 	mediaevents "github.com/optimiqs/optimiq-voice/apps/mediad/internal/events"
+	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/metrics"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 	secure "github.com/optimiqs/optimiq-voice/apps/mediad/internal/webrtc"
 )
@@ -138,13 +139,17 @@ func run() error {
 	announcer := control.NewLifecycleAnnouncer(
 		mediaevents.NewJetStreamPublisher(js), sessionDirectory, cfg.InstanceID, log)
 
+	// Telemetry, fed by decorating the lifecycle the Manager already calls. No switch, for the
+	// reason sipd states: a Prometheus registry is not a denial-of-service surface the way pprof is.
+	mediadMetrics := metrics.New()
+
 	manager, err := rtp.NewManager(rtp.ManagerOptions{
 		Allocator:      allocator,
 		PublicAddr:     cfg.PublicIP,
 		IdleAfter:      cfg.SessionIdleTimeout,
 		RTPTimeout:     cfg.RTPTimeout,
 		EchoDiagnostic: cfg.EchoDiagnostic,
-		Lifecycle:      announcer,
+		Lifecycle:      mediadMetrics.Observe(announcer),
 		Logger:         log,
 	})
 	if err != nil {
@@ -186,11 +191,16 @@ func run() error {
 		RecordingsDir: cfg.RecordingsDir,
 		InstanceID:    cfg.InstanceID,
 		PublicAddr:    cfg.PublicIP,
+		SRTPPolicy:    cfg.SRTPPolicy,
 		Logger:        log,
 	})
 	if err != nil {
 		return err
 	}
+	mediadMetrics.Gauge("sessions", "Media sessions this instance holds.", manager.Len)
+	mediadMetrics.Gauge("session_capacity", "Sessions the configured RTP port range can hold.",
+		manager.Capacity)
+
 	subscriptions, err := server.Subscribe(conn, queueGroup)
 	if err != nil {
 		return err
@@ -201,7 +211,7 @@ func run() error {
 	}
 	healthServer, err := health.Start(ctx, cfg.HealthAddr,
 		func() bool { return conn.IsConnected() && !cfg.EchoDiagnostic },
-		health.WithPprof(cfg.EnablePprof))
+		health.WithPprof(cfg.EnablePprof), health.WithMetrics(mediadMetrics.Handler()))
 	if err != nil {
 		return err
 	}

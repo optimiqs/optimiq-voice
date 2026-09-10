@@ -352,3 +352,84 @@ func TestCacheEvictionSweepIsRateLimited(t *testing.T) {
 		t.Errorf("cache holds %d entries, want the ceiling of 8 held by a single-entry eviction", store.Len())
 	}
 }
+
+// A rotated SIP secret leaves the cache holding the previous ha1 and there is no invalidation
+// channel to hear about it on, so a failed digest provokes the re-ask. It has to be bounded: a
+// failed digest is far more often a wrong password than a rotation.
+func TestRefreshReAsksOncePerAccountPerInterval(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	var asked atomic.Int64
+	store := &NATSStore{
+		cache:       map[string]cacheEntry{},
+		lastRefresh: map[string]time.Time{},
+		maxEntries:  16,
+		positiveTTL: 30 * time.Second,
+		negativeTTL: 10 * time.Second,
+		refreshTTL:  5 * time.Second,
+		now:         func() time.Time { return now },
+	}
+	store.rpc = func(_ context.Context, realm, username string) (Credential, error) {
+		asked.Add(1)
+		return Credential{OrgID: "org", Realm: realm, Username: username, HA1: testHA1}, nil
+	}
+
+	const realm, user = "acme.example.com", "1001"
+	key := lookupKey(realm, user)
+	store.store(key, cacheEntry{
+		credential: Credential{OrgID: "org", Realm: realm, Username: user, HA1: strings.Repeat("a", 32)},
+		expires:    now.Add(30 * time.Second),
+	})
+
+	// The first re-ask evicts and goes to the responder, so the rotated ha1 arrives immediately
+	// rather than on the positive TTL.
+	refreshed, err := store.Refresh(t.Context(), realm, user)
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if refreshed.HA1 != testHA1 {
+		t.Fatalf("ha1 = %q, want the re-fetched one", refreshed.HA1)
+	}
+	if asked.Load() != 1 {
+		t.Fatalf("asked the responder %d times, want 1", asked.Load())
+	}
+
+	// Everything inside the interval is answered from the cache the first re-ask installed: a spray
+	// against one account must not become one RPC per packet.
+	for range 20 {
+		if _, err := store.Refresh(t.Context(), realm, user); err != nil {
+			t.Fatalf("Refresh: %v", err)
+		}
+	}
+	if asked.Load() != 1 {
+		t.Fatalf("asked the responder %d times inside the interval, want 1", asked.Load())
+	}
+
+	now = now.Add(5 * time.Second)
+	if _, err := store.Refresh(t.Context(), realm, user); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if asked.Load() != 2 {
+		t.Fatalf("asked the responder %d times after the interval, want 2", asked.Load())
+	}
+}
+
+// The refresh table is keyed on an attacker-chosen username, so it is bounded like the cache.
+func TestTheRefreshTableIsBounded(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	store := &NATSStore{
+		cache:       map[string]cacheEntry{},
+		lastRefresh: map[string]time.Time{},
+		maxEntries:  8,
+		refreshTTL:  5 * time.Second,
+		now:         func() time.Time { return now },
+	}
+	for i := range 100 {
+		store.admitRefresh(lookupKey("acme.example.com", strconv.Itoa(i)))
+	}
+	store.mu.Lock()
+	held := len(store.lastRefresh)
+	store.mu.Unlock()
+	if held > store.maxEntries {
+		t.Fatalf("the refresh table holds %d entries, above the %d bound", held, store.maxEntries)
+	}
+}

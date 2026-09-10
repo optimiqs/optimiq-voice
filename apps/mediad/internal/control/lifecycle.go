@@ -290,6 +290,7 @@ func (a *LifecycleAnnouncer) RecordingFinished(
 		Bytes:        int(recording.Bytes),
 		ObjectKey:    recording.ObjectKey,
 		Direction:    contract.MediaRecordingFinishedDirection(recording.Direction),
+		Pauses:       recordingPauses(recording.Pauses),
 		Detail:       stringPtr(recording.Detail),
 	}
 
@@ -305,6 +306,23 @@ func (a *LifecycleAnnouncer) RecordingFinished(
 				Data:    data,
 			})
 	}, "recording.finished", session.SessionID)
+}
+
+// recordingPauses is the PCI half of the payload: every stretch `pause-recording` silenced, against
+// the file's own timeline. Nil when nothing was paused, so the field is absent on the wire rather
+// than an empty array — the two mean the same thing and one of them is smaller.
+func recordingPauses(pauses []rtp.RecordingPause) []contract.MediaRecordingFinishedPauses {
+	if len(pauses) == 0 {
+		return nil
+	}
+	out := make([]contract.MediaRecordingFinishedPauses, 0, len(pauses))
+	for _, pause := range pauses {
+		out = append(out, contract.MediaRecordingFinishedPauses{
+			StartMs: pause.StartMs,
+			EndMs:   pause.EndMs,
+		})
+	}
+	return out
 }
 
 // DtmfReceived publishes `dtmf.received`, one event per KEYPRESS.

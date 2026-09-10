@@ -3,6 +3,7 @@ package transfer_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/credentials"
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/dialog"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/kv"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/registrar"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/transfer"
@@ -35,6 +37,9 @@ const (
 	testPass  = "s3cret"
 	testAOR   = "sip:1001@acme.example.com"
 	testCall  = "3c26700c1adf-6qgy0fkn7cvb"
+	// The From JsSIP puts on an in-dialog REFER for a session the referrer ANSWERED: the dialog's
+	// local URI, which is an anonymous instance URI no credential can be found for.
+	testInstanceURI = "sip:mdokeqt0@bnttdi537va5.invalid;transport=ws"
 )
 
 type fakeRequester struct {
@@ -104,6 +109,7 @@ func (s staticCredentials) Lookup(context.Context, string, string) (credentials.
 type harness struct {
 	t         *testing.T
 	handler   *transfer.Handler
+	dialogs   transfer.Dialogs
 	requester *fakeRequester
 	notifier  *recordingNotifier
 	bindings  *kv.MemoryStore
@@ -118,6 +124,9 @@ type harnessOptions struct {
 	requestErr  error
 	unregistred bool
 	expired     bool
+	// dialog wires a dialog table holding one ANSWERED dialog for testCall, whose account is
+	// testAOR: the answering party's orientation.
+	dialog bool
 }
 
 func newHarness(t *testing.T, opts harnessOptions) *harness {
@@ -177,10 +186,15 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 		}
 	}
 
+	if opts.dialog {
+		h.dialogs = h.answeredDialog(t)
+	}
+
 	handler, err := transfer.New(transfer.Options{
 		Realm:       testRealm,
 		Auth:        authenticator,
 		Credentials: lookup,
+		Dialogs:     h.dialogs,
 		Bindings:    h.bindings,
 		Transfers:   h.requester,
 		Notifier:    h.notifier,
@@ -194,6 +208,55 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 	}
 	h.handler = handler
 	return h
+}
+
+// answeredDialog builds the dialog table as it looks on the leg sipd dialled to the party that
+// ANSWERED: our tag in To, theirs in From, and the AOR we resolved to reach them.
+func (h *harness) answeredDialog(t *testing.T) *dialog.Store {
+	t.Helper()
+	store := dialog.NewStore(dialog.StoreOptions{InstanceID: "sipd-test", Now: func() time.Time { return h.now }})
+	created, err := dialog.New(dialog.Options{
+		LegID:      "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b52",
+		OrgID:      testOrg,
+		Role:       dialog.RoleUAC,
+		Identity:   dialog.Identity{SIPCallID: testCall, LocalTag: "totag", RemoteTag: "fromtag"},
+		AccountAOR: testAOR,
+		Now:        func() time.Time { return h.now },
+	})
+	if err != nil {
+		t.Fatalf("dialog.New: %v", err)
+	}
+	for _, in := range []dialog.Input{
+		{Trigger: dialog.TriggerRemoteProvisional},
+		{Trigger: dialog.TriggerRemoteEarly, RemoteTag: "fromtag"},
+		{Trigger: dialog.TriggerRemoteAnswer, RemoteTag: "fromtag"},
+	} {
+		if _, err := created.Apply(in); err != nil {
+			t.Fatalf("Apply(%v): %v", in.Trigger, err)
+		}
+	}
+	if err := store.Insert(created); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	return store
+}
+
+// referAs sends ONE unauthenticated REFER with the given dialog identifiers and From URI.
+func (h *harness) referAs(callID, fromURI, fromTag string) *sip.Response {
+	h.t.Helper()
+	req := h.newRefer("")
+	if header := req.CallID(); header != nil {
+		*header = sip.CallIDHeader(callID)
+	}
+	from := req.From()
+	uri := sip.Uri{}
+	if err := sip.ParseUri(fromURI, &uri); err != nil {
+		h.t.Fatalf("ParseUri(%q): %v", fromURI, err)
+	}
+	from.Address = uri
+	from.Params.Remove("tag")
+	from.Params.Add("tag", fromTag)
+	return h.send(req)
 }
 
 // refer performs the full two-legged digest exchange and returns the FINAL response.
@@ -456,6 +519,16 @@ func TestReferForADisabledAccountIsRefused(t *testing.T) {
 	}
 }
 
+func TestReferWhenTheCredentialRPCIsUnavailable(t *testing.T) {
+	h := newHarness(t, harnessOptions{
+		lookup: staticCredentials{err: fmt.Errorf("%w: context deadline exceeded", credentials.ErrLookupFailed)},
+	})
+
+	if res := h.refer(); res.StatusCode != 503 {
+		t.Fatalf("status = %d, want 503: no answer from the credential RPC is not a claim about the referrer", res.StatusCode)
+	}
+}
+
 func TestReferWithNoTargetIsABadRequest(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 
@@ -602,4 +675,81 @@ func headerOf(t *testing.T, req *sip.Request, name string) string {
 		t.Fatalf("the NOTIFY carried no %s header", name)
 	}
 	return header.Value()
+}
+
+// The failure E2E-final2.md row 5b captured: the party who ANSWERED refers, JsSIP writes the
+// dialog's anonymous local URI into the From, and the digest path challenges an account that cannot
+// exist. Membership of the established dialog is the authorisation instead (RFC 3261 §12.2).
+func TestReferFromTheAnsweringPartyIsAuthorisedByItsDialog(t *testing.T) {
+	h := newHarness(t, harnessOptions{dialog: true, response: contract.SipTransferResponse{Ok: true}})
+
+	res := h.referAs(testCall, testInstanceURI, "fromtag")
+
+	if res.StatusCode != 202 {
+		t.Fatalf("status = %d, want 202: an in-dialog REFER carries no digestable identity", res.StatusCode)
+	}
+	seen := h.requester.seen()
+	if len(seen) != 1 {
+		t.Fatalf("issued %d requests, want 1", len(seen))
+	}
+	// The acting identity is the DIALOG's extension, never the anonymous URI on the wire.
+	if seen[0].OrgID != testOrg || seen[0].ReferredBy.AOR != testAOR ||
+		seen[0].ReferredBy.Username != testUser {
+		t.Errorf("referredBy = %+v in org %q, want the dialog's own account",
+			seen[0].ReferredBy, seen[0].OrgID)
+	}
+	if seen[0].ReferredBy.ExtensionID == nil || seen[0].ReferredBy.DeviceID == nil {
+		t.Error("the inventory ids of the dialog's account must travel with the request")
+	}
+	if frags := h.notifier.frags(); len(frags) != 2 || frags[1] != transfer.FragOK {
+		t.Errorf("sipfrags = %v, want the transfer to be reported as done", frags)
+	}
+}
+
+func TestReferClaimingADialogWithTheWrongTagIsChallenged(t *testing.T) {
+	// Both tags are unguessable secrets shared only with the dialog's peers. Knowing the Call-ID is
+	// not membership, so the digest path takes over and the anonymous URI has no account.
+	h := newHarness(t, harnessOptions{dialog: true})
+
+	res := h.referAs(testCall, testInstanceURI, "guessed")
+
+	if res.StatusCode != 401 {
+		t.Fatalf("status = %d, want 401", res.StatusCode)
+	}
+	if seen := h.requester.seen(); len(seen) != 0 {
+		t.Errorf("issued %d requests; nothing may reach the broker", len(seen))
+	}
+}
+
+func TestReferOutOfDialogFromAnUnknownIdentityIsStillChallenged(t *testing.T) {
+	h := newHarness(t, harnessOptions{dialog: true})
+
+	// A different Call-ID: no dialog to be a member of, so the digest path is unchanged.
+	res := h.referAs("some-other-call", testInstanceURI, "fromtag")
+
+	if res.StatusCode != 401 {
+		t.Fatalf("status = %d, want 401", res.StatusCode)
+	}
+}
+
+// The caller orientation, which already worked: a digest-authenticated REFER whose dialog this
+// instance does not hold is accepted exactly as before.
+func TestReferOnTheDigestPathIsUnchangedByTheDialogTable(t *testing.T) {
+	h := newHarness(t, harnessOptions{dialog: true, response: contract.SipTransferResponse{Ok: true}})
+
+	req := h.newRefer("")
+	if callID := req.CallID(); callID != nil {
+		*callID = sip.CallIDHeader("some-other-call")
+	}
+	challenge := h.send(req)
+	if challenge.StatusCode != 401 {
+		t.Fatalf("status = %d, want 401", challenge.StatusCode)
+	}
+	authorized := h.newRefer(h.answerChallenge(challenge, "REFER"))
+	if callID := authorized.CallID(); callID != nil {
+		*callID = sip.CallIDHeader("some-other-call")
+	}
+	if res := h.send(authorized); res.StatusCode != 202 {
+		t.Fatalf("status = %d, want 202", res.StatusCode)
+	}
 }

@@ -1,9 +1,12 @@
 package command
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -197,24 +200,29 @@ func TestAnswerRefusesAnEmptyBody(t *testing.T) {
 	}
 }
 
-// Early media is refused by NAME. A 183 carrying an answer commits the offer/answer exchange and
-// the 200 must then repeat it byte for byte (RFC 3261 §13.2.1); a half-built path is a call that
-// connects with no audio.
-func TestRingRefusesEarlyMediaAndSaysWhy(t *testing.T) {
+// A 183 carries its answer through to the dialog layer, which commits it so the 200 OK can repeat
+// it (RFC 3261 §13.2.1). A body on a 180 is refused: that response commits nothing.
+func TestRingCarriesAnEarlyAnswerOnA183AndRefusesOneOnA180(t *testing.T) {
 	answer := "v=0\r\n"
-	server := newTestServer(t, &stubDialogs{})
+	dialogs := &stubDialogs{}
+	server := newTestServer(t, dialogs)
 
 	reply := decode[contract.SipRingResponse](t,
 		server.HandleRing(mustJSON(t, contract.SipRingRequest{LegID: "leg-1", Status: 183, SDPAnswer: &answer})))
+	if !reply.Ok {
+		t.Fatalf("early media refused: %+v", reply)
+	}
+	if dialogs.ringStatus != 183 || dialogs.ringAnswer != answer {
+		t.Fatalf("ring(status=%d, answer=%q), want (183, %q)", dialogs.ringStatus, dialogs.ringAnswer, answer)
+	}
 
-	if reply.Ok {
-		t.Fatal("early media was accepted")
+	onA180 := decode[contract.SipRingResponse](t,
+		server.HandleRing(mustJSON(t, contract.SipRingRequest{LegID: "leg-1", Status: 180, SDPAnswer: &answer})))
+	if onA180.Ok {
+		t.Fatal("a 180 was allowed to carry an answer")
 	}
-	if reply.Reason == nil || string(*reply.Reason) != ReasonNotSupported {
-		t.Fatalf("reason = %v, want %q", reply.Reason, ReasonNotSupported)
-	}
-	if reply.Error == nil || !strings.Contains(*reply.Error, "13.2.1") {
-		t.Fatalf("error = %v, want it to cite the RFC that decides it", reply.Error)
+	if onA180.Reason == nil || string(*onA180.Reason) != ReasonBadRequest {
+		t.Fatalf("reason = %v, want %q", onA180.Reason, ReasonBadRequest)
 	}
 }
 
@@ -426,4 +434,64 @@ func mustJSON(t *testing.T, value any) []byte {
 		t.Fatalf("cannot encode %T: %v", value, err)
 	}
 	return payload
+}
+
+// A stale WebSocket binding used to cost three warnings for one fact: a refused originate, the
+// engine's teardown of the leg it thought it had, and the engine's own echo of both. Only the first
+// says anything, and none of it is this process's health.
+func TestARefusalIsOnlyLoudWhenSomebodyCanActOnIt(t *testing.T) {
+	for reason, want := range map[string]slog.Level{
+		ReasonUnknownDialog:      slog.LevelInfo,
+		ReasonDialogGone:         slog.LevelInfo,
+		ReasonUnregisteredTarget: slog.LevelInfo,
+		ReasonNoRoute:            slog.LevelInfo,
+		ReasonShuttingDown:       slog.LevelInfo,
+		ReasonInternal:           slog.LevelWarn,
+		ReasonBadRequest:         slog.LevelWarn,
+		ReasonCapacity:           slog.LevelWarn,
+		ReasonUnknownTrunk:       slog.LevelWarn,
+	} {
+		if got := levelFor(reason); got != want {
+			t.Errorf("levelFor(%q) = %v, want %v", reason, got, want)
+		}
+	}
+}
+
+func TestAStaleBindingLeavesNoWarning(t *testing.T) {
+	var sink bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&sink, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	dialogs := &stubDialogs{
+		originateErr: fmt.Errorf("dialling: %w", dialog.ErrNoRoute),
+		hangupErr:    fmt.Errorf("hangup: %w", dialog.ErrUnknownDialog),
+	}
+	server, err := NewServer(Options{Dialogs: dialogs, InstanceID: "sipd-test", Logger: log})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	aorTarget := "sip:1001@local.test"
+	originate := decode[contract.SipOriginateResponse](t, server.HandleOriginate(mustJSON(t, contract.SipOriginateRequest{
+		LegID:    "leg-1",
+		OrgID:    "org-1",
+		CallID:   "call-1",
+		SDPOffer: "v=0\r\n",
+		Target:   contract.SipOriginateRequestTarget{Kind: contract.SipOriginateRequestTargetKindAOR, AOR: &aorTarget},
+	})))
+	if originate.Ok {
+		t.Fatal("the originate must still be refused")
+	}
+	hangup := decode[contract.SipHangupResponse](t, server.HandleHangup(mustJSON(t, contract.SipHangupRequest{LegID: "leg-1"})))
+	if hangup.Ok {
+		t.Fatal("the hangup must still be refused")
+	}
+
+	if strings.Contains(sink.String(), `"level":"WARN"`) || strings.Contains(sink.String(), `"level":"ERROR"`) {
+		t.Errorf("a stale binding must not warn:\n%s", sink.String())
+	}
+	if count := strings.Count(sink.String(), `"msg":"refusing an originate"`); count != 1 {
+		t.Errorf("the one fact must be recorded exactly once, got %d", count)
+	}
+	if strings.Contains(sink.String(), `"msg":"refusing a hangup"`) {
+		t.Errorf("the hangup echo adds nothing above debug:\n%s", sink.String())
+	}
 }

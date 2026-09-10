@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -123,6 +124,9 @@ type dialTarget struct {
 	contacts   []contract.SipResolveTargetResponseContacts
 	owner      string
 	requestURI sip.Uri
+	// aor is the address of record we resolved, as opposed to requestURI which is the registered
+	// CONTACT it currently lives at. Empty for a trunk or a bare URI.
+	aor string
 	// destination is an explicit host:port to write to, empty when the Request-URI's own host is it.
 	destination string
 	// from is the address this edge presents as: for a trunk the carrier's domain rather than our
@@ -210,6 +214,7 @@ func (h *Handler) resolveAOR(ctx context.Context, orgID, address, contactURI str
 	}
 	target := dialTarget{
 		requestURI: uri,
+		aor:        address,
 		owner:      primary.SIPDInstanceID,
 		// The observed source, not the Contact: a device behind NAT advertises an address that does
 		// not work.
@@ -331,13 +336,44 @@ func (h *Handler) buildOriginateInvite(
 	if from.User == "" {
 		from.User = h.contact.User
 	}
-	fromHeader := &sip.FromHeader{Address: from, Params: sip.NewParams()}
-	fromHeader.Params.Add("tag", h.newTag())
-	if name := deref(request.CallerIDName); name != "" {
-		fromHeader.DisplayName = name
+	displayName := deref(request.CallerIDName)
+	restricted := request.CallerIDPresentation != nil &&
+		*request.CallerIDPresentation == contract.SipOriginateRequestCallerIDPresentationRestricted
+
+	fromHeader := &sip.FromHeader{Address: from, DisplayName: displayName, Params: sip.NewParams()}
+	if restricted {
+		// RFC 3323 §4.1.1.3: literally this display name and this reserved host. A real domain here
+		// leaks the tenant; the real identity still travels in P-Asserted-Identity.
+		fromHeader.Address = sip.Uri{Scheme: "sip", User: "anonymous", Host: "anonymous.invalid"}
+		fromHeader.DisplayName = "Anonymous"
 	}
+	fromHeader.Params.Add("tag", h.newTag())
 	req.AppendHeader(fromHeader)
-	req.AppendHeader(&sip.ToHeader{Address: target.requestURI, Params: sip.NewParams()})
+	// RFC 3261 §8.1.1.2: the To names the LOGICAL recipient — the address of record — while the
+	// Request-URI names the contact it currently lives at. The distinction is not cosmetic here: a
+	// phone builds every in-dialog request's From from this To (RFC 3261 §12.2), so a registered
+	// contact in it makes the callee's own REFER claim an anonymous instance URI.
+	to := target.requestURI
+	if target.aor != "" {
+		aorURI := sip.Uri{}
+		if err := sip.ParseUri(target.aor, &aorURI); err == nil {
+			to = aorURI
+		}
+	}
+	req.AppendHeader(&sip.ToHeader{Address: to, Params: sip.NewParams()})
+
+	if target.trunkID != "" {
+		// RFC 3325 §7, on every trunk INVITE regardless of presentation: carriers authenticate the
+		// trunk's identity on PAI and treat From as display-only, so a trunk sending From alone has
+		// its tenant's chosen caller ID overwritten upstream. Trunks only — PAI is valid inside a
+		// trust domain, never toward a registered device.
+		req.AppendHeader(sip.NewHeader("P-Asserted-Identity", assertedIdentity(displayName, from)))
+	}
+	if restricted {
+		// RFC 3323 §4.2: `id`, not `user`. The From is already anonymised here; this asks the
+		// trust-domain edge to strip the asserted identity before the call leaves it.
+		req.AppendHeader(sip.NewHeader("Privacy", "id"))
+	}
 
 	// The Call-ID is minted here and is deliberately not the leg id: it is phone-facing and goes on
 	// the wire, so reusing the leg id would expose a platform identifier to every carrier we peer
@@ -386,6 +422,15 @@ func (h *Handler) buildOriginateInvite(
 		req.SetDestination(target.destination)
 	}
 	return req, callID.Value()
+}
+
+// assertedIdentity renders one RFC 3325 P-Asserted-Identity value: the real identity, with the
+// display name only when there is one. One `sip:` form and no `tel:` twin.
+func assertedIdentity(displayName string, uri sip.Uri) string {
+	if displayName == "" {
+		return "<" + uri.String() + ">"
+	}
+	return "\"" + displayName + "\" <" + uri.String() + ">"
 }
 
 // headerAllowed decides whether a caller-supplied header name may go on an INVITE.
@@ -441,8 +486,9 @@ func (h *Handler) createOutboundLeg(
 			Observed:  target.destination,
 			Transport: target.transport,
 		},
-		Profile: profileNameForOutbound,
-		Now:     h.now,
+		Profile:    profileNameForOutbound,
+		AccountAOR: target.aor,
+		Now:        h.now,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -715,7 +761,13 @@ func (h *Handler) applyInviteResponse(session *dialog.Session, legID string, res
 				return
 			}
 			if err := h.dialogs.Rebind(legID, d.Identity); err != nil {
-				h.log.Warn("cannot re-index an outbound dialog on its remote tag",
+				// The dialog ended between the trigger and this rebind — a 200 racing a CANCEL, or a
+				// hangup that landed first. Expected, and there is nothing left to re-index.
+				level := slog.LevelWarn
+				if errors.Is(err, dialog.ErrUnknownDialog) {
+					level = slog.LevelDebug
+				}
+				h.log.Log(ctx, level, "cannot re-index an outbound dialog on its remote tag",
 					"legId", legID, "error", err)
 			}
 		})

@@ -2,9 +2,10 @@
 //
 //  1. HEARTBEAT. Every live dialog on this instance gets its claim re-written with a fresh
 //     expiresAt, so a busy instance's calls do not look dead to its neighbours.
-//  2. REAP. Every claim belonging to some OTHER instance whose lease has lapsed produces a
-//     `dialog.terminated{reason: "instance-lost", cause: 41}` published on the dead owner's behalf,
-//     and the claim is deleted.
+//  2. REAP. Every claim belonging to some OTHER instance that is gone — its claim lease lapsed, or
+//     its `sip-instances` lease did, which happens in seconds rather than in ninety of them —
+//     produces a `dialog.terminated{reason: "instance-lost", cause: 41}` published on the dead
+//     owner's behalf, and the claim is deleted.
 //
 // One package owns both because they are the same sweep seen from two sides; splitting them across
 // two intervals could let a deployment reap faster than it heartbeats, and a process that reaps its
@@ -52,6 +53,13 @@ type Live interface {
 	Claims() []dialog.Claim
 }
 
+// Leases is the read half of the `sip-instances` bucket: which sipd processes renewed recently.
+// Optional, and deliberately so — without it the sweep still reaps on the claim's own lease, which
+// is the behaviour that shipped before the bucket existed.
+type Leases interface {
+	Live(ctx context.Context, now time.Time) (map[string]struct{}, error)
+}
+
 // Options configures a Reaper. Every dependency is an interface, so the unit suite runs with no
 // broker and no clock.
 type Options struct {
@@ -62,6 +70,9 @@ type Options struct {
 	// Events publishes the terminations reaped on a dead owner's behalf. Required: deleting claims
 	// without publishing would destroy the evidence this reaper exists to deliver.
 	Events sipevents.Publisher
+	// Leases, when set, lets a sweep reap a dead owner's dialogs off its INSTANCE lease — seconds —
+	// instead of waiting out each claim's own ninety-second one. Optional.
+	Leases Leases
 	// InstanceID is this process's token. Required: it is what dialog.Orphans compares against to
 	// decide which claims are somebody else's.
 	InstanceID string
@@ -83,6 +94,7 @@ type Reaper struct {
 	store    Claims
 	dialogs  Live
 	events   sipevents.Publisher
+	leases   Leases
 	instance string
 	interval time.Duration
 	// reapInterval and nextReap gate the bucket listing. See Sweep.
@@ -111,6 +123,7 @@ func New(opts Options) (*Reaper, error) {
 		store:        opts.Store,
 		dialogs:      opts.Dialogs,
 		events:       opts.Events,
+		leases:       opts.Leases,
 		instance:     opts.InstanceID,
 		interval:     opts.Interval,
 		reapInterval: opts.ReapInterval,
@@ -217,7 +230,7 @@ func (r *Reaper) reap(ctx context.Context) {
 		r.log.Warn("cannot list dialog claims; nothing was reaped this sweep", "error", err)
 		return
 	}
-	orphans := dialog.Orphans(claims, r.instance, r.now())
+	orphans := dialog.Reapable(claims, r.instance, r.now(), r.liveInstances(ctx))
 	if len(orphans) == 0 {
 		return
 	}
@@ -246,6 +259,76 @@ func (r *Reaper) reap(ctx context.Context) {
 			"state", orphan.State,
 			"sipCallId", orphan.SIPCallID)
 	}
+}
+
+// SweepPredecessor reaps the claims this instance id left behind in a PREVIOUS incarnation.
+//
+// The rule that keeps the ordinary sweep safe — never reap a claim carrying our own instance id,
+// because our own expired claim is a late heartbeat and not a dead call — has a hole at boot when
+// the instance id is stable across restarts, which it is under every orchestrator that names a pod
+// deterministically and in every deployment that sets SIPD_INSTANCE_ID. A killed sipd's claims then
+// look like the replacement's own for ever: nothing reaps them, no `dialog.terminated` is published
+// for the calls that died, and the bucket accumulates one dead dialog per crashed call until the
+// six-hour TTL. Observed live: 25 claims against zero live channels.
+//
+// It is safe precisely because it runs at BOOT: this process holds no dialogs yet, so every claim
+// bearing its id belongs to an incarnation that is gone. The guard makes that explicit rather than
+// trusting the call site, and a caller that runs it late reaps nothing instead of reaping live calls.
+func (r *Reaper) SweepPredecessor(ctx context.Context) {
+	if len(r.dialogs.Claims()) > 0 {
+		r.log.Warn("refusing to sweep this instance id's older claims: it is already serving dialogs",
+			"instanceId", r.instance)
+		return
+	}
+	sweepCtx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	claims, err := r.store.All(sweepCtx)
+	if err != nil {
+		r.log.Warn("cannot list dialog claims at boot; a previous incarnation's calls are unreaped",
+			"error", err)
+		return
+	}
+	stale := make([]dialog.Claim, 0)
+	for _, claim := range claims {
+		if claim.InstanceID == r.instance {
+			stale = append(stale, claim)
+		}
+	}
+	if len(stale) == 0 {
+		return
+	}
+
+	r.log.Warn("reaping the dialogs a previous incarnation of this instance id left behind",
+		"count", len(stale), "instanceId", r.instance)
+	for _, claim := range stale {
+		if err := r.publishTermination(sweepCtx, claim); err != nil {
+			r.log.Error("cannot publish a predecessor dialog's termination; leaving the claim",
+				"legId", claim.LegID, "error", err)
+			continue
+		}
+		if err := r.store.Delete(sweepCtx, claim.LegID); err != nil {
+			r.log.Warn("reaped a predecessor dialog but could not delete its claim",
+				"legId", claim.LegID, "error", err)
+		}
+	}
+}
+
+// liveInstances reads the instance leases, or returns nil when there is no lease evidence to be
+// had. Nil is the safe answer in every failure: dialog.Reapable ignores an empty set, so a bucket
+// that could not be listed falls back to judging each claim on its own lease rather than concluding
+// that the whole fleet is dead.
+func (r *Reaper) liveInstances(ctx context.Context) map[string]struct{} {
+	if r.leases == nil {
+		return nil
+	}
+	live, err := r.leases.Live(ctx, r.now())
+	if err != nil {
+		r.log.Warn("cannot read the instance liveness leases; reaping on claim leases alone",
+			"error", err)
+		return nil
+	}
+	return live
 }
 
 // publishTermination builds and publishes one orphan's `dialog.terminated`.

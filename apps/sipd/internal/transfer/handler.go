@@ -13,6 +13,7 @@ import (
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/credentials"
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/dialog"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/kv"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/registrar"
 )
@@ -25,7 +26,14 @@ const (
 	statusForbidden      = 403
 	statusServerError    = 500
 	statusNotImplemented = 501
+	statusUnavailable    = 503
 )
+
+// Dialogs resolves an in-dialog request against this instance's dialog table. *dialog.Store
+// implements it.
+type Dialogs interface {
+	MatchEstablished(req *sip.Request) (dialog.Membership, bool)
+}
 
 // Options configures a Handler. Every dependency is an interface so the tests run without a broker
 // or a socket.
@@ -37,6 +45,9 @@ type Options struct {
 	Auth *registrar.Authenticator
 	// Credentials resolves the account behind the referrer's AOR.
 	Credentials credentials.Store
+	// Dialogs authorises an in-dialog REFER by dialog membership. Optional: without it every REFER
+	// takes the digest path, which the party who ANSWERED a call cannot satisfy.
+	Dialogs Dialogs
 	// Bindings is the location service. Read to confirm the referrer is registered HERE, and never
 	// written — a REFER changes no binding.
 	Bindings kv.Store
@@ -66,10 +77,11 @@ type Options struct {
 // Handler answers REFER. This is the security boundary for transfers; before anything reaches the
 // broker it establishes that:
 //
-//  1. The REFER answers a digest challenge this fleet minted. Unauthenticated REFERs are
-//     challenged, wrong ones refused 403.
-//  2. The authenticated account is the one in the `From` header. Without this any valid account on
-//     the realm could transfer as somebody else.
+//  1. The referrer is either a member of an established dialog this instance holds, or answers a
+//     digest challenge this fleet minted. Unauthenticated out-of-dialog REFERs are challenged,
+//     wrong ones refused 403.
+//  2. On the digest path the authenticated account is the one in the `From` header; on the
+//     in-dialog path the acting account is the DIALOG's. Either way the `From` never chooses it.
 //  3. That account has a LIVE binding in this deployment's location service.
 //  4. The `Refer-To` is a dialable SIP URI, and a `Replaces` — if present — parses.
 //
@@ -84,6 +96,7 @@ type Handler struct {
 	realm     string
 	auth      *registrar.Authenticator
 	creds     credentials.Store
+	dialogs   Dialogs
 	bindings  kv.Store
 	transfers Requester
 	notifier  Notifier
@@ -124,6 +137,7 @@ func New(opts Options) (*Handler, error) {
 		realm:         opts.Realm,
 		auth:          opts.Auth,
 		creds:         opts.Credentials,
+		dialogs:       opts.Dialogs,
 		bindings:      opts.Bindings,
 		transfers:     opts.Transfers,
 		notifier:      opts.Notifier,
@@ -200,18 +214,18 @@ func (h *Handler) HandleRefer(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	// The referrer is the From: a REFER is sent BY the party asking for the transfer, unlike a
 	// REGISTER whose To is the address of record being bound.
-	aor, user, ok := addressOfRecord(from.Address)
+	fromAOR, fromUser, ok := addressOfRecord(from.Address)
 	if !ok {
 		log.Info("rejecting a REFER with no usable From address")
 		h.respond(tx, req, statusBadRequest, "Bad Request")
 		return
 	}
-	log = log.With("aor", aor)
 
-	credential, authorized := h.authorize(ctx, req, tx, user, log)
+	credential, aor, authorized := h.identify(ctx, req, tx, fromAOR, fromUser, log)
 	if !authorized {
 		return
 	}
+	log = log.With("aor", aor)
 
 	// Parsed AFTER authentication on purpose: the parser is not run on an anonymous packet, and an
 	// unauthenticated caller learns nothing about which Refer-To spellings this edge accepts.
@@ -389,6 +403,65 @@ func (h *Handler) requestFor(
 	return request
 }
 
+// identify establishes who is asking for the transfer, and returns the account plus its address of
+// record. It answers the transaction itself on every failure path.
+//
+// An IN-DIALOG REFER — Call-ID plus BOTH dialog tags matching a dialog this instance has
+// established — is authorised by that membership, the same way BYE, re-INVITE and UPDATE already
+// are. RFC 3261 §12.2: an in-dialog request's From is the dialog's own local URI, so it asserts no
+// identity — on a session the referrer ANSWERED it is an anonymous instance URI no credential can
+// exist for. The two tags are unguessable secrets shared only with the dialog's peers, so matching
+// both is the proof; the acting account then comes from the DIALOG and never from the header.
+//
+// Everything else — out of dialog, an unestablished dialog, or a dialog with no account behind it
+// such as a trunk leg — is digest challenged as before.
+func (h *Handler) identify(
+	ctx context.Context,
+	req *sip.Request,
+	tx sip.ServerTransaction,
+	fromAOR, fromUser string,
+	log *slog.Logger,
+) (credentials.Credential, string, bool) {
+	if h.dialogs != nil {
+		if member, matched := h.dialogs.MatchEstablished(req); matched && member.AccountAOR != "" {
+			credential, err := h.accountFor(ctx, member)
+			if err == nil {
+				return credential, member.AccountAOR, true
+			}
+			log.Warn("cannot resolve the account behind an established dialog; challenging the REFER",
+				"legId", member.LegID, "error", err)
+		}
+	}
+	credential, authorized := h.authorize(ctx, req, tx, fromUser, log)
+	return credential, fromAOR, authorized
+}
+
+// accountFor resolves the credential behind a dialog's address of record. The org on the credential
+// must be the org on the dialog: a credential store that answered for another tenant would put a
+// transfer in the wrong one.
+func (h *Handler) accountFor(ctx context.Context, member dialog.Membership) (credentials.Credential, error) {
+	uri := sip.Uri{}
+	if err := sip.ParseUri(member.AccountAOR, &uri); err != nil {
+		return credentials.Credential{}, fmt.Errorf("transfer: %q is not a usable address of record: %w",
+			member.AccountAOR, err)
+	}
+	_, user, ok := addressOfRecord(uri)
+	if !ok {
+		return credentials.Credential{}, fmt.Errorf("transfer: %q is not a usable address of record",
+			member.AccountAOR)
+	}
+	credential, err := h.creds.Lookup(ctx, strings.ToLower(uri.Host), user)
+	if err != nil {
+		return credentials.Credential{}, err
+	}
+	if member.OrgID != "" && credential.OrgID != member.OrgID {
+		return credentials.Credential{}, fmt.Errorf(
+			"transfer: %s resolves to org %s but its dialog belongs to %s",
+			member.AccountAOR, credential.OrgID, member.OrgID)
+	}
+	return credential, nil
+}
+
 // authorize runs the digest exchange for a REFER. It answers the transaction itself on every failure
 // path and reports whether the caller should continue.
 //
@@ -434,15 +507,21 @@ func (h *Handler) authorize(
 
 	credential, err := h.creds.Lookup(ctx, accountAuth.Realm(), auth.Username)
 	if err != nil {
+		status, reason := statusForbidden, "Forbidden"
 		switch {
 		case errors.Is(err, credentials.ErrNotFound):
 			log.Info("rejecting an unknown account", "username", auth.Username)
 		case errors.Is(err, credentials.ErrDisabled):
 			log.Info("rejecting a disabled account", "username", auth.Username)
 		default:
+			// No answer from the credential RPC is not a claim about this account: a 403 tells the
+			// phone its credentials are wrong and most handsets stop retrying, so a burst that
+			// exceeds the responder's deadline would black out a fleet until somebody re-provisions
+			// it. 503 is the retriable answer (RFC 3261 §21.5.4).
 			log.Error("cannot look up the account", "username", auth.Username, "error", err)
+			status, reason = statusUnavailable, "Service Unavailable"
 		}
-		h.respond(tx, req, statusForbidden, "Forbidden")
+		h.respond(tx, req, status, reason)
 		return credentials.Credential{}, false
 	}
 

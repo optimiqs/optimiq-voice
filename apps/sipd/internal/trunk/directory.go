@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
@@ -163,50 +164,87 @@ func OpenDirectoryBucket(ctx context.Context, js jetstream.JetStream) (jetstream
 // boundary with a nil entry, so there is no window between the two in which an edit is missed.
 //
 // The returned channel is closed once the initial replay is complete, so a caller can wait for the
-// directory to be populated before starting a registration sweep.
+// directory to be populated before starting a registration sweep. It is closed exactly once, on the
+// FIRST replay boundary; a later re-established replay does not close it again.
+//
+// The watch RE-ESTABLISHES itself when the update stream ends without the context being cancelled.
+// A broker restart ends the ordered consumer ("stream not found: recreating ordered consumer"), and
+// a watch that gave up there would leave the edge registering whatever trunks it last held for the
+// rest of the process's life — with no error, and with every subsequent carrier edit invisible.
 func Watch(ctx context.Context, bucket jetstream.KeyValue, directory *Directory) (<-chan struct{}, error) {
 	if bucket == nil {
 		return nil, errors.New("trunk: a trunks bucket is required to watch it")
 	}
-	watcher, err := bucket.WatchAll(ctx)
+	updates, err := bucket.WatchAll(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("trunk: watching the %s bucket: %w", contract.TrunksKV.Name, err)
 	}
 
 	ready := make(chan struct{})
-	go func() {
-		defer func() { _ = watcher.Stop() }()
-		settled := false
-		closeReady := func() {
-			if !settled {
-				settled = true
-				close(ready)
-			}
-		}
-		defer closeReady()
+	closeReady := sync.OnceFunc(func() { close(ready) })
 
+	go func() {
+		defer closeReady()
+		backoff := watchRetryMin
 		for {
+			// The directory from the previous stream stands while the replacement replays: the
+			// alternative is an edge that answers `unknown_trunk` for the length of a reconnect.
+			ended := consume(ctx, updates, directory, closeReady)
+			_ = updates.Stop()
+			if ctx.Err() != nil || !ended {
+				return
+			}
+			directory.log.Warn("the trunk directory watch ended; re-establishing it",
+				"bucket", contract.TrunksKV.Name, "retryIn", backoff)
 			select {
 			case <-ctx.Done():
 				return
-			case entry, ok := <-watcher.Updates():
-				if !ok {
-					return
-				}
-				if entry == nil {
-					// The end of the initial replay. Everything after this is a live edit.
-					directory.log.Info("trunk directory loaded",
-						"bucket", contract.TrunksKV.Name, "trunks", directory.Len())
-					// One reconcile for the whole replay rather than one per key.
-					directory.changed()
-					closeReady()
-					continue
-				}
-				applyTrunkUpdate(directory, entry)
+			case <-time.After(backoff):
 			}
+			backoff = min(backoff*2, watchRetryMax)
+			next, err := bucket.WatchAll(ctx)
+			if err != nil {
+				directory.log.Error("cannot re-establish the trunk directory watch",
+					"bucket", contract.TrunksKV.Name, "error", err)
+				continue
+			}
+			backoff = watchRetryMin
+			updates = next
 		}
 	}()
 	return ready, nil
+}
+
+// watchRetryMin and watchRetryMax bound the re-establish backoff. A broker that is down is down for
+// everything, so the ceiling is short enough that the directory reloads promptly once it returns.
+const (
+	watchRetryMin = time.Second
+	watchRetryMax = 30 * time.Second
+)
+
+// consume drains one update stream. It reports whether the stream ENDED (so a replacement is
+// wanted) rather than the context being cancelled.
+func consume(ctx context.Context, updates jetstream.KeyWatcher, directory *Directory, closeReady func()) bool {
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case entry, ok := <-updates.Updates():
+			if !ok {
+				return true
+			}
+			if entry == nil {
+				// The end of the replay. Everything after this is a live edit.
+				directory.log.Info("trunk directory loaded",
+					"bucket", contract.TrunksKV.Name, "trunks", directory.Len())
+				// One reconcile for the whole replay rather than one per key.
+				directory.changed()
+				closeReady()
+				continue
+			}
+			applyTrunkUpdate(directory, entry)
+		}
+	}
 }
 
 // applyTrunkUpdate turns one KV update into a directory change. A DELETE or PURGE removes the

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +41,7 @@ type NATSStore struct {
 
 	positiveTTL time.Duration
 	negativeTTL time.Duration
+	refreshTTL  time.Duration
 	maxEntries  int
 
 	// now is swapped in tests so TTL behaviour is asserted without sleeping.
@@ -50,6 +52,9 @@ type NATSStore struct {
 
 	mu    sync.Mutex
 	cache map[string]cacheEntry
+	// lastRefresh is when each account's cached answer was last re-asked because a digest failed
+	// against it. Bounded with the cache, and swept by the same evictLocked.
+	lastRefresh map[string]time.Time
 	// lastEvict is when the full expiry sweep last ran. See evictLocked.
 	lastEvict time.Time
 	// inflight collapses concurrent lookups for one account into one RPC. The cache handles the
@@ -75,6 +80,9 @@ type NATSOptions struct {
 	PositiveTTL time.Duration
 	// NegativeTTL is how long an unknown/disabled answer is reused.
 	NegativeTTL time.Duration
+	// RefreshInterval bounds how often one account's cached answer may be re-asked because a digest
+	// failed against it. Defaults to defaultRefreshInterval.
+	RefreshInterval time.Duration
 	// MaxEntries bounds the cache. Zero means the default.
 	MaxEntries int
 	// Now is the clock, for tests.
@@ -85,6 +93,11 @@ const (
 	defaultPositiveTTL = 30 * time.Second
 	defaultNegativeTTL = 10 * time.Second
 	defaultMaxEntries  = 10_000
+	// defaultRefreshInterval is the ceiling on re-asks provoked by a failed digest. Short enough
+	// that a rotated phone recovers on its next REGISTER rather than on the positive TTL, and long
+	// enough that a credential spray against one account costs one extra RPC every few seconds
+	// rather than one per packet.
+	defaultRefreshInterval = 5 * time.Second
 )
 
 // ErrLookupFailed wraps every transport-level failure so a caller can distinguish "the answer is
@@ -104,9 +117,11 @@ func NewNATSStore(conn *nats.Conn, opts NATSOptions) (*NATSStore, error) {
 		timeout:     opts.Timeout,
 		positiveTTL: opts.PositiveTTL,
 		negativeTTL: opts.NegativeTTL,
+		refreshTTL:  opts.RefreshInterval,
 		maxEntries:  opts.MaxEntries,
 		now:         opts.Now,
 		cache:       make(map[string]cacheEntry),
+		lastRefresh: make(map[string]time.Time),
 	}
 	if store.subject == "" {
 		store.subject = contract.SubjectSipCredentialRPC
@@ -119,6 +134,9 @@ func NewNATSStore(conn *nats.Conn, opts NATSOptions) (*NATSStore, error) {
 	}
 	if store.negativeTTL <= 0 {
 		store.negativeTTL = defaultNegativeTTL
+	}
+	if store.refreshTTL <= 0 {
+		store.refreshTTL = defaultRefreshInterval
 	}
 	if store.maxEntries <= 0 {
 		store.maxEntries = defaultMaxEntries
@@ -306,8 +324,77 @@ func (s *NATSStore) Len() int {
 	return len(s.cache)
 }
 
+// Refresh implements Refresher: it discards this account's cached answer and re-asks, so a rotated
+// secret takes effect on the phone's next REGISTER instead of on the positive TTL.
+//
+// Rate-bounded per account, because the caller invokes it on a FAILED digest and a failed digest is
+// usually a wrong password. When the bound refuses, the cached answer is returned unchanged, so the
+// caller re-verifies against what it already had and refuses — which is the same outcome as not
+// having asked.
+func (s *NATSStore) Refresh(ctx context.Context, realm, username string) (Credential, error) {
+	key := lookupKey(realm, username)
+	if !s.admitRefresh(key) {
+		if entry, ok := s.cached(key); ok {
+			return entry.credential, entry.err
+		}
+	} else {
+		s.Forget(realm, username)
+	}
+	return s.Lookup(ctx, realm, username)
+}
+
+// admitRefresh reports whether this account may be re-asked now, and records it when it may.
+func (s *NATSStore) admitRefresh(key string) bool {
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if last, seen := s.lastRefresh[key]; seen && now.Sub(last) < s.refreshTTL {
+		return false
+	}
+	if len(s.lastRefresh) >= s.maxEntries {
+		// Same bound and the same reason as the cache: the key space is attacker-chosen.
+		maps.DeleteFunc(s.lastRefresh, func(_ string, last time.Time) bool {
+			return now.Sub(last) >= s.refreshTTL
+		})
+		if len(s.lastRefresh) >= s.maxEntries {
+			clear(s.lastRefresh)
+		}
+	}
+	s.lastRefresh[key] = now
+	return true
+}
+
+// EvictOrg implements OrgEvictor: it drops every cached answer belonging to one tenant and reports
+// how many went. Driven by `credential.invalidated`, whose payload names no account.
+//
+// Cached REFUSALS go with them. A refusal carries no org — ErrNotFound is an answer about a
+// username no tenant owns — and it is exactly what a re-enable or a rename has to clear; their TTL
+// is seconds, so the cost of dropping another tenant's is a single re-ask. There is no realm→org
+// map to drop alongside: the org travels on the credential itself.
+func (s *NATSStore) EvictOrg(orgID string) int {
+	orgID = strings.TrimSpace(orgID)
+	if orgID == "" {
+		return 0
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	dropped := 0
+	for key, entry := range s.cache {
+		if entry.err == nil && entry.credential.OrgID != orgID {
+			continue
+		}
+		delete(s.cache, key)
+		delete(s.lastRefresh, key)
+		dropped++
+	}
+	return dropped
+}
+
 // Forget drops a cached answer, so a provisioning change can take effect before its TTL. It is the
-// seam a future JetStream invalidation consumer attaches to without reaching into cache internals.
+// seam the invalidation consumer in invalidate.go attaches to without reaching into cache
+// internals.
 func (s *NATSStore) Forget(realm, username string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

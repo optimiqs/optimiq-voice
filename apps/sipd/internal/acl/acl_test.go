@@ -1,7 +1,15 @@
 package acl
 
 import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/nats-io/nats.go/jetstream"
 
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 
@@ -233,5 +241,139 @@ func TestSuspendDefersRecompilationUntilResume(t *testing.T) {
 	watcher.Remove("203.0.113.0/24")
 	if _, allowed := acl.Match("203.0.113.7:5060"); allowed {
 		t.Fatal("a withdrawn entry still admits after a resume")
+	}
+}
+
+// stubWatcher is one update stream that the test closes to simulate a broker restart ending the
+// ordered consumer.
+type stubWatcher struct {
+	updates chan jetstream.KeyValueEntry
+	stopped atomic.Bool
+}
+
+func (s *stubWatcher) Updates() <-chan jetstream.KeyValueEntry { return s.updates }
+func (s *stubWatcher) Stop() error                             { s.stopped.Store(true); return nil }
+
+// stubBucket hands out one stubWatcher per WatchAll. Only WatchAll is implemented; the embedded
+// interface is nil, so any other call would panic — which is the assertion that Watch uses nothing
+// else.
+type stubBucket struct {
+	jetstream.KeyValue
+	mu       sync.Mutex
+	handed   []*stubWatcher
+	watchers chan *stubWatcher
+}
+
+func (b *stubBucket) WatchAll(context.Context, ...jetstream.WatchOpt) (jetstream.KeyWatcher, error) {
+	watcher := &stubWatcher{updates: make(chan jetstream.KeyValueEntry, 8)}
+	b.mu.Lock()
+	b.handed = append(b.handed, watcher)
+	b.mu.Unlock()
+	b.watchers <- watcher
+	return watcher, nil
+}
+
+// stubEntry is one KV update. Only the four accessors applyUpdate reads are implemented.
+type stubEntry struct {
+	jetstream.KeyValueEntry
+	key       string
+	value     []byte
+	operation jetstream.KeyValueOp
+}
+
+func (e stubEntry) Key() string                     { return e.key }
+func (e stubEntry) Value() []byte                   { return e.value }
+func (e stubEntry) Operation() jetstream.KeyValueOp { return e.operation }
+
+// TestTheWatchSurvivesTheStreamEnding is the broker-restart case: nats.go ends the ordered consumer,
+// and a watch that did not re-establish itself would leave the edge on a frozen ACL for the life of
+// the process, silently.
+func TestTheWatchSurvivesTheStreamEnding(t *testing.T) {
+	evaluator := profile.NewWatchedACL(nil)
+	watcher, err := NewWatcher(evaluator, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	bucket := &stubBucket{watchers: make(chan *stubWatcher, 4)}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ready, err := Watch(ctx, bucket, watcher)
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+
+	first := <-bucket.watchers
+	first.updates <- nil // end of the initial replay
+	<-ready
+
+	// The broker restarts: the ordered consumer's channel closes.
+	close(first.updates)
+
+	var second *stubWatcher
+	select {
+	case second = <-bucket.watchers:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the watch was never re-established after the update stream ended")
+	}
+
+	record := contract.SIPACLEntry{
+		Network: "203.0.113.7/32", Action: contract.SIPACLEntryActionAllow,
+		Scope: contract.SIPACLEntryScopeTrunk, Priority: 10, Enabled: true,
+	}
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("marshalling the record: %v", err)
+	}
+	second.updates <- stubEntry{key: "203-0-113-7-32", value: encoded, operation: jetstream.KeyValuePut}
+	second.updates <- nil
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, allowed := evaluator.Match("203.0.113.7:5060"); allowed {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("an entry written after the stream restarted never reached the evaluator")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// The bucket carries both edge scopes on one watch. Compiling either into the other's evaluator is
+// how an ACL written to block a credential-stuffing run admits a carrier — or the reverse.
+func TestTheTwoScopesCompileIntoSeparateEvaluators(t *testing.T) {
+	trunkACL := profile.NewWatchedACL(nil)
+	registrationACL := profile.NewWatchedBlocklist(nil)
+	watcher, err := NewWatcher(trunkACL, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	watcher.WithRegistrationACL(registrationACL)
+
+	carrier := record("198.51.100.0/24", "allow", 100, "trunk-a")
+	watcher.Put("198-51-100-0-24", carrier)
+
+	blocked := record("203.0.113.0/24", "deny", 100, "")
+	blocked.Scope = ScopeRegistration
+	watcher.Put("203-0-113-0-24", blocked)
+
+	if _, allowed := trunkACL.Match("198.51.100.7:5060"); !allowed {
+		t.Error("the trunk-scoped allow did not reach the trunk evaluator")
+	}
+	if _, allowed := trunkACL.Match("203.0.113.7:5060"); allowed {
+		t.Error("a registration-scoped entry admitted an INVITE")
+	}
+	if _, allowed := registrationACL.Match("203.0.113.7:5060"); allowed {
+		t.Error("the registration-scoped deny did not reach the registration evaluator")
+	}
+	// A blocklist admits what no rule names, including an address a trunk rule allows.
+	if _, allowed := registrationACL.Match("198.51.100.7:5060"); !allowed {
+		t.Error("the registration blocklist refused an address no registration rule names")
+	}
+
+	watcher.Remove("203-0-113-0-24")
+	if _, allowed := registrationACL.Match("203.0.113.7:5060"); !allowed {
+		t.Error("a withdrawn registration deny still blocks")
 	}
 }

@@ -262,7 +262,7 @@ func TestAllocateSkipsAPairWhoseRTCPHalfIsHeld(t *testing.T) {
 
 // Concurrent allocation must never double-issue a port; many goroutines is the normal condition.
 func TestConcurrentAllocateIssuesDistinctPorts(t *testing.T) {
-	const low, high = 52000, 52039 // 20 pairs
+	const low, high = 39100, 39139 // 20 pairs, below the ephemeral range like testLow/testHigh
 	allocator := newAllocator(t, low, high)
 
 	var (

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,6 +67,18 @@ func (r resourceRequest) sessions() []string {
 	return ids
 }
 
+// orderingKey names the resources a request touches, so the command runner keeps one session's
+// commands in arrival order while letting different sessions run at once. A request naming nothing
+// falls back to the empty key, which is one shared FIFO chain.
+func (r resourceRequest) orderingKey() string {
+	ids := r.sessions()
+	if len(ids) == 0 {
+		return r.resourceKey()
+	}
+	slices.Sort(ids)
+	return strings.Join(slices.Compact(ids), "\x00")
+}
+
 func (r resourceRequest) resourceKey() string {
 	for _, item := range []struct{ kind, id string }{
 		{"bridge", r.BridgeID}, {"playback", r.PlaybackRef},
@@ -78,54 +91,42 @@ func (r resourceRequest) resourceKey() string {
 	return ""
 }
 
-// routeRequest answers a request, or returns a forward to be run off the caller's goroutine.
-//
-// Exactly one of the two results is set. A forward blocks on a neighbour for up to RoutingTimeout,
-// and the caller is a NATS subscription dispatcher that serialises every other request on the same
-// subject behind it, so relaying inline made one unreachable neighbour stall a whole subject.
-func (s *Server) routeRequest(conn *nats.Conn, subject string, data []byte, handle func([]byte) []byte, addressed bool) (reply []byte, forward func() []byte) {
+// routeRequest answers a request. It runs on a keyedRunner goroutine, never on the subscription
+// dispatcher: both halves below block on the broker, so answering inline serialised every request on
+// the subject behind the KV round trips of the one in front.
+func (s *Server) routeRequest(conn *nats.Conn, subject string, data []byte, request resourceRequest, handle func([]byte) []byte, addressed bool) []byte {
 	if s.ownership == nil {
-		return handle(data), nil
-	}
-	var request resourceRequest
-	if json.Unmarshal(data, &request) != nil {
-		return handle(data), nil
+		return handle(data)
 	}
 	// Bounded by the engine's own RPC budget: past it the reply lands on a caller that has given
-	// up, while the NATS callback goroutine issuing it stays parked.
+	// up, while the goroutine issuing it stays parked.
 	ctx, cancel := context.WithTimeout(context.Background(), RoutingTimeout)
+	defer cancel()
 	owner, keys, err := s.requestOwner(ctx, subject, request)
 	if err != nil {
-		cancel()
-		return s.routingFailure(request, ReasonInternal, err), nil
+		return s.routingFailure(request, ReasonInternal, err)
 	}
 	if owner != "" && owner != s.instanceID {
 		if addressed {
-			cancel()
 			return s.routingFailure(request, ReasonWrongNode,
-				errors.New("addressed media owner no longer owns the resource")), nil
+				errors.New("addressed media owner no longer owns the resource"))
 		}
 		select {
 		case s.ownership.forwards <- struct{}{}:
 		default:
-			cancel()
 			return s.routingFailure(request, ReasonWrongNode,
-				errors.New("too many media requests are already being relayed")), nil
+				errors.New("too many media requests are already being relayed"))
 		}
-		return nil, func() []byte {
-			defer cancel()
-			defer func() { <-s.ownership.forwards }()
-			relayed, err := conn.RequestWithContext(ctx, mediaInstanceSubject(subject, owner), data)
-			if err != nil {
-				// wrong_instance, not internal: the session is alive on a named neighbour, which is
-				// the code the engine branches on to re-address it there.
-				return s.routingFailure(request, ReasonWrongNode,
-					errors.New("owning media instance is unavailable"))
-			}
-			return relayed.Data
+		defer func() { <-s.ownership.forwards }()
+		relayed, err := conn.RequestWithContext(ctx, mediaInstanceSubject(subject, owner), data)
+		if err != nil {
+			// wrong_instance, not internal: the session is alive on a named neighbour, which is
+			// the code the engine branches on to re-address it there.
+			return s.routingFailure(request, ReasonWrongNode,
+				errors.New("owning media instance is unavailable"))
 		}
+		return relayed.Data
 	}
-	defer cancel()
 	result := handle(data)
 	var response struct {
 		Ok bool `json:"ok"`
@@ -142,7 +143,7 @@ func (s *Server) routeRequest(conn *nats.Conn, subject string, data []byte, hand
 		}
 		s.ownership.mu.Unlock()
 	}
-	return result, nil
+	return result
 }
 
 func (s *Server) requestOwner(ctx context.Context, subject string, request resourceRequest) (string, []string, error) {

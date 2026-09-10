@@ -12,6 +12,7 @@ package profile
 import (
 	"errors"
 	"fmt"
+	"net"
 	"slices"
 	"strings"
 
@@ -236,12 +237,19 @@ type Set struct {
 	// byListener maps `network/addr` to a profile, which is the authoritative selector when the
 	// transport tells us which socket a message arrived on.
 	byListener map[string]int
+	// byPort maps `network/port` to a profile, for the listener whose configured address is a
+	// wildcard (`:5060`) or spelled differently from what the kernel reports (`0.0.0.0:5060`).
+	// -1 means two profiles share the port on that transport, in which case it settles nothing.
+	byPort map[string]int
+	// arrivals supplies the local listener address sipgo does not stamp on inbound messages. Nil in
+	// the tests that do not exercise transport, where selection falls back to the source step.
+	arrivals *Arrivals
 }
 
 // NewSet validates every profile and indexes the listeners. Two profiles on one listener is refused:
 // a packet arriving on a shared socket would have two policies and no way to choose.
 func NewSet(profiles ...Profile) (*Set, error) {
-	set := &Set{byListener: make(map[string]int)}
+	set := &Set{byListener: make(map[string]int), byPort: make(map[string]int)}
 	var problems []string
 	names := make(map[string]bool, len(profiles))
 
@@ -264,6 +272,14 @@ func NewSet(profiles ...Profile) (*Set, error) {
 				continue
 			}
 			set.byListener[key] = len(set.profiles)
+			if _, port, err := net.SplitHostPort(listener.Addr); err == nil && port != "" {
+				portKey := listenerKey(listener.Network, port)
+				if existing, taken := set.byPort[portKey]; taken && existing != len(set.profiles) {
+					set.byPort[portKey] = -1
+				} else {
+					set.byPort[portKey] = len(set.profiles)
+				}
+			}
 		}
 		set.profiles = append(set.profiles, candidate)
 	}
@@ -275,6 +291,11 @@ func NewSet(profiles ...Profile) (*Set, error) {
 	}
 	return set, nil
 }
+
+// TrackArrivals attaches the table that records which listener each peer's traffic arrives on, so
+// `For` can select by listener rather than by the sender's own address. Called once at boot, before
+// any traffic is served.
+func (s *Set) TrackArrivals(arrivals *Arrivals) { s.arrivals = arrivals }
 
 // Profiles returns the set's profiles in declaration order.
 func (s *Set) Profiles() []Profile { return s.profiles }
@@ -301,11 +322,12 @@ func (s *Set) ByName(name string) (Profile, bool) {
 
 // For decides which profile owns a request, in this order:
 //
-//  1. The LOCAL address the message arrived on — the only selector the sender cannot influence.
+//  1. The LOCAL address the message arrived on — the only selector the sender cannot influence. It
+//     comes from the Arrivals table, because nothing in sipgo stamps it on an inbound message.
 //  2. The transport, when exactly one profile serves it.
-//  3. The SOURCE address against each external profile's ACL, including an external profile with no
-//     listeners of its own. Last, because it is the only step where the sender's own address
-//     participates in choosing the policy applied to it.
+//  3. The SOURCE address against an external profile's ACL — a profile with no listeners of its own
+//     always, one that owns listeners only while the arrival socket is unknown. Last, and narrowed,
+//     because it is the only step where the sender's own address chooses the policy applied to it.
 //
 // Nothing matching is ErrNoProfile, and the caller answers 403. There is no default profile.
 func (s *Set) For(req *sip.Request) (Profile, error) {
@@ -314,10 +336,27 @@ func (s *Set) For(req *sip.Request) (Profile, error) {
 	}
 	transport := strings.ToLower(req.Transport())
 
-	if local := req.Destination(); local != "" {
+	// An external profile with no listeners of its own shares the internal profile's sockets, so the
+	// listener tells the two apart for nothing and the source ACL is the only discriminator left.
+	// That is a property of the configuration and not of this function: give the external profile a
+	// socket (SIPD_EXTERNAL_LISTEN_ADDR) and the listener decides again.
+	shared := slices.ContainsFunc(s.profiles, func(candidate Profile) bool {
+		return candidate.Kind == KindExternal && len(candidate.Listeners) == 0
+	})
+
+	local := s.localAddrFor(req)
+	arrived := -1
+	if local != "" {
 		if index, found := s.byListener[listenerKey(transport, local)]; found {
-			return s.profiles[index], nil
+			arrived = index
+		} else if _, port, err := net.SplitHostPort(local); err == nil {
+			if index, found := s.byPort[listenerKey(transport, port)]; found && index >= 0 {
+				arrived = index
+			}
 		}
+	}
+	if arrived >= 0 && (!shared || s.profiles[arrived].Kind == KindExternal) {
+		return s.profiles[arrived], nil
 	}
 
 	matches := make([]int, 0, len(s.profiles))
@@ -332,9 +371,6 @@ func (s *Set) For(req *sip.Request) (Profile, error) {
 	// An external profile with no listeners of its own never appears in `matches`, so the transport
 	// step would otherwise see only the internal profile and answer every carrier INVITE with a
 	// digest challenge no carrier can answer. The source step has to run first when one exists.
-	shared := slices.ContainsFunc(s.profiles, func(candidate Profile) bool {
-		return candidate.Kind == KindExternal && len(candidate.Listeners) == 0
-	})
 	if !shared && len(matches) == 1 {
 		return s.profiles[matches[0]], nil
 	}
@@ -344,8 +380,17 @@ func (s *Set) For(req *sip.Request) (Profile, error) {
 		if candidate.Kind != KindExternal {
 			continue
 		}
-		if len(candidate.Listeners) > 0 && !slices.Contains(matches, index) {
-			continue
+		if len(candidate.Listeners) > 0 {
+			// A profile that owns sockets is chosen by them. Once the arrival socket is known the
+			// listener step above has already had its say, and letting the source step run again
+			// here is exactly the hole this ordering closes: a trunk ACL entry covering a network
+			// would otherwise claim that network's requests off another profile's listener.
+			if arrived >= 0 {
+				continue
+			}
+			if !slices.Contains(matches, index) {
+				continue
+			}
 		}
 		if _, allowed := candidate.ACL.Match(source); allowed {
 			return candidate, nil
@@ -366,6 +411,23 @@ func (s *Set) For(req *sip.Request) (Profile, error) {
 		return s.profiles[internal[0]], nil
 	}
 	return Profile{}, ErrNoProfile
+}
+
+// localAddrFor is the address the request arrived on.
+//
+// It reads the destination off the embedded MessageData and NOT off `req.Destination()`: the
+// Request override falls back to the Route header or the Request-URI when nothing set one, which is
+// the SENDER's own text and must never choose the trust boundary applied to it. Nothing in sipgo
+// sets the field on an inbound message, so in practice this is the arrivals table.
+func (s *Set) localAddrFor(req *sip.Request) string {
+	if local := req.MessageData.Destination(); local != "" {
+		return local
+	}
+	if s.arrivals == nil {
+		return ""
+	}
+	local, _ := s.arrivals.LocalFor(req.Transport(), req.Source())
+	return local
 }
 
 func listenerKey(network, addr string) string {

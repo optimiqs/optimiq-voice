@@ -286,3 +286,49 @@ func TestAcceptAnswerRefusesMissingFields(t *testing.T) {
 		})
 	}
 }
+
+// Early media sends to a leg before it has spoken, and mediad's far end is otherwise learn-only. So
+// both negotiation moments hand the packet path the address the settled SDP advertised: the offer's
+// at allocate, the answer's at accept-answer.
+func TestNegotiationSeedsTheFarEndFromTheSettledSDP(t *testing.T) {
+	t.Run("allocate seeds from the offer", func(t *testing.T) {
+		rig := newRig(t)
+
+		if r := decodeAllocate(t, rig.server.HandleAllocateSession(mustJSON(t, validAllocate()))); !r.Ok {
+			t.Fatalf("allocate refused: %+v", r)
+		}
+
+		seeds := rig.sessions.seeds()
+		if len(seeds) != 1 {
+			t.Fatalf("seeds = %+v, want exactly one", seeds)
+		}
+		if seeds[0].sessionID != testSession || seeds[0].addr.String() != "203.0.113.9:41000" {
+			t.Errorf("seed = %+v, want the offer's c=/m= address", seeds[0])
+		}
+	})
+
+	t.Run("accept-answer seeds from the answer", func(t *testing.T) {
+		rig := newRig(t)
+		if r := decodeCreateOffer(t, rig.server.HandleCreateOffer(mustJSON(t, validCreateOffer()))); !r.Ok {
+			t.Fatalf("create-offer refused: %+v", r)
+		}
+		// create-offer has no far end to seed from: mediad is the offerer there.
+		if seeds := rig.sessions.seeds(); len(seeds) != 0 {
+			t.Fatalf("seeds = %+v, want none before an answer arrives", seeds)
+		}
+
+		response := decodeAcceptAnswer(t, rig.server.HandleAcceptAnswer(mustJSON(t,
+			contract.MediaAcceptAnswerRequest{SessionID: testSession, SDPAnswer: answerBodyPCMU})))
+		if !response.Ok {
+			t.Fatalf("accept-answer refused: %+v", response)
+		}
+
+		seeds := rig.sessions.seeds()
+		if len(seeds) != 1 {
+			t.Fatalf("seeds = %+v, want exactly one", seeds)
+		}
+		if seeds[0].addr.String() != "198.51.100.7:40000" {
+			t.Errorf("seed = %+v, want the answer's c=/m= address", seeds[0])
+		}
+	})
+}

@@ -490,3 +490,64 @@ func TestControlPlaneLoad(t *testing.T) {
 		}
 	}
 }
+
+// TestControlPlaneBurst is the shape TestControlPlaneLoad cannot reach: every request issued at
+// once, which is what 200 simultaneous call setups look like at the media plane. It is the harness
+// the dispatcher-serialisation fix is measured on — each create-offer costs two KV claims and a
+// directory write, and answering them on the subscription's single dispatcher goroutine put every
+// one of those round trips end to end.
+func TestControlPlaneBurst(t *testing.T) {
+	if os.Getenv("RUN_MEDIAD_LOAD") != "1" {
+		t.Skip("set RUN_MEDIAD_LOAD=1 to run the control-plane burst")
+	}
+	url := startBenchNATS(t)
+	for _, concurrency := range []int{100, 200} {
+		t.Run(fmt.Sprintf("createOffer concurrency=%d", concurrency), func(t *testing.T) {
+			rig := newWireRig(t, url, true)
+			_ = rig
+			client, err := nats.Connect(url)
+			if err != nil {
+				t.Fatalf("client: %v", err)
+			}
+			defer client.Close()
+
+			latencies := make([]time.Duration, concurrency)
+			failures := make([]bool, concurrency)
+			var wg sync.WaitGroup
+			var counter atomic.Int64
+			start := time.Now()
+			for slot := range concurrency {
+				wg.Go(func() {
+					// A distinct call per request: 200 concurrent setups are 200 calls, so the call
+					// ownership key is contended by nobody and the KV round trips are the real ones.
+					index := int(counter.Add(1)) + 100_000
+					request := contract.MediaCreateOfferRequest{
+						SessionID: benchSessionID(index),
+						OrgID:     testOrg,
+						CallID:    benchSessionID(index + 500_000),
+						Direction: contract.MediaCreateOfferRequestDirectionSendrecv,
+					}
+					payload, _ := json.Marshal(request)
+					issued := time.Now()
+					if _, err := client.Request(control.SubjectCreateOffer, payload, 10*time.Second); err != nil {
+						failures[slot] = true
+					}
+					latencies[slot] = time.Since(issued)
+				})
+			}
+			wg.Wait()
+			span := time.Since(start)
+
+			failed := 0
+			for _, f := range failures {
+				if f {
+					failed++
+				}
+			}
+			slices.Sort(latencies)
+			p := func(q float64) time.Duration { return latencies[int(float64(len(latencies)-1)*q)] }
+			t.Logf("concurrency=%d span=%s failures=%d p50=%s p90=%s p99=%s max=%s goroutines=%d",
+				concurrency, span, failed, p(0.5), p(0.9), p(0.99), p(1), runtime.NumGoroutine())
+		})
+	}
+}

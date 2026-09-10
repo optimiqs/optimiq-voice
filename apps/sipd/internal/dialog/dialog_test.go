@@ -364,6 +364,34 @@ func TestTheTwoHundredRepeatsTheAnswerCommittedByAnEarlyMediaResponse(t *testing
 	}
 }
 
+// A carrier's 183 with an answer must reach the engine as one: the `progressed` effect carries the
+// body, or `dialog.progressed.sdpAnswer` arrives empty and early media cannot be settled without a
+// second round trip back to the edge for bytes the edge is already holding.
+func TestACarriersEarlyAnswerTravelsOnTheProgressedEffect(t *testing.T) {
+	d := newTestDialog(t, RoleUAC)
+	body := []byte("v=0\r\no=- 1 1 IN IP4 198.51.100.1\r\nm=audio 40000 RTP/AVP 0\r\n")
+
+	outcome := apply(t, d, Input{Trigger: TriggerRemoteEarly, RemoteTag: "far", Status: 183, Body: body})
+
+	effect := outcome.Effects[len(outcome.Effects)-1]
+	if effect.Kind != EffectPublish || effect.Event != EventProgressed {
+		t.Fatalf("effect = %v/%v, want a progressed publish", effect.Kind, effect.Event)
+	}
+	if string(effect.Body) != string(body) {
+		t.Fatalf("the progressed effect carried %q, want the 183's answer verbatim", effect.Body)
+	}
+	if effect.Status != 183 || effect.Detail != "early media" {
+		t.Fatalf("effect = %d/%q, want 183 early media", effect.Status, effect.Detail)
+	}
+
+	// A plain 180 stays a plain 180: only a body makes it early media.
+	plain := newTestDialog(t, RoleUAC)
+	outcome = apply(t, plain, Input{Trigger: TriggerRemoteEarly, RemoteTag: "far", Status: 180})
+	if effect := outcome.Effects[len(outcome.Effects)-1]; len(effect.Body) != 0 || effect.Detail != "" {
+		t.Fatalf("a bodiless 180 reported early media: %+v", effect)
+	}
+}
+
 // A ring timeout ends an unanswered UAS leg with a status and an unanswered UAC leg with a CANCEL.
 func TestRingTimeoutEndsTheCallByRole(t *testing.T) {
 	uas := newTestDialog(t, RoleUAS)
@@ -404,4 +432,53 @@ func TestNewRefusesADialogWithNoKey(t *testing.T) {
 	if _, err := New(Options{LegID: "leg"}); !errors.Is(err, ErrNoIdentity) {
 		t.Errorf("err = %v, want ErrNoIdentity", err)
 	}
+}
+
+// The 183 WE send must be announced as the 183 it was.
+//
+// `effectsFor(TriggerLocalEarlyMedia)` put the status and the body on the RESPOND effect and left
+// both off the PUBLISH one, and `eventFor` reads the event off the effect it is handed — defaulting
+// a publish with no status line to 180. So a 183-with-SDP that went out on the wire correctly was
+// announced to the engine as `status 180, hasEarlyMedia false, no sdpAnswer`, which is the shape of
+// plain ringback. Anything reading the event family rather than a packet capture concluded the body
+// had been dropped.
+func TestOurOwnEarlyMediaIsPublishedAsAOneEightyThreeWithItsBody(t *testing.T) {
+	d := newTestDialog(t, RoleUAS)
+	body := []byte("v=0\r\no=- 1 1 IN IP4 198.51.100.1\r\nm=audio 40000 RTP/AVP 0\r\n")
+
+	outcome := apply(t, d, Input{Trigger: TriggerLocalEarlyMedia, Body: body})
+
+	var published *Effect
+	for i := range outcome.Effects {
+		if outcome.Effects[i].Kind == EffectPublish && outcome.Effects[i].Event == EventProgressed {
+			published = &outcome.Effects[i]
+		}
+	}
+	if published == nil {
+		t.Fatalf("effects = %v, want a progressed publish", outcome.Effects)
+	}
+	if published.Status != 183 {
+		t.Fatalf("published status = %d, want 183", published.Status)
+	}
+	if string(published.Body) != string(body) {
+		t.Fatalf("published body = %q, want the answer that went on the wire", published.Body)
+	}
+}
+
+// A 181 or a 182 sent through the ring command is announced as itself too, for the same reason: the
+// publish effect used to carry no status at all and everything on this path read as a 180.
+func TestARingsStatusTravelsOnItsPublishEffect(t *testing.T) {
+	d := newTestDialog(t, RoleUAS)
+
+	outcome := apply(t, d, Input{Trigger: TriggerLocalRing, Status: 182, Reason: "Queued"})
+
+	for i := range outcome.Effects {
+		if outcome.Effects[i].Kind == EffectPublish && outcome.Effects[i].Event == EventProgressed {
+			if outcome.Effects[i].Status != 182 {
+				t.Fatalf("published status = %d, want 182", outcome.Effects[i].Status)
+			}
+			return
+		}
+	}
+	t.Fatalf("effects = %v, want a progressed publish", outcome.Effects)
 }

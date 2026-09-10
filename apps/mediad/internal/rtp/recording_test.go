@@ -365,3 +365,129 @@ func TestRecordingExcludesTelephoneEventPacketsFromTheAudio(t *testing.T) {
 		}
 	}
 }
+
+func TestPauseRecordingKeepsOneFileAndWritesSilenceForTheGap(t *testing.T) {
+	// PCI: the caller reads a card number, the agent pauses, and the file survives it. A stop and a
+	// restart would end the artifact at exactly the moment a reviewer cares about.
+	rig := newRecordingRig(t, 57900, 57919)
+	rig.latch(t)
+	rig.start(t, "rec-p1", rtp.RecordReceive, rtp.RecordingOptions{})
+
+	rig.speak(t, 0x10)
+	waitFor(t, "the first frame reached the recorder", func() bool {
+		session, ok := rig.manager.Get(rig.aID)
+		return ok && session.Stats().PacketsReceived >= 2
+	})
+	rig.tick(t)
+	rig.tick(t)
+
+	if _, applied, paused := rig.manager.PauseRecording("rec-p1", true); !applied || !paused {
+		t.Fatalf("PauseRecording = applied %v, paused %v; want both true", applied, paused)
+	}
+	// Spoken THROUGH the pause: this is the card number, and it must not reach the file.
+	rig.speak(t, 0x20)
+	waitFor(t, "the silenced frame reached the recorder", func() bool {
+		session, ok := rig.manager.Get(rig.aID)
+		return ok && session.Stats().PacketsReceived >= 3
+	})
+	for range 3 {
+		rig.tick(t)
+	}
+	if _, applied, paused := rig.manager.PauseRecording("rec-p1", false); !applied || paused {
+		t.Fatalf("resume = applied %v, paused %v; want applied and not paused", applied, paused)
+	}
+	rig.tick(t)
+
+	rig.manager.StopRecording("rec-p1")
+	summary := rig.finishedSummary(t)
+
+	if len(summary.Pauses) != 1 {
+		t.Fatalf("pauses = %v, want exactly one interval", summary.Pauses)
+	}
+	interval := summary.Pauses[0]
+	if interval.StartMs <= 0 || interval.EndMs <= interval.StartMs {
+		t.Errorf("pause = %+v, want a closed interval on the file's own timeline", interval)
+	}
+	if interval.EndMs > summary.DurationMs {
+		t.Errorf("pause ends at %d ms in a file %d ms long", interval.EndMs, summary.DurationMs)
+	}
+
+	// One file, and the gap is silence rather than a shorter recording.
+	samples := readSamples(t, filepath.Join(rig.root, testOrg, testCall, "rec-p1.wav"))
+	first := interval.StartMs * audio.SampleRate / 1000
+	last := interval.EndMs * audio.SampleRate / 1000
+	if last > len(samples) {
+		last = len(samples)
+	}
+	for index := first; index < last; index++ {
+		if samples[index] != 0 {
+			t.Fatalf("sample %d inside the pause is %d, want silence", index, samples[index])
+		}
+	}
+}
+
+func TestPauseRecordingIsIdempotentInBothDirections(t *testing.T) {
+	// Pausing a paused recording opens no second interval, and resuming one that was never paused
+	// closes nothing. Either would put an interval in the metadata that never happened.
+	rig := newRecordingRig(t, 57920, 57939)
+	rig.latch(t)
+	rig.start(t, "rec-p2", rtp.RecordReceive, rtp.RecordingOptions{})
+
+	rig.manager.PauseRecording("rec-p2", false)
+	rig.tick(t)
+	rig.manager.PauseRecording("rec-p2", true)
+	rig.manager.PauseRecording("rec-p2", true)
+	rig.tick(t)
+	rig.manager.PauseRecording("rec-p2", false)
+	rig.manager.PauseRecording("rec-p2", false)
+	rig.tick(t)
+
+	rig.manager.StopRecording("rec-p2")
+	summary := rig.finishedSummary(t)
+
+	if len(summary.Pauses) != 1 {
+		t.Fatalf("pauses = %v, want exactly one interval from the repeated commands", summary.Pauses)
+	}
+}
+
+func TestPauseRecordingClosesAnOpenPauseAtTheEndOfTheFile(t *testing.T) {
+	// An interval left open on a finished artifact says nothing to the person reading it.
+	rig := newRecordingRig(t, 57940, 57959)
+	rig.latch(t)
+	rig.start(t, "rec-p3", rtp.RecordReceive, rtp.RecordingOptions{})
+
+	rig.tick(t)
+	rig.manager.PauseRecording("rec-p3", true)
+	rig.tick(t)
+	rig.tick(t)
+	rig.manager.StopRecording("rec-p3")
+	summary := rig.finishedSummary(t)
+
+	if len(summary.Pauses) != 1 {
+		t.Fatalf("pauses = %v, want the open pause closed at the file's duration", summary.Pauses)
+	}
+	if summary.Pauses[0].EndMs != summary.DurationMs {
+		t.Errorf("pause ends at %d ms, want the file's duration %d ms",
+			summary.Pauses[0].EndMs, summary.DurationMs)
+	}
+}
+
+func TestPauseRecordingIsFencedByReference(t *testing.T) {
+	// A pause naming a reference this session is not recording must not silence the one it is —
+	// same fence as StopRecording, and a worse failure: the file would be quiet and nobody told.
+	rig := newRecordingRig(t, 57960, 57979)
+	rig.latch(t)
+	rig.start(t, "rec-p4", rtp.RecordReceive, rtp.RecordingOptions{})
+
+	if _, applied, _ := rig.manager.PauseRecording("some-other-ref", true); applied {
+		t.Error("a pause naming a different reference was applied to the live recording")
+	}
+	if _, applied, _ := rig.manager.PauseRecording("never-existed", true); applied {
+		t.Error("pausing a reference nothing is recording reported that it did something")
+	}
+	rig.manager.StopRecording("rec-p4")
+	summary := rig.finishedSummary(t)
+	if len(summary.Pauses) != 0 {
+		t.Errorf("pauses = %v, want none", summary.Pauses)
+	}
+}

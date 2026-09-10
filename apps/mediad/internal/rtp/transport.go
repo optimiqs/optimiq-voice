@@ -31,14 +31,30 @@ func (s *Session) readRTP(buf []byte) (int, *net.UDPAddr, error) {
 		n, err := s.transport.ReadRTP(buf)
 		return n, securePacketSource, err
 	}
-	return s.ports.RTP.ReadFromUDP(buf)
+	n, from, err := s.ports.RTP.ReadFromUDP(buf)
+	secure := s.srtp.Load()
+	if err != nil || secure == nil {
+		return n, from, err
+	}
+	// A packet that fails the auth tag is indistinguishable from noise on an open UDP port. It is
+	// handed back as a zero-length read, which handlePacket counts as malformed; an error here
+	// would end the read loop on the first stray datagram.
+	plain, decryptErr := secure.unprotectRTP(buf[:n])
+	if decryptErr != nil {
+		return 0, from, nil
+	}
+	return len(plain), from, nil
 }
 
 func (s *Session) writeRTP(buf []byte, to *net.UDPAddr) (int, error) {
 	if s.transport != nil {
 		return s.transport.WriteRTP(buf)
 	}
-	return s.ports.RTP.WriteToUDP(buf, to)
+	secure := s.srtp.Load()
+	if secure == nil {
+		return s.ports.RTP.WriteToUDP(buf, to)
+	}
+	return s.protectedWrite(s.ports.RTP, secure.protectRTP, buf, to)
 }
 
 func (s *Session) readRTCP(buf []byte) (int, *net.UDPAddr, error) {
@@ -46,14 +62,47 @@ func (s *Session) readRTCP(buf []byte) (int, *net.UDPAddr, error) {
 		n, err := s.transport.ReadRTCP(buf)
 		return n, securePacketSource, err
 	}
-	return s.ports.RTCP.ReadFromUDP(buf)
+	n, from, err := s.ports.RTCP.ReadFromUDP(buf)
+	secure := s.srtp.Load()
+	if err != nil || secure == nil {
+		return n, from, err
+	}
+	plain, decryptErr := secure.unprotectRTCP(buf[:n])
+	if decryptErr != nil {
+		return 0, from, nil
+	}
+	return len(plain), from, nil
 }
 
 func (s *Session) writeRTCP(buf []byte, to *net.UDPAddr) (int, error) {
 	if s.transport != nil {
 		return s.transport.WriteRTCP(buf)
 	}
-	return s.ports.RTCP.WriteToUDP(buf, to)
+	secure := s.srtp.Load()
+	if secure == nil {
+		return s.ports.RTCP.WriteToUDP(buf, to)
+	}
+	return s.protectedWrite(s.ports.RTCP, secure.protectRTCP, buf, to)
+}
+
+// protectedWrite encrypts into pooled scratch and writes the result, reporting the PLAINTEXT length
+// so callers cannot tell an SRTP leg from a plain one by the byte count.
+func (s *Session) protectedWrite(
+	socket *net.UDPConn,
+	protect func(dst, plaintext []byte) ([]byte, error),
+	buf []byte,
+	to *net.UDPAddr,
+) (int, error) {
+	scratch, _ := outboundBuffers.Get().(*[]byte)
+	defer outboundBuffers.Put(scratch)
+	protected, err := protect((*scratch)[:0], buf)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := socket.WriteToUDP(protected, to); err != nil {
+		return 0, err
+	}
+	return len(buf), nil
 }
 
 // outboundBuffers is the scratch every send path marshals into before the socket write.

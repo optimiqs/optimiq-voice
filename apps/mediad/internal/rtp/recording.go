@@ -85,6 +85,13 @@ type RecordingOptions struct {
 	TerminateOn string
 }
 
+// RecordingPause is one stretch the recorder wrote silence for, against the file's own timeline.
+// Milliseconds from the start of the file, `[StartMs, EndMs)`.
+type RecordingPause struct {
+	StartMs int
+	EndMs   int
+}
+
 // RecordingSummary is a finished recording's facts, flattened for a Lifecycle implementation.
 type RecordingSummary struct {
 	Ref        string
@@ -93,6 +100,7 @@ type RecordingSummary struct {
 	Reason     RecordingEndReason
 	DurationMs int
 	Bytes      int64
+	Pauses     []RecordingPause
 	Detail     string
 }
 
@@ -115,6 +123,21 @@ type Recording struct {
 
 	// dropped counts frames that arrived with the queue full, so a hole in the file is explicable.
 	dropped atomic.Int64
+
+	// paused is read on the recorder's own tick and written by `pause-recording`. While it is set
+	// the tick still runs and still writes a frame — silence — which is the whole difference from a
+	// stop: one file, and the audio after the gap still sits at the offset it happened at.
+	paused atomic.Bool
+	// writtenMs is how much audio the file holds, in whole frames, published by the recorder for
+	// the command path to read. The WAVWriter is the recorder goroutine's alone, so a pause that
+	// asked IT for the offset would be a data race.
+	writtenMs atomic.Int64
+
+	// pauseMu guards the two fields below, which the command path appends to and the recorder reads
+	// once, at finish. pauseStartMs is -1 when nothing is paused.
+	pauseMu      sync.Mutex
+	pauseStartMs int
+	pauses       []RecordingPause
 
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -144,6 +167,47 @@ func (r *Recording) Summary() RecordingSummary { return r.summary }
 
 // Dropped is how many frames arrived while a direction's queue was full.
 func (r *Recording) Dropped() int { return int(r.dropped.Load()) }
+
+// Paused reports whether the recorder is currently writing silence.
+func (r *Recording) Paused() bool { return r.paused.Load() }
+
+// SetPaused pauses or resumes the capture WITHOUT ending the file, and reports the state after.
+//
+// Idempotent in both directions: pausing a paused recording, or resuming one that was never paused,
+// changes nothing and is not an error. A pause is only ever closed here or at finish, so the
+// intervals cannot overlap and cannot be left open on a finished artifact.
+func (r *Recording) SetPaused(paused bool) bool {
+	r.pauseMu.Lock()
+	defer r.pauseMu.Unlock()
+
+	if paused == r.paused.Load() {
+		return paused
+	}
+	at := int(r.writtenMs.Load())
+	if paused {
+		r.pauseStartMs = at
+	} else if r.pauseStartMs >= 0 {
+		r.pauses = append(r.pauses, RecordingPause{StartMs: r.pauseStartMs, EndMs: at})
+		r.pauseStartMs = -1
+	}
+	r.paused.Store(paused)
+	return paused
+}
+
+// closePauses returns the intervals, closing an open one at the file's own duration. A pause still
+// running when the recording ended has to be closed by something, and an open interval on a
+// finished artifact says nothing to the person reading it.
+func (r *Recording) closePauses(durationMs int) []RecordingPause {
+	r.pauseMu.Lock()
+	defer r.pauseMu.Unlock()
+
+	if r.pauseStartMs >= 0 {
+		r.pauses = append(r.pauses, RecordingPause{StartMs: r.pauseStartMs, EndMs: durationMs})
+		r.pauseStartMs = -1
+		r.paused.Store(false)
+	}
+	return r.pauses
+}
 
 // Stop finalises the recording. Idempotent; a stop of a finished recording does nothing.
 func (r *Recording) Stop() { r.stopFor(RecordingStopped) }
@@ -222,6 +286,8 @@ func (s *Session) StartRecording(opts RecordingOptions) (*Recording, error) {
 		sent:     make(chan []byte, recordingQueueFrames),
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
+
+		pauseStartMs: -1,
 	}
 
 	// Claimed before the file is opened, so two racing starts cannot both create a partial.
@@ -251,6 +317,17 @@ func (s *Session) StopRecording(ref string) bool {
 	}
 	recording.Stop()
 	return true
+}
+
+// PauseRecording pauses or resumes the session's recording when it matches ref, reporting whether
+// there was one to act on and the paused state after. Fenced on the reference exactly as
+// StopRecording is, for the same reason: a late pause must not silence a recording it does not name.
+func (s *Session) PauseRecording(ref string, paused bool) (bool, bool) {
+	recording := s.ActiveRecording()
+	if recording == nil || recording.opts.Ref != ref {
+		return false, false
+	}
+	return true, recording.SetPaused(paused)
 }
 
 // ActiveRecording is the recording in flight on this session, or nil.
@@ -290,6 +367,7 @@ func (r *Recording) run() {
 			r.fail(err)
 			return
 		}
+		r.writtenMs.Add(audio.FrameDurationMs)
 
 		if maxSilentFrames > 0 {
 			if quiet(frame) {
@@ -315,6 +393,14 @@ func (r *Recording) run() {
 func (r *Recording) mixOneFrame() []int16 {
 	mixed := make([]int16, audio.FrameSamples)
 
+	if r.paused.Load() {
+		// Still consuming one frame per direction, so the queues drain at the rate they fill: a
+		// pause that let them back up would replay the silenced audio the moment it lifted, which
+		// is precisely the card number the pause exists to keep out of the file.
+		r.discardOneFrame()
+		return mixed
+	}
+
 	select {
 	case frame := <-r.received:
 		audio.MixInto(mixed, audio.DecodeLinear(frame, r.opts.Encoding))
@@ -329,6 +415,20 @@ func (r *Recording) mixOneFrame() []int16 {
 		}
 	}
 	return mixed
+}
+
+// discardOneFrame drops at most one frame from each direction the recording captures.
+func (r *Recording) discardOneFrame() {
+	select {
+	case <-r.received:
+	default:
+	}
+	if r.opts.Direction == RecordBoth {
+		select {
+		case <-r.sent:
+		default:
+		}
+	}
 }
 
 // finish closes the file and records the outcome. Exactly once.
@@ -371,6 +471,7 @@ func (r *Recording) finish(reason RecordingEndReason) {
 			Reason:     reason,
 			DurationMs: durationMs,
 			Bytes:      bytes,
+			Pauses:     r.closePauses(durationMs),
 			Detail:     detail,
 		}
 	})

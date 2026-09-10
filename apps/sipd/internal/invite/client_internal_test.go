@@ -44,6 +44,9 @@ func TestATrunkIntentOmitsTheTenantEntirely(t *testing.T) {
 	if request.TrunkID == nil || *request.TrunkID == "" {
 		t.Fatal("trunkId was not carried; the engine cannot attribute the call without it")
 	}
+	if request.DeviceID != nil {
+		t.Fatalf("deviceId = %v, want it omitted for a trunk INVITE", *request.DeviceID)
+	}
 }
 
 // A digest INVITE carries the tenant the credential resolved, and the AOR rebuilt from the
@@ -52,6 +55,7 @@ func TestADigestIntentCarriesTheTenantAndTheCredentialAOR(t *testing.T) {
 	intent := trunkIntent()
 	intent.Authentication = AuthenticationDigest
 	intent.OrgID = "018f0000-0000-7000-8000-000000000000"
+	intent.DeviceID = "018f0000-0000-7000-8000-0000000000d1"
 	intent.RoutingContext = profile.ContextInternal
 	intent.TrunkID = ""
 	intent.From.AOR = "sip:1001@acme.example.com"
@@ -60,6 +64,9 @@ func TestADigestIntentCarriesTheTenantAndTheCredentialAOR(t *testing.T) {
 
 	if request.OrgID == nil || *request.OrgID != intent.OrgID {
 		t.Fatalf("orgId = %v, want %q", request.OrgID, intent.OrgID)
+	}
+	if request.DeviceID == nil || *request.DeviceID != intent.DeviceID {
+		t.Fatalf("deviceId = %v, want %q", request.DeviceID, intent.DeviceID)
 	}
 	if request.From.AOR == nil || *request.From.AOR != "sip:1001@acme.example.com" {
 		t.Fatalf("from.aor = %v, want the credential's canonical form", request.From.AOR)

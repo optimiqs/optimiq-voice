@@ -100,9 +100,10 @@ func NewAuthenticator(realm string, secret []byte, ttl time.Duration) (*Authenti
 // Realm returns the realm this authenticator challenges for.
 func (a *Authenticator) Realm() string { return a.realm }
 
-// ForRequest selects the account domain, never the called destination or an unverified digest
-// realm. The credential directory remains the authority for which organizations own domains.
-func (a *Authenticator) ForRequest(req *sip.Request) *Authenticator {
+// RequestRealm is the account domain a request names: the To host on a REGISTER, the From host
+// otherwise. Empty when the request names none, which is the ONLY case in which the deployment-wide
+// SIPD_REALM stands in for a tenant's domain — see ForRequest.
+func RequestRealm(req *sip.Request) string {
 	realm := ""
 	if req.Method == sip.REGISTER {
 		if to := req.To(); to != nil {
@@ -111,7 +112,18 @@ func (a *Authenticator) ForRequest(req *sip.Request) *Authenticator {
 	} else if from := req.From(); from != nil {
 		realm = from.Address.Host
 	}
-	realm = strings.ToLower(strings.TrimSpace(realm))
+	return strings.ToLower(strings.TrimSpace(realm))
+}
+
+// ForRequest selects the account domain, never the called destination or an unverified digest
+// realm. The credential directory remains the authority for which organizations own domains.
+//
+// A request that names no domain falls back to this authenticator's own realm — SIPD_REALM. That is
+// a "no tenant matched" default and nothing else: it is the realm this edge challenges with when it
+// has been given no domain to challenge for, never a realm handed to a tenant. Nothing upstream may
+// substitute it for an organization's own domain; the API and the engine both refuse instead.
+func (a *Authenticator) ForRequest(req *sip.Request) *Authenticator {
+	realm := RequestRealm(req)
 	if realm == "" || realm == a.realm {
 		return a
 	}

@@ -60,6 +60,10 @@ type CallIntent struct {
 	InstanceID string
 	// OrgID is present ONLY when a digest resolved a credential. Absent for a trunk.
 	OrgID string
+	// DeviceID is the registered device the credential maps to, present ONLY on a digest INVITE.
+	// Identity, never authorisation: the engine stamps it on the leg so an emergency call names the
+	// handset it was placed from rather than inferring one.
+	DeviceID string
 	// Authentication is how the sender proved itself.
 	Authentication Authentication
 	// Profile names the trust boundary this arrived on.
@@ -89,6 +93,9 @@ type CallIntent struct {
 	// MediaHint tells the media plane that the far end's advertised media address disagrees with
 	// where its signalling came from, so a latch is expected rather than a surprise.
 	MediaHint nat.MediaHint
+	// Attestation is the carrier's STIR/SHAKEN claim, populated ONLY on a trunk-authenticated
+	// INVITE. See the type for why a digest-authenticated one is deliberately left empty.
+	Attestation Attestation
 	// UserAgent is the far end's User-Agent.
 	UserAgent string
 	// Replaces is the RFC 3891 header when this INVITE completes an attended transfer, and
@@ -139,6 +146,7 @@ func Parse(req *sip.Request, opts ParseOptions) (CallIntent, error) {
 		LegID:          opts.LegID,
 		InstanceID:     opts.InstanceID,
 		OrgID:          opts.OrgID,
+		DeviceID:       opts.DeviceID,
 		Authentication: opts.Authentication,
 		Profile:        opts.Profile,
 		RoutingContext: opts.RoutingContext,
@@ -165,6 +173,9 @@ func Parse(req *sip.Request, opts ParseOptions) (CallIntent, error) {
 	if intent.HasOffer {
 		intent.MediaHint = nat.HintFor(body, intent.SourceAddress)
 	}
+	if opts.Authentication == AuthenticationTrunkACL {
+		intent.Attestation = attestationOf(req)
+	}
 	return intent, nil
 }
 
@@ -174,6 +185,7 @@ type ParseOptions struct {
 	LegID          string
 	InstanceID     string
 	OrgID          string
+	DeviceID       string
 	Authentication Authentication
 	Profile        string
 	RoutingContext profile.RoutingContext

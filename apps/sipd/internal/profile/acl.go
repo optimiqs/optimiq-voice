@@ -81,8 +81,8 @@ type ACL struct {
 	// watched records that this ACL is fed by a KV watch rather than fixed at boot. It changes
 	// exactly one thing: whether an empty ACL is a valid external profile. See Profile.Validate.
 	watched bool
-	// defaultAllow is what happens when nothing matches. It is false for every ACL this package
-	// builds and no constructor sets it true: an ACL whose default is allow is not an ACL.
+	// defaultAllow is what happens when nothing matches. False for every ACL that IS the boundary;
+	// true only for a blocklist standing in front of a credential. See NewWatchedBlocklist.
 	defaultAllow bool
 }
 
@@ -98,6 +98,24 @@ func NewACL(entries []Entry) *ACL {
 // to type: a watched ACL may legitimately be empty at boot, and a fixed one may not.
 func NewWatchedACL(entries []Entry) *ACL {
 	acl := &ACL{watched: true}
+	acl.store(entries)
+	return acl
+}
+
+// NewWatchedBlocklist compiles entries into an evaluator whose default is ADMIT.
+//
+// The one place that is correct is REGISTER admission, and the reason is that the credential is
+// somewhere else. A trunk INVITE has no secret behind it, so the ACL IS the boundary and an address
+// matching nothing must be refused. A REGISTER is digest-authenticated whatever this answers, so
+// this list is a blocklist in front of a credential — the fail2ban half of the boundary — and a
+// default of refuse would mean one tenant writing one `registration` allow rule silently stopped
+// every other tenant's phones on a shared edge, since the `sip-acl` read model carries no
+// organization an arriving REGISTER could be matched against.
+//
+// An `allow` entry therefore only carves an exception out of a broader `deny`; specificity-then-
+// priority already orders the two.
+func NewWatchedBlocklist(entries []Entry) *ACL {
+	acl := &ACL{watched: true, defaultAllow: true}
 	acl.store(entries)
 	return acl
 }
@@ -167,14 +185,21 @@ func (a *ACL) Len() int {
 // Match evaluates one source address, which must be the OBSERVED transport source, `host:port` or a
 // bare host. Never a header: an ACL that matched on a Via or a From is an ACL an attacker writes.
 func (a *ACL) Match(source string) (Entry, bool) {
+	if a == nil {
+		// A nil ACL has no default to consult and refuses, as it did before blocklists existed.
+		return Entry{}, false
+	}
 	entries := a.load()
 	if len(entries) == 0 {
 		// An empty ACL matches nothing, so one whose bucket has not loaded yet refuses every carrier:
-		// an outage an operator notices, rather than an open relay nobody does.
-		return Entry{}, false
+		// an outage an operator notices, rather than an open relay nobody does. A blocklist with
+		// nothing in it blocks nothing, which is the same rule read from the other side.
+		return Entry{}, a.defaultAllow
 	}
 	address, ok := addressOf(source)
 	if !ok {
+		// An unparseable source cannot be matched. Refused whatever the default is: a blocklist that
+		// admitted what it could not evaluate would be bypassed by malforming the address.
 		return Entry{}, false
 	}
 	for _, entry := range entries {

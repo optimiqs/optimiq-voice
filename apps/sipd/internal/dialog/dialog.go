@@ -106,6 +106,11 @@ type Dialog struct {
 	// Profile names the listener profile this dialog arrived on (internal or external), so a
 	// mid-dialog decision can apply the same policy the initial request was admitted under.
 	Profile string
+	// AccountAOR is the address of record of the registered account at the FAR end of this dialog:
+	// rebuilt from the credential on an inbound digest INVITE, and the AOR we resolved on an
+	// outbound one. Empty for a trunk leg or a bare URI, which have no account. It is the acting
+	// identity for an in-dialog request (RFC 3261 §12.2), whose own From header carries none.
+	AccountAOR string
 
 	state State
 	// cause and termination are set by whichever path ends the dialog, and read by the one place
@@ -153,6 +158,8 @@ type Options struct {
 	Identity Identity
 	Target   Target
 	Profile  string
+	// AccountAOR is the far end's address of record when it has one. See Dialog.AccountAOR.
+	AccountAOR string
 	// Now is injectable so expiry and duration behaviour is testable without sleeping.
 	Now func() time.Time
 }
@@ -170,16 +177,17 @@ func New(opts Options) (*Dialog, error) {
 		return nil, ErrNoIdentity
 	}
 	dialog := &Dialog{
-		LegID:    opts.LegID,
-		OrgID:    opts.OrgID,
-		CallID:   opts.CallID,
-		TrunkID:  opts.TrunkID,
-		Role:     opts.Role,
-		Identity: opts.Identity,
-		Target:   opts.Target,
-		Profile:  opts.Profile,
-		state:    StateInit,
-		now:      opts.Now,
+		LegID:      opts.LegID,
+		OrgID:      opts.OrgID,
+		CallID:     opts.CallID,
+		TrunkID:    opts.TrunkID,
+		Role:       opts.Role,
+		Identity:   opts.Identity,
+		Target:     opts.Target,
+		Profile:    opts.Profile,
+		AccountAOR: opts.AccountAOR,
+		state:      StateInit,
+		now:        opts.Now,
 	}
 	if dialog.now == nil {
 		dialog.now = time.Now
@@ -290,7 +298,10 @@ func (d *Dialog) effectsFor(in Input, from, next State, at time.Time) []Effect {
 		}
 		return []Effect{
 			{Kind: EffectRespond, Status: status, Reason: reason},
-			publish(EventProgressed),
+			// The status travels on the publish effect too. `eventFor` reads the event off the
+			// effect it is given, and a publish with no status line is defaulted to 180 there — so
+			// a 181 or a 182 sent on this path would be reported to the engine as a plain 180.
+			{Kind: EffectPublish, Event: EventProgressed, Status: status},
 		}
 
 	case TriggerLocalEarlyMedia:
@@ -299,7 +310,17 @@ func (d *Dialog) effectsFor(in Input, from, next State, at time.Time) []Effect {
 		d.offer.commitAnswer(in.Body)
 		return []Effect{
 			{Kind: EffectRespond, Status: 183, Reason: "Session Progress", Body: in.Body},
-			{Kind: EffectPublish, Event: EventProgressed, Detail: "early media"},
+			// Status AND body, both of which this publish effect used to omit — so a 183 that went
+			// out on the wire correctly was announced to the engine as `status 180, hasEarlyMedia
+			// false, no sdpAnswer`, which is the shape of plain ringback. Anything reading the event
+			// family rather than a packet capture concluded the body had been dropped.
+			{
+				Kind:   EffectPublish,
+				Event:  EventProgressed,
+				Status: 183,
+				Body:   in.Body,
+				Detail: "early media",
+			},
 		}
 
 	case TriggerLocalAnswer:
@@ -402,7 +423,16 @@ func (d *Dialog) effectsFor(in Input, from, next State, at time.Time) []Effect {
 			d.offer.commitAnswer(in.Body)
 			detail = "early media"
 		}
-		return append(effects, Effect{Kind: EffectPublish, Event: EventProgressed, Detail: detail})
+		// The body travels on the effect, not merely into the offer state: `dialog.progressed`
+		// carries the far end's early answer on a UAC leg so early media can be settled without a
+		// second round trip back to the edge for bytes the edge already holds.
+		return append(effects, Effect{
+			Kind:   EffectPublish,
+			Event:  EventProgressed,
+			Detail: detail,
+			Status: in.Status,
+			Body:   in.Body,
+		})
 
 	case TriggerRemoteAnswer:
 		return d.remoteAnswerEffects(in, from, at)

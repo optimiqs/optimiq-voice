@@ -126,6 +126,9 @@ type Options struct {
 	Auth *registrar.Authenticator
 	// Credentials resolves the account behind the caller's AOR.
 	Credentials credentials.Store
+	// Lockout throttles credential guessing. It must be the same instance the registrar holds: a
+	// spray that got one budget per method would get several. Nil disables it.
+	Lockout *registrar.Lockout
 	// Dialogs is this instance's dialog table.
 	Dialogs *dialog.Store
 	// Claims is the `sip-dialogs` bucket. Optional: without it a single instance still works and
@@ -192,6 +195,7 @@ type Handler struct {
 	realm     string
 	auth      *registrar.Authenticator
 	creds     credentials.Store
+	lockout   *registrar.Lockout
 	dialogs   *dialog.Store
 	claims    dialog.ClaimStore
 	profiles  *profile.Set
@@ -288,6 +292,7 @@ func New(opts Options) (*Handler, error) {
 		realm:         opts.Realm,
 		auth:          opts.Auth,
 		creds:         opts.Credentials,
+		lockout:       opts.Lockout,
 		dialogs:       opts.Dialogs,
 		claims:        opts.Claims,
 		profiles:      opts.Profiles,
@@ -439,6 +444,7 @@ func (h *Handler) handleInitialInvite(req *sip.Request, tx sip.ServerTransaction
 		}
 		parseOpts.Authentication = AuthenticationDigest
 		parseOpts.OrgID = credential.OrgID
+		parseOpts.DeviceID = credential.DeviceID
 		// Rebuilt from the credential, not the From header: the equality check covers the user part
 		// alone, so the message could otherwise choose the domain spelling the engine sees.
 		parseOpts.CallerAOR = "sip:" + credential.Username + "@" + strings.ToLower(credential.Realm)
@@ -558,14 +564,15 @@ func (h *Handler) createLeg(
 	}
 
 	created, err := dialog.New(dialog.Options{
-		LegID:    intent.LegID,
-		OrgID:    intent.OrgID,
-		TrunkID:  intent.TrunkID,
-		Role:     dialog.RoleUAS,
-		Identity: identity,
-		Target:   target,
-		Profile:  owner.Name,
-		Now:      h.now,
+		LegID:      intent.LegID,
+		OrgID:      intent.OrgID,
+		TrunkID:    intent.TrunkID,
+		Role:       dialog.RoleUAS,
+		Identity:   identity,
+		Target:     target,
+		Profile:    owner.Name,
+		AccountAOR: intent.From.AOR,
+		Now:        h.now,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -719,8 +726,24 @@ func (h *Handler) HandleAck(req *sip.Request, _ sip.ServerTransaction) {
 func (h *Handler) HandleBye(req *sip.Request, tx sip.ServerTransaction) {
 	target, found := h.dialogs.MatchRequest(req)
 	if !found {
-		// 481: this instance does not hold that dialog — either the call is over, or the BYE
-		// reached the wrong replica.
+		// 481: this instance does not hold that dialog — the call is over, the BYE reached the wrong
+		// replica, or this process replaced the one that held it.
+		//
+		// A restarted sipd deliberately does NOT re-adopt its predecessor's dialogs from the
+		// `sip-dialogs` claims. The claim records the dialog's IDENTITY — Call-ID and tags — and
+		// nothing that makes a process a participant in it: no route set, no local or remote CSeq,
+		// no transport binding, no transaction state. A half-adopted dialog could answer this BYE
+		// and then fail every re-INVITE and every in-dialog request after it, which is a worse lie
+		// than 481, and RFC 3261 §12.2.2 requires 481 for a request that matches no dialog anyway.
+		// The engine ends these legs off the instance lease instead (internal/lease), so the CDR is
+		// written and the other party gets a BYE; the phone's own retry then finds nothing, which is
+		// the truth. Logged rather than silent so a 481 after a restart is self-explaining.
+		sipCallID := ""
+		if header := req.CallID(); header != nil {
+			sipCallID = header.Value()
+		}
+		h.log.Info("answered a request 481: this process does not hold that dialog",
+			"method", req.Method.String(), "sipCallId", sipCallID, "source", req.Source())
 		h.respond(tx, req, statusCallDoesNotExist, "Call/Transaction Does Not Exist")
 		return
 	}
@@ -1015,17 +1038,33 @@ func (h *Handler) authorize(
 		return credentials.Credential{}, false
 	}
 
+	// Before the lookup, and answered exactly as an unknown account is — see the same check in
+	// registrar.authorize for why the ordering and the indistinguishable status are the point.
+	if refusal, locked := h.lockout.Locked(req.Source(), auth.Username); locked {
+		log.Info("refusing an INVITE from a locked source",
+			"username", auth.Username, "retryAfterSeconds", int(refusal.RetryAfter.Seconds()))
+		h.respond(tx, req, statusForbidden, "Forbidden")
+		return credentials.Credential{}, false
+	}
+
 	credential, err := h.creds.Lookup(ctx, accountAuth.Realm(), auth.Username)
 	if err != nil {
+		status, reason := statusForbidden, "Forbidden"
 		switch {
 		case errors.Is(err, credentials.ErrNotFound):
+			h.lockout.Fail(req.Source(), auth.Username, "", "")
 			log.Info("refusing an unknown account", "username", auth.Username)
 		case errors.Is(err, credentials.ErrDisabled):
 			log.Info("refusing a disabled account", "username", auth.Username)
 		default:
+			// No answer from the credential RPC is not a claim about this account: a 403 tells the
+			// phone its credentials are wrong and most handsets stop retrying, so a burst that
+			// exceeds the responder's deadline would black out a fleet until somebody re-provisions
+			// it. 503 is the retriable answer (RFC 3261 §21.5.4).
 			log.Error("cannot look up the account", "username", auth.Username, "error", err)
+			status, reason = statusServiceUnavail, "Service Unavailable"
 		}
-		h.respond(tx, req, statusForbidden, "Forbidden")
+		h.respond(tx, req, status, reason)
 		return credentials.Credential{}, false
 	}
 	// INVITE, not REGISTER: HA2 is MD5(method:uri), so the wrong method name accepts nothing.
@@ -1034,10 +1073,13 @@ func (h *Handler) authorize(
 			h.challenge(req, tx, true, log)
 			return credentials.Credential{}, false
 		}
+		h.lockout.Fail(req.Source(), auth.Username, credential.OrgID,
+			"sip:"+credential.Username+"@"+strings.ToLower(credential.Realm))
 		log.Warn("refusing a failed digest", "username", auth.Username, "reason", err)
 		h.respond(tx, req, statusForbidden, "Forbidden")
 		return credentials.Credential{}, false
 	}
+	h.lockout.Succeed(req.Source(), auth.Username)
 	return credential, true
 }
 

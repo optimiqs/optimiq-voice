@@ -128,7 +128,27 @@ type Config struct {
 
 	// ShutdownTimeout bounds graceful shutdown. MEDIAD_SHUTDOWN_TIMEOUT, default 10s.
 	ShutdownTimeout time.Duration
+
+	// SRTPPolicy decides SDES-SRTP (RFC 4568) on the SIP/RTP legs. MEDIAD_SRTP_POLICY, default
+	// `prefer`. WebRTC is unaffected: that leg is DTLS-SRTP and mandatory either way.
+	//
+	// Deployment-wide because no per-org or per-device setting exists yet; when one does, the engine
+	// carries it per leg on allocate-session and this becomes the fallback.
+	SRTPPolicy SRTPPolicy
 }
+
+// SRTPPolicy is what mediad does about SDES on a SIP leg.
+type SRTPPolicy string
+
+const (
+	// SRTPPrefer accepts SDES when the offer carries a usable crypto line under SAVP, and answers
+	// plain RTP/AVP otherwise. The default: desk phones on UDP/TCP frequently offer neither.
+	SRTPPrefer SRTPPolicy = "prefer"
+	// SRTPRequire refuses an offer with no usable SDES.
+	SRTPRequire SRTPPolicy = "require"
+	// SRTPDisable never offers or accepts SDES.
+	SRTPDisable SRTPPolicy = "disable"
+)
 
 // EventSource is the `source` field mediad stamps on anything it publishes, and its NATS client
 // name.
@@ -220,6 +240,12 @@ func Load(getenv Getenv) (Config, error) {
 	}
 	if cfg.EnablePprof, err = boolOr(getenv, "MEDIAD_PPROF", false); err != nil {
 		fail("%v", err)
+	}
+	switch policy := SRTPPolicy(stringOr(getenv, "MEDIAD_SRTP_POLICY", string(SRTPPrefer))); policy {
+	case SRTPPrefer, SRTPRequire, SRTPDisable:
+		cfg.SRTPPolicy = policy
+	default:
+		fail("MEDIAD_SRTP_POLICY must be one of prefer/require/disable, got %q", policy)
 	}
 
 	// PublicIP has no fallback, so it is parsed here rather than through addrOr.

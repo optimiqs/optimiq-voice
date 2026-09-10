@@ -224,6 +224,39 @@ func TestOrphansIgnoresOurOwnAndLiveClaims(t *testing.T) {
 	}
 }
 
+// Reapable adds the second piece of evidence: an owner with no live INSTANCE lease is gone now,
+// however long its claim's own lease still has to run.
+func TestReapableTakesAClaimWhoseOwnerHasNoInstanceLease(t *testing.T) {
+	now := testClock
+	claims := []Claim{
+		{LegID: "a", InstanceID: "sipd-gone", ExpiresAt: now.Add(time.Hour).UnixMilli()},
+		{LegID: "b", InstanceID: "sipd-other", ExpiresAt: now.Add(time.Hour).UnixMilli()},
+		{LegID: "c", InstanceID: "sipd-ours", ExpiresAt: now.Add(-time.Hour).UnixMilli()},
+	}
+	live := map[string]struct{}{"sipd-ours": {}, "sipd-other": {}}
+	reapable := Reapable(claims, "sipd-ours", now, live)
+	if len(reapable) != 1 || reapable[0].LegID != "a" {
+		t.Fatalf("reapable = %v, want only leg a", reapable)
+	}
+}
+
+// The safety property. An empty set is "no lease evidence this sweep" — an older sipd, or a bucket
+// that could not be listed — and must never be read as "every instance in the fleet is dead".
+func TestReapableIgnoresAnEmptyLiveSet(t *testing.T) {
+	now := testClock
+	claims := []Claim{{LegID: "a", InstanceID: "sipd-other", ExpiresAt: now.Add(time.Hour).UnixMilli()}}
+	for name, live := range map[string]map[string]struct{}{
+		"nil":   nil,
+		"empty": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if reapable := Reapable(claims, "sipd-ours", now, live); len(reapable) != 0 {
+				t.Fatalf("reapable = %v with no lease evidence, want none", reapable)
+			}
+		})
+	}
+}
+
 func TestMemoryClaimStoreRoundTrips(t *testing.T) {
 	ctx := t.Context()
 	store := NewMemoryClaimStore()
@@ -357,4 +390,77 @@ func TestClaimsDoNotRaceWithTheOwningGoroutine(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	close(stop)
 	work.Wait()
+}
+
+// answerUAC drives a fresh UAC dialog to StateEstablished the way the wire does.
+func answerUAC(t *testing.T, d *Dialog) {
+	t.Helper()
+	for _, in := range []Input{
+		{Trigger: TriggerRemoteProvisional},
+		{Trigger: TriggerRemoteEarly, RemoteTag: d.Identity.RemoteTag},
+		{Trigger: TriggerRemoteAnswer, RemoteTag: d.Identity.RemoteTag},
+	} {
+		if _, err := d.Apply(in); err != nil {
+			t.Fatalf("Apply(%v): %v", in.Trigger, err)
+		}
+	}
+}
+
+func referTo(t *testing.T, callID, fromTag, toTag string) *sip.Request {
+	t.Helper()
+	return parseRequest(t, `REFER sip:edge@acme.example.com SIP/2.0
+Via: SIP/2.0/UDP 203.0.113.7:5060;branch=z9hG4bK1
+From: <sip:mdokeqt0@bnttdi537va5.invalid;transport=ws>;tag=`+fromTag+`
+To: <sip:1002@acme.example.com>;tag=`+toTag+`
+Call-ID: `+callID+`
+CSeq: 2 REFER
+Refer-To: <sip:1003@acme.example.com>
+Content-Length: 0
+
+`)
+}
+
+func TestMatchEstablishedAuthorisesOnTheFullTriple(t *testing.T) {
+	identity := Identity{SIPCallID: "call-1", LocalTag: "ours", RemoteTag: "theirs"}
+	store, created := storeWithDialog(t, RoleUAC, identity)
+	created.AccountAOR = "sip:1002@acme.example.com"
+	answerUAC(t, created)
+
+	member, ok := store.MatchEstablished(referTo(t, "call-1", "theirs", "ours"))
+	if !ok {
+		t.Fatal("an in-dialog REFER on an answered dialog must match")
+	}
+	if member.LegID != created.LegID || member.AccountAOR != created.AccountAOR ||
+		member.OrgID != created.OrgID {
+		t.Errorf("membership = %+v, want the dialog's own identity", member)
+	}
+
+	// Both tags are the secret. A guessed Call-ID with a wrong tag on either side matches nothing,
+	// and the early index — Call-ID plus our tag alone — must not be a way in.
+	for _, tc := range []struct{ name, fromTag, toTag string }{
+		{"a wrong remote tag", "guessed", "ours"},
+		{"a wrong local tag", "theirs", "guessed"},
+	} {
+		if _, ok := store.MatchEstablished(referTo(t, "call-1", tc.fromTag, tc.toTag)); ok {
+			t.Errorf("%s matched an established dialog", tc.name)
+		}
+	}
+}
+
+func TestMatchEstablishedRefusesADialogThatIsNotAnswered(t *testing.T) {
+	identity := Identity{SIPCallID: "call-2", LocalTag: "ours", RemoteTag: "theirs"}
+	store, created := storeWithDialog(t, RoleUAC, identity)
+	created.AccountAOR = "sip:1002@acme.example.com"
+
+	if _, ok := store.MatchEstablished(referTo(t, "call-2", "theirs", "ours")); ok {
+		t.Error("a dialog that has not been answered must not authorise an in-dialog request")
+	}
+
+	answerUAC(t, created)
+	if _, err := created.Apply(Input{Trigger: TriggerRemoteBye}); err != nil {
+		t.Fatalf("Apply(bye): %v", err)
+	}
+	if _, ok := store.MatchEstablished(referTo(t, "call-2", "theirs", "ours")); ok {
+		t.Error("a dialog that has ended must not authorise an in-dialog request")
+	}
 }

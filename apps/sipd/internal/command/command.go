@@ -50,6 +50,8 @@ type Server struct {
 	instance string
 	token    string
 	log      *slog.Logger
+	// commands runs handlers off the subscription dispatcher, ordered per leg. See keyedRunner.
+	commands *keyedRunner
 }
 
 // Options configures a Server. Every dependency is an interface, so the unit suite drives every
@@ -79,6 +81,7 @@ func NewServer(opts Options) (*Server, error) {
 		log = slog.Default()
 	}
 	return &Server{
+		commands: newKeyedRunner(maxConcurrentCommands),
 		dialogs:  opts.Dialogs,
 		instance: strings.TrimSpace(opts.InstanceID),
 		token:    token,
@@ -150,9 +153,12 @@ func (s *Server) Subscribe(conn *nats.Conn) ([]*nats.Subscription, error) {
 				s.log.Warn("ignoring a command with no reply subject", "subject", subject)
 				return
 			}
-			if err := msg.Respond(handle(msg.Data)); err != nil {
-				s.log.Error("cannot reply to a command", "subject", subject, "error", err)
-			}
+			data := msg.Data
+			s.commands.Submit(orderingKey(data), func() {
+				if err := msg.Respond(handle(data)); err != nil {
+					s.log.Error("cannot reply to a command", "subject", subject, "error", err)
+				}
+			})
 		}
 
 		var (

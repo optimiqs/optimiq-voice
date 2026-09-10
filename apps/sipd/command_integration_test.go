@@ -5,6 +5,11 @@ package sipd_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
+	"runtime"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -341,7 +346,7 @@ func TestTheSIPACLWatchDeliversAnEntry(t *testing.T) {
 		t.Fatal("an empty ACL admitted an address")
 	}
 
-	key, err := contract.SIPACLKVKey("203.0.113.0/24")
+	key, err := contract.SIPACLKVKey(itOrg, string(acl.ScopeTrunk), "203.0.113.0/24")
 	if err != nil {
 		t.Fatalf("SIPACLKVKey: %v", err)
 	}
@@ -458,5 +463,94 @@ func TestTheTrunkDirectoryWatchDeliversARecord(t *testing.T) {
 			t.Fatal("the trunk directory watch never delivered the record")
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// resolvingDialogs answers resolve-target after a fixed delay standing in for the location
+// service's KV round trip, which is the only work HandleResolveTarget does.
+type resolvingDialogs struct {
+	commandDialogs
+	delay time.Duration
+}
+
+func (r resolvingDialogs) ResolveTarget(
+	ctx context.Context, _ string, _ contract.SipOriginateRequestTarget,
+) (contract.SipResolveTargetResponse, error) {
+	select {
+	case <-time.After(r.delay):
+	case <-ctx.Done():
+		return contract.SipResolveTargetResponse{}, ctx.Err()
+	}
+	uri, transport := "sip:1001@192.0.2.10:5060", contract.SIPTransportUDP
+	return contract.SipResolveTargetResponse{Ok: true, RequestURI: &uri, Transport: &transport}, nil
+}
+
+// TestResolveTargetBurst is the 200-simultaneous-setup shape at the SIP edge. A NATS subscription
+// dispatches its subject on one goroutine, so answering inline put every resolve's location-service
+// round trip end to end; the number to watch is p99 against the per-resolve delay below.
+func TestResolveTargetBurst(t *testing.T) {
+	requireIntegration(t)
+	if os.Getenv("RUN_SIPD_LOAD") != "1" {
+		t.Skip("set RUN_SIPD_LOAD=1 to run the resolve-target burst")
+	}
+	url := startNATS(t)
+	conn, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connecting to NATS: %v", err)
+	}
+	defer conn.Close()
+
+	// 400µs is what a KV Get costs on this loopback broker; the handler's own work is a JSON decode.
+	dialogs := resolvingDialogs{commandDialogs{legs: make(chan string, 1024)}, 400 * time.Microsecond}
+	server, err := command.NewServer(command.Options{Dialogs: dialogs, InstanceID: "sipd-burst-1"})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	subscriptions, err := server.Subscribe(conn)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer func() {
+		for _, subscription := range subscriptions {
+			_ = subscription.Unsubscribe()
+		}
+	}()
+
+	for _, concurrency := range []int{100, 200} {
+		t.Run(fmt.Sprintf("concurrency=%d", concurrency), func(t *testing.T) {
+			aor := "1001@local.test"
+			latencies := make([]time.Duration, concurrency)
+			failures := make([]bool, concurrency)
+			var wg sync.WaitGroup
+			start := time.Now()
+			for slot := range concurrency {
+				wg.Go(func() {
+					payload, _ := json.Marshal(contract.SipOriginateRequest{
+						LegID: fmt.Sprintf("leg-%d-%d", concurrency, slot),
+						OrgID: "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+						Target: contract.SipOriginateRequestTarget{
+							Kind: contract.SipOriginateRequestTargetKindAOR, AOR: &aor,
+						},
+					})
+					issued := time.Now()
+					if _, err := conn.Request(contract.SubjectSipResolveTargetRPC, payload, 10*time.Second); err != nil {
+						failures[slot] = true
+					}
+					latencies[slot] = time.Since(issued)
+				})
+			}
+			wg.Wait()
+			span := time.Since(start)
+			failed := 0
+			for _, f := range failures {
+				if f {
+					failed++
+				}
+			}
+			slices.Sort(latencies)
+			p := func(q float64) time.Duration { return latencies[int(float64(len(latencies)-1)*q)] }
+			t.Logf("concurrency=%d span=%s failures=%d p50=%s p90=%s p99=%s max=%s goroutines=%d",
+				concurrency, span, failed, p(0.5), p(0.9), p(0.99), p(1), runtime.NumGoroutine())
+		})
 	}
 }

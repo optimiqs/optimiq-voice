@@ -42,6 +42,8 @@ type Descriptor struct {
 // AllocateOptions is everything the control surface has decided about a new session.
 type AllocateOptions struct {
 	Transport PacketTransport
+	// SRTP is the negotiated SDES context for a SIP leg, or nil for plain RTP.
+	SRTP *SRTPContext
 	// SessionID is caller-assigned and required. See the note on Allocate.
 	SessionID string
 	// OrgID, CallID and LegID travel to the session directory and the lifecycle events; mediad
@@ -270,6 +272,7 @@ func (m *Manager) Allocate(opts AllocateOptions) (Descriptor, error) {
 
 	session, err := NewSession(Options{
 		Transport:                 opts.Transport,
+		SRTP:                      opts.SRTP,
 		ID:                        sessionID,
 		MuteIn:                    opts.MuteIn,
 		MuteOut:                   opts.MuteOut,
@@ -376,6 +379,30 @@ func (m *Manager) SettleAnswer(
 		"audioPayloadType", audioPT,
 		"telephoneEventPayloadType", telephoneEventPT)
 	return m.describe(session), nil
+}
+
+// SeedRemote pre-fills a live session's far end from the address its negotiated SDP advertised, so
+// the leg can be sent to before it has spoken — the early-media case, where the caller stays silent
+// until the 200 and a learn-only remote would drop the announcement. Advisory: the first packet to
+// arrive still latches over it (RFC 4961). An unknown id is ErrUnknownSession.
+func (m *Manager) SeedRemote(sessionID string, addr netip.AddrPort) error {
+	session, err := m.liveSession(sessionID)
+	if err != nil {
+		return err
+	}
+	session.SeedRemote(addr)
+	return nil
+}
+
+// SettleSRTP attaches the SDES context a B-leg's answer keyed, on a session create-offer bound
+// before the far end's key was known. Idempotent; an unknown id is ErrUnknownSession.
+func (m *Manager) SettleSRTP(sessionID string, ctx *SRTPContext) error {
+	session, err := m.liveSession(sessionID)
+	if err != nil {
+		return err
+	}
+	session.SettleSRTP(ctx)
+	return nil
 }
 
 // Release tears a session down, reporting whether there was one to tear down so a retried release
@@ -738,6 +765,25 @@ func (m *Manager) StopRecording(ref string) (string, bool) {
 		return sessionID, false
 	}
 	return sessionID, session.StopRecording(ref)
+}
+
+// PauseRecording pauses or resumes a recording by reference WITHOUT ending its file, reporting the
+// session it is on, whether there was one to act on, and the paused state after. A false for a
+// reference nothing is recording is a success at the wire, exactly as StopRecording's is.
+func (m *Manager) PauseRecording(ref string, paused bool) (string, bool, bool) {
+	m.mu.Lock()
+	sessionID, ok := m.recordings[ref]
+	var session *Session
+	if ok {
+		session = m.sessions[sessionID]
+	}
+	m.mu.Unlock()
+
+	if session == nil {
+		return sessionID, false, false
+	}
+	applied, state := session.PauseRecording(ref, paused)
+	return sessionID, applied, state
 }
 
 // RecordingSessionOf reports which session holds a recording reference, if any.

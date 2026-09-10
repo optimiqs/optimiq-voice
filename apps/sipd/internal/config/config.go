@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/registrar"
 )
 
 // CredentialSource selects which credentials.Store implementation is wired at boot.
@@ -124,7 +126,10 @@ type Config struct {
 	// listeners and is selected by source address.
 	ExternalListenAddr string
 
-	// Realm is the digest authentication realm presented in every challenge. SIPD_REALM.
+	// Realm is the digest realm this edge challenges with when a request names NO domain — a
+	// "no tenant matched" default and not a tenant's realm. A request that names one (the To host on
+	// a REGISTER, the From host otherwise) is challenged and looked up under THAT domain, so one
+	// process serves many tenants; see registrar.Authenticator.ForRequest. SIPD_REALM.
 	//
 	// It is part of HA1 = MD5(username:realm:password), so changing it invalidates every stored
 	// credential. There is no default: a shared realm would make a credential from one deployment
@@ -186,6 +191,19 @@ type Config struct {
 	// fleet: a device challenged by instance A would be rejected by instance B. Set it (32+ random
 	// bytes, same value fleet-wide) in any deployment with more than one replica.
 	NonceSecret string
+
+	// Credential-spray lockout. The rate at which a source may guess a SIP password, enforced in
+	// internal/registrar and shared by REGISTER and INVITE.
+	//
+	//   SIPD_AUTH_LOCKOUT_THRESHOLD        default 5   — failures on one (source, account) pair
+	//   SIPD_AUTH_LOCKOUT_SOURCE_THRESHOLD default 50  — failures from one source, any account; 0 off
+	//   SIPD_AUTH_LOCKOUT_BASE             default 30s — first lockout, doubling on each subsequent
+	//   SIPD_AUTH_LOCKOUT_MAX              default 30m — the ceiling on that doubling
+	//   SIPD_AUTH_LOCKOUT_WINDOW           default 15m — idle time after which a counter is forgotten
+	//
+	// A threshold of 0 disables the mechanism entirely, which is a deliberate choice and not a
+	// default: without it a spray costs one credential RPC per packet.
+	AuthLockout registrar.LockoutPolicy
 
 	// SweepInterval is how often the expiry sweeper runs. SIPD_SWEEP_INTERVAL, default 5s. It bounds
 	// how late an `expired` event can be, not how long a binding lives.
@@ -379,6 +397,22 @@ func Load(getenv Getenv) (Config, error) {
 	if cfg.SweepInterval, err = durationOr(getenv, "SIPD_SWEEP_INTERVAL", 5*time.Second); err != nil {
 		fail("%v", err)
 	}
+	if cfg.AuthLockout.Threshold, err = intOr(getenv, "SIPD_AUTH_LOCKOUT_THRESHOLD", 5); err != nil {
+		fail("%v", err)
+	}
+	if cfg.AuthLockout.SourceThreshold, err = intOr(getenv, "SIPD_AUTH_LOCKOUT_SOURCE_THRESHOLD", 50); err != nil {
+		fail("%v", err)
+	}
+	if cfg.AuthLockout.Base, err = durationOr(getenv, "SIPD_AUTH_LOCKOUT_BASE", 30*time.Second); err != nil {
+		fail("%v", err)
+	}
+	if cfg.AuthLockout.Max, err = durationOr(getenv, "SIPD_AUTH_LOCKOUT_MAX", 30*time.Minute); err != nil {
+		fail("%v", err)
+	}
+	if cfg.AuthLockout.Window, err = durationOr(getenv, "SIPD_AUTH_LOCKOUT_WINDOW", 15*time.Minute); err != nil {
+		fail("%v", err)
+	}
+	cfg.AuthLockout.MaxTracked = registrar.DefaultLockoutPolicy().MaxTracked
 	if cfg.ShutdownTimeout, err = durationOr(getenv, "SIPD_SHUTDOWN_TIMEOUT", 10*time.Second); err != nil {
 		fail("%v", err)
 	}
@@ -484,6 +518,24 @@ func Load(getenv Getenv) (Config, error) {
 	}
 	if cfg.NonceTTL <= 0 {
 		fail("SIPD_NONCE_TTL must be positive")
+	}
+	if cfg.AuthLockout.Threshold < 0 {
+		fail("SIPD_AUTH_LOCKOUT_THRESHOLD must not be negative; 0 disables the lockout")
+	}
+	if cfg.AuthLockout.SourceThreshold < 0 {
+		fail("SIPD_AUTH_LOCKOUT_SOURCE_THRESHOLD must not be negative; 0 disables the source cap")
+	}
+	if cfg.AuthLockout.Threshold > 0 {
+		if cfg.AuthLockout.Base <= 0 {
+			fail("SIPD_AUTH_LOCKOUT_BASE must be positive")
+		}
+		if cfg.AuthLockout.Max < cfg.AuthLockout.Base {
+			fail("SIPD_AUTH_LOCKOUT_MAX (%s) must not be shorter than SIPD_AUTH_LOCKOUT_BASE (%s)",
+				cfg.AuthLockout.Max, cfg.AuthLockout.Base)
+		}
+		if cfg.AuthLockout.Window <= 0 {
+			fail("SIPD_AUTH_LOCKOUT_WINDOW must be positive")
+		}
 	}
 
 	if len(problems) > 0 {

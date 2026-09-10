@@ -53,6 +53,21 @@ type Store interface {
 	Lookup(ctx context.Context, realm, username string) (Credential, error)
 }
 
+// Refresher is a Store that caches, and can be told its answer for one account may be stale.
+//
+// It backs up the `credential.invalidated` subscription in invalidate.go rather than replacing it:
+// `rpc.sip.v1.credential` is pull-only, so a missed or ungranted invalidation leaves this edge
+// holding the previous HA1, and a digest that does not verify is the only other signal it gets. A
+// rotated phone would otherwise be refused for a whole positive TTL while it re-REGISTERs perfectly
+// correctly.
+//
+// Implementations must rate-bound the re-ask: a wrong password is far more often a wrong password
+// than a rotation, and one RPC per failed digest is the amplification the negative cache exists to
+// prevent.
+type Refresher interface {
+	Refresh(ctx context.Context, realm, username string) (Credential, error)
+}
+
 // HA1 computes MD5(username:realm:password).
 //
 // MD5 is mandated by RFC 2617 digest, not chosen. It is a legacy construction protected by the

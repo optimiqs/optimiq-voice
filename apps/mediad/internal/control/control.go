@@ -22,6 +22,7 @@ import (
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
+	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/config"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/directory"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 	secure "github.com/optimiqs/optimiq-voice/apps/mediad/internal/webrtc"
@@ -39,6 +40,7 @@ const (
 	SubjectSendDtmf         = contract.SubjectMediaSendDtmfRPC
 	SubjectStartRecording   = contract.SubjectMediaStartRecordingRPC
 	SubjectStopRecording    = contract.SubjectMediaStopRecordingRPC
+	SubjectPauseRecording   = contract.SubjectMediaPauseRecordingRPC
 	SubjectTapSession       = contract.SubjectMediaTapSessionRPC
 	SubjectUntapSession     = contract.SubjectMediaUntapSessionRPC
 	// Two subjects, not four: mute and unmute differ in one bit of one payload, where a bridge and
@@ -74,6 +76,9 @@ type Sessions interface {
 	SendDtmf(sessionID string, opts rtp.DtmfOptions) error
 	StartRecording(sessionID string, opts rtp.RecordingOptions) error
 	StopRecording(recordingRef string) (string, bool)
+	// PauseRecording silences a recording's capture without ending its file: the session it is on,
+	// whether there was one to act on, and the paused state after.
+	PauseRecording(recordingRef string, paused bool) (string, bool, bool)
 	// AudioPayloadType reports the G.711 type a live session answered with, and whether it exists.
 	// A value rather than the session, so the packet path's internals stay out of a NATS callback.
 	AudioPayloadType(sessionID string) (uint8, bool)
@@ -91,6 +96,14 @@ type Sessions interface {
 	// SettleAnswer pins the codec and telephone-event type a callee chose onto a live B-leg that
 	// create-offer bound on a default. An unknown id is rtp.ErrUnknownSession.
 	SettleAnswer(sessionID string, format audio.Format, audioPT, telephoneEventPT uint8) (rtp.Descriptor, error)
+
+	// SeedRemote pre-fills a session's far end from the address its negotiated SDP advertised, so
+	// a leg can be sent to before it has spoken (early media). Advisory — the first packet still
+	// latches over it.
+	SeedRemote(sessionID string, addr netip.AddrPort) error
+	// SettleSRTP attaches the SDES context a callee's answer keyed onto a live B-leg, which
+	// create-offer bound before the far end's key existed. An unknown id is rtp.ErrUnknownSession.
+	SettleSRTP(sessionID string, ctx *rtp.SRTPContext) error
 
 	// Tap joins a supervisor to a conversation on asymmetric terms; Untap takes it down.
 	Tap(opts rtp.TapOptions) (rtp.TapResult, error)
@@ -122,7 +135,13 @@ type Server struct {
 	log            *slog.Logger
 	instanceID     string
 	publicAddr     netip.Addr
-	ownership      *ownershipRouter
+	srtpPolicy     config.SRTPPolicy
+	// pendingSRTP holds the local key of a leg create-offer keyed, until accept-answer supplies the
+	// callee's. Keyed by session id; entries are removed on settle and on release.
+	pendingSRTP sync.Map
+	ownership   *ownershipRouter
+	// commands runs handlers off the subscription dispatcher, ordered per resource. See keyedRunner.
+	commands *keyedRunner
 }
 
 // ServerOptions configures a Server.
@@ -144,6 +163,8 @@ type ServerOptions struct {
 	InstanceID string
 	// PublicAddr is what goes into an SDP answer's `c=` line. Required.
 	PublicAddr netip.Addr
+	// SRTPPolicy decides SDES on the SIP legs. Empty is config.SRTPPrefer.
+	SRTPPolicy config.SRTPPolicy
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
 }
@@ -176,8 +197,14 @@ func NewServer(opts ServerOptions) (*Server, error) {
 			forwards: make(chan struct{}, maxConcurrentForwards),
 		}
 	}
+	srtpPolicy := opts.SRTPPolicy
+	if srtpPolicy == "" {
+		srtpPolicy = config.SRTPPrefer
+	}
 	return &Server{
 		webRTC:        opts.WebRTC,
+		commands:      newKeyedRunner(maxConcurrentCommands),
+		srtpPolicy:    srtpPolicy,
 		ownership:     ownership,
 		sessions:      opts.Sessions,
 		dir:           opts.Directory,
@@ -214,6 +241,7 @@ func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscrip
 		{SubjectSendDtmf, s.HandleSendDtmf},
 		{SubjectStartRecording, s.HandleStartRecording},
 		{SubjectStopRecording, s.HandleStopRecording},
+		{SubjectPauseRecording, s.HandlePauseRecording},
 		{SubjectTapSession, s.HandleTapSession},
 		{SubjectUntapSession, s.HandleUntapSession},
 		{SubjectMuteSession, s.HandleMuteSession},
@@ -234,18 +262,19 @@ func (s *Server) Subscribe(conn *nats.Conn, queueGroup string) ([]*nats.Subscrip
 				return
 			}
 			addressed := msg.Subject != subject
-			answer := func(reply []byte) {
+			data := msg.Data
+			// One parse of the identity fields here, so the runner can order this request against
+			// the others touching the same session before any handler work begins.
+			var request resourceRequest
+			if json.Unmarshal(data, &request) != nil {
+				request = resourceRequest{}
+			}
+			s.commands.Submit(request.orderingKey(), func() {
+				reply := s.routeRequest(conn, subject, data, request, handle, addressed)
 				if err := msg.Respond(reply); err != nil {
 					s.log.Error("cannot reply", "subject", subject, "error", err)
 				}
-			}
-			reply, forward := s.routeRequest(conn, subject, msg.Data, handle, addressed)
-			if forward == nil {
-				answer(reply)
-				return
-			}
-			// Off the dispatcher: see routeRequest.
-			go func() { answer(forward()) }()
+			})
 		}
 
 		var (

@@ -112,6 +112,8 @@ func admissionRequest(intent CallIntent) contract.SipInviteRequest {
 	// orgId is present only when a digest resolved a credential: a trunk has no tenant until the
 	// engine's did-index lookup resolves one. An empty string would fail the responder's `z.uuid()`.
 	request.OrgID = optional(intent.OrgID)
+	// Digest only: a trunk INVITE resolves no credential and must assert no device.
+	request.DeviceID = optional(intent.DeviceID)
 	request.Profile = optional(intent.Profile)
 	request.TrunkID = optional(intent.TrunkID)
 	if intent.Transport != "" {
@@ -129,6 +131,17 @@ func admissionRequest(intent CallIntent) contract.SipInviteRequest {
 			AdvertisedMedia:  optional(hint.AdvertisedMedia),
 			Mismatch:         hint.Mismatch,
 			Private:          hint.Private,
+		}
+	}
+	if !intent.Attestation.Empty() {
+		request.Attestation = &contract.SipInviteRequestAttestation{
+			Verstat:          optional(intent.Attestation.Verstat),
+			AssertedIdentity: optional(intent.Attestation.AssertedIdentity),
+			OrigID:           optional(intent.Attestation.OrigID),
+			Signed:           intent.Attestation.Signed,
+		}
+		if level := intent.Attestation.Level; level != "" {
+			request.Attestation.Level = new(contract.SipInviteRequestAttestationLevel(level))
 		}
 	}
 	if intent.Replaces != nil {

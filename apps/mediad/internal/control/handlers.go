@@ -58,7 +58,7 @@ func (s *Server) HandleAllocateSession(data []byte) []byte {
 	if protocol == "UDP/TLS/RTP/SAVPF" {
 		return s.allocateWebRTC(request)
 	}
-	if protocol != "RTP/AVP" && protocol != "RTP/AVPF" {
+	if !s.acceptsProtocol(protocol) {
 		return s.refuseAllocate(request.SessionID, ReasonNotSupported, "unsupported audio transport: "+protocol)
 	}
 
@@ -79,10 +79,17 @@ func (s *Server) HandleAllocateSession(data []byte) []byte {
 		return s.refuseAllocate(request.SessionID, reason, offerErr.Error())
 	}
 
+	answerCrypto, secure, err := s.negotiateSDES(offer.Crypto)
+	if err != nil {
+		// Before any port is bound, so a refused offer still costs no capacity.
+		return s.refuseAllocate(request.SessionID, ReasonNotSupported, err.Error())
+	}
+
 	answerDirection := sdp.AnswerDirection(offer.Direction, requested)
 	muteIn, muteOut := directionToMutes(answerDirection)
 
 	descriptor, err := s.sessions.Allocate(rtp.AllocateOptions{
+		SRTP:                      secure,
 		SessionID:                 request.SessionID,
 		OrgID:                     request.OrgID,
 		CallID:                    request.CallID,
@@ -116,6 +123,11 @@ func (s *Server) HandleAllocateSession(data []byte) []byte {
 		s.log.Warn("could not apply a renegotiated direction",
 			"sessionId", request.SessionID, "direction", answerDirection, "error", err)
 	}
+	// Advisory, and never fatal: it only matters for a leg that must be sent to before it speaks.
+	if err := s.sessions.SeedRemote(request.SessionID, offer.RemoteAddress); err != nil {
+		s.log.Debug("could not seed the far end from the offer",
+			"sessionId", request.SessionID, "error", err)
+	}
 
 	sessionID, sessionVersion := sdpSessionIDs(descriptor.RTPPort)
 	negotiated := sdp.CodecForFormat(descriptor.Format)
@@ -129,6 +141,7 @@ func (s *Server) HandleAllocateSession(data []byte) []byte {
 		TelephoneEventPayloadType: descriptor.TelephoneEventPayloadType,
 		OpusFmtp:                  offer.OpusFmtp,
 		Direction:                 answerDirection,
+		Crypto:                    answerCrypto,
 	}
 	if err := toAnswer.Validate(); err != nil {
 		// A dynamic codec that reached here without its payload type would render under PT 0, which
@@ -250,6 +263,11 @@ func (s *Server) HandleCreateOffer(data []byte) []byte {
 	}
 	muteIn, muteOut := directionToMutes(direction)
 
+	offerCrypto, err := s.offerSDES()
+	if err != nil {
+		return s.refuseCreateOffer(request.SessionID, ReasonInternal, err.Error())
+	}
+
 	descriptor, err := s.sessions.Allocate(rtp.AllocateOptions{
 		SessionID: request.SessionID,
 		OrgID:     request.OrgID,
@@ -287,7 +305,13 @@ func (s *Server) HandleCreateOffer(data []byte) []byte {
 		Codecs:                    offeredCodecs,
 		TelephoneEventPayloadType: descriptor.TelephoneEventPayloadType,
 		Direction:                 direction,
+		Crypto:                    offerCrypto,
 	})
+	if offerCrypto.IsSet() {
+		// The callee's key arrives on accept-answer; until then the socket carries plaintext, which
+		// is safe because a leg with no answer has no far end to send to.
+		s.pendingSRTP.Store(request.SessionID, offerCrypto)
+	}
 
 	s.recordSessionEntry(request.OrgID, request.CallID, derefString(request.LegID), descriptor)
 
@@ -361,7 +385,7 @@ func (s *Server) HandleAcceptAnswer(data []byte) []byte {
 		if err := transport.AcceptAnswer(request.SDPAnswer); err != nil {
 			return s.refuseAcceptAnswer(request.SessionID, ReasonNotSupported, err.Error())
 		}
-	} else if protocol != "RTP/AVP" && protocol != "RTP/AVPF" {
+	} else if !s.acceptsProtocol(protocol) {
 		return s.refuseAcceptAnswer(request.SessionID, ReasonNotSupported, "answer changed the media transport")
 	}
 
@@ -382,6 +406,10 @@ func (s *Server) HandleAcceptAnswer(data []byte) []byte {
 			fmt.Sprintf("the answer settled on %s, and create-offer proposed only PCMU and PCMA", answer.Codec))
 	}
 
+	if err := s.settleOfferedSDES(request.SessionID, answer.Crypto); err != nil {
+		return s.refuseAcceptAnswer(request.SessionID, ReasonNotSupported, err.Error())
+	}
+
 	descriptor, err := s.sessions.SettleAnswer(
 		request.SessionID, answer.Codec.Format(), answer.AudioPayloadType, answer.TelephoneEventPayloadType)
 	if err != nil {
@@ -395,6 +423,11 @@ func (s *Server) HandleAcceptAnswer(data []byte) []byte {
 		s.log.Warn("refusing an accept-answer",
 			"sessionId", request.SessionID, "reason", reason, "error", err)
 		return s.refuseAcceptAnswer(request.SessionID, reason, err.Error())
+	}
+
+	if err := s.sessions.SeedRemote(request.SessionID, answer.RemoteAddress); err != nil {
+		s.log.Debug("could not seed the far end from the answer",
+			"sessionId", request.SessionID, "error", err)
 	}
 
 	settled := string(sdp.CodecForFormat(descriptor.Format))
@@ -655,6 +688,8 @@ func (s *Server) HandleReleaseSession(data []byte) []byte {
 	}
 
 	released := s.sessions.Release(request.SessionID)
+	// A B-leg released before its answer arrived would otherwise leave its local key behind forever.
+	s.pendingSRTP.Delete(request.SessionID)
 
 	// The delete runs whether or not there was a live session. A release for a session this instance
 	// does not hold is the shape of a retry that landed on the wrong node after a failover, and leaving
@@ -1192,6 +1227,49 @@ func (s *Server) HandleStopRecording(data []byte) []byte {
 func (s *Server) refuseStopRecording(recordingRef, reason, message string) []byte {
 	code := contract.MediaStopRecordingResponseReason(reason)
 	return encode(s.log, contract.MediaStopRecordingResponse{
+		Ok:           false,
+		RecordingRef: recordingRef,
+		InstanceID:   stringPtr(s.instanceID),
+		Reason:       &code,
+		Error:        stringPtr(message),
+	})
+}
+
+// HandlePauseRecording pauses or resumes a recording WITHOUT ending its file. PCI.
+//
+// The point of the whole subject is that the artifact survives: a caller reads a card number, the
+// agent pauses, and what lands in the file is silence at the offset the card number was spoken —
+// one object, one object key, one CDR row. A stop-and-start would end the artifact at exactly the
+// moment a compliance reviewer cares about.
+//
+// Idempotent in both directions, and a pause for a reference nothing is recording is
+// `ok:true, applied:false` — the same SUCCESS `stop-recording` reports, and for the same reason: a
+// recording that hit its duration limit has already finalised itself.
+func (s *Server) HandlePauseRecording(data []byte) []byte {
+	var request contract.MediaPauseRecordingRequest
+	if err := json.Unmarshal(data, &request); err != nil {
+		return s.refusePauseRecording("", ReasonBadRequest,
+			fmt.Sprintf("malformed pause-recording request: %v", err))
+	}
+	if request.RecordingRef == "" {
+		return s.refusePauseRecording("", ReasonBadRequest, "recordingRef is required")
+	}
+
+	sessionID, applied, paused := s.sessions.PauseRecording(request.RecordingRef, !request.Resume)
+
+	return encode(s.log, contract.MediaPauseRecordingResponse{
+		Ok:           true,
+		RecordingRef: request.RecordingRef,
+		Paused:       paused,
+		Applied:      applied,
+		SessionID:    stringPtr(sessionID),
+		InstanceID:   stringPtr(s.instanceID),
+	})
+}
+
+func (s *Server) refusePauseRecording(recordingRef, reason, message string) []byte {
+	code := contract.MediaPauseRecordingResponseReason(reason)
+	return encode(s.log, contract.MediaPauseRecordingResponse{
 		Ok:           false,
 		RecordingRef: recordingRef,
 		InstanceID:   stringPtr(s.instanceID),

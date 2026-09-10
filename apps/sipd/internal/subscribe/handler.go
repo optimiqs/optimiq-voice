@@ -41,6 +41,7 @@ const (
 	statusIntervalTooBrief = 423
 	statusServerError      = 500
 	statusBadEvent         = 489
+	statusUnavailable      = 503
 )
 
 // ExpiryPolicy clamps the interval a subscriber asks for.
@@ -996,15 +997,21 @@ func (h *Handler) authorize(
 
 	credential, err := h.creds.Lookup(ctx, accountAuth.Realm(), auth.Username)
 	if err != nil {
+		status, reason := statusForbidden, "Forbidden"
 		switch {
 		case errors.Is(err, credentials.ErrNotFound):
 			log.Info("rejecting an unknown account", "username", auth.Username)
 		case errors.Is(err, credentials.ErrDisabled):
 			log.Info("rejecting a disabled account", "username", auth.Username)
 		default:
+			// No answer from the credential RPC is not a claim about this account: a 403 tells the
+			// phone its credentials are wrong and most handsets stop retrying, so a burst that
+			// exceeds the responder's deadline would black out a fleet until somebody re-provisions
+			// it. 503 is the retriable answer (RFC 3261 §21.5.4).
 			log.Error("cannot look up the account", "username", auth.Username, "error", err)
+			status, reason = statusUnavailable, "Service Unavailable"
 		}
-		h.respond(tx, req, statusForbidden, "Forbidden")
+		h.respond(tx, req, status, reason)
 		return credentials.Credential{}, false
 	}
 

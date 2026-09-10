@@ -112,7 +112,15 @@ func (e *executor) eventFor(d *dialog.Dialog, effect dialog.Effect) Event {
 		// "Early media" is a 18x that committed an answer, not merely a far end that is ringing.
 		if len(effect.Body) > 0 {
 			event.HasEarlyMedia = true
-			event.SDPAnswer = string(effect.Body)
+			// The BODY is only reported on a UAC leg, which is what the contract says
+			// (`sipDialogProgressedDataSchema.sdpAnswer`: "Present only on a UAC leg"). On a UAS leg
+			// this is the answer WE wrote a moment ago, and the engine feeds a `progressed`
+			// `sdpAnswer` straight into `mediad.acceptAnswer` for the leg the event names — so
+			// echoing our own answer back at ourselves would settle the caller's session against a
+			// body it produced. The flag still travels: that is the fact a consumer needs.
+			if d.Role == dialog.RoleUAC {
+				event.SDPAnswer = string(effect.Body)
+			}
 		}
 		if event.Status == 0 {
 			// A UAC leg's `progressed` comes from a response we received, so the effect carries no

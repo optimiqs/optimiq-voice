@@ -96,6 +96,25 @@ func TestZeroSocketBufferLeavesTheKernelDefault(t *testing.T) {
 	}
 }
 
+func TestSRTPPolicyDefaultsToPrefer(t *testing.T) {
+	cfg, err := config.Load(env(minimal(nil)))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.SRTPPolicy != config.SRTPPrefer {
+		t.Errorf("SRTPPolicy = %q, want %q", cfg.SRTPPolicy, config.SRTPPrefer)
+	}
+	for _, policy := range []config.SRTPPolicy{config.SRTPPrefer, config.SRTPRequire, config.SRTPDisable} {
+		cfg, err := config.Load(env(minimal(map[string]string{"MEDIAD_SRTP_POLICY": string(policy)})))
+		if err != nil {
+			t.Fatalf("Load(%s): %v", policy, err)
+		}
+		if cfg.SRTPPolicy != policy {
+			t.Errorf("SRTPPolicy = %q, want %q", cfg.SRTPPolicy, policy)
+		}
+	}
+}
+
 func TestCapacityCountsPairsNotPorts(t *testing.T) {
 	cfg, err := config.Load(env(minimal(nil)))
 	if err != nil {
@@ -338,6 +357,11 @@ func TestLoadRejectsBadConfiguration(t *testing.T) {
 			name: "unparseable pprof switch",
 			env:  minimal(map[string]string{"MEDIAD_PPROF": "yes please"}),
 			want: "MEDIAD_PPROF must be true or false",
+		},
+		{
+			name: "unknown SRTP policy",
+			env:  minimal(map[string]string{"MEDIAD_SRTP_POLICY": "mandatory"}),
+			want: "MEDIAD_SRTP_POLICY must be one of prefer/require/disable",
 		},
 		{
 			name: "unknown log level",

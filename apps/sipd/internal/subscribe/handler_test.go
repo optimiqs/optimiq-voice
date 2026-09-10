@@ -3,6 +3,7 @@ package subscribe_test
 import (
 	"context"
 	"encoding/xml"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -488,6 +489,17 @@ func TestUnsupportedEventPackageIsRefusedWithTheHonestList(t *testing.T) {
 		if got := headerOf(t, res, "Allow-Events"); got != subscribe.AllowEvents {
 			t.Errorf("Event %q: Allow-Events = %q, want %q", event, got, subscribe.AllowEvents)
 		}
+	}
+}
+
+func TestSubscribeWhenTheCredentialRPCIsUnavailable(t *testing.T) {
+	h := newHarness(t, harnessOptions{
+		lookup: staticCredentials{err: fmt.Errorf("%w: context deadline exceeded", credentials.ErrLookupFailed)},
+	})
+
+	if res := h.subscribe(subscribeOptions{}); res.StatusCode != 503 {
+		t.Fatalf("SUBSCRIBE = %d %s, want 503: no answer from the credential RPC is not a claim "+
+			"about the subscriber", res.StatusCode, res.Reason)
 	}
 }
 

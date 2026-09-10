@@ -17,9 +17,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
@@ -27,10 +29,16 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/profile"
 )
 
-// ScopeTrunk is the only scope this edge's INVITE admission consults. Keeping the four scopes apart
-// is the anti-toll-fraud boundary: an entry admitting an address to the provisioning endpoint must
-// not also let it send unauthenticated INVITEs.
-const ScopeTrunk = contract.SIPACLEntryScopeTrunk
+// The two scopes this edge evaluates. Keeping the four scopes apart is the anti-toll-fraud
+// boundary: an entry admitting an address to the provisioning endpoint must not also let it send
+// unauthenticated INVITEs, or register a phone.
+const (
+	// ScopeTrunk governs unauthenticated INVITE admission on the external profile.
+	ScopeTrunk = contract.SIPACLEntryScopeTrunk
+	// ScopeRegistration governs REGISTER admission. See profile.NewWatchedBlocklist for why the
+	// two scopes fail in opposite directions when nothing matches.
+	ScopeRegistration = contract.SIPACLEntryScopeRegistration
+)
 
 // Record is one entry as the `sip-acl` bucket holds it. An alias, not a copy, of the generated
 // contract type, so the field names are the writer's rather than a convention this reader hopes
@@ -61,11 +69,11 @@ func deref(value *string) string {
 	return *value
 }
 
-// applies reports whether this entry governs unauthenticated INVITE admission. Both conditions are
-// refusals rather than filters: treating a disabled entry or another scope's entry as an allow is
-// how an ACL written for the admin API becomes a carrier trunk.
-func applies(r Record) bool {
-	return r.Enabled && strings.ToLower(strings.TrimSpace(string(r.Scope))) == string(ScopeTrunk)
+// applies reports whether this entry governs the given scope. Both conditions are refusals rather
+// than filters: treating a disabled entry or another scope's entry as an allow is how an ACL
+// written for the admin API becomes a carrier trunk.
+func applies(r Record, scope contract.SIPACLEntryScope) bool {
+	return r.Enabled && strings.ToLower(strings.TrimSpace(string(r.Scope))) == string(scope)
 }
 
 // priorityOf inverts the column's "lower first" ordering into the evaluator's "higher wins".
@@ -78,7 +86,11 @@ func priorityOf(columnPriority int) int { return -columnPriority }
 // removed and its replacement has not yet arrived.
 type Watcher struct {
 	acl *profile.ACL
-	log *slog.Logger
+	// registration is the REGISTER-admission list, filled from the same bucket and the same replay
+	// so the two scopes can never disagree about which records they have seen. Nil when the edge
+	// serves no registrations.
+	registration *profile.ACL
+	log          *slog.Logger
 
 	mu      sync.Mutex
 	records map[string]Record
@@ -108,6 +120,14 @@ func NewWatcher(acl *profile.ACL, overrides []profile.Entry, log *slog.Logger) (
 	}
 	watcher.recompile()
 	return watcher, nil
+}
+
+// WithRegistrationACL attaches the `scope=registration` half of the bucket to acl and recompiles.
+// Install it at boot, before Watch; it is not safe to call once the watch is running.
+func (w *Watcher) WithRegistrationACL(acl *profile.ACL) *Watcher {
+	w.registration = acl
+	w.recompile()
+	return w
 }
 
 // Len reports how many bucket records the watcher holds, excluding overrides.
@@ -174,37 +194,47 @@ func (w *Watcher) hold() bool {
 // plane take every carrier offline at once.
 func (w *Watcher) recompile() {
 	w.mu.Lock()
-	records := make([]Record, 0, len(w.records))
-	keys := make([]string, 0, len(w.records))
-	for key := range w.records {
-		keys = append(keys, key)
-	}
-	slices.Sort(keys)
+	keys := slices.Sorted(maps.Keys(w.records))
+	records := make([]Record, 0, len(keys))
 	for _, key := range keys {
 		records = append(records, w.records[key])
 	}
 	overrides := slices.Clone(w.overrides)
 	w.mu.Unlock()
 
+	w.apply(w.acl, ScopeTrunk, keys, records, overrides)
+	if w.registration != nil {
+		w.apply(w.registration, ScopeRegistration, keys, records, nil)
+	}
+}
+
+// apply compiles one scope's records and swaps them into its evaluator.
+func (w *Watcher) apply(
+	acl *profile.ACL,
+	scope contract.SIPACLEntryScope,
+	keys []string,
+	records []Record,
+	overrides []profile.Entry,
+) {
 	entries := make([]profile.Entry, 0, len(records)+len(overrides))
 	entries = append(entries, overrides...)
 	skipped := 0
 	for index, record := range records {
-		if !applies(record) {
+		if !applies(record, scope) {
 			continue
 		}
 		entry, err := compile(record)
 		if err != nil {
 			skipped++
-			w.log.Error("ignoring an unusable sip-acl entry", "key", keys[index], "error", err)
+			w.log.Error("ignoring an unusable sip-acl entry", "key", keys[index], "scope", scope, "error", err)
 			continue
 		}
 		entries = append(entries, entry)
 	}
-	w.acl.Replace(entries)
+	acl.Replace(entries)
 	if skipped > 0 {
 		w.log.Warn("some sip-acl entries were skipped",
-			"skipped", skipped, "applied", len(entries), "bucket", contract.SIPACLKV.Name)
+			"skipped", skipped, "applied", len(entries), "scope", scope, "bucket", contract.SIPACLKV.Name)
 	}
 }
 
@@ -225,6 +255,12 @@ func OpenBucket(ctx context.Context, js jetstream.JetStream) (jetstream.KeyValue
 // Watch fills the ACL from the bucket and keeps it filled until the context is cancelled. One
 // WatchAll rather than a load followed by a watch, so there is no window in which an edit — on this
 // boundary, a deny — could be missed. The returned channel closes once the initial replay completes.
+//
+// The watch RE-ESTABLISHES itself when the update stream ends without the context being cancelled.
+// A broker restart ends the ordered consumer ("stream not found: recreating ordered consumer"), and
+// a watch that gave up there would leave the edge serving whatever ACL it last compiled for the rest
+// of the process's life — with no error, and with every subsequent entry an operator writes
+// invisible to the security boundary that entry exists to move.
 func Watch(ctx context.Context, bucket jetstream.KeyValue, watcher *Watcher) (<-chan struct{}, error) {
 	if bucket == nil {
 		return nil, errors.New("acl: a sip-acl bucket is required to watch it")
@@ -237,40 +273,73 @@ func Watch(ctx context.Context, bucket jetstream.KeyValue, watcher *Watcher) (<-
 	watcher.Suspend()
 
 	ready := make(chan struct{})
-	go func() {
-		defer func() { _ = updates.Stop() }()
-		defer watcher.Resume()
-		settled := false
-		closeReady := func() {
-			if !settled {
-				settled = true
-				close(ready)
-			}
-		}
-		defer closeReady()
+	closeReady := sync.OnceFunc(func() { close(ready) })
 
+	go func() {
+		defer closeReady()
+		backoff := watchRetryMin
 		for {
+			// The compiled ACL from the previous stream stands while the replacement replays: the
+			// alternative is an edge that refuses every carrier for the length of a reconnect.
+			ended := consume(ctx, updates, watcher, closeReady)
+			_ = updates.Stop()
+			if ctx.Err() != nil || !ended {
+				return
+			}
+			watcher.log.Warn("the sip-acl watch ended; re-establishing it",
+				"bucket", contract.SIPACLKV.Name, "retryIn", backoff)
 			select {
 			case <-ctx.Done():
 				return
-			case entry, ok := <-updates.Updates():
-				if !ok {
-					return
-				}
-				if entry == nil {
-					watcher.Resume()
-					watcher.log.Info("sip acl loaded",
-						"bucket", contract.SIPACLKV.Name,
-						"records", watcher.Len(),
-						"entries", watcher.acl.Len())
-					closeReady()
-					continue
-				}
-				applyUpdate(watcher, entry)
+			case <-time.After(backoff):
 			}
+			backoff = min(backoff*2, watchRetryMax)
+			next, err := bucket.WatchAll(ctx)
+			if err != nil {
+				watcher.log.Error("cannot re-establish the sip-acl watch",
+					"bucket", contract.SIPACLKV.Name, "error", err)
+				continue
+			}
+			backoff = watchRetryMin
+			updates = next
+			// Suspended again so the replay recompiles the whole set once rather than once per key.
+			watcher.Suspend()
 		}
 	}()
 	return ready, nil
+}
+
+// watchRetryMin and watchRetryMax bound the re-establish backoff. A broker that is down is down for
+// everything, so the ceiling is short enough that the boundary reloads promptly once it returns.
+const (
+	watchRetryMin = time.Second
+	watchRetryMax = 30 * time.Second
+)
+
+// consume drains one update stream. It reports whether the stream ENDED (so a replacement is
+// wanted) rather than the context being cancelled.
+func consume(ctx context.Context, updates jetstream.KeyWatcher, watcher *Watcher, closeReady func()) bool {
+	defer watcher.Resume()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case entry, ok := <-updates.Updates():
+			if !ok {
+				return true
+			}
+			if entry == nil {
+				watcher.Resume()
+				watcher.log.Info("sip acl loaded",
+					"bucket", contract.SIPACLKV.Name,
+					"records", watcher.Len(),
+					"entries", watcher.acl.Len())
+				closeReady()
+				continue
+			}
+			applyUpdate(watcher, entry)
+		}
+	}
 }
 
 func applyUpdate(watcher *Watcher, entry jetstream.KeyValueEntry) {

@@ -347,16 +347,105 @@ func TestSetForSelectsAListenerlessExternalProfileBySource(t *testing.T) {
 		t.Errorf("context = %q, want the untrusted one", got.Context)
 	}
 
-	// The local address still wins: traffic that arrived on the internal socket is internal, even
-	// from an address the carrier ACL allows.
+	// The listener cannot separate the two here, because the external profile has none of its own:
+	// a carrier and a phone arrive on the same socket, so the ACL decides and an address it allows
+	// is external wherever it landed. Giving the external profile its own socket
+	// (SIPD_EXTERNAL_LISTEN_ADDR) is what makes the listener the boundary again — see
+	// TestSetForPrefersTheArrivalListenerOverTheSourceACL.
 	got, err = set.For(request(t, "UDP", "203.0.113.9:5060", "0.0.0.0:5060"))
-	if err != nil || got.Name != "internal" {
-		t.Fatalf("For = %q / %v, want the internal profile", got.Name, err)
+	if err != nil || got.Name != "external" {
+		t.Fatalf("For = %q / %v, want the external profile", got.Name, err)
 	}
 
 	// A stranger the ACL does not claim falls to the internal profile, where it is challenged.
 	got, err = set.For(request(t, "UDP", "8.8.8.8:5060", ""))
 	if err != nil || got.Name != "internal" {
 		t.Fatalf("For = %q / %v, want the internal profile", got.Name, err)
+	}
+}
+
+// The hole this closes: sipgo leaves Destination() empty on every inbound message, so before the
+// arrivals table the source step decided every request on a shared transport — and a tenant's trunk
+// ACL entry covering an office network reclassified that office's digest-authenticated phones as
+// digest-free carrier peers.
+func TestSetForPrefersTheArrivalListenerOverTheSourceACL(t *testing.T) {
+	// The office network is in the trunk ACL, as a tenant that owns a trunk there can arrange.
+	acl := NewACL([]Entry{mustEntry(t, "198.51.100.0/24", ActionAllow, 0, "trunk-telnyx")})
+	internal := Internal("internal",
+		Listener{Network: "udp", Addr: "0.0.0.0:5160"},
+		Listener{Network: "tcp", Addr: "0.0.0.0:5160"})
+	external := External("external", acl,
+		Listener{Network: "udp", Addr: "0.0.0.0:5162"},
+		Listener{Network: "tcp", Addr: "0.0.0.0:5162"})
+
+	set, err := NewSet(internal, external)
+	if err != nil {
+		t.Fatalf("NewSet: %v", err)
+	}
+	arrivals := NewArrivals(16)
+	set.TrackArrivals(arrivals)
+
+	phone := addr("198.51.100.7:5060")
+	for _, transport := range []string{"udp", "tcp"} {
+		arrivals.Observe(transport, addr("0.0.0.0:5160"), phone)
+		got, err := set.For(request(t, transport, phone.String(), ""))
+		if err != nil || got.Name != "internal" {
+			t.Fatalf("%s: For = %q / %v, want the internal profile", transport, got.Name, err)
+		}
+		if got.Auth != AuthDigest {
+			t.Errorf("%s: auth = %q, want the phone to be challenged", transport, got.Auth)
+		}
+	}
+
+	// The carrier on the external listener is still admitted, on the same source address.
+	arrivals.Observe("udp", addr("0.0.0.0:5162"), phone)
+	got, err := set.For(request(t, "udp", phone.String(), ""))
+	if err != nil || got.Name != "external" {
+		t.Fatalf("For = %q / %v, want the external profile", got.Name, err)
+	}
+	if got.Context != ContextUntrusted {
+		t.Errorf("context = %q, want the untrusted one", got.Context)
+	}
+}
+
+// A listener bound to a wildcard is reported by the kernel as 0.0.0.0:port, and one bound to a
+// concrete address is reported with that address; the port settles both when the spellings differ.
+func TestSetForFallsBackToTheListenerPort(t *testing.T) {
+	acl := NewACL([]Entry{mustEntry(t, "198.51.100.0/24", ActionAllow, 0, "trunk-telnyx")})
+	internal := Internal("internal", Listener{Network: "udp", Addr: ":5160"})
+	external := External("external", acl, Listener{Network: "udp", Addr: ":5162"})
+
+	set, err := NewSet(internal, external)
+	if err != nil {
+		t.Fatalf("NewSet: %v", err)
+	}
+	arrivals := NewArrivals(16)
+	set.TrackArrivals(arrivals)
+
+	arrivals.Observe("udp", addr("0.0.0.0:5160"), addr("198.51.100.7:5060"))
+	got, err := set.For(request(t, "udp", "198.51.100.7:5060", ""))
+	if err != nil || got.Name != "internal" {
+		t.Fatalf("For = %q / %v, want the internal profile", got.Name, err)
+	}
+}
+
+// The default deployment: no SIPD_EXTERNAL_LISTEN_ADDR, so the external profile owns no socket and
+// the source ACL is the only thing that can admit a carrier. That must keep working.
+func TestSetForStillAdmitsAListenerlessCarrierWithArrivalsInPlace(t *testing.T) {
+	acl := NewACL([]Entry{mustEntry(t, "203.0.113.0/24", ActionAllow, 0, "trunk-telnyx")})
+	internal := Internal("internal", Listener{Network: "udp", Addr: "0.0.0.0:5160"})
+	external := External("external", acl)
+
+	set, err := NewSet(internal, external)
+	if err != nil {
+		t.Fatalf("NewSet: %v", err)
+	}
+	arrivals := NewArrivals(16)
+	set.TrackArrivals(arrivals)
+
+	arrivals.Observe("udp", addr("0.0.0.0:5160"), addr("203.0.113.9:5060"))
+	got, err := set.For(request(t, "udp", "203.0.113.9:5060", ""))
+	if err != nil || got.Name != "external" {
+		t.Fatalf("For = %q / %v, want the external profile", got.Name, err)
 	}
 }

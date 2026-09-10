@@ -11,8 +11,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
@@ -47,6 +49,7 @@ type Store interface {
 // NATSStore is the production Store, backed by the presence KV bucket.
 type NATSStore struct {
 	bucket jetstream.KeyValue
+	log    *slog.Logger
 }
 
 var _ Store = (*NATSStore)(nil)
@@ -106,42 +109,86 @@ func (s *NATSStore) Get(ctx context.Context, orgID, extensionNumber string) (Sta
 //
 // Updates only — initial values are read by Get when a subscription is accepted, and replaying the
 // bucket on reconnect would send a redundant NOTIFY to every phone at once.
+//
+// The watch RE-ESTABLISHES itself when the update stream ends without the context being cancelled: a
+// broker restart ends the ordered consumer ("stream not found: recreating ordered consumer"), and a
+// watch that gave up there would freeze every busy lamp in the fleet for the life of the process.
+// The returned channel STAYS OPEN across a re-establish and closes only when the watch is done for
+// good — the SUBSCRIBE handler drops its reference on close, so a close is permanent deafness.
 func (s *NATSStore) Watch(ctx context.Context) (<-chan Change, error) {
-	watcher, err := s.bucket.WatchAll(ctx, jetstream.UpdatesOnly())
+	updates, err := s.bucket.WatchAll(ctx, jetstream.UpdatesOnly())
 	if err != nil {
 		return nil, fmt.Errorf("presence: watching the %s bucket: %w", contract.PresenceKV.Name, err)
+	}
+	log := s.log
+	if log == nil {
+		log = slog.Default()
 	}
 
 	changes := make(chan Change, 64)
 	go func() {
 		defer close(changes)
-		defer func() { _ = watcher.Stop() }()
-
+		backoff := watchRetryMin
 		for {
+			ended := consume(ctx, updates, changes)
+			_ = updates.Stop()
+			if ctx.Err() != nil || !ended {
+				return
+			}
+			log.Warn("the presence watch ended; re-establishing it",
+				"bucket", contract.PresenceKV.Name, "retryIn", backoff)
 			select {
 			case <-ctx.Done():
 				return
-			case entry, ok := <-watcher.Updates():
-				if !ok {
-					return
-				}
-				if entry == nil {
-					// The end-of-initial-values marker; nats.go sends one even with UpdatesOnly.
-					continue
-				}
-				change, ok := changeFor(entry)
-				if !ok {
-					continue
-				}
-				select {
-				case changes <- change:
-				case <-ctx.Done():
-					return
-				}
+			case <-time.After(backoff):
 			}
+			backoff = min(backoff*2, watchRetryMax)
+			next, err := s.bucket.WatchAll(ctx, jetstream.UpdatesOnly())
+			if err != nil {
+				log.Error("cannot re-establish the presence watch",
+					"bucket", contract.PresenceKV.Name, "error", err)
+				continue
+			}
+			backoff = watchRetryMin
+			updates = next
 		}
 	}()
 	return changes, nil
+}
+
+// watchRetryMin and watchRetryMax bound the re-establish backoff. A broker that is down is down for
+// everything, so the ceiling is short enough that lamps resume promptly once it returns.
+const (
+	watchRetryMin = time.Second
+	watchRetryMax = 30 * time.Second
+)
+
+// consume drains one update stream into changes. It reports whether the stream ENDED (so a
+// replacement is wanted) rather than the context being cancelled.
+func consume(ctx context.Context, updates jetstream.KeyWatcher, changes chan<- Change) bool {
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case entry, ok := <-updates.Updates():
+			if !ok {
+				return true
+			}
+			if entry == nil {
+				// The end-of-initial-values marker; nats.go sends one even with UpdatesOnly.
+				continue
+			}
+			change, ok := changeFor(entry)
+			if !ok {
+				continue
+			}
+			select {
+			case changes <- change:
+			case <-ctx.Done():
+				return false
+			}
+		}
+	}
 }
 
 // changeFor turns one KV entry into a Change, reporting false for anything unusable.

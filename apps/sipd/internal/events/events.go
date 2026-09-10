@@ -20,6 +20,7 @@ type Publisher interface {
 	Registered(ctx context.Context, envelope contract.Envelope[contract.RegistrationRegisteredData]) error
 	Unregistered(ctx context.Context, envelope contract.Envelope[contract.RegistrationUnregisteredData]) error
 	Expired(ctx context.Context, envelope contract.Envelope[contract.RegistrationExpiredData]) error
+	AuthFailed(ctx context.Context, envelope contract.Envelope[contract.RegistrationAuthFailedData]) error
 }
 
 // JetStreamPublisher publishes into the REGISTRATIONS stream.
@@ -59,6 +60,14 @@ func (p *JetStreamPublisher) Expired(
 	return publish(p.js, envelope)
 }
 
+// AuthFailed publishes an `auth-failed` event.
+func (p *JetStreamPublisher) AuthFailed(
+	_ context.Context,
+	envelope contract.Envelope[contract.RegistrationAuthFailedData],
+) error {
+	return publish(p.js, envelope)
+}
+
 // publish enqueues one envelope asynchronously.
 //
 // Asynchronous because the caller is a SIP handler that has not yet answered the device, and the
@@ -88,6 +97,7 @@ type RecordingPublisher struct {
 	registered   []contract.Envelope[contract.RegistrationRegisteredData]
 	unregistered []contract.Envelope[contract.RegistrationUnregisteredData]
 	expired      []contract.Envelope[contract.RegistrationExpiredData]
+	authFailed   []contract.Envelope[contract.RegistrationAuthFailedData]
 }
 
 var _ Publisher = (*RecordingPublisher)(nil)
@@ -128,6 +138,17 @@ func (p *RecordingPublisher) Expired(
 	return nil
 }
 
+// AuthFailed implements Publisher.
+func (p *RecordingPublisher) AuthFailed(
+	_ context.Context,
+	envelope contract.Envelope[contract.RegistrationAuthFailedData],
+) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.authFailed = append(p.authFailed, envelope)
+	return nil
+}
+
 // RegisteredEvents returns a copy of the recorded `registered` events.
 func (p *RecordingPublisher) RegisteredEvents() []contract.Envelope[contract.RegistrationRegisteredData] {
 	p.mu.Lock()
@@ -147,4 +168,11 @@ func (p *RecordingPublisher) ExpiredEvents() []contract.Envelope[contract.Regist
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return slices.Clone(p.expired)
+}
+
+// AuthFailedEvents returns a copy of the recorded `auth-failed` events.
+func (p *RecordingPublisher) AuthFailedEvents() []contract.Envelope[contract.RegistrationAuthFailedData] {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.authFailed)
 }

@@ -132,7 +132,14 @@ type Session struct {
 	mode      Mode
 	ports     *PortPair
 	transport PacketTransport
-	log       *slog.Logger
+	// srtp protects the UDP sockets when the leg negotiated SDES (RFC 4568). Nil is a plain RTP
+	// leg, which behaves exactly as it did before SRTP existed.
+	//
+	// ATOMIC for the same reason the codec fields are: a B-leg's remote key is not known at
+	// allocation, so create-offer binds the socket unprotected and `accept-answer` settles the
+	// context on a control goroutine while the read loop is already running.
+	srtp atomic.Pointer[SRTPContext]
+	log  *slog.Logger
 
 	// audioPayloadType is the ONE audio type this session negotiated; negotiation is per leg, so a
 	// session must drop what its own answer did not agree to.
@@ -153,9 +160,15 @@ type Session struct {
 	peerMu sync.RWMutex
 	peer   *Session
 
-	// remote is the far end, LEARNED from the first packet rather than configured. See latch.
+	// remote is the far end. Normally LEARNED from the first packet (see latch); SeedRemote may
+	// pre-fill it from the negotiated SDP so an early-media announcement has somewhere to go before
+	// the far end has spoken.
 	remoteMu sync.RWMutex
 	remote   *net.UDPAddr
+	// remoteLearned distinguishes a latched address from a seeded one. A seeded address is advisory
+	// — behind NAT the advertised address is private — so the first packet to arrive replaces it and
+	// latches for good. Guarded by remoteMu.
+	remoteLearned bool
 
 	// sequence is this session's own outbound counter; a relay does not reuse the sender's numbers.
 	//
@@ -235,6 +248,9 @@ type Session struct {
 // Options configures a Session.
 type Options struct {
 	Transport PacketTransport
+	// SRTP is the negotiated SDES key pair, or nil for a plain RTP leg. Ignored when Transport is
+	// set: a WebRTC leg is already DTLS-SRTP.
+	SRTP *SRTPContext
 	// ID is required.
 	ID string
 	// Ports is the allocated pair the session takes ownership of. Closing the session closes it.
@@ -329,6 +345,9 @@ func NewSession(opts Options) (*Session, error) {
 		done:      make(chan struct{}),
 		createdAt: time.Now(),
 	}
+	if opts.SRTP != nil {
+		session.srtp.Store(opts.SRTP)
+	}
 	session.mutedIn.Store(opts.MuteIn)
 	session.mutedOut.Store(opts.MuteOut)
 	session.audioPayloadType.Store(uint32(opts.AudioPayloadType))
@@ -346,6 +365,14 @@ func NewSession(opts Options) (*Session, error) {
 // The three fields are written together so the packet path sees either the pre-answer default or
 // the settled codec, never a torn mixture. It MUST run before the leg is bridged, so no live relay
 // has its codec changed underneath it.
+// SettleSRTP attaches the SDES context a B-leg's answer settled on. Idempotent per session: the
+// first context wins, so a retried accept-answer cannot rekey a stream mid-call.
+func (s *Session) SettleSRTP(ctx *SRTPContext) {
+	if ctx != nil {
+		s.srtp.CompareAndSwap(nil, ctx)
+	}
+}
+
 func (s *Session) settleCodec(format audio.Format, audioPT, telephoneEventPT uint8) {
 	s.format.Store(uint32(format))
 	s.audioPayloadType.Store(uint32(audioPT))
@@ -404,11 +431,31 @@ func (s *Session) Stats() Stats {
 	return stats
 }
 
-// Remote is the learned far end, or nil before the first packet.
+// Remote is the far end: the latched address, or the one seeded from the SDP before the first
+// packet, or nil when neither is known.
 func (s *Session) Remote() *net.UDPAddr {
 	s.remoteMu.RLock()
 	defer s.remoteMu.RUnlock()
 	return s.remote
+}
+
+// SeedRemote pre-fills the far end from the address the negotiated SDP advertised, so a leg that
+// must be SENT to before it has spoken — early media, where the caller sends nothing until the 200
+// — has somewhere to forward to. Advisory: symmetric-RTP learning still overrides it on the first
+// packet, which is the address that works behind NAT. A latched session, a zero address and a
+// loopback-of-nothing are all no-ops.
+func (s *Session) SeedRemote(addr netip.AddrPort) {
+	if !addr.IsValid() || addr.Port() == 0 || addr.Addr().IsUnspecified() {
+		return
+	}
+	s.remoteMu.Lock()
+	defer s.remoteMu.Unlock()
+	if s.remoteLearned {
+		return
+	}
+	ip := addr.Addr().Unmap()
+	s.remote = &net.UDPAddr{IP: net.IP(ip.AsSlice()), Port: int(addr.Port())}
+	s.log.Debug("seeded the far end from the negotiated SDP", "remote", s.remote.String())
 }
 
 // Idle reports how long since the last received packet. Before the first packet it is measured
@@ -690,19 +737,20 @@ func (s *Session) forward(packet *pionrtp.Packet, sourceTelephoneEventPT uint8) 
 // an endpoint legitimately changing address mid-call is cut off until an authenticated re-INVITE.
 func (s *Session) latch(from *net.UDPAddr) bool {
 	s.remoteMu.RLock()
-	current := s.remote
+	current, learned := s.remote, s.remoteLearned
 	s.remoteMu.RUnlock()
 
-	if current != nil {
+	if current != nil && learned {
 		return current.IP.Equal(from.IP) && current.Port == from.Port
 	}
 
 	s.remoteMu.Lock()
 	defer s.remoteMu.Unlock()
 	// Two packets can race the read lock above; the loser must not overwrite the winner's latch.
-	if s.remote != nil {
+	if s.remoteLearned {
 		return s.remote.IP.Equal(from.IP) && s.remote.Port == from.Port
 	}
+	s.remoteLearned = true
 	s.remote = &net.UDPAddr{IP: append(net.IP(nil), from.IP...), Port: from.Port, Zone: from.Zone}
 	s.log.Debug("latched to the far end", "remote", s.remote.String())
 	return true
