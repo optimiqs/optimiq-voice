@@ -20,16 +20,18 @@ import { ApiError } from "~/lib/api-client";
 import { DEFAULT_SLA_SECONDS } from "~/lib/cdr/client";
 import { formatDuration } from "~/lib/cdr/format";
 import { emptyQueueStats, formatWait, waitTone } from "~/lib/cdr/queue-stats";
-import { longestWaitMs } from "~/lib/live/store";
+import { isEngineBenched, isEngineUnavailableReason, longestWaitMs } from "~/lib/live/store";
 import { PBX_CHILDREN, PBX_RESOURCES } from "~/lib/pbx/client";
 import { QUEUE_PRIORITY_MIN } from "~/lib/pbx/contracts";
 import { routes } from "~/lib/routes";
 import { usePermission } from "../../_context/session-context";
+import { useAgentSessions } from "../../_hooks/use-agent-session";
 import { useQueueStats } from "../../_hooks/use-cdr-queries";
 import { useLiveAgentStates, useLiveQueue } from "../../_hooks/use-live-queries";
 import { usePbxChildren, usePbxItem, usePbxRoster } from "../../_hooks/use-pbx-queries";
 import { AgentSessionControls, LiveIndicator } from "../../queues/_components/agent-console";
 import { AgentStatusBadge } from "../../queues/_components/queue-shared";
+import { SuperviseControls } from "./supervise-controls";
 import { ServiceLevelBadge, WallTile } from "./wallboard-shared";
 import type { QueueAgentRow, QueueAgentStatus, QueueRow, QueueTierRow } from "~/lib/pbx/contracts";
 
@@ -68,9 +70,23 @@ export function OperatorPanel({ queueId }: { queueId: string }) {
 	const live = useLiveQueue(queueId);
 	const agentStates = useLiveAgentStates();
 	const stats = useQueueStats({ queueId });
+	/**
+	 * The supervise button needs the call id, and the call id only ever arrived over the socket. When
+	 * that socket is cold — or the operator holds `calls.supervise` but not `queues.monitor`, which
+	 * the permission registry treats as two separate grants — the session endpoint carries the same
+	 * field. Only the seats the persisted column already calls on-call are asked for, so a wallboard
+	 * with a cold socket makes a handful of requests rather than one per agent on the roster.
+	 */
+	const superviseSeats = useAgentSessions(
+		agentStates.loaded ? [] : onCallAgentIds(tiers.data, agents.query.data),
+		{ pollMs: 5_000 },
+	);
 
 	const canManageAgents = usePermission(PBX_RESOURCES.queueAgents.permissions.write);
 	const canJoinAny = usePermission("queues.join");
+	// Asked for again rather than assumed from the route: this is the one control here that puts a
+	// person inside somebody else's conversation.
+	const canMonitor = usePermission("queues.monitor");
 
 	if (queue.isPending) {
 		return <LoadingPanel label="Loading queue" />;
@@ -125,13 +141,25 @@ export function OperatorPanel({ queueId }: { queueId: string }) {
 
 	let available = 0;
 	let staffed = 0;
+	/**
+	 * Agents the DISTRIBUTOR took out, which is not the same as agents who took themselves out.
+	 *
+	 * Counted separately because it is the number that means somebody has to walk over: a paused
+	 * agent came back from lunch by themselves, and a benched one is a handset nobody is picking up.
+	 * They are still "staffed" — they are logged in — which is exactly why the staffed count alone
+	 * cannot show this.
+	 */
+	let benched = 0;
 	for (const tier of roster) {
-		const status = agentStates.byAgentId.get(tier.queueAgentId)?.status;
-		if (status !== undefined && status !== "logged-out") {
+		const entry = agentStates.byAgentId.get(tier.queueAgentId);
+		if (entry !== undefined && entry.status !== "logged-out") {
 			staffed += 1;
 		}
-		if (status === "available") {
+		if (entry?.status === "available") {
 			available += 1;
+		}
+		if (isEngineBenched(entry)) {
+			benched += 1;
 		}
 	}
 
@@ -166,7 +194,11 @@ export function OperatorPanel({ queueId }: { queueId: string }) {
 					label="Available"
 					value={String(available)}
 					tone={waiting.length > 0 && staffed === 0 ? "alert" : "neutral"}
-					hint={`${String(staffed)} of ${String(roster.length)} staffed`}
+					hint={
+						benched === 0
+							? `${String(staffed)} of ${String(roster.length)} staffed`
+							: `${String(staffed)} of ${String(roster.length)} staffed · ${String(benched)} not answering`
+					}
 				/>
 				{/*
 				 * The one number here that is not live. No window control on this page on purpose: it is
@@ -293,10 +325,29 @@ export function OperatorPanel({ queueId }: { queueId: string }) {
 											// The socket first and the row second: the engine writes ringing and
 											// on-call into the bucket without touching Postgres, so the column is
 											// behind by construction and never ahead.
-											const status = (agentStates.byAgentId.get(tier.queueAgentId)?.status ??
+											const entry = agentStates.byAgentId.get(tier.queueAgentId);
+											const seat = superviseSeats.get(tier.queueAgentId);
+											const status = (entry?.status ??
 												agent?.status ??
 												"logged-out") as QueueAgentStatus;
-											const reason = agentStates.byAgentId.get(tier.queueAgentId)?.reason;
+											const reason = entry?.reason ?? seat?.reason ?? undefined;
+											/**
+											 * The call to listen in on — and only when the entry says THIS queue
+											 * distributed it. An agent staffing four queues is on somebody else's
+											 * call the rest of the time, and the API refuses a call id whose entry
+											 * names another queue anyway; offering the button would be offering a
+											 * 404 and, worse, a way to guess at calls this queue never had.
+											 */
+											const superviseCallId =
+												status !== "on-call"
+													? undefined
+													: entry !== undefined
+														? entry.queueId === queueId
+															? entry.callId
+															: undefined
+														: seat?.queueId === queueId
+															? (seat.callId ?? undefined)
+															: undefined;
 											return (
 												<li
 													key={tier.id}
@@ -314,10 +365,18 @@ export function OperatorPanel({ queueId }: { queueId: string }) {
 														</Badge>
 													) : null}
 													{agent && !agent.enabled ? <Badge tone="neutral">Disabled</Badge> : null}
-													<AgentStatusBadge status={status} />
-													{reason ? (
+													<AgentStatusBadge status={status} reason={reason} />
+													{reason && !isEngineUnavailableReason(reason) ? (
 														<span className="truncate text-xs text-muted-foreground">{reason}</span>
 													) : null}
+													{superviseCallId === undefined ? null : (
+														<SuperviseControls
+															queueId={queueId}
+															callId={superviseCallId}
+															agentName={agent?.name ?? "this agent"}
+															canMonitor={canMonitor}
+														/>
+													)}
 													{agent ? (
 														<AgentSessionControls
 															agentId={agent.id}
@@ -344,4 +403,31 @@ export function OperatorPanel({ queueId }: { queueId: string }) {
 			</Card>
 		</>
 	);
+}
+
+/**
+ * The agents whose PERSISTED status says they are on a call.
+ *
+ * The column is behind the bucket by construction — the engine writes `on-call` into the bucket
+ * without touching Postgres — so this is a superset of nothing and a subset of "everyone": it is
+ * only ever used to decide which seats are worth one HTTP request when the socket is cold, and the
+ * answer that comes back is what actually decides whether the button appears.
+ */
+function onCallAgentIds(
+	tiers: readonly QueueTierRow[] | undefined,
+	agents: readonly QueueAgentRow[] | undefined,
+): string[] {
+	if (tiers === undefined || agents === undefined) {
+		return [];
+	}
+	const onCall = new Set(
+		agents.filter((agent) => agent.status === "on-call").map((agent) => agent.id),
+	);
+	const ids = new Set<string>();
+	for (const tier of tiers) {
+		if (onCall.has(tier.queueAgentId)) {
+			ids.add(tier.queueAgentId);
+		}
+	}
+	return [...ids];
 }

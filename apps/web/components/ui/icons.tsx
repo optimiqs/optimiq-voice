@@ -223,6 +223,22 @@ export function ShieldIcon(props: IconProps) {
 }
 
 /**
+ * A closed padlock: this leg's audio is encrypted.
+ *
+ * Deliberately only the CLOSED form. There is no open-padlock companion, because the indicator it
+ * serves asserts encryption and never asserts its absence — see `EncryptionIndicator` in the
+ * softphone dialer for the argument.
+ */
+export function LockIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<rect x="4.75" y="10.5" width="14.5" height="9.75" rx="2" />
+			<path d="M8.25 10.5V7.75a3.75 3.75 0 1 1 7.5 0v2.75" />
+		</Glyph>
+	);
+}
+
+/**
  * Webhooks: a signal leaving a node.
  *
  * An outward arc rather than a plug or a link glyph — what a subscription does is push an event out
@@ -384,6 +400,21 @@ export function LogOutIcon(props: IconProps) {
 		<Glyph {...props}>
 			<path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3" />
 			<path d="M10 8 6 12l4 4M6 12h9" />
+		</Glyph>
+	);
+}
+
+/**
+ * A speech bubble, for the messaging inbox.
+ *
+ * Deliberately not the envelope: this app already spends the mail metaphor on voicemail-to-email
+ * and on the notification settings, and an SMS thread is a conversation rather than a delivery.
+ */
+export function MessageIcon(props: IconProps) {
+	return (
+		<Glyph {...props}>
+			<path d="M21 12a8 8 0 0 1-8 8H8l-5 3 1.3-4.2A8 8 0 1 1 21 12Z" />
+			<path d="M8.5 11h7M8.5 14.5h4" />
 		</Glyph>
 	);
 }

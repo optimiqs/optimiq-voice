@@ -1,6 +1,7 @@
 import {
 	BlockIcon,
 	BlocksIcon,
+	BuildingIcon,
 	ConferenceIcon,
 	DeviceIcon,
 	GaugeIcon,
@@ -11,6 +12,7 @@ import {
 	LedgerIcon,
 	MegaphoneIcon,
 	MenuIcon,
+	MessageIcon,
 	MusicIcon,
 	ParkIcon,
 	PhoneIcon,
@@ -131,6 +133,20 @@ export const NAV_SECTIONS: readonly NavSection[] = [
 		label: "Call features",
 		items: [
 			{ title: "Voicemail", url: routes.voicemail, icon: VoicemailIcon },
+			/**
+			 * Messaging, beside voicemail rather than under "Insight" or "Organization".
+			 *
+			 * These sections are a claim about WHO does something. Voicemail and messaging are the two
+			 * places where a message from outside is waiting for somebody in this organization to
+			 * answer it, and whoever is working through one is the same person working through the
+			 * other. It carries `messaging.read`, which the agent template holds — so for an agent this
+			 * section has exactly two entries in it, and both are theirs.
+			 *
+			 * The REGISTRATION screens are not here. They are `/settings/messaging` on
+			 * `messaging.manage`, which is the split between reading a thread and filing a company's
+			 * EIN with a carrier.
+			 */
+			{ title: "Messaging", url: routes.messaging, icon: MessageIcon },
 			{ title: "Conferences", url: routes.conferences, icon: ConferenceIcon },
 			{ title: "Park lots", url: routes.parkLots, icon: ParkIcon },
 			/**
@@ -204,7 +220,37 @@ export const NAV_SECTIONS: readonly NavSection[] = [
 			 * something an administrator sets out to do daily.
 			 */
 			{ title: "Security", url: routes.security, icon: ShieldIcon },
+			/**
+			 * Carrier compliance — who this organization is, and which caller IDs it may present.
+			 *
+			 * In this section rather than under "Insight", because it is not a report: the KYC record
+			 * and the verified caller ID list are things an administrator MAINTAINS, and the two
+			 * policies beside them decide what happens to a live outbound call. It sits beside Security
+			 * on the same claim the comment above makes — both are about who this tenant is allowed to
+			 * be on somebody else's network.
+			 */
+			{ title: "Compliance", url: routes.compliance, icon: BuildingIcon },
 			{ title: "Webhooks", url: routes.webhooks, icon: WebhookIcon },
+		],
+	},
+	/**
+	 * The PLATFORM operator's two screens, in a section of their own and last.
+	 *
+	 * Every other section here is about this tenant. These two are not: they read and write across
+	 * tenants on `compliance.review` and `compliance.traceback`, both owner-only, so for every
+	 * customer role `canAccessPage` answers false for both items and `sidebar.tsx` drops the whole
+	 * section — a section with no reachable items is filtered out, which is why no permission field
+	 * is needed here and why an operator-only heading does not leak the feature's existence.
+	 *
+	 * Its own section rather than joining "Organization" because the label is the honest warning: an
+	 * operator glancing at the sidebar should be able to tell which of these screens leaves the
+	 * organization they have selected, and "Organization" would say the opposite.
+	 */
+	{
+		label: "Platform",
+		items: [
+			{ title: "KYC review", url: routes.platformKyc, icon: BuildingIcon },
+			{ title: "Traceback", url: routes.platformTraceback, icon: LedgerIcon },
 		],
 	},
 ];

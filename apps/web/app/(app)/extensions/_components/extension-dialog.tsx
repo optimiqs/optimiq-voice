@@ -1,7 +1,7 @@
 "use client";
 
 import { useForm } from "@tanstack/react-form";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { EntityFormDialog, FormSection } from "~/components/pbx/entity-form-dialog";
 import { ResourceSelect } from "~/components/pbx/resource-select";
 import { SelectField, SwitchField, TextField } from "~/components/ui/form-fields";
@@ -22,8 +22,21 @@ import {
 	type ExtensionFormValues,
 	type FollowMeFormValues,
 } from "~/lib/pbx/schemas";
+import {
+	fromOverrideFormValues,
+	overrideFieldErrors,
+	sameOverride,
+	toOverrideFormValues,
+	type TollFraudOverrideFormValues,
+} from "~/lib/toll-fraud/override-form";
+import { usePermission } from "../../_context/session-context";
 import { usePbxCreate, usePbxUpdate } from "../../_hooks/use-pbx-queries";
+import {
+	useSaveTollFraudOverride,
+	useTollFraudOverrides,
+} from "../../_hooks/use-toll-fraud-queries";
 import { FollowMeField } from "./follow-me-field";
+import { TollFraudOverrideField } from "./toll-fraud-override-field";
 import type { ExtensionRow } from "~/lib/pbx/contracts";
 
 /**
@@ -62,6 +75,19 @@ import type { ExtensionRow } from "~/lib/pbx/contracts";
  * applied to the one field on this form that needs it. Its consequence is worth stating: an
  * extension nobody has ever configured follow-me on gets NO `followMe` key on any save from this
  * dialog, so the column stays `null` rather than becoming an empty ladder.
+ *
+ * ## The fraud override is a SECOND request, and only when it differs
+ *
+ * `/api/v1/toll-fraud/overrides/:extensionId` is a different table behind a different grant
+ * (`toll-fraud.write`), so it cannot ride the extension body — and it is keyed on an extension id,
+ * so there is nothing to write until the extension exists. The section is therefore offered on an
+ * EDIT only, and it is `PUT` after the extension save succeeds, on exactly the follow-me rule: only
+ * when it differs from the stored override. That is what keeps an extension nobody has overridden
+ * from acquiring a row full of inherits the moment somebody corrects its caller ID.
+ *
+ * A failure on that second request is surfaced and the extension save is NOT rolled back — the two
+ * are separate writes with separate grants, and pretending otherwise would mean claiming a name
+ * change was undone when it was not.
  */
 
 const TOLL_CLASS_LABELS: Readonly<Record<(typeof TOLL_CLASSES)[number], string>> = {
@@ -99,6 +125,7 @@ function defaultsFor(extension: ExtensionRow | null): ExtensionFormValues {
 		outboundCallerIdPresentation: extension?.outboundCallerIdPresentation ?? "allowed",
 		tollClass: extension?.tollClass ?? "national",
 		recordPolicy: extension?.recordPolicy ?? "none",
+		recordAutoPauseOnDtmf: extension?.recordAutoPauseOnDtmf ?? false,
 		pickupGroup: extension?.pickupGroup ?? "",
 		callScreening: extension?.callScreening ?? false,
 		callTimeoutSeconds:
@@ -138,6 +165,36 @@ export function ExtensionDialog({
 	const initialFollowMe = readFollowMe(extension);
 	const [followMe, setFollowMe] = useState<FollowMeFormValues>(initialFollowMe);
 	const [localErrors, setLocalErrors] = useState<Readonly<Record<string, string>>>({});
+
+	/**
+	 * The override lives beside the form for the reason the ladder does: it is a second request to a
+	 * second endpoint, not a field of the extension body.
+	 */
+	const canWriteFraud = usePermission("toll-fraud.write");
+	const showOverride = extension !== null && canWriteFraud;
+	const overrides = useTollFraudOverrides();
+	const saveOverride = useSaveTollFraudOverride();
+	const storedOverride = toOverrideFormValues(
+		overrides.data?.find((row) => row.extensionId === extension?.id),
+	);
+	const [override, setOverride] = useState<TollFraudOverrideFormValues>(storedOverride);
+
+	/**
+	 * The override list resolves after this dialog mounts, so the initial state above is the
+	 * all-inherit seed. Re-basing on the stored row when it arrives is what stops an extension that
+	 * HAS an override from being shown as inheriting and then written back as one.
+	 */
+	const loadedOverrides = overrides.data;
+	useEffect(() => {
+		if (loadedOverrides !== undefined) {
+			setOverride(
+				toOverrideFormValues(loadedOverrides.find((row) => row.extensionId === extension?.id)),
+			);
+		}
+	}, [loadedOverrides, extension?.id]);
+
+	/** Both writes hold the form: the second one is still this dialog's save. */
+	const pending = mutation.isPending || saveOverride.isPending;
 
 	const form = useForm({
 		defaultValues: defaultsFor(extension),
@@ -187,6 +244,7 @@ export function ExtensionDialog({
 				outboundCallerIdPresentation: parsed.outboundCallerIdPresentation,
 				tollClass: parsed.tollClass,
 				recordPolicy: parsed.recordPolicy,
+				recordAutoPauseOnDtmf: parsed.recordAutoPauseOnDtmf,
 				/**
 				 * `null` when blank, never an absent key — the same rule `mohClassId` follows and for
 				 * the same reason. The column is `nullish` on the server, so `null` clears it; an
@@ -205,11 +263,24 @@ export function ExtensionDialog({
 				...(sameFollowMe(storedFollowMe, nextFollowMe) ? {} : { followMe: nextFollowMe }),
 			};
 
+			const overrideProblems = showOverride ? overrideFieldErrors(override) : {};
+			if (Object.keys(overrideProblems).length > 0) {
+				setLocalErrors(overrideProblems);
+				return;
+			}
+
 			try {
 				if (extension === null) {
 					await create.mutateAsync(body);
 				} else {
 					await update.mutateAsync({ id: extension.id, values: body });
+					// Only when it differs — see the note at the top of this file.
+					if (showOverride && !sameOverride(storedOverride, override)) {
+						await saveOverride.mutateAsync({
+							extensionId: extension.id,
+							values: fromOverrideFormValues(override),
+						});
+					}
 				}
 				form.reset();
 				onOpenChange(false);
@@ -230,6 +301,8 @@ export function ExtensionDialog({
 					mutation.reset();
 					setLocalErrors({});
 					setFollowMe(initialFollowMe);
+					setOverride(storedOverride);
+					saveOverride.reset();
 					form.reset();
 				}
 				onOpenChange(next);
@@ -237,8 +310,8 @@ export function ExtensionDialog({
 			title={extension === null ? "New extension" : `Edit ${extension.number}`}
 			description="An internal endpoint: what it dials as, what it may dial, and what happens when nobody answers."
 			submitLabel={extension === null ? "Create extension" : "Save changes"}
-			pending={mutation.isPending}
-			error={mutation.error}
+			pending={pending}
+			error={mutation.error ?? saveOverride.error}
 			onSubmit={() => void form.handleSubmit()}
 			size="lg"
 		>
@@ -379,6 +452,16 @@ export function ExtensionDialog({
 						</SelectField>
 					)}
 				</form.Field>
+				<form.Field name="recordAutoPauseOnDtmf">
+					{(field) => (
+						<SwitchField
+							field={field}
+							label="Pause recording during keypad entry"
+							description="Pauses the recorder while the caller presses keys and resumes once they stop, so card details typed on the keypad are not captured. Overrides the organization's setting for calls this extension takes."
+							disabled={mutation.isPending}
+						/>
+					)}
+				</form.Field>
 				<form.Field name="callTimeoutSeconds">
 					{(field) => (
 						<TextField
@@ -503,6 +586,25 @@ export function ExtensionDialog({
 					)}
 				</form.Field>
 			</FormSection>
+
+			{showOverride ? (
+				<FormSection
+					title="International calling limits"
+					description="Overrides the organization's fraud policy for this extension alone."
+					columns={1}
+				>
+					<TollFraudOverrideField value={override} onChange={setOverride} disabled={pending} />
+					{(localErrors.maxConcurrentInternationalCalls ??
+					localErrors.maxInternationalMinutesPerHour ??
+					localErrors.maxInternationalMinutesPerDay) ? (
+						<p role="alert" className="text-xs text-danger sm:col-span-2">
+							{localErrors.maxConcurrentInternationalCalls ??
+								localErrors.maxInternationalMinutesPerHour ??
+								localErrors.maxInternationalMinutesPerDay}
+						</p>
+					) : null}
+				</FormSection>
+			) : null}
 		</EntityFormDialog>
 	);
 }

@@ -3,6 +3,7 @@ import { queryKeys } from "../query-keys";
 import {
 	changedSettings,
 	NOTIFICATIONS_CATEGORY,
+	DEFAULT_ALL_PARTY_REGIONS,
 	RECORDING_RETENTION_MAX_DAYS,
 	RECORDINGS_CATEGORY,
 	RETRYABLE_HANGUP_CAUSES,
@@ -91,8 +92,8 @@ describe("toRecordingSettings", () => {
 	 * — which means the fallback and the real value are indistinguishable here, and correctly so.
 	 */
 	it("reads zero as a real value rather than as an absence", () => {
-		expect(toRecordingSettings({ retentionDays: 0 })).toEqual({ retentionDays: 0 });
-		expect(toRecordingSettings({ retentionDays: 30 })).toEqual({ retentionDays: 30 });
+		expect(toRecordingSettings({ retentionDays: 0 }).retentionDays).toBe(0);
+		expect(toRecordingSettings({ retentionDays: 30 }).retentionDays).toBe(30);
 	});
 
 	/**
@@ -101,16 +102,82 @@ describe("toRecordingSettings", () => {
 	 * report to an auditor.
 	 */
 	it("falls back to keep-for-ever rather than to a guessed window", () => {
-		expect(toRecordingSettings({})).toEqual({ retentionDays: 0 });
-		expect(toRecordingSettings({ retentionDays: "30" })).toEqual({ retentionDays: 0 });
-		expect(toRecordingSettings({ retentionDays: -1 })).toEqual({ retentionDays: 0 });
-		expect(toRecordingSettings({ retentionDays: 1.5 })).toEqual({ retentionDays: 0 });
+		expect(toRecordingSettings({}).retentionDays).toBe(0);
+		expect(toRecordingSettings({ retentionDays: "30" }).retentionDays).toBe(0);
+		expect(toRecordingSettings({ retentionDays: -1 }).retentionDays).toBe(0);
+		expect(toRecordingSettings({ retentionDays: 1.5 }).retentionDays).toBe(0);
 	});
 
 	it("holds the server's ten-year ceiling", () => {
 		expect(RECORDING_RETENTION_MAX_DAYS).toBe(3_650);
-		expect(toRecordingSettings({ retentionDays: 3_650 })).toEqual({ retentionDays: 3_650 });
-		expect(toRecordingSettings({ retentionDays: 3_651 })).toEqual({ retentionDays: 0 });
+		expect(toRecordingSettings({ retentionDays: 3_650 }).retentionDays).toBe(3_650);
+		expect(toRecordingSettings({ retentionDays: 3_651 }).retentionDays).toBe(0);
+	});
+
+	/**
+	 * The voicemail window takes the SAME units and the same bounds, and is narrowed by the same
+	 * function. Asserted separately all the same: two retention settings that drifted apart on which
+	 * number means "for ever" is the failure the shared vocabulary exists to prevent.
+	 */
+	it("reads the voicemail window on the recording window's terms", () => {
+		expect(toRecordingSettings({ voicemailRetentionDays: 14 }).voicemailRetentionDays).toBe(14);
+		expect(toRecordingSettings({}).voicemailRetentionDays).toBe(0);
+		expect(toRecordingSettings({ voicemailRetentionDays: -1 }).voicemailRetentionDays).toBe(0);
+	});
+
+	/**
+	 * A policy the catalogue does not know resolves to `none` rather than being passed through.
+	 *
+	 * `none` is the weakest posture, and choosing it as the fallback is deliberate: the alternative
+	 * is a screen that displays a policy string the engine will not honour, which would tell an
+	 * administrator that disclosure is on when no call announces anything.
+	 */
+	it("narrows the disclosure policy to the three the engine honours", () => {
+		expect(toRecordingSettings({ consentPolicy: "announce" }).consentPolicy).toBe("announce");
+		expect(
+			toRecordingSettings({ consentPolicy: "announce-and-require-keypress" }).consentPolicy,
+		).toBe("announce-and-require-keypress");
+		expect(toRecordingSettings({ consentPolicy: "shout" }).consentPolicy).toBe("none");
+		expect(toRecordingSettings({}).consentPolicy).toBe("none");
+	});
+
+	/**
+	 * The digits fall back to the catalogue's `1` and `2` rather than to whatever was stored.
+	 *
+	 * A multi-character or empty "digit" is a value the engine compares against a single keypress
+	 * and never matches, which would silently mean nobody can consent — so the fallback is the pair
+	 * the built-in announcement names.
+	 */
+	it("falls back to the catalogue's consent digits when the stored ones are not digits", () => {
+		expect(toRecordingSettings({ consentAcceptDigit: "9" }).consentAcceptDigit).toBe("9");
+		expect(toRecordingSettings({ consentDeclineDigit: "#" }).consentDeclineDigit).toBe("#");
+		expect(toRecordingSettings({ consentAcceptDigit: "99" }).consentAcceptDigit).toBe("1");
+		expect(toRecordingSettings({ consentDeclineDigit: "" }).consentDeclineDigit).toBe("2");
+	});
+
+	/**
+	 * An absent region list falls back to the platform's, and a STORED empty list does not.
+	 *
+	 * The two are different instructions: no row means "use the shipped default", and `[]` means
+	 * "this tenant decided no jurisdiction forces an announcement". Collapsing them would put a
+	 * prompt on calls a tenant deliberately exempted.
+	 */
+	it("keeps a stored empty region list distinct from an absent one", () => {
+		expect(toRecordingSettings({}).allPartyRegions).toEqual(DEFAULT_ALL_PARTY_REGIONS);
+		expect(toRecordingSettings({ allPartyRegions: [] }).allPartyRegions).toEqual([]);
+		expect(toRecordingSettings({ allPartyRegions: ["US-CA", 7] }).allPartyRegions).toEqual([
+			"US-CA",
+		]);
+	});
+
+	it("defaults the keypad backstop off, because unexplained gaps in evidence are worse", () => {
+		expect(toRecordingSettings({}).autoPauseOnDtmf).toBe(false);
+		expect(toRecordingSettings({ autoPauseOnDtmf: true }).autoPauseOnDtmf).toBe(true);
+	});
+
+	it("clears a prompt id that is not a string, rather than rendering it", () => {
+		expect(toRecordingSettings({ consentPromptId: "p-1" }).consentPromptId).toBe("p-1");
+		expect(toRecordingSettings({}).consentPromptId).toBeNull();
 	});
 });
 

@@ -4,6 +4,7 @@ import { Card, CardBody, CardDescription, CardHeader, CardTitle } from "~/compon
 import { PageHeader } from "~/components/ui/page-header";
 import { SoftphoneDialer } from "../../_components/softphone/softphone-dialer";
 import { useSoftphone } from "../../_context/softphone-context";
+import { AgentWrapUpPanel } from "../../queues/_components/wrap-up-panel";
 
 export function SoftphoneScreen() {
 	const phone = useSoftphone();
@@ -14,6 +15,14 @@ export function SoftphoneScreen() {
 				title="Softphone"
 				description="Make and receive calls using your assigned extension."
 			/>
+
+			{/*
+			 * The wrap-up question, for an agent who works from this screen rather than from the queues
+			 * page. It is the same panel and the same live entry — an agent should not have to know
+			 * which tab the platform decided to ask them on — and it renders nothing at all unless the
+			 * engine says a code is owed.
+			 */}
+			<AgentWrapUpPanel />
 
 			<div className="grid gap-6 lg:grid-cols-[20rem_1fr]">
 				<Card>

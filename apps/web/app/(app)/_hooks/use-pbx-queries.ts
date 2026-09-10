@@ -14,6 +14,7 @@ import {
 	deletePbx,
 	deletePbxChild,
 	fetchFeatureCodeParamFields,
+	fetchKycRecord,
 	fetchOrgLimits,
 	fetchOrgUsage,
 	getPbx,
@@ -22,6 +23,7 @@ import {
 	MAX_PAGE_LIMIT,
 	PBX_RESOURCES,
 	reorderPbxChildren,
+	saveKycRecord,
 	setPinSetEntryPin,
 	setTimeConditionOverride,
 	toggleCallFlow,
@@ -40,6 +42,8 @@ import type {
 	CallFlowRow,
 	FeatureCodeParamFields,
 	MutationEnvelope,
+	KycRecord,
+	KycRecordInput,
 	OrgLimits,
 	OrgUsageReport,
 	PagedEnvelope,
@@ -595,4 +599,55 @@ function isFieldAddressable(error: unknown): boolean {
 
 function capitalize(value: string): string {
 	return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Carrier compliance — the KYC record
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The organization's KYC record.
+ *
+ * A singleton read rather than a list, because the API is one: `GET /compliance/kyc` answers with
+ * the record or 404s when nothing has been submitted yet, and the screen renders the form empty in
+ * that case rather than treating it as an error.
+ */
+export function useKycRecord(): UseQueryResult<KycRecord> {
+	const organizationId = useOrganizationId();
+	return useQuery({
+		queryKey: queryKeys.complianceKyc(organizationId),
+		queryFn: fetchKycRecord,
+		enabled: organizationId.length > 0,
+		retry: false,
+	});
+}
+
+/**
+ * Submits it.
+ *
+ * No routing invalidation: the compiler has no KYC input, and the record reaches an outbound call
+ * through the signing decision rather than through the artifact.
+ *
+ * The toast does not say "approved". A `PUT` that succeeds means the record was STORED, and a
+ * submission that resets the decision to `pending` — which it does, because a changed legal entity
+ * is a new question for the reviewer — must not read as an outcome.
+ */
+export function useKycRecordSave(): UseMutationResult<KycRecord, Error, KycRecordInput> {
+	const queryClient = useQueryClient();
+	const organizationId = useOrganizationId();
+
+	return useMutation({
+		mutationFn: async (input: KycRecordInput) => (await saveKycRecord(input)).data,
+		onSuccess: async () => {
+			await queryClient.invalidateQueries({ queryKey: queryKeys.complianceKyc(organizationId) });
+			toast.success("Compliance record submitted", {
+				description: "A reviewer decides on it. The decision shows on this page when it changes.",
+			});
+		},
+		onError: (error) => {
+			if (!isFieldAddressable(error)) {
+				toast.error(pbxToastMessage(error, "Could not save the compliance record"));
+			}
+		},
+	});
 }

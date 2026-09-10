@@ -189,6 +189,45 @@ export interface LiveAgentState {
 	readonly reason?: string;
 	readonly queueId?: string;
 	readonly source?: "engine" | "api";
+	/** Not eligible for distribution before this instant, whatever the status says. */
+	readonly availableAt?: string;
+	/** The call the agent is ringing for or on. Absent when they are not on one. */
+	readonly callId?: string;
+	/**
+	 * The call this agent still owes a wrap-up code for, while they are in `wrap-up`.
+	 *
+	 * Separate from the call they are ON, and they stop being the same value the moment a second
+	 * caller reaches the agent. The engine sets it when wrap-up begins and clears it when wrap-up
+	 * ends, whichever way it ended — which is what makes it the console's cue to ask, rather than a
+	 * CDR row the console would have to wait for.
+	 */
+	readonly dispositionCallId?: string;
+	/** The code the agent chose for {@link dispositionCallId}, once they have. */
+	readonly dispositionCode?: string;
+	/** Whether the queue asks for one at all. Copied onto the entry so the console needs one read. */
+	readonly dispositionRequired?: boolean;
+}
+
+/**
+ * The two `unavailable` reasons the ENGINE writes, as opposed to the free text a human types.
+ *
+ * Mirrors `ENGINE_UNAVAILABLE_REASONS` in `packages/events`, and it is mirrored rather than imported
+ * for the reason `lib/pbx/contracts.ts` mirrors its closed sets. Both mean the same thing to
+ * distribution — this handset is not being answered, stop sending it callers — and different things
+ * to a supervisor, which is the entire point of separating them on a wallboard: an agent a person
+ * paused will come back, and an agent the distributor benched is a phone nobody is picking up.
+ */
+export const ENGINE_UNAVAILABLE_REASONS = ["max-no-answer", "rona"] as const;
+export type EngineUnavailableReason = (typeof ENGINE_UNAVAILABLE_REASONS)[number];
+
+/** Whether a `reason` came from the distributor rather than from somebody typing it. */
+export function isEngineUnavailableReason(reason: string | undefined): boolean {
+	return reason !== undefined && (ENGINE_UNAVAILABLE_REASONS as readonly string[]).includes(reason);
+}
+
+/** Whether an `unavailable` entry was benched by the distributor rather than by a person. */
+export function isEngineBenched(entry: LiveAgentState | undefined): boolean {
+	return entry?.status === "unavailable" && isEngineUnavailableReason(entry.reason);
 }
 
 export function parseAgentState(value: unknown): LiveAgentState | undefined {

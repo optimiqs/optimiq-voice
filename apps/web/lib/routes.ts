@@ -161,8 +161,59 @@ export const routes = {
 	 * own notification preferences.
 	 */
 	security: "/security",
+	/**
+	 * Carrier compliance: the KYC record, the verified caller IDs, and the two policies that decide
+	 * what an outbound call may present.
+	 *
+	 * Its own top-level route rather than a settings tab, and the rule this file keeps applying
+	 * decides it again: a page may only be a tab of another when the two are gated by the SAME
+	 * permission. This one is `compliance.read`, which no settings tab asks for — putting it in the
+	 * settings bar would have meant a `PAGE_PERMISSIONS` entry disagreeing with every sibling, and
+	 * either hiding the page from a compliance officer holding no settings grant or showing it to
+	 * every self-service role that holds `settings.read`.
+	 *
+	 * The two `compliance` org settings live on this page as a panel rather than under `/settings`
+	 * for the same reason, even though the cascade itself is guarded by `settings.read`/`.write`:
+	 * the panel gates its own save on `settings.write` and renders read-only without it.
+	 */
+	compliance: "/compliance",
+	/**
+	 * The two PLATFORM-OPERATOR screens, under a `/platform` prefix that is load-bearing.
+	 *
+	 * Every other route in this app is answered inside the caller's active organization. These two
+	 * are not: they read and write across tenants on `compliance.review` and `compliance.traceback`,
+	 * both of which are `OWNER_ONLY_PERMISSIONS`. The prefix mirrors the API's own `/api/v1/platform/`
+	 * segment for the same reason it exists there — so that "what in this product leaves the tenant?"
+	 * is answered by grepping one segment rather than by knowing which permissions happen to be
+	 * owner-only. The permission is the guard; the prefix is the documentation, and the two must
+	 * never disagree.
+	 *
+	 * Two routes rather than one page with two tabs, and the rule this file keeps applying decides it
+	 * again: a page may only be a tab of another when both are gated by the SAME permission. The
+	 * review queue is `compliance.review` and the traceback is `compliance.traceback`, and the owner
+	 * template is the only holder of either — but an operator deployment that splits its compliance
+	 * desk from its abuse desk can grant one without the other, and a shared page would have had to
+	 * name one of them and hide the other.
+	 */
+	platformKyc: "/platform/kyc",
+	platformTraceback: "/platform/traceback",
 	/** Outbound webhook subscriptions — the integrator surface, gated by `webhooks.*`. */
 	webhooks: "/webhooks",
+	/**
+	 * The messaging inbox — threads on this organization's own numbers.
+	 *
+	 * A top-level route rather than a tab of anything, and the rule this file has applied six times
+	 * decides it again: a page may only be a tab of another when the two are gated by the SAME
+	 * grant, because a tab inherits its parent's requirement by ancestry. `messaging.read` is held
+	 * by the agent template, which holds neither `cdr.read` nor `numbers.read`, so filing the inbox
+	 * under either would hide it from the only people who will live in it all day.
+	 *
+	 * The REGISTRATION screens are the other half of this feature and are deliberately somewhere
+	 * else — under `/settings/messaging`, on `messaging.manage` — because a 10DLC brand carries a
+	 * company's EIN and a campaign decides what a carrier will accept. Reading a thread and filing
+	 * a federal registration are not the same job and are not the same grant.
+	 */
+	messaging: "/messaging",
 	settings: "/settings",
 	members: "/settings/members",
 	apiKeys: "/settings/api-keys",
@@ -220,6 +271,23 @@ export const routes = {
 	 * `page-permissions.ts`.
 	 */
 	mySettings: "/settings/me",
+	/**
+	 * Messaging registration — five screens under one settings segment.
+	 *
+	 * They are nested under `/settings/messaging` rather than spread across the settings bar, and
+	 * the nesting is load-bearing: `getPagePermissions` walks up to the nearest declared ancestor,
+	 * so the four children inherit `messaging.read` from the parent by ancestry and no future
+	 * screen added here can quietly fall back to `/settings`' much wider `settings.read`.
+	 *
+	 * They are under `/settings` and not under `/messaging` for the reason the inbox states: this
+	 * is `messaging.manage` — a company's EIN, a campaign's sample messages, a carrier submission —
+	 * and the agent who reads threads all day holds no part of it.
+	 */
+	messagingNumbers: "/settings/messaging",
+	messagingBrand: "/settings/messaging/brand",
+	messagingCampaigns: "/settings/messaging/campaigns",
+	messagingTollFree: "/settings/messaging/toll-free",
+	messagingOptOuts: "/settings/messaging/opt-outs",
 
 	/**
 	 * Detail views, for the five entities that own a child collection.
@@ -362,6 +430,14 @@ export function deviceTabHref(tab: DeviceTab): string {
  * else for is a third view of "numbers", not a fourth sidebar entry, and it would have needed a
  * `PAGE_PERMISSIONS` line duplicating `numbers.read` all over again.
  */
+export const COMPLIANCE_TABS = ["kyc", "caller-ids", "policy"] as const;
+
+export type ComplianceTab = (typeof COMPLIANCE_TABS)[number];
+
+export function complianceTabHref(tab: ComplianceTab): string {
+	return tab === "kyc" ? routes.compliance : `${routes.compliance}?tab=${tab}`;
+}
+
 export const NUMBER_TABS = ["numbers", "order", "porting"] as const;
 
 export type NumberTab = (typeof NUMBER_TABS)[number];
@@ -371,7 +447,7 @@ export function numberTabHref(tab: NumberTab): string {
 }
 
 /**
- * The Security page's two sections.
+ * The Security page's three sections.
  *
  * The rules and the refusals are two views of ONE subject — who may reach the SIP edge — and both
  * are gated by `security.read`. Two sidebar entries would be two ways to say "SIP security", and
@@ -380,8 +456,21 @@ export function numberTabHref(tab: NumberTab): string {
  * They belong together for a stronger reason than shared permissions, though: the attack log is how
  * an administrator finds out a rule is wrong, and the rule list is where they fix it. Splitting them
  * across two routes would put the question and the answer one navigation apart.
+ *
+ * ## The fraud tab does NOT share the other two's permission, and that is why it gates itself
+ *
+ * The access rules and the failure log are `security.*`, which is what `PAGE_PERMISSIONS` names for
+ * this route. The fraud controls are `toll-fraud.*` — the API's decision, argued in
+ * `toll-fraud.controller.ts`: `security.*` is the NETWORK boundary and this is a COMMERCIAL one,
+ * read by different people during different incidents.
+ *
+ * It is nonetheless the right neighbour rather than a route of its own, on exactly the argument
+ * above: the auth-failure log is how somebody learns a credential leaked, and the fraud ceilings
+ * are what bound the leak's cost. The grants come apart in the harmless direction — the panel
+ * renders read-only without `toll-fraud.write` and says so — so the tab gates itself, on the
+ * precedent {@link MEDIA_TABS}' phrases tab set.
  */
-export const SECURITY_TABS = ["access-rules", "auth-failures"] as const;
+export const SECURITY_TABS = ["access-rules", "auth-failures", "fraud-controls"] as const;
 
 export type SecurityTab = (typeof SECURITY_TABS)[number];
 

@@ -18,20 +18,28 @@ import { normalizeE164Message } from "@optimiq-voice/telephony";
 import { networkIssue, normalizeNetwork } from "./cidr";
 import {
 	CALL_BLOCK_ACTIONS,
+	CALLER_ID_VERIFICATION_METHODS,
 	CALL_BLOCK_DIRECTIONS,
 	CALL_BLOCK_MATCH_KINDS,
 	DIRECTORY_SEARCH_FIELDS,
 	FEATURE_CODE_ACTIONS,
 	MOH_SOURCES,
 	IVR_OPTION_MATCH_KINDS,
+	KYC_ENTITY_TYPES,
 	QUEUE_AGENT_CONTACT_KINDS,
 	QUEUE_AGENT_STATUSES,
+	QUEUE_DISPOSITION_UNSET,
 	QUEUE_EXIT_KEY_PATTERN,
 	QUEUE_PRIORITY_MAX,
 	QUEUE_PRIORITY_MIN,
+	QUEUE_SKILL_LEVEL_MAX,
+	QUEUE_SKILL_LEVEL_MIN,
 	QUEUE_STRATEGIES,
+	QUEUE_SURVEY_MAX_QUESTIONS,
+	QUEUE_TAG_PATTERN,
 	CALLER_ID_PRESENTATIONS,
 	RECORD_POLICIES,
+	RECORDING_CONSENT_POLICIES,
 	RING_GROUP_STRATEGIES,
 	ROUTE_MATCH_KINDS,
 	ROUTING_CONTEXTS,
@@ -44,6 +52,7 @@ import {
 	VOICEMAIL_EMAIL_MODES,
 	VOICEMAIL_GREETING_KINDS,
 } from "./contracts";
+import type { RecordingConsentPolicy } from "./contracts";
 
 // ---------------------------------------------------------------------------------------------
 // Shared primitives, mirroring shared/dto.ts
@@ -202,6 +211,26 @@ function optionalReference() {
 		.transform((value) => (value.length === 0 ? null : value));
 }
 
+/**
+ * A recording-disclosure override on a DID or an inbound route: one of the three policies, or blank
+ * for "inherit the organization".
+ *
+ * Blank has to reach the wire as `null` rather than as `"none"`, and the difference is the whole
+ * control. `null` means this number follows whatever the organization decides next; `"none"` means
+ * this number says nothing whatever the organization decides. The server's DTO is `.nullish()` for
+ * exactly that reason.
+ */
+function inheritedConsentPolicy() {
+	return z
+		.string()
+		.trim()
+		.refine(
+			(value) => value === "" || (RECORDING_CONSENT_POLICIES as readonly string[]).includes(value),
+			{ message: "Pick one of the disclosure settings" },
+		)
+		.transform((value) => (value.length === 0 ? null : (value as RecordingConsentPolicy)));
+}
+
 export const timezoneName = z
 	.string()
 	.trim()
@@ -259,6 +288,14 @@ function extensionSchema(sipSecretRef: SecretRefField) {
 		outboundCallerIdPresentation: z.enum(CALLER_ID_PRESENTATIONS),
 		tollClass: z.enum(TOLL_CLASSES),
 		recordPolicy: z.enum(RECORD_POLICIES),
+		/**
+		 * Pause the recorder while the caller is pressing keys, so card details typed on the keypad
+		 * are not captured even when the agent forgets to pause.
+		 *
+		 * A plain boolean over a `not null default false` column: the control always holds an answer,
+		 * so there is no "unset" for the form to encode.
+		 */
+		recordAutoPauseOnDtmf: z.boolean(),
 		/**
 		 * The `*8` pickup group, bounded at 64 to match `pickupGroupName` in the server's DTO.
 		 *
@@ -341,6 +378,10 @@ export const phoneNumberFormSchema = z.strictObject({
 	label: optionalText(128),
 	callerIdNamePrefix: optionalText(32),
 	recordEnabled: z.boolean(),
+	/** Blank inherits the organization's disclosure setting — see {@link inheritedConsentPolicy}. */
+	recordingConsentPolicy: inheritedConsentPolicy(),
+	/** Blank uses the organization's disclosure prompt, or the built-in announcement. */
+	recordingConsentPromptId: optionalReference(),
 	/**
 	 * The dispatchable location this DID reports when somebody dials 911 (RAY BAUM'S Act).
 	 *
@@ -397,6 +438,9 @@ export const inboundRouteFormSchema = z
 		callerIdPattern: optionalText(256),
 		timeConditionId: z.string().trim(),
 		recordEnabled: z.boolean(),
+		/** The same override the DID carries, one level in. Blank inherits the organization's. */
+		recordingConsentPolicy: inheritedConsentPolicy(),
+		recordingConsentPromptId: optionalReference(),
 		enabled: z.boolean(),
 	})
 	/**
@@ -796,6 +840,22 @@ export const queueFormSchema = z.strictObject({
 	maxWaitSeconds: optionalInt(0, 86_400),
 	maxWaitNoAgentSeconds: optionalInt(0, 86_400),
 	wrapUpSeconds: optionalInt(0, 3600),
+	/**
+	 * Whether the console insists on a wrap-up code.
+	 *
+	 * A plain boolean and NOT a validator that could make the console block: the engine's wrap-up
+	 * deadline ends the after-call work regardless and records `unset`, so this switch buys emphasis
+	 * on a screen and nothing more. See `agent-console.tsx` for the other half of that sentence.
+	 */
+	dispositionRequired: z.boolean(),
+	/** ONE unanswered offer benches the agent until a person resumes them. */
+	ronaEnabled: z.boolean(),
+	surveyEnabled: z.boolean(),
+	/**
+	 * Played once before the first question. Blank leaves the survey silent up front, which is a
+	 * cleared column rather than a restored default — the same reading every selector here has.
+	 */
+	surveyIntroPromptId: optionalReference(),
 	announcePositionEnabled: z.boolean(),
 	announceFrequencySeconds: optionalInt(5, 3600),
 	abandonedResumeAllowed: z.boolean(),
@@ -810,6 +870,8 @@ export const queueFormSchema = z.strictObject({
 	 * accepts at all — a strict object answers the old key with a 400.
 	 */
 	recordPolicy: z.enum(RECORD_POLICIES),
+	/** The keypad backstop, on the terms `extensionSchema` states. */
+	recordAutoPauseOnDtmf: z.boolean(),
 	/**
 	 * The single DTMF digit a waiting caller may press to leave. Blank removes it.
 	 *
@@ -920,6 +982,80 @@ export const queueTierFormSchema = z.strictObject({
 	announcePromptId: optionalReference(),
 });
 export type QueueTierFormValues = z.input<typeof queueTierFormSchema>;
+
+/**
+ * A skill tag or a disposition code, normalised exactly as the server's DTO normalises it.
+ *
+ * Lower-cased before the check for the reason {@link queueFormSchema}'s exit key is upper-cased:
+ * the value is compared with `===` on the call path, and `Spanish` and `spanish` are not equivalent
+ * anywhere below this line. Normalising in the browser is what makes the control and the column
+ * agree rather than what makes the form lenient — the database carries the same regex as a check
+ * constraint, so a value that got past this would be refused there instead.
+ */
+const queueTag = z
+	.string()
+	.trim()
+	.toLowerCase()
+	.refine((value) => QUEUE_TAG_PATTERN.test(value), {
+		message: "Lower-case letters, digits, _ and -, starting with a letter or digit",
+	});
+
+/**
+ * One wrap-up code the queue offers.
+ *
+ * `unset` is refused here as well as by the server and the database check, because it is what the
+ * wrap-up deadline records when nobody chose: a tenant-defined code spelled the same way would make
+ * "nobody answered the question" and "the agent picked this" one row in every report.
+ */
+export const queueDispositionCodeFormSchema = z.strictObject({
+	code: queueTag.refine((value) => value !== QUEUE_DISPOSITION_UNSET, {
+		message: `"${QUEUE_DISPOSITION_UNSET}" is reserved for the code recorded when nobody chose.`,
+	}),
+	label: displayName,
+	/** Lowest first; ties fall back to the code. Empty restores the server's default. */
+	position: optionalInt(0, 1000),
+	enabled: z.boolean(),
+});
+export type QueueDispositionCodeFormValues = z.input<typeof queueDispositionCodeFormSchema>;
+
+/**
+ * One skill this queue's callers need.
+ *
+ * `relaxAfterSeconds` is seconds of waiting per one-level drop in the bar, and `0` never relaxes —
+ * which is the right answer for a regulated skill and the wrong one for a preference. The form says
+ * so rather than leaving an operator to discover that a queue with an absolute requirement and one
+ * qualified agent holds callers until the wait cap.
+ */
+export const queueSkillRequirementFormSchema = z.strictObject({
+	skill: queueTag,
+	minLevel: optionalInt(QUEUE_SKILL_LEVEL_MIN, QUEUE_SKILL_LEVEL_MAX),
+	relaxAfterSeconds: optionalInt(0, 3600),
+});
+export type QueueSkillRequirementFormValues = z.input<typeof queueSkillRequirementFormSchema>;
+
+/**
+ * One post-call survey question.
+ *
+ * `position` is {@link requiredInt} and not {@link optionalInt}, unlike every other ordinal in this
+ * file: the column has a default the schema does not give it, because 1-2-3 is the question's
+ * identity in every report. A blank here would be a 400 with no field on it rather than "use the
+ * default".
+ */
+export const queueSurveyQuestionFormSchema = z.strictObject({
+	position: requiredInt(1, QUEUE_SURVEY_MAX_QUESTIONS),
+	/** Blank leaves the question silent. The column is nullable, so this clears rather than defaults. */
+	promptId: optionalReference(),
+	/** For the console and the report. The caller never hears it. */
+	label: displayName,
+});
+export type QueueSurveyQuestionFormValues = z.input<typeof queueSurveyQuestionFormSchema>;
+
+/** One skill an AGENT has. The scale is the queue requirement's, because the two are compared. */
+export const queueAgentSkillFormSchema = z.strictObject({
+	skill: queueTag,
+	level: optionalInt(QUEUE_SKILL_LEVEL_MIN, QUEUE_SKILL_LEVEL_MAX),
+});
+export type QueueAgentSkillFormValues = z.input<typeof queueAgentSkillFormSchema>;
 
 /**
  * A conference room.
@@ -1572,3 +1708,89 @@ export const webhookFormSchema = z.strictObject({
 	enabled: z.boolean(),
 });
 export type WebhookFormValues = z.input<typeof webhookFormSchema>;
+
+// ---------------------------------------------------------------------------------------------
+// Carrier compliance
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * An optional ISO date, as a `<input type="date">` gives it: `YYYY-MM-DD`, blank for none.
+ *
+ * Sent as the date the user typed rather than as an instant. A verification's expiry is a calendar
+ * fact, and running it through `new Date()` in the browser would move it a day for anybody west of
+ * UTC — which on an expiry is the difference between a caller ID that still supports a `B`
+ * attestation and one that does not.
+ */
+function optionalIsoDate() {
+	return z
+		.string()
+		.trim()
+		.refine((value) => value === "" || /^\d{4}-\d{2}-\d{2}$/u.test(value), {
+			message: "Enter a date",
+		})
+		.transform((value) => (value.length === 0 ? null : value));
+}
+
+export const verifiedCallerIdFormSchema = z
+	.strictObject({
+		e164,
+		label: optionalText(128),
+		verificationMethod: z.enum(CALLER_ID_VERIFICATION_METHODS),
+		verificationReference: optionalText(256),
+		verifiedAt: optionalIsoDate(),
+		expiresAt: optionalIsoDate(),
+		notes: optionalText(1_000),
+	})
+	.refine(
+		(value) =>
+			value.verifiedAt === null || value.expiresAt === null || value.expiresAt >= value.verifiedAt,
+		{
+			path: ["expiresAt"],
+			message: "An expiry before the verification date is not a verification.",
+		},
+	);
+export type VerifiedCallerIdFormValues = z.input<typeof verifiedCallerIdFormSchema>;
+
+/**
+ * The KYC record, as the form sends it.
+ *
+ * `taxId` is the full identifier and is WRITE-ONLY — the API never returns it, so an empty box
+ * means "leave what is stored alone" and is transformed to `undefined` rather than to `null`. A
+ * `null` here would be a request to clear the stored id on every save that did not retype it.
+ *
+ * The reviewer's fields (`decision`, `reviewedAt`, `reviewNotes`) are deliberately absent: a
+ * strict object refuses them, so no future edit to this form can accidentally let a tenant submit
+ * their own approval.
+ */
+export const kycFormSchema = z.strictObject({
+	legalEntityName: displayName,
+	entityType: z.enum(KYC_ENTITY_TYPES),
+	taxId: z
+		.string()
+		.trim()
+		.max(64, "At most 64 characters")
+		.transform((value) => (value.length === 0 ? undefined : value)),
+	addressLine1: displayName,
+	addressLine2: optionalText(128),
+	addressCity: displayName,
+	addressRegion: z.string().trim().min(1, "Required").max(128, "At most 128 characters"),
+	addressPostalCode: z.string().trim().min(1, "Required").max(32, "At most 32 characters"),
+	addressCountry: z
+		.string()
+		.trim()
+		.toUpperCase()
+		.regex(/^[A-Z]{2}$/u, "A two-letter country code, e.g. US"),
+	contactName: displayName,
+	contactEmail: z.email("Enter an email address").max(254),
+	contactPhone: e164,
+	websiteUrl: z
+		.string()
+		.trim()
+		.refine((value) => value === "" || z.url().safeParse(value).success, {
+			message: "Enter a URL, including https://",
+		})
+		.transform((value) => (value.length === 0 ? null : value)),
+	expectedTrafficProfile: optionalText(1_000),
+	expectedMonthlyMinutes: optionalInt(0, 100_000_000),
+});
+export type KycFormValues = z.input<typeof kycFormSchema>;

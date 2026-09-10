@@ -21,6 +21,7 @@ import { useLiveRegistrations } from "../../_hooks/use-live-queries";
 import { usePbxDelete, usePbxList } from "../../_hooks/use-pbx-queries";
 import { ExtensionDialog } from "./extension-dialog";
 import { ExtensionUsersDialog } from "./extension-users-dialog";
+import { RotateSecretDialog } from "./rotate-secret-dialog";
 import type { ExtensionRow } from "~/lib/pbx/contracts";
 
 /**
@@ -55,6 +56,13 @@ export function ExtensionsScreen() {
 	const canAssign = usePermission("extensions.assign");
 	const [assigning, setAssigning] = useState<ExtensionRow | null>(null);
 	const canDelete = usePermission(resource.permissions.delete);
+	/**
+	 * Its own grant, not `extensions.write`: invalidating the credential a physical handset holds is
+	 * an outage on a schedule the handset chooses, which is the argument the permission registry
+	 * makes for `security.rotate-credentials` existing at all.
+	 */
+	const canRotate = usePermission("security.rotate-credentials");
+	const [rotating, setRotating] = useState<ExtensionRow | null>(null);
 	const registrations = useLiveRegistrations();
 
 	const [editing, setEditing] = useState<ExtensionRow | null>(null);
@@ -184,8 +192,15 @@ export function ExtensionsScreen() {
 					<RowActions
 						label={`extension ${row.number}`}
 						extra={
-							canAssign ? (
-								<MenuItem onClick={() => setAssigning(row)}>Assign users</MenuItem>
+							canAssign || canRotate ? (
+								<>
+									{canAssign ? (
+										<MenuItem onClick={() => setAssigning(row)}>Assign users</MenuItem>
+									) : null}
+									{canRotate ? (
+										<MenuItem onClick={() => setRotating(row)}>Rotate SIP secret</MenuItem>
+									) : null}
+								</>
 							) : undefined
 						}
 						onEdit={canWrite ? () => openEdit(row) : undefined}
@@ -226,6 +241,14 @@ export function ExtensionsScreen() {
 					key={assigning.id}
 					extension={assigning}
 					onClose={() => setAssigning(null)}
+				/>
+			) : null}
+
+			{rotating ? (
+				<RotateSecretDialog
+					key={rotating.id}
+					extension={rotating}
+					onClose={() => setRotating(null)}
 				/>
 			) : null}
 

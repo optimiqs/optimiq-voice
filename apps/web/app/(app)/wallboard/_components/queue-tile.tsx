@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { Badge } from "~/components/ui/badge";
 import { formatWait, waitTone } from "~/lib/cdr/queue-stats";
-import { longestWaitMs } from "~/lib/live/store";
+import { isEngineBenched, longestWaitMs } from "~/lib/live/store";
 import { PBX_CHILDREN } from "~/lib/pbx/client";
 import { routes } from "~/lib/routes";
 import { useLiveQueue } from "../../_hooks/use-live-queries";
@@ -50,13 +50,18 @@ export function QueueTile({
 	const roster = tiers.data ?? [];
 	let available = 0;
 	let staffed = 0;
+	/** Logged in and taken out by the DISTRIBUTOR — a phone nobody is picking up. See the panel. */
+	let benched = 0;
 	for (const tier of roster) {
-		const status = agentStates.byAgentId.get(tier.queueAgentId)?.status;
-		if (status !== undefined && status !== "logged-out") {
+		const entry = agentStates.byAgentId.get(tier.queueAgentId);
+		if (entry !== undefined && entry.status !== "logged-out") {
 			staffed += 1;
 		}
-		if (status === "available") {
+		if (entry?.status === "available") {
 			available += 1;
+		}
+		if (isEngineBenched(entry)) {
+			benched += 1;
 		}
 	}
 
@@ -109,7 +114,11 @@ export function QueueTile({
 					label="Available"
 					value={String(available)}
 					tone={unattended ? "alert" : "neutral"}
-					hint={`${String(staffed)} of ${String(roster.length)} staffed`}
+					hint={
+						benched === 0
+							? `${String(staffed)} of ${String(roster.length)} staffed`
+							: `${String(staffed)} of ${String(roster.length)} staffed · ${String(benched)} not answering`
+					}
 				/>
 			</div>
 

@@ -14,6 +14,7 @@ import {
 } from "react";
 import { ApiError } from "~/lib/api-client";
 import { listCallLegs } from "~/lib/cdr/client";
+import { isLegEncrypted } from "~/lib/live/encryption";
 import { listPbx, PBX_RESOURCES } from "~/lib/pbx/client";
 import { queryKeys } from "~/lib/query-keys";
 import {
@@ -130,6 +131,18 @@ export interface SoftphoneContextValue {
 	 * control is hidden in that state rather than disabled.
 	 */
 	readonly recording: RecordingState;
+	/**
+	 * Whether the PLATFORM says this agent's own live leg is carrying encrypted audio.
+	 *
+	 * Off the same `active-calls` feed and the same extension match the recording observation uses,
+	 * because nothing in the browser can answer it: jssip knows a SIP dialog and the WebRTC leg's own
+	 * DTLS, and says nothing about the SRTP context `mediad` installed on the leg it is talking to.
+	 *
+	 * `false` while the call is not connected and `false` for a session that cannot read the topic
+	 * (`cdr.read`) — the padlock is simply absent in both, which is the honest rendering: the icon
+	 * asserts encryption and never asserts its absence.
+	 */
+	readonly mediaEncrypted: boolean;
 	/** Announces the platform's recording facts into the control's machine. */
 	dispatchRecording(event: RecordingEvent): void;
 	/** Pauses the recording — what an agent presses before asking for a card number. */
@@ -405,6 +418,24 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
 	 * `LIVE_TOPIC_PERMISSIONS`, not to this file.
 	 */
 	const liveCalls = useLiveActiveCalls();
+	/**
+	 * This agent's own leg out of the whole tenant's feed, matched the way `observedRecording`
+	 * matches: the engine resolves the agent's extension onto the leg as either the caller id (a
+	 * call they placed) or the destination (one that rang them). Only while a call is actually
+	 * CONNECTED — a ringing leg has negotiated nothing, and a padlock drawn there would be a claim
+	 * about a session that does not exist yet.
+	 */
+	const mediaEncrypted = useMemo(() => {
+		if (state.call.status !== "active" || extensionNumber === null || extensionNumber === "") {
+			return false;
+		}
+		return liveCalls.legs.some(
+			(leg) =>
+				(leg.profile?.callerIdNumber === extensionNumber ||
+					leg.profile?.destinationNumber === extensionNumber) &&
+				isLegEncrypted(leg),
+		);
+	}, [liveCalls.legs, extensionNumber, state.call.status]);
 	const observation = useMemo(
 		// Only while a call is actually up on this phone. The feed lags a hangup by a beat, and
 		// without this gate the control would light back up on a call that has just ended — undoing
@@ -479,6 +510,7 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
 			dispatchRecording,
 			pauseRecording,
 			resumeRecording,
+			mediaEncrypted,
 		}),
 		[
 			resolved,
@@ -508,6 +540,7 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
 			recording,
 			pauseRecording,
 			resumeRecording,
+			mediaEncrypted,
 		],
 	);
 

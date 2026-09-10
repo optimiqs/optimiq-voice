@@ -33,6 +33,13 @@ import {
 	type QueueStatsQuery,
 	type RecordingListQuery,
 } from "~/lib/cdr/client";
+import {
+	applyErasure,
+	isEmptyErasure,
+	previewErasure,
+	type ErasureCounts,
+	type ErasureSubject,
+} from "~/lib/cdr/erasure";
 import { pbxToastMessage } from "~/lib/pbx/errors";
 import { queryKeys } from "~/lib/query-keys";
 import { useActiveOrganization, usePermission } from "../_context/session-context";
@@ -456,6 +463,66 @@ export function useDeleteCdrExport(): UseMutationResult<{ readonly id: string },
 		},
 		onError: (error) => {
 			toast.error(pbxToastMessage(error, "Could not delete this export"));
+		},
+	});
+}
+
+// ---------------------------------------------------------------------------------------------
+// Erasure — honouring a "delete everything you hold about me" request
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Counting what an erasure would take. A mutation rather than a query, and deliberately.
+ *
+ * A preview is a POST with a body, it is gated on `recordings.delete`, and asking for one about a
+ * number is itself the cheapest way in the product to find out whether that number ever called this
+ * tenant. Caching the answer would mean a stale count sitting under a confirm button that destroys
+ * things, which is the one place a stale number must not appear.
+ */
+export function usePreviewErasure(): UseMutationResult<ErasureCounts, Error, ErasureSubject> {
+	return useMutation({
+		mutationFn: (subject: ErasureSubject) => previewErasure(subject),
+		onError: (error) => {
+			toast.error(pbxToastMessage(error, "Could not work out what this would erase"));
+		},
+	});
+}
+
+/**
+ * Honouring the request. Irreversible.
+ *
+ * Sweeps the recordings subtree and the call ledger, because both change: the media rows are gone
+ * or tombstoned, and the legs survive with their numbers hashed. Leaving either cached would show
+ * an operator a recording that no longer exists, seconds after they destroyed it.
+ *
+ * The toast reports the counts rather than saying "done" — what a compliance record needs is what
+ * actually went, and those counts can differ from the preview when a call lands in between.
+ */
+export function useApplyErasure(): UseMutationResult<ErasureCounts, Error, ErasureSubject> {
+	const queryClient = useQueryClient();
+	const organizationId = useOrganizationId();
+	return useMutation({
+		mutationFn: (subject: ErasureSubject) => applyErasure(subject),
+		onSuccess: async (counts) => {
+			await queryClient.invalidateQueries({
+				queryKey: queryKeys.recordings(organizationId),
+			});
+			await queryClient.invalidateQueries({
+				queryKey: queryKeys.cdr(organizationId),
+			});
+			toast.success(
+				isEmptyErasure(counts)
+					? "Nothing was left to erase"
+					: `Erased ${counts.recordings} recordings and ${counts.voicemailMessages} voicemail messages`,
+				{
+					description: isEmptyErasure(counts)
+						? "This organization holds no recordings, voicemail or call records for that person."
+						: `${counts.callLegs} call records were kept with the numbers hashed, so billing counts stay right.`,
+				},
+			);
+		},
+		onError: (error) => {
+			toast.error(pbxToastMessage(error, "Could not erase this person's data"));
 		},
 	});
 }

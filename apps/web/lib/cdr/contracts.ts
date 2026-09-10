@@ -87,6 +87,55 @@ export interface CallLegRow {
 	 */
 	readonly authPinOrdinal?: number | null;
 	readonly authPinLabel?: string | null;
+	/**
+	 * What the CARRIER claimed about an inbound call's caller ID — STIR/SHAKEN, as received.
+	 *
+	 * `sipAttestation` is the `attest` parameter of the Identity header's PASSporT (`A`, `B` or
+	 * `C`), `sipVerstat` the `verstat` the verification service appended to the P-Asserted-Identity
+	 * (`TN-Validation-Passed`, `TN-Validation-Failed`, `No-TN-Validation`), and `sipOrigId` the
+	 * `origid` that names which originating service signed it.
+	 *
+	 * These are a CLAIM by an upstream party, recorded verbatim. Nothing on this platform verified
+	 * them, and the renderer must never present them as something this platform checked — an
+	 * attestation of `A` on an inbound call means the originating carrier vouched for its own
+	 * customer, not that the number is who it says it is. That distinction is the entire reason
+	 * these are rendered separately from {@link expectedAttestation} below.
+	 *
+	 * @see expectedAttestation for the OUTBOUND counterpart, which is this platform's own decision.
+	 */
+	readonly sipAttestation?: string | null;
+	readonly sipVerstat?: string | null;
+	readonly sipOrigId?: string | null;
+	/**
+	 * What THIS platform decided to attest for an outbound call, and on what basis.
+	 *
+	 * `expectedAttestation` is the level the signing request asked for and
+	 * `callerIdRightToUse` is the evidence that justified it: `owned` (a number this platform
+	 * assigned to the tenant) supports `A`, `verified` (a documented external verification — an
+	 * LOA, a call-back, a carrier attestation on file) supports `B`, and neither supports only `C`.
+	 *
+	 * The pair is what a traceback is answered with, which is why the basis is stored beside the
+	 * level rather than being re-derived: the number may have been released, or its verification
+	 * expired, since the call was placed, and re-deriving would answer with today's facts about a
+	 * decision made months ago.
+	 *
+	 * ## All seven compliance fields are OPTIONAL, on the `authPinOrdinal` precedent
+	 *
+	 * The columns exist on `call_legs`, but `LEG_LIST_COLUMNS` / `LEG_DETAIL_COLUMNS` in
+	 * `apps/api/src/cdr/query/cdr.repository.ts` do not select all of them yet, so a leg read today
+	 * can arrive with the keys ABSENT rather than null. Typing them `string | null` alone would be
+	 * this app asserting a projection the server does not have. `?` is what makes the renderer's
+	 * `== null` test correct for both absences at once — "not selected" and "nothing was recorded"
+	 * — and what makes widening the projection a change with no diff on this side.
+	 *
+	 * @see sipAttestation for the INBOUND counterpart, which is a carrier's claim, not ours.
+	 */
+	readonly expectedAttestation?: string | null;
+	readonly callerIdRightToUse?: string | null;
+	/** The `trunk.id` the leg was offered to or arrived on. A uuid; this database holds no names. */
+	readonly trunkRef?: string | null;
+	/** The peer's signalling address as the SIP stack saw it — `host:port`, sometimes with transport. */
+	readonly signalingAddress?: string | null;
 }
 
 /** The detail view adds the media-quality block and the passthrough jsonb. */
@@ -110,6 +159,44 @@ export interface CallLegDetail extends CallLegRow {
 	readonly recordings: readonly RecordingRow[];
 }
 
+/**
+ * What actually happened on one call, mirroring `RECORDING_CONSENT_OUTCOMES` in
+ * `@optimiq-voice/routing` — the row's `consent.outcome`.
+ *
+ * `not-required` is a real answer and not a missing one: the policy asked for nothing and nothing
+ * was said. A row with NO consent record at all is different again — it predates this feature — and
+ * the screen shows nothing for it rather than guessing.
+ */
+export const RECORDING_CONSENT_OUTCOMES = [
+	"not-required",
+	"announced",
+	"accepted",
+	"declined",
+] as const;
+export type RecordingConsentOutcome = (typeof RECORDING_CONSENT_OUTCOMES)[number];
+
+/** How the outcome was reached. Mirrors `RECORDING_CONSENT_METHODS`. */
+export const RECORDING_CONSENT_METHODS = ["none", "announcement", "keypress"] as const;
+export type RecordingConsentMethod = (typeof RECORDING_CONSENT_METHODS)[number];
+
+/**
+ * The consent record one recording carries, mirroring `RecordingConsentRow` in
+ * `@optimiq-voice/cdr-db`.
+ *
+ * Optional everywhere it appears, and that is the compatibility rule the whole feature is built on:
+ * a recording written before consent existed has no record, and must read exactly as it did.
+ */
+export interface RecordingConsent {
+	readonly outcome: RecordingConsentOutcome;
+	readonly method: RecordingConsentMethod;
+	readonly policy: string;
+	/** ISO 8601, stamped when the outcome was decided rather than when the row was written. */
+	readonly at: string;
+	readonly parties: readonly string[];
+	readonly regions?: readonly string[];
+	readonly promptId?: string;
+}
+
 export interface RecordingRow {
 	readonly id: string;
 	readonly callId: string | null;
@@ -121,6 +208,15 @@ export interface RecordingRow {
 	readonly retentionUntil: string | null;
 	/** Set once the object is purged; the row is kept as an audit tombstone and cannot be played. */
 	readonly deletedAt: string | null;
+	/**
+	 * What the parties were told before this object was made, when anything was.
+	 *
+	 * Absent or `null` on every recording made before the consent gate existed, and on any made
+	 * under a policy that asked for nothing at all where the engine wrote no record. A screen must
+	 * render that as nothing rather than as "unknown": a blank cell is the truth, and "unknown" reads
+	 * like a failure to look.
+	 */
+	readonly consent?: RecordingConsent | null;
 	readonly createdAt: string;
 }
 
@@ -129,6 +225,14 @@ export interface CallDetail {
 	readonly callId: string;
 	readonly legs: readonly CallLegRow[];
 	readonly recordings: readonly RecordingRow[];
+	/**
+	 * What the caller answered after the agent hung up, ordered by question.
+	 *
+	 * Joined by the server from the PBX database — the answers and the legs live in two different
+	 * databases and share only this call id. Empty for a call that was never surveyed, which is
+	 * every call that did not come through a queue with one configured.
+	 */
+	readonly survey: readonly QueueSurveyCallAnswer[];
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -289,6 +393,47 @@ export interface QueueStatsRow {
 	readonly serviceLevelPct: number | null;
 	/** How many offered calls beat the target — the numerator, exposed so the maths is checkable. */
 	readonly withinTarget: number;
+	/**
+	 * The queue's post-call survey over the same window, ABSENT when nobody answered one.
+	 *
+	 * Absent rather than an empty summary, and the distinction is the reason this is optional: a
+	 * queue with no survey configured and a queue whose survey nobody answered are different facts,
+	 * and a panel that rendered a row of zeros for both would report the second as the first.
+	 */
+	readonly survey?: QueueSurveySummary;
+}
+
+/** One survey question's answers over a window. Mirrors `apps/api/src/cdr/query/queue-survey.port.ts`. */
+export interface QueueSurveyQuestionSummary {
+	readonly questionId: string;
+	readonly position: number;
+	readonly label: string;
+	/** How many callers answered THIS question — never the queue's call count. */
+	readonly responses: number;
+	/** Counts for answers 1-5, in order. Always five entries, so a missing score is a zero. */
+	readonly distribution: readonly number[];
+	/** The mean of the answers given, to one decimal. `null` when nobody answered. */
+	readonly average: number | null;
+}
+
+/** One queue's post-call survey over a window. */
+export interface QueueSurveySummary {
+	readonly queueId: string;
+	/** Answers across every question. Not callers: one caller answering two questions is two. */
+	readonly responses: number;
+	readonly average: number | null;
+	readonly questions: readonly QueueSurveyQuestionSummary[];
+}
+
+/** One answer one caller gave, as a call's own record of it. */
+export interface QueueSurveyCallAnswer {
+	readonly callId: string;
+	readonly queueId: string;
+	readonly questionId: string;
+	readonly position: number;
+	readonly label: string;
+	readonly answer: number;
+	readonly answeredAt: string;
 }
 
 /**
@@ -346,8 +491,27 @@ export interface AgentStatsRow {
 	readonly wrapUpMs: number;
 	readonly averageWrapUpMs: number;
 	readonly wrapUpSamples: number;
+	/**
+	 * What this agent's calls CLOSED as, commonest first.
+	 *
+	 * A MEASUREMENT rather than the wrap-up field's cousin: the code was chosen by the agent (or
+	 * recorded as `unset` by the wrap-up deadline when they chose nothing), so unlike the inter-call
+	 * gap above it is not inferred from anything.
+	 *
+	 * Empty for every agent on a queue that asks no wrap-up question. The counts do NOT have to sum
+	 * to {@link AgentStatsRow.answered}, and a screen must not present them as a share of it: a leg
+	 * dispositioned after the CDR consumer filed it keeps its NULL, and a queue that started asking
+	 * halfway through the window has both kinds in it.
+	 */
+	readonly dispositions: readonly AgentDispositionCount[];
 	/** Per-queue breakdown, busiest first. */
 	readonly queues: readonly AgentQueueStatsRow[];
+}
+
+/** One wrap-up outcome and how often this agent reached it. `unset` is one of them. */
+export interface AgentDispositionCount {
+	readonly code: string;
+	readonly count: number;
 }
 
 export interface AgentStatsEnvelope {

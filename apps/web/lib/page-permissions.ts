@@ -25,6 +25,25 @@ export const PAGE_PERMISSIONS: Readonly<Record<string, PageRequirement>> = {
 	[routes.extensions]: { permissions: ["extensions.read", "extensions.read.own"] },
 	[routes.devices]: { permissions: ["devices.read", "devices.read.own"] },
 	[routes.numbers]: { permissions: ["numbers.read"] },
+	/**
+	 * `compliance.read` and nothing else. The page has three panels asking for three different
+	 * grants — the KYC record and the verified caller IDs on `compliance.*`, the policy panel on
+	 * `settings.*` — and the widest of them would have been the wrong gate in both directions.
+	 * Each panel gates its own writes; this is only the door.
+	 */
+	[routes.compliance]: { permissions: ["compliance.read"] },
+	/**
+	 * The two cross-tenant operator screens, each on its own owner-only grant.
+	 *
+	 * `mode: "every"` — the default — and each names exactly ONE permission, because each page IS one
+	 * endpoint's surface. There is no `.own` variant to widen to and there must not be: a tenant
+	 * approving its own KYC file makes the file worthless, and a tenant answering a traceback is
+	 * reading another tenant's calls. Both are in `OWNER_ONLY_PERMISSIONS`, so for every customer
+	 * role `canAccessPage` answers false, the sidebar drops the whole section, and the layout renders
+	 * `PermissionDenied` to anyone who types the URL.
+	 */
+	[routes.platformKyc]: { permissions: ["compliance.review"] },
+	[routes.platformTraceback]: { permissions: ["compliance.traceback"] },
 	[routes.trunks]: { permissions: ["trunks.read"] },
 	/**
 	 * Four tabs share this page — inbound, outbound, time conditions, feature codes — and the last
@@ -273,6 +292,38 @@ export const PAGE_PERMISSIONS: Readonly<Record<string, PageRequirement>> = {
 	 * what is in force for it and not change it should see it.
 	 */
 	[routes.mySettings]: { permissions: ["settings.read.own"] },
+	/**
+	 * The messaging inbox.
+	 *
+	 * `messaging.read` alone, which is what the conversation and message reads are guarded with.
+	 * SENDING is `messaging.send` and is gated INSIDE the page rather than here, and that split is
+	 * the feature rather than the usual read/write hedge: somebody supervising a shared number needs
+	 * to read what was sent on it without being able to reply, and the composer says which grant it
+	 * is missing rather than disappearing.
+	 *
+	 * NOT `messaging.manage`. The registration screens are the surface that grant opens, and they
+	 * are a different route so that an agent who lives in this page all day never sees the form
+	 * carrying the company's EIN.
+	 */
+	[routes.messaging]: { permissions: ["messaging.read"] },
+	/**
+	 * The five registration screens.
+	 *
+	 * `messaging.read` for the READ, exactly the split `/settings/branding` and
+	 * `/settings/recordings` already use: the page is reachable for a role that may see which
+	 * numbers are registered and which campaign they sit on, and every WRITE on it — enabling a
+	 * number, submitting a brand, creating a campaign, filing a toll-free verification, adding or
+	 * removing an opt-out — is gated inside the page with `messaging.manage`.
+	 *
+	 * Naming `messaging.manage` here instead would hide the registration STATE from the person
+	 * holding `messaging.read` who has just been told by the composer that their number is not
+	 * registered — and this is the only screen in the app that says why it is not.
+	 *
+	 * Declared once: the four child routes inherit it by ancestry, which is what stops them falling
+	 * back to `/settings`' `settings.read` — a grant every self-service role holds, and one that
+	 * would open a carrier submission form to all of them.
+	 */
+	[routes.messagingNumbers]: { permissions: ["messaging.read"] },
 };
 
 /** True when `path` matches `pattern`, treating any `[segment]` in the pattern as a wildcard. */

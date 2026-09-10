@@ -11,6 +11,8 @@ import {
 	emptyConferenceState,
 	emptyKvState,
 	isChannelLive,
+	isEngineBenched,
+	isEngineUnavailableReason,
 	isRegistrationLive,
 	longestWaitMs,
 	parseAgentState,
@@ -21,6 +23,7 @@ import {
 	parseTrunkStatusEvent,
 	parseWaitingRecord,
 	rankWaiting,
+	type LiveAgentState,
 	type LiveChannel,
 	type LiveRegistration,
 	type LiveWaitingEntry,
@@ -273,6 +276,53 @@ describe("the parsers", () => {
 		expect(parseAgentState({ agentId: "a", status: "available" })).not.toBe(undefined);
 		expect(parseAgentState({ agentId: "a" })).toBe(undefined);
 		expect(parseAgentState(null)).toBe(undefined);
+	});
+});
+
+/**
+ * Telling an agent the DISTRIBUTOR benched apart from one who stepped away.
+ *
+ * `unavailable` is one status and two situations, and the difference is the whole of what RONA buys
+ * a supervisor: a paused agent will come back on their own, and a benched one is a handset nobody is
+ * picking up. `reason` is a free string — "back at 3" is a legitimate value — so the two the engine
+ * writes are the only ones that may be read as a bench, and anything else came from a person.
+ */
+describe("isEngineBenched", () => {
+	function entry(overrides: Record<string, unknown> = {}): LiveAgentState {
+		return {
+			orgId: ORG,
+			agentId: "019fd3c2-1111-76be-a6b3-b0f1914e39b6",
+			status: "unavailable",
+			since: "2026-08-06T09:00:00.000Z",
+			...overrides,
+		} as LiveAgentState;
+	}
+
+	it("recognises the two reasons the engine writes", () => {
+		expect(isEngineBenched(entry({ reason: "rona" }))).toBe(true);
+		expect(isEngineBenched(entry({ reason: "max-no-answer" }))).toBe(true);
+	});
+
+	it("does not read a person's own words as a bench", () => {
+		expect(isEngineBenched(entry({ reason: "back at 3" }))).toBe(false);
+		expect(isEngineBenched(entry())).toBe(false);
+		expect(isEngineBenched(undefined)).toBe(false);
+	});
+
+	/**
+	 * The status is half the question. An agent who was benched, resumed and then took a break
+	 * carries no engine reason any more — but an entry that somehow kept one must not make
+	 * `on-break` render as "not answering", which is a supervisor sent to a desk for no reason.
+	 */
+	it("is false for any status other than unavailable, whatever the reason says", () => {
+		expect(isEngineBenched(entry({ status: "on-break", reason: "rona" }))).toBe(false);
+		expect(isEngineBenched(entry({ status: "available", reason: "rona" }))).toBe(false);
+	});
+
+	it("reads the reason on its own, for a badge that has the string and not the entry", () => {
+		expect(isEngineUnavailableReason("rona")).toBe(true);
+		expect(isEngineUnavailableReason("lunch")).toBe(false);
+		expect(isEngineUnavailableReason(undefined)).toBe(false);
 	});
 });
 

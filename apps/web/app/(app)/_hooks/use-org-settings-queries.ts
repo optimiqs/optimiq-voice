@@ -9,6 +9,7 @@ import {
 } from "@tanstack/react-query";
 import { toast } from "~/components/ui/toast";
 import {
+	COMPLIANCE_CATEGORY,
 	fetchOwnSettings,
 	fetchSettingCategory,
 	NOTIFICATIONS_CATEGORY,
@@ -16,10 +17,12 @@ import {
 	patchSettingCategory,
 	RECORDINGS_CATEGORY,
 	ROUTING_CATEGORY,
+	toComplianceSettings,
 	toNotificationSettings,
 	toOwnNotificationSettings,
 	toRecordingSettings,
 	toRoutingSettings,
+	type ComplianceSettings,
 	type NotificationSettings,
 	type OwnNotificationSettings,
 	type RecordingSettings,
@@ -241,6 +244,65 @@ export function useSaveRoutingSettings(): UseMutationResult<
 		},
 		onError: (error) => {
 			toast.error(pbxToastMessage(error, "Not saved — these settings were rolled back"));
+		},
+	});
+}
+
+/**
+ * The `compliance` category: what happens to an unverified caller ID, and whether outbound dialling
+ * waits on an approved KYC record.
+ *
+ * Read on `settings.read` and written on `settings.write`, like every other category — the
+ * `compliance.*` grants guard the KYC record and the verified caller ID list, not the cascade. A
+ * role holding `compliance.write` and no settings grant can add a verified number and still cannot
+ * change the policy that decides what happens to numbers that are not on the list, which is the
+ * split the API draws and this app only restates.
+ */
+export function useComplianceSettings(): UseQueryResult<ComplianceSettings> {
+	const organizationId = useOrganizationId();
+	return useQuery({
+		queryKey: queryKeys.orgSettingsCategory(organizationId, COMPLIANCE_CATEGORY),
+		queryFn: async () =>
+			toComplianceSettings((await fetchSettingCategory(COMPLIANCE_CATEGORY)).data),
+		enabled: organizationId.length > 0,
+	});
+}
+
+/**
+ * Saving the `compliance` category.
+ *
+ * The compile view is invalidated for the reason the notifications save gives: the write goes
+ * through the same repository and produces the same recompile, so a "last compiled" timestamp left
+ * stale by it would be a lie the user cannot debug. The toast does NOT claim routing changed —
+ * neither of these names is a compiler input, and both take effect where an outbound call is
+ * signed.
+ */
+export function useSaveComplianceSettings(): UseMutationResult<
+	SettingCategoryMutation,
+	Error,
+	Readonly<Record<string, unknown>>
+> {
+	const queryClient = useQueryClient();
+	const organizationId = useOrganizationId();
+	return useMutation({
+		mutationFn: (patch: Readonly<Record<string, unknown>>) =>
+			patchSettingCategory(COMPLIANCE_CATEGORY, patch),
+		onSuccess: async (result) => {
+			await queryClient.invalidateQueries({
+				queryKey: queryKeys.orgSettingsCategory(organizationId, COMPLIANCE_CATEGORY),
+			});
+			await queryClient.invalidateQueries({
+				queryKey: queryKeys.routingCompile(organizationId),
+			});
+			toast.success("Compliance settings saved", {
+				description:
+					result.written.length > 0
+						? "This applies to the next outbound call."
+						: "Nothing had changed, so nothing was written.",
+			});
+		},
+		onError: (error) => {
+			toast.error(pbxToastMessage(error, "Not saved"));
 		},
 	});
 }

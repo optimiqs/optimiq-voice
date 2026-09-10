@@ -6,9 +6,11 @@ import { Tabs, TabsIndicator, TabsList, TabsPanel, TabsTrigger } from "~/compone
 import { SECURITY_TABS, type SecurityTab } from "~/lib/routes";
 import { AccessRulesPanel } from "./access-rules-panel";
 import { AuthFailuresPanel } from "./auth-failures-panel";
+import { FraudControlsPanel } from "./fraud-controls-panel";
 
 /**
- * SIP security: which networks may reach the edge, and what the edge refused.
+ * SIP security: which networks may reach the edge, what the edge refused, and what a leaked
+ * credential is allowed to spend.
  *
  * ## Why one page rather than two sidebar entries
  *
@@ -34,6 +36,7 @@ import { AuthFailuresPanel } from "./auth-failures-panel";
 const TAB_LABELS: Readonly<Record<SecurityTab, string>> = {
 	"access-rules": "Access rules",
 	"auth-failures": "Auth failures",
+	"fraud-controls": "Fraud controls",
 };
 
 export function SecurityScreen() {
@@ -48,7 +51,7 @@ export function SecurityScreen() {
 		<>
 			<PageHeader
 				title="Security"
-				description="Which networks may register phones, terminate calls, fetch provisioning or reach the API — and every attempt that was refused."
+				description="Which networks may register phones, terminate calls, fetch provisioning or reach the API, every attempt that was refused, and the limits on what international calling this organization may do."
 			/>
 
 			<Tabs value={tab} onValueChange={(next) => void setTab(next as SecurityTab)}>
@@ -66,6 +69,9 @@ export function SecurityScreen() {
 				</TabsPanel>
 				<TabsPanel value="auth-failures">
 					<AuthFailuresPanel />
+				</TabsPanel>
+				<TabsPanel value="fraud-controls">
+					<FraudControlsPanel />
 				</TabsPanel>
 			</Tabs>
 		</>

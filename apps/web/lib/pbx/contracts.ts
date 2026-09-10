@@ -179,6 +179,29 @@ export type CallerIdPresentation = (typeof CALLER_ID_PRESENTATIONS)[number];
 export const RECORD_POLICIES = ["none", "inbound", "outbound", "all", "on-demand"] as const;
 export type RecordPolicy = (typeof RECORD_POLICIES)[number];
 
+/**
+ * What a tenant tells the parties to a recorded call before recording starts.
+ *
+ * Mirrors `RECORDING_CONSENT_POLICIES` in `@optimiq-voice/routing`, on the same terms as every
+ * other closed set here. It is ORTHOGONAL to {@link RECORD_POLICIES}: that decides whether a call
+ * is recorded at all, this decides what is said about it. `none` means "say nothing here" rather
+ * than "consent does not apply" — the organization's all-party region list can still upgrade a
+ * particular call to an announcement.
+ */
+export const RECORDING_CONSENT_POLICIES = [
+	"none",
+	"announce",
+	"announce-and-require-keypress",
+] as const;
+export type RecordingConsentPolicy = (typeof RECORDING_CONSENT_POLICIES)[number];
+
+/** How each policy reads on a form. Sentence case, because these are choices and not headings. */
+export const RECORDING_CONSENT_POLICY_LABELS: Record<RecordingConsentPolicy, string> = {
+	none: "Say nothing",
+	announce: "Play the disclosure",
+	"announce-and-require-keypress": "Play the disclosure and require a keypress",
+};
+
 export const TOLL_CLASSES = ["internal", "local", "national", "international", "premium"] as const;
 export type TollClass = (typeof TOLL_CLASSES)[number];
 
@@ -294,6 +317,40 @@ export const QUEUE_PRIORITY_MAX = 1000;
  * fires, and the operator would have configured a feature that does nothing.
  */
 export const QUEUE_EXIT_KEY_PATTERN = /^[0-9*#A-D]$/u;
+
+/**
+ * The skill scale, mirroring `QUEUE_SKILL_LEVEL_MIN` / `QUEUE_SKILL_LEVEL_MAX` in
+ * `packages/pbx-db`.
+ *
+ * One scale for both halves of the match: an agent's `level` and a queue's `minLevel` are compared
+ * with `>=`, so a form that offered 1-10 on one side and 1-5 on the other would be a requirement no
+ * agent can meet.
+ */
+export const QUEUE_SKILL_LEVEL_MIN = 1;
+export const QUEUE_SKILL_LEVEL_MAX = 5;
+
+/**
+ * A skill tag and a disposition code share one shape, and it is the DATABASE's.
+ *
+ * `queue_agent_skill_shape_check`, `queue_skill_requirement_shape_check` and
+ * `queue_disposition_code_shape_check` are the same regex, and the API lower-cases before checking
+ * it. Both values are compared with `===` on the call path — a seat's skills against a queue's
+ * requirements, a submitted code against the queue's vocabulary — so `Spanish` and `spanish` are not
+ * equivalent anywhere below this line, and a form that let one through would fragment the
+ * vocabulary rather than fail.
+ */
+export const QUEUE_TAG_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/u;
+
+/**
+ * The wrap-up code the engine's deadline records when the agent chose nothing.
+ *
+ * Reserved: the API refuses it as a tenant-defined code, because a report would otherwise fold
+ * "nobody answered the question" and "the agent picked the code called unset" into one row.
+ */
+export const QUEUE_DISPOSITION_UNSET = "unset";
+
+/** At most three questions, at positions 1 to 3. `queue_survey_question_position_range_check`. */
+export const QUEUE_SURVEY_MAX_QUESTIONS = 3;
 
 export const VOICEMAIL_EMAIL_MODES = ["none", "notify", "attach"] as const;
 export type VoicemailEmailMode = (typeof VOICEMAIL_EMAIL_MODES)[number];
@@ -434,6 +491,14 @@ export interface ExtensionRow extends EntityRow {
 		readonly targets: readonly FollowMeTarget[];
 	} | null;
 	readonly recordPolicy: RecordPolicy;
+	/**
+	 * Pause the recorder while this extension's caller is pressing keys, and resume once they stop.
+	 *
+	 * PCI DSS 4.0.1 prefers not capturing a card number to asking an agent to remember to pause, and
+	 * this is that preference as a column. It is a backstop under the manual pause rather than a
+	 * replacement for it, and it overrides the organization's setting for calls this extension takes.
+	 */
+	readonly recordAutoPauseOnDtmf: boolean;
 	readonly tollClass: TollClass;
 	/**
 	 * The `*8` pickup group this extension belongs to, or `null` for none.
@@ -490,6 +555,17 @@ export interface PhoneNumberRow extends EntityRow, DestinationTrio {
 	readonly label: string | null;
 	readonly callerIdNamePrefix: string | null;
 	readonly recordEnabled: boolean;
+	/**
+	 * What the parties to a call on this DID are told before recording starts, or `null` to inherit
+	 * the organization's setting.
+	 *
+	 * `null` is not `"none"`. Inheriting means this number follows whatever the organization decides
+	 * next; `"none"` is this number saying nothing whatever the organization decides. The two look
+	 * identical on a stock install and diverge the first time somebody turns disclosure on.
+	 */
+	readonly recordingConsentPolicy: RecordingConsentPolicy | null;
+	/** The prompt played as the disclosure. `null` uses the organization's, or the built-in one. */
+	readonly recordingConsentPromptId: string | null;
 	readonly emergencyAddressId: string | null;
 	readonly voiceEnabled: boolean;
 	readonly faxEnabled: boolean;
@@ -572,6 +648,9 @@ export interface InboundRouteRow extends EntityRow, DestinationTrio {
 	readonly failoverDestinationData: DestinationData | null;
 	readonly timeConditionId: string | null;
 	readonly recordEnabled: boolean;
+	/** The same override {@link PhoneNumberRow.recordingConsentPolicy} carries, one level in. */
+	readonly recordingConsentPolicy: RecordingConsentPolicy | null;
+	readonly recordingConsentPromptId: string | null;
 	readonly enabled: boolean;
 }
 
@@ -1050,6 +1129,28 @@ export interface QueueRow extends EntityRow {
 	readonly maxWaitSeconds: number;
 	readonly maxWaitNoAgentSeconds: number;
 	readonly wrapUpSeconds: number;
+	/**
+	 * Whether the console insists on a wrap-up code before the agent goes back on the floor.
+	 *
+	 * "Insists" and not "blocks", and the difference is the whole of what a console may do with it:
+	 * the engine's wrap-up deadline ends the after-call work regardless and records `unset`, so a UI
+	 * that refused to let the agent continue would be holding a form open over a state the platform
+	 * has already left. A queue with no {@link QueueDispositionCodeRow} ignores it entirely — there
+	 * is nothing to pick.
+	 */
+	readonly dispositionRequired: boolean;
+	/**
+	 * ONE unanswered offer benches the agent until a person resumes them.
+	 *
+	 * Off, the ceiling is `queue_agent.max_no_answer` and the engine's reason is `max-no-answer`.
+	 * On, a single ring-out is `rona` — the same `unavailable` status to distribution and a
+	 * different sentence to the supervisor, which is why the wallboard separates them.
+	 */
+	readonly ronaEnabled: boolean;
+	/** Whether the caller is offered the questions after the AGENT hangs up on an answered call. */
+	readonly surveyEnabled: boolean;
+	/** "Please stay on the line to rate this call." Played once, before the first question. */
+	readonly surveyIntroPromptId: string | null;
 	readonly announcePositionEnabled: boolean;
 	readonly announceFrequencySeconds: number;
 	readonly abandonedResumeAllowed: boolean;
@@ -1067,6 +1168,8 @@ export interface QueueRow extends EntityRow {
 	 * anything, and recording it would put every abandoned call in the retention bucket.
 	 */
 	readonly recordPolicy: RecordPolicy;
+	/** The same keypad backstop {@link ExtensionRow.recordAutoPauseOnDtmf} carries, per queue. */
+	readonly recordAutoPauseOnDtmf: boolean;
 	/**
 	 * The single DTMF digit a WAITING caller may press to leave the line. `null` disables it.
 	 *
@@ -1144,6 +1247,68 @@ export interface QueueTierRow extends EntityRow {
 	 * levels is whoever knows what each level should be told.
 	 */
 	readonly announcePromptId: string | null;
+}
+
+/**
+ * One wrap-up code a queue offers: `sale`, `escalated`, `wrong-number`.
+ *
+ * A retired code is `enabled: false` rather than deleted — the history that points at it is what the
+ * vocabulary exists for. Deleting one is allowed and leaves the denormalised `code` on the calls it
+ * closed, so a report keeps its rows.
+ */
+export interface QueueDispositionCodeRow extends EntityRow {
+	readonly queueId: string;
+	/** Machine-readable and stable. Reports group by this; {@link label} is free to change. */
+	readonly code: string;
+	readonly label: string;
+	/** Order in the console's list. Lowest first; ties fall back to the code. */
+	readonly position: number;
+	readonly enabled: boolean;
+}
+
+/**
+ * One skill this queue's callers need, and how fast it stops insisting.
+ *
+ * `relaxAfterSeconds` is the seconds of waiting that buy a one-level drop in `minLevel`; `0` never
+ * relaxes and makes the requirement absolute, which is right for a regulated skill and wrong for a
+ * preference — which is why it is per requirement rather than a queue-wide switch.
+ */
+export interface QueueSkillRequirementRow extends EntityRow {
+	readonly queueId: string;
+	readonly skill: string;
+	readonly minLevel: number;
+	readonly relaxAfterSeconds: number;
+}
+
+/**
+ * One post-call survey question.
+ *
+ * `position` is the question's IDENTITY rather than a mere order: every report groups by it, so
+ * renumbering rows would re-file last month's answers under a different question. That is why there
+ * is no reorder here and why the position is typed.
+ */
+export interface QueueSurveyQuestionRow extends EntityRow {
+	readonly queueId: string;
+	/** 1 to {@link QUEUE_SURVEY_MAX_QUESTIONS}, unique within the queue. */
+	readonly position: number;
+	/** `null` leaves the question silent — the caller hears the digits prompt and nothing else. */
+	readonly promptId: string | null;
+	/** For the console and the report. The caller never hears it. */
+	readonly label: string;
+}
+
+/**
+ * One skill an AGENT has, and how good they are at it.
+ *
+ * Hung off the agent rather than off a tier because a skill is a property of the person: the same
+ * agent carries `spanish: 4` into every queue they staff, and a copy per membership would be a
+ * second value somebody has to keep in step.
+ */
+export interface QueueAgentSkillRow extends EntityRow {
+	readonly queueAgentId: string;
+	readonly skill: string;
+	/** {@link QUEUE_SKILL_LEVEL_MIN} to {@link QUEUE_SKILL_LEVEL_MAX}. */
+	readonly level: number;
 }
 
 /**
@@ -1837,4 +2002,121 @@ export interface SimulateResult {
 	readonly dialedNumber?: string;
 	readonly reason?: string;
 	readonly diagnostics: readonly WireDiagnostic[];
+}
+
+// ---------------------------------------------------------------------------------------------
+// Carrier compliance — who this organization is, and which caller IDs it may present
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * How the legal entity behind this organization is constituted.
+ *
+ * A closed set because it is what the carrier's own KYC form asks, and because the answer changes
+ * which documents a reviewer will demand. Mirrored by hand from the API's DTO, like everything
+ * else in this file — there is no generator, and importing across the app boundary is not an
+ * option this repo has.
+ */
+export const KYC_ENTITY_TYPES = [
+	"sole-proprietor",
+	"partnership",
+	"private-company",
+	"public-company",
+	"non-profit",
+	"government",
+] as const;
+export type KycEntityType = (typeof KYC_ENTITY_TYPES)[number];
+
+/**
+ * Where the record stands with whoever reviews it.
+ *
+ * `needs-info` is NOT a rejection and must never be rendered as one: it is the reviewer asking for
+ * something, and the thing they asked for is in `reviewNotes`. A screen that painted it red would
+ * make the one state the tenant can act on look like the one they cannot.
+ */
+export const KYC_DECISIONS = ["pending", "approved", "rejected", "needs-info"] as const;
+export type KycDecision = (typeof KYC_DECISIONS)[number];
+
+/**
+ * The organization's know-your-customer record. One per organization, hence no list endpoint:
+ * `GET /compliance/kyc` and `PUT /compliance/kyc`, both guarded by `compliance.read`/`.write`.
+ *
+ * ## `taxIdLast4` is the whole of what comes back, and that is deliberate
+ *
+ * The tax id is encrypted at rest and the API never returns it. The form therefore takes it as a
+ * WRITE-ONLY input — an empty box means "leave what is stored alone", not "clear it" — and renders
+ * `taxIdLast4` beside the box as the only evidence that something is on file. Treating the field
+ * as a normal round-tripped value would silently wipe the stored id on every save that left the
+ * box untouched.
+ *
+ * ## `decision`, `reviewedAt` and `reviewNotes` are read-only here
+ *
+ * They are the REVIEWER's half of the record and a `PUT` from this screen does not carry them. A
+ * tenant editing their address does not get to mark themselves approved.
+ */
+export interface KycRecord {
+	readonly id: string;
+	readonly legalEntityName: string;
+	readonly entityType: KycEntityType;
+	/** The last four digits of the stored tax id, or `null` when none is on file. Never the id. */
+	readonly taxIdLast4: string | null;
+	readonly addressLine1: string;
+	readonly addressLine2: string | null;
+	readonly addressCity: string;
+	readonly addressRegion: string;
+	readonly addressPostalCode: string;
+	/** ISO 3166-1 alpha-2. */
+	readonly addressCountry: string;
+	readonly contactName: string;
+	readonly contactEmail: string;
+	readonly contactPhone: string;
+	readonly websiteUrl: string | null;
+	/** Free text: what this organization says its calls are. A reviewer reads it against the CDR. */
+	readonly expectedTrafficProfile: string | null;
+	readonly expectedMonthlyMinutes: number | null;
+	readonly decision: KycDecision;
+	readonly reviewedAt: string | null;
+	/** What the reviewer wrote. The only actionable content of a `needs-info` decision. */
+	readonly reviewNotes: string | null;
+	readonly createdAt: string;
+	readonly updatedAt: string;
+}
+
+/** The fields a tenant may submit. The reviewer's half of {@link KycRecord} is not among them. */
+export type KycRecordInput = Omit<
+	KycRecord,
+	"id" | "taxIdLast4" | "decision" | "reviewedAt" | "reviewNotes" | "createdAt" | "updatedAt"
+> & {
+	/**
+	 * The full tax id, sent only when the user typed one. Omitted — not `null` — to leave the
+	 * stored value alone; `null` would be a request to clear it.
+	 */
+	readonly taxId?: string;
+};
+
+/**
+ * How a caller ID this organization does not own was proved to be theirs to present.
+ *
+ * The method is what an outbound call's `B` attestation rests on, so it is stored rather than
+ * inferred: `document` is an LOA or a bill on file, `call-back` is a code read back on the number
+ * itself, and `carrier-loa` is the losing carrier's own authorisation.
+ */
+export const CALLER_ID_VERIFICATION_METHODS = ["document", "call-back", "carrier-loa"] as const;
+export type CallerIdVerificationMethod = (typeof CALLER_ID_VERIFICATION_METHODS)[number];
+
+/**
+ * An external number this organization has proved it may present as caller ID.
+ *
+ * `expiresAt` is not decoration: a verification goes stale, and a number whose proof has lapsed
+ * can no longer support a `B` attestation. The list renders the expiry so an operator finds out
+ * before a carrier does.
+ */
+export interface VerifiedCallerIdRow extends EntityRow {
+	readonly e164: string;
+	readonly label: string | null;
+	readonly verificationMethod: CallerIdVerificationMethod;
+	/** The LOA reference, ticket number or call-back code that can be produced on request. */
+	readonly verificationReference: string | null;
+	readonly verifiedAt: string | null;
+	readonly expiresAt: string | null;
+	readonly notes: string | null;
 }

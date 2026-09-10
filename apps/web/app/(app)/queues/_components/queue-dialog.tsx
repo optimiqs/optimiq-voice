@@ -72,6 +72,10 @@ function defaultsFor(queue: QueueRow | null): QueueFormValues {
 		maxWaitSeconds: numeric(queue?.maxWaitSeconds),
 		maxWaitNoAgentSeconds: numeric(queue?.maxWaitNoAgentSeconds),
 		wrapUpSeconds: numeric(queue?.wrapUpSeconds),
+		dispositionRequired: queue?.dispositionRequired ?? false,
+		ronaEnabled: queue?.ronaEnabled ?? false,
+		surveyEnabled: queue?.surveyEnabled ?? false,
+		surveyIntroPromptId: queue?.surveyIntroPromptId ?? "",
 		announcePositionEnabled: queue?.announcePositionEnabled ?? false,
 		announceFrequencySeconds: numeric(queue?.announceFrequencySeconds),
 		abandonedResumeAllowed: queue?.abandonedResumeAllowed ?? false,
@@ -80,6 +84,7 @@ function defaultsFor(queue: QueueRow | null): QueueFormValues {
 		tierRuleWaitSeconds: numeric(queue?.tierRuleWaitSeconds),
 		tierRuleNoAgentNoWait: queue?.tierRuleNoAgentNoWait ?? false,
 		recordPolicy: queue?.recordPolicy ?? "none",
+		recordAutoPauseOnDtmf: queue?.recordAutoPauseOnDtmf ?? false,
 		exitKey: queue?.exitKey ?? "",
 		callbackEnabled: queue?.callbackEnabled ?? false,
 		callbackKey: queue?.callbackKey ?? "",
@@ -173,6 +178,10 @@ export function QueueDialog({
 				maxWaitSeconds: parsed.maxWaitSeconds,
 				maxWaitNoAgentSeconds: parsed.maxWaitNoAgentSeconds,
 				wrapUpSeconds: parsed.wrapUpSeconds,
+				dispositionRequired: parsed.dispositionRequired,
+				ronaEnabled: parsed.ronaEnabled,
+				surveyEnabled: parsed.surveyEnabled,
+				surveyIntroPromptId: parsed.surveyIntroPromptId,
 				announcePositionEnabled: parsed.announcePositionEnabled,
 				announceFrequencySeconds: parsed.announceFrequencySeconds,
 				abandonedResumeAllowed: parsed.abandonedResumeAllowed,
@@ -181,6 +190,7 @@ export function QueueDialog({
 				tierRuleWaitSeconds: parsed.tierRuleWaitSeconds,
 				tierRuleNoAgentNoWait: parsed.tierRuleNoAgentNoWait,
 				recordPolicy: parsed.recordPolicy,
+				recordAutoPauseOnDtmf: parsed.recordAutoPauseOnDtmf,
 				exitKey: parsed.exitKey,
 				callbackEnabled: parsed.callbackEnabled,
 				callbackKey: parsed.callbackKey,
@@ -630,6 +640,56 @@ export function QueueDialog({
 				</form.Field>
 			</FormSection>
 
+			{/*
+			 * After the call: the wrap-up question the AGENT answers, and the survey the CALLER does.
+			 *
+			 * One section because they are the same moment seen from the two ends of a bridge that has
+			 * just come down, and an operator deciding whether to ask anything at all is deciding both.
+			 * The codes themselves and the questions themselves are child collections on the queue's
+			 * page rather than fields here — there are several of each, and a dialog that grew a list
+			 * editor would be the tier table all over again in a modal.
+			 */}
+			<FormSection
+				title="After the call"
+				description="What the platform asks once the call is over — the agent for an outcome, the caller for a rating. The codes and the questions are edited on the queue's own page."
+				columns={1}
+			>
+				<form.Field name="dispositionRequired">
+					{(field) => (
+						<SwitchField
+							field={field}
+							label="Ask the agent for a wrap-up code"
+							description="The console insists on one before the agent goes back on the floor. It cannot hold them there: the wrap-up time above ends the after-call work regardless, and a call nobody coded is recorded as 'unset'. A queue with no codes ignores this."
+							disabled={mutation.isPending}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="surveyEnabled">
+					{(field) => (
+						<SwitchField
+							field={field}
+							label="Offer the caller a survey"
+							description="Asked after the AGENT hangs up, on answered calls only. A caller who abandoned the queue is never surveyed — they already told you what they thought."
+							disabled={mutation.isPending}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="surveyIntroPromptId">
+					{(field) => (
+						<PromptSelect
+							id="queueSurveyIntroPromptId"
+							label="Survey introduction"
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="Go straight to the first question"
+							description="Played once, before the first question — 'please stay on the line to rate this call'. Without it the caller hears the first question with no warning that anything is coming."
+							disabled={mutation.isPending}
+							error={errors.surveyIntroPromptId}
+						/>
+					)}
+				</form.Field>
+			</FormSection>
+
 			<FormSection
 				title="Tier rules"
 				description="How the queue walks down the tiers when the level it is on does not answer."
@@ -670,6 +730,16 @@ export function QueueDialog({
 			</FormSection>
 
 			<FormSection title="Behaviour" columns={1}>
+				<form.Field name="ronaEnabled">
+					{(field) => (
+						<SwitchField
+							field={field}
+							label="Bench an agent who misses one call (RONA)"
+							description="Off, an agent is pulled out only after the misses allowed on their own record. On, a single unanswered offer takes them out of distribution until a person puts them back — the wallboard shows them apart from somebody who paused themselves."
+							disabled={mutation.isPending}
+						/>
+					)}
+				</form.Field>
 				<form.Field name="abandonedResumeAllowed">
 					{(field) => (
 						<SwitchField
@@ -695,6 +765,16 @@ export function QueueDialog({
 								</option>
 							))}
 						</SelectField>
+					)}
+				</form.Field>
+				<form.Field name="recordAutoPauseOnDtmf">
+					{(field) => (
+						<SwitchField
+							field={field}
+							label="Pause recording during keypad entry"
+							description="Pauses the recorder while a caller presses keys and resumes once they stop, so card details typed on the keypad are not captured. Overrides the organization's setting for calls this queue distributes."
+							disabled={mutation.isPending}
+						/>
 					)}
 				</form.Field>
 				<form.Field name="enabled">

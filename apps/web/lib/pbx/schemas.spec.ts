@@ -31,7 +31,11 @@ import {
 	pinSetFormSchema,
 	promptFormSchema,
 	queueAgentFormSchema,
+	queueAgentSkillFormSchema,
+	queueDispositionCodeFormSchema,
 	queueFormSchema,
+	queueSkillRequirementFormSchema,
+	queueSurveyQuestionFormSchema,
 	queueTierFormSchema,
 	ringGroupFormSchema,
 	sharedLineAppearanceFormSchema,
@@ -102,6 +106,7 @@ describe("optional text", () => {
 			outboundCallerIdPresentation: "allowed" as const,
 			tollClass: "national",
 			recordPolicy: "none",
+			recordAutoPauseOnDtmf: false,
 			pickupGroup: "",
 			callScreening: false,
 			callTimeoutSeconds: "",
@@ -131,6 +136,7 @@ describe("optional text", () => {
 			outboundCallerIdPresentation: "allowed" as const,
 			tollClass: "national" as const,
 			recordPolicy: "none" as const,
+			recordAutoPauseOnDtmf: false,
 			pickupGroup: "",
 			callScreening: false,
 			callTimeoutSeconds: "",
@@ -157,6 +163,7 @@ describe("optional text", () => {
 			outboundCallerIdPresentation: "allowed" as const,
 			tollClass: "national" as const,
 			recordPolicy: "none" as const,
+			recordAutoPauseOnDtmf: false,
 			pickupGroup: "",
 			callScreening: false,
 			callTimeoutSeconds: "4",
@@ -195,6 +202,7 @@ describe("the outbound caller-id presentation", () => {
 		outboundCallerIdPresentation: "allowed" as const,
 		tollClass: "national" as const,
 		recordPolicy: "none" as const,
+		recordAutoPauseOnDtmf: false,
 		pickupGroup: "",
 		callScreening: false,
 		callTimeoutSeconds: "",
@@ -228,6 +236,7 @@ describe("the pickup group", () => {
 		outboundCallerIdPresentation: "allowed" as const,
 		tollClass: "national" as const,
 		recordPolicy: "none" as const,
+		recordAutoPauseOnDtmf: false,
 		pickupGroup: "",
 		callScreening: false,
 		callTimeoutSeconds: "",
@@ -266,6 +275,122 @@ describe("the pickup group", () => {
 	});
 });
 
+/**
+ * The recording-disclosure override a DID or an inbound route may carry.
+ *
+ * Blank is not `"none"`, and that is the whole control: blank means this row follows whatever the
+ * organization decides next, while `"none"` means this row says nothing whatever the organization
+ * decides. They look identical on a stock install and diverge the first time somebody turns
+ * disclosure on, which is exactly when getting it wrong is expensive.
+ */
+describe("the recording disclosure override", () => {
+	const number = {
+		e164: "+12125550100",
+		label: "",
+		callerIdNamePrefix: "",
+		recordEnabled: false,
+		recordingConsentPolicy: "",
+		recordingConsentPromptId: "",
+		emergencyAddressId: "",
+		voiceEnabled: true,
+		faxEnabled: false,
+		enabled: true,
+	};
+
+	it("sends a blank override as null, meaning inherit rather than say nothing", () => {
+		expect(phoneNumberFormSchema.parse(number).recordingConsentPolicy).toBeNull();
+		expect(
+			phoneNumberFormSchema.parse({ ...number, recordingConsentPolicy: "none" })
+				.recordingConsentPolicy,
+		).toBe("none");
+	});
+
+	it("accepts each policy the engine honours and refuses anything else", () => {
+		expect(
+			phoneNumberFormSchema.parse({ ...number, recordingConsentPolicy: "announce" })
+				.recordingConsentPolicy,
+		).toBe("announce");
+		expect(
+			phoneNumberFormSchema.parse({
+				...number,
+				recordingConsentPolicy: "announce-and-require-keypress",
+			}).recordingConsentPolicy,
+		).toBe("announce-and-require-keypress");
+		expect(
+			phoneNumberFormSchema.safeParse({ ...number, recordingConsentPolicy: "shout" }).success,
+		).toBe(false);
+	});
+
+	/**
+	 * The prompt clears to `null` on the same terms every other selector on this form does: the
+	 * column is nullable, and `""` would be a prompt id that names nothing.
+	 */
+	it("clears the disclosure prompt to null rather than to an empty string", () => {
+		expect(phoneNumberFormSchema.parse(number).recordingConsentPromptId).toBeNull();
+	});
+
+	it("carries the same override on an inbound route", () => {
+		const route = {
+			name: "Main line",
+			priority: "100",
+			matchKind: "any" as const,
+			matchPattern: "",
+			phoneNumberId: "",
+			callerIdPattern: "",
+			timeConditionId: "",
+			recordEnabled: false,
+			recordingConsentPolicy: "announce",
+			recordingConsentPromptId: "",
+			enabled: true,
+		};
+		expect(inboundRouteFormSchema.parse(route).recordingConsentPolicy).toBe("announce");
+		expect(inboundRouteFormSchema.parse(route).recordingConsentPromptId).toBeNull();
+	});
+});
+
+/**
+ * The PCI keypad backstop.
+ *
+ * A plain boolean over a `not null default false` column, which is why the assertion is that it
+ * round-trips rather than that a blank clears it: there is no "unset" for the form to encode, and a
+ * schema that accepted one would be inventing a third state the column cannot hold.
+ */
+describe("the keypad auto-pause backstop", () => {
+	// The queue carries the same column and the same rule; `queueFormSchema`'s own base above
+	// already parses it, so what is asserted here is the shape both of them share.
+	const extension = {
+		number: "1001",
+		label: "Alice",
+		sipSecretRef: "secret://x",
+		callerIdName: "",
+		callerIdNumber: "",
+		outboundCallerIdNumber: "",
+		outboundCallerIdPresentation: "allowed" as const,
+		tollClass: "national" as const,
+		recordPolicy: "none" as const,
+		recordAutoPauseOnDtmf: false,
+		pickupGroup: "",
+		callScreening: false,
+		callTimeoutSeconds: "",
+		maxRegistrations: "",
+		mohClassId: "",
+		voicemailEnabled: true,
+		doNotDisturb: false,
+		enabled: true,
+	};
+
+	it("round-trips on an extension and refuses a non-boolean", () => {
+		expect(extensionFormSchema.parse(extension).recordAutoPauseOnDtmf).toBe(false);
+		expect(
+			extensionFormSchema.parse({ ...extension, recordAutoPauseOnDtmf: true })
+				.recordAutoPauseOnDtmf,
+		).toBe(true);
+		expect(
+			extensionFormSchema.safeParse({ ...extension, recordAutoPauseOnDtmf: "yes" }).success,
+		).toBe(false);
+	});
+});
+
 describe("inboundRouteFormSchema", () => {
 	const base = {
 		name: "Main line",
@@ -276,6 +401,8 @@ describe("inboundRouteFormSchema", () => {
 		callerIdPattern: "",
 		timeConditionId: "",
 		recordEnabled: false,
+		recordingConsentPolicy: "",
+		recordingConsentPromptId: "",
 		enabled: true,
 	};
 
@@ -554,6 +681,10 @@ describe("queueFormSchema", () => {
 		maxWaitSeconds: "",
 		maxWaitNoAgentSeconds: "",
 		wrapUpSeconds: "",
+		dispositionRequired: false,
+		ronaEnabled: false,
+		surveyEnabled: false,
+		surveyIntroPromptId: "",
 		announcePositionEnabled: false,
 		announceFrequencySeconds: "",
 		abandonedResumeAllowed: false,
@@ -562,6 +693,7 @@ describe("queueFormSchema", () => {
 		tierRuleWaitSeconds: "",
 		tierRuleNoAgentNoWait: false,
 		recordPolicy: "none" as const,
+		recordAutoPauseOnDtmf: false,
 		exitKey: "",
 		callbackEnabled: false,
 		callbackKey: "",
@@ -671,6 +803,139 @@ describe("queueFormSchema", () => {
 		expect(queueFormSchema.safeParse({ ...base, defaultPriority: "1001" }).success).toBe(false);
 		expect(queueFormSchema.safeParse({ ...base, defaultPriority: "-1" }).success).toBe(false);
 		expect(queueFormSchema.parse(base).defaultPriority).toBeNull();
+	});
+
+	/**
+	 * The three after-call switches are plain booleans, and `dispositionRequired` is the one worth
+	 * asserting the shape of: it must not grow a validator that could make the console block. The
+	 * engine's wrap-up deadline ends the after-call work regardless and records `unset`, so a form
+	 * that refused to submit without codes configured would be refusing on the platform's behalf
+	 * something the platform does not refuse.
+	 */
+	it("carries the after-call switches without making any of them conditional on another", () => {
+		const parsed = queueFormSchema.parse({
+			...base,
+			dispositionRequired: true,
+			ronaEnabled: true,
+			surveyEnabled: true,
+		});
+		expect(parsed.dispositionRequired).toBe(true);
+		expect(parsed.ronaEnabled).toBe(true);
+		expect(parsed.surveyEnabled).toBe(true);
+		// A survey with no introduction is legal: the caller hears the first question instead.
+		expect(parsed.surveyIntroPromptId).toBeNull();
+	});
+});
+
+describe("queueDispositionCodeFormSchema", () => {
+	const base = { code: "sale", label: "Sale", position: "", enabled: true };
+
+	/**
+	 * The code is lower-cased before the check, exactly as a skill tag is, because the engine and
+	 * every report compare it with `===`. Two spellings would be two outcomes.
+	 */
+	it("normalises the code and refuses a shape the check constraint would refuse", () => {
+		expect(queueDispositionCodeFormSchema.parse({ ...base, code: " Wrong-Number " }).code).toBe(
+			"wrong-number",
+		);
+		for (const refused of ["", "-lead", "with space", "a".repeat(64)]) {
+			expect(queueDispositionCodeFormSchema.safeParse({ ...base, code: refused }).success).toBe(
+				false,
+			);
+		}
+	});
+
+	/**
+	 * `unset` is what the wrap-up deadline records when nobody chose. A tenant-defined code spelled
+	 * the same way would fold "the agent did not answer" and a real outcome into one report row, so
+	 * all three layers refuse it and this is the one that can put the message on the field.
+	 */
+	it("refuses the reserved code the deadline records", () => {
+		expect(queueDispositionCodeFormSchema.safeParse({ ...base, code: "unset" }).success).toBe(
+			false,
+		);
+		expect(queueDispositionCodeFormSchema.safeParse({ ...base, code: " UNSET " }).success).toBe(
+			false,
+		);
+	});
+
+	it("turns an emptied position into a null so the server default comes back", () => {
+		expect(queueDispositionCodeFormSchema.parse(base).position).toBeNull();
+		expect(queueDispositionCodeFormSchema.parse({ ...base, position: "0" }).position).toBe(0);
+		expect(queueDispositionCodeFormSchema.safeParse({ ...base, position: "1001" }).success).toBe(
+			false,
+		);
+	});
+});
+
+describe("queueSkillRequirementFormSchema", () => {
+	const base = { skill: "spanish", minLevel: "", relaxAfterSeconds: "" };
+
+	it("normalises the tag and bounds the level to the scale agents are rated on", () => {
+		expect(queueSkillRequirementFormSchema.parse({ ...base, skill: " Spanish " }).skill).toBe(
+			"spanish",
+		);
+		expect(queueSkillRequirementFormSchema.parse({ ...base, minLevel: "5" }).minLevel).toBe(5);
+		expect(queueSkillRequirementFormSchema.safeParse({ ...base, minLevel: "6" }).success).toBe(
+			false,
+		);
+		expect(queueSkillRequirementFormSchema.safeParse({ ...base, minLevel: "0" }).success).toBe(
+			false,
+		);
+	});
+
+	/**
+	 * Zero is a legal value and it is the one that matters: it makes the requirement ABSOLUTE, which
+	 * is right for a regulated skill and is how a queue with one qualified agent holds callers until
+	 * the wait cap. An emptied control is the server's default instead, which is a different answer.
+	 */
+	it("keeps a zero relax window, which is not the same as leaving it empty", () => {
+		expect(
+			queueSkillRequirementFormSchema.parse({ ...base, relaxAfterSeconds: "0" }).relaxAfterSeconds,
+		).toBe(0);
+		expect(queueSkillRequirementFormSchema.parse(base).relaxAfterSeconds).toBeNull();
+		expect(
+			queueSkillRequirementFormSchema.safeParse({ ...base, relaxAfterSeconds: "3601" }).success,
+		).toBe(false);
+	});
+});
+
+describe("queueSurveyQuestionFormSchema", () => {
+	const base = { position: "1", promptId: "", label: "Did we solve it?" };
+
+	/**
+	 * The position is REQUIRED, unlike every other ordinal on this surface: it is the question's
+	 * identity in every report rather than a display order, so a blank is a missing column and not
+	 * "use the default".
+	 */
+	it("requires a position inside the three the database allows", () => {
+		expect(queueSurveyQuestionFormSchema.parse(base).position).toBe(1);
+		expect(queueSurveyQuestionFormSchema.parse({ ...base, position: "3" }).position).toBe(3);
+		expect(queueSurveyQuestionFormSchema.safeParse({ ...base, position: "" }).success).toBe(false);
+		expect(queueSurveyQuestionFormSchema.safeParse({ ...base, position: "4" }).success).toBe(false);
+		expect(queueSurveyQuestionFormSchema.safeParse({ ...base, position: "0" }).success).toBe(false);
+	});
+
+	it("lets a question be silent, which clears the prompt rather than restoring a default", () => {
+		expect(queueSurveyQuestionFormSchema.parse(base).promptId).toBeNull();
+	});
+});
+
+describe("queueAgentSkillFormSchema", () => {
+	const base = { skill: "spanish", level: "" };
+
+	/**
+	 * The same scale and the same tag shape as the queue's requirement, because the two are compared
+	 * with `>=` and `===`. A form that let one side drift would produce a requirement no agent can
+	 * meet, and a queue that holds callers with a qualified agent sitting idle.
+	 */
+	it("shares the requirement's tag shape and level scale", () => {
+		expect(queueAgentSkillFormSchema.parse({ ...base, skill: " Spanish " }).skill).toBe("spanish");
+		expect(queueAgentSkillFormSchema.parse({ ...base, level: "5" }).level).toBe(5);
+		expect(queueAgentSkillFormSchema.safeParse({ ...base, level: "6" }).success).toBe(false);
+		expect(queueAgentSkillFormSchema.safeParse({ ...base, skill: "Spanish!" }).success).toBe(false);
+		// Empty is the server's default, which is the lowest level rather than no skill at all.
+		expect(queueAgentSkillFormSchema.parse(base).level).toBeNull();
 	});
 });
 
@@ -1401,6 +1666,8 @@ describe("phoneNumberFormSchema, now carrying a dispatchable location", () => {
 		label: "",
 		callerIdNamePrefix: "",
 		recordEnabled: false,
+		recordingConsentPolicy: "",
+		recordingConsentPromptId: "",
 		emergencyAddressId: "",
 		voiceEnabled: true,
 		faxEnabled: false,
@@ -1452,6 +1719,7 @@ const AUDIO_REFERENCE_FORMS = [
 			outboundCallerIdPresentation: "allowed" as const,
 			tollClass: "national",
 			recordPolicy: "none",
+			recordAutoPauseOnDtmf: false,
 			pickupGroup: "",
 			callScreening: false,
 			callTimeoutSeconds: "",
@@ -1477,6 +1745,10 @@ const AUDIO_REFERENCE_FORMS = [
 			maxWaitSeconds: "",
 			maxWaitNoAgentSeconds: "",
 			wrapUpSeconds: "",
+			dispositionRequired: false,
+			ronaEnabled: false,
+			surveyEnabled: false,
+			surveyIntroPromptId: "",
 			announcePositionEnabled: false,
 			announceFrequencySeconds: "",
 			abandonedResumeAllowed: false,
@@ -1485,6 +1757,7 @@ const AUDIO_REFERENCE_FORMS = [
 			tierRuleWaitSeconds: "",
 			tierRuleNoAgentNoWait: false,
 			recordPolicy: "none",
+			recordAutoPauseOnDtmf: false,
 			exitKey: "",
 			callbackEnabled: false,
 			callbackKey: "",
@@ -1510,6 +1783,7 @@ const AUDIO_REFERENCE_FORMS = [
 			"agentWhisperPromptId",
 			"callbackOfferPromptId",
 			"callbackConfirmPromptId",
+			"surveyIntroPromptId",
 		],
 	},
 	{

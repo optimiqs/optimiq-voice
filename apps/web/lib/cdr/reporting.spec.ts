@@ -146,6 +146,9 @@ describe("an agent's numbers", () => {
 		const empty = emptyAgentStats("seat");
 		expect(empty.answered).toBe(0);
 		expect(empty.queues).toEqual([]);
+		// An agent who took no calls closed none, and an empty breakdown is what the table renders
+		// as "not asked" rather than as a zero of some code that was never offered.
+		expect(empty.dispositions).toEqual([]);
 	});
 });
 

@@ -94,7 +94,13 @@ export default function OverviewPage() {
 						hint={
 							calls.callCount === 0
 								? "Nothing in progress."
-								: `${String(calls.answeredCount)} answered, ${String(calls.legs.length)} legs`
+								: // The encrypted count is stated only when there IS one, on the same rule the
+									// softphone's padlock follows: the indicator asserts encryption and never
+									// asserts its absence, so an estate that has not turned SRTP on reads the
+									// line it always read instead of a standing warning.
+									`${String(calls.answeredCount)} answered, ${String(calls.legs.length)} legs${
+										calls.encryptedLegs === 0 ? "" : `, ${String(calls.encryptedLegs)} encrypted`
+									}`
 						}
 						href={routes.cdr}
 					/>

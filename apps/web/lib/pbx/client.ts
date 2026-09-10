@@ -53,7 +53,11 @@ import type {
 	PromptKind,
 	PromptRow,
 	QueueAgentRow,
+	QueueAgentSkillRow,
+	QueueDispositionCodeRow,
 	QueueRow,
+	QueueSkillRequirementRow,
+	QueueSurveyQuestionRow,
 	QueueTierRow,
 	RingGroupMemberRow,
 	RingGroupRow,
@@ -68,6 +72,8 @@ import type {
 	TimeConditionOverride,
 	TimeConditionRow,
 	TimeConditionRuleRow,
+	KycRecord,
+	KycRecordInput,
 	TranslationRulesetRow,
 	TranslationRuleRow,
 	TrunkRow,
@@ -81,6 +87,7 @@ import type {
 	VoicemailMessagePage,
 	VoicemailMessageResult,
 	VoicemailPinState,
+	VerifiedCallerIdRow,
 	VoicemailPlaybackLink,
 	WebhookRow,
 } from "./contracts";
@@ -623,6 +630,27 @@ export const PBX_RESOURCES = {
 		permissions: { read: "webhooks.read", write: "webhooks.write", delete: "webhooks.write" },
 		displayName: (row) => row.description ?? row.url,
 	}),
+	/**
+	 * External caller IDs this organization has proved it may present.
+	 *
+	 * `affectsRouting: false`: the compiler has no caller-ID-verification input. The list is read at
+	 * SIGNING time, when the platform decides what attestation an outbound call may carry — a
+	 * decision made per call from live rows, not baked into an artifact — so a write here must not
+	 * evict the compile view and imply the dial plan was republished.
+	 *
+	 * `delete` is `compliance.write` rather than a `compliance.delete` that does not exist: the
+	 * permission registry mints `read`/`write`/`review`/`traceback` for this resource and nothing
+	 * narrower, and this map's job is to restate what the controller asks for.
+	 */
+	verifiedCallerIds: descriptor<VerifiedCallerIdRow>({
+		key: "verified-caller-ids",
+		affectsRouting: false,
+		path: "/compliance/caller-ids",
+		label: "verified caller ID",
+		labelPlural: "Verified caller IDs",
+		permissions: { read: "compliance.read", write: "compliance.write", delete: "compliance.write" },
+		displayName: (row) => (row.label ? `${row.e164} · ${row.label}` : row.e164),
+	}),
 } as const;
 
 /**
@@ -732,6 +760,60 @@ export const PBX_CHILDREN = {
 		label: "agent",
 		parentPath: "/queues",
 		displayName: (row) => `Level ${row.level}, position ${row.position}`,
+		affectsRouting: false,
+	}),
+	/**
+	 * The three collections a queue's WRAP-UP and SURVEY are configured from, and the skills its
+	 * callers need.
+	 *
+	 * All `affectsRouting: false`, which the routing package decides rather than this comment:
+	 * `ROUTING_TABLE_TO_ENTITY` maps `queue` and nothing else in this family, so none of the four
+	 * republishes the artifact. That is the same call `queue_tier` got and for the same reason —
+	 * they are read at distribution time, not compiled into a plan.
+	 *
+	 * None of them has an `ordinalColumn` on the server, so none has a reorder endpoint. A
+	 * disposition code's `position` is a number the caller sets; a survey question's position is the
+	 * question's IDENTITY in every report, and a drag handle over it would silently re-file last
+	 * month's answers.
+	 */
+	queueDispositionCodes: child<QueueDispositionCodeRow>({
+		key: "disposition-codes",
+		segment: "disposition-codes",
+		label: "wrap-up code",
+		parentPath: "/queues",
+		displayName: (row) => row.label,
+		affectsRouting: false,
+	}),
+	queueSkillRequirements: child<QueueSkillRequirementRow>({
+		key: "skill-requirements",
+		segment: "skill-requirements",
+		label: "skill requirement",
+		parentPath: "/queues",
+		displayName: (row) => `${row.skill} ${String(row.minLevel)}+`,
+		affectsRouting: false,
+	}),
+	queueSurveyQuestions: child<QueueSurveyQuestionRow>({
+		key: "survey-questions",
+		segment: "survey-questions",
+		label: "survey question",
+		parentPath: "/queues",
+		displayName: (row) => `${String(row.position)}. ${row.label}`,
+		affectsRouting: false,
+	}),
+	/**
+	 * The only child here whose parent is an AGENT rather than a queue.
+	 *
+	 * It hangs off `queue_agent` for the reason that table is top-level to begin with: a skill is a
+	 * property of the person and the same agent carries it into every queue they staff. `key` differs
+	 * from `segment` for the reason `pin-set-entries` does — `CHILD_TABLES` in `contracts.spec.ts` is
+	 * keyed by `key`, and a second collection spelled `skills` would collapse into one entry there.
+	 */
+	queueAgentSkills: child<QueueAgentSkillRow>({
+		key: "agent-skills",
+		segment: "skills",
+		label: "skill",
+		parentPath: "/queue-agents",
+		displayName: (row) => `${row.skill} ${String(row.level)}`,
 		affectsRouting: false,
 	}),
 	/**
@@ -1683,4 +1765,32 @@ export async function listSipAuthEvents(
 	return await apiFetch<AuditCursorEnvelope<SipAuthEventRow>>(
 		`/sip-auth-events?${ledgerSearchParams({ ...query })}`,
 	);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Carrier compliance — the KYC record
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The organization's KYC record.
+ *
+ * Not a {@link PbxResourceDescriptor}, because there is nothing to list: exactly one record exists
+ * per organization and the API says so with a singleton `GET`/`PUT` rather than a CRUD collection.
+ * Forcing it through the generic scaffold would have meant inventing a page of one row.
+ */
+export async function fetchKycRecord(): Promise<KycRecord> {
+	const { data } = await apiFetch<ItemEnvelope<KycRecord>>("/compliance/kyc");
+	return data;
+}
+
+/**
+ * `PUT`, not `PATCH`, because the API says `PUT` — the record is submitted as a whole, which is
+ * what makes a review of it meaningful. `taxId` is the one key the caller may omit: see
+ * {@link KycRecordInput} for why omitting it and sending `null` are different requests.
+ */
+export async function saveKycRecord(input: KycRecordInput): Promise<MutationEnvelope<KycRecord>> {
+	return await apiFetch<MutationEnvelope<KycRecord>>("/compliance/kyc", {
+		method: "PUT",
+		body: JSON.stringify(input),
+	});
 }

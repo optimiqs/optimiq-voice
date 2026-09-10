@@ -35,6 +35,11 @@ import {
 	usePbxRoster,
 } from "../../_hooks/use-pbx-queries";
 import { AgentSessionControls, LiveIndicator } from "./agent-console";
+import {
+	QueueDispositionCodesPanel,
+	QueueSkillRequirementsPanel,
+	QueueSurveyQuestionsPanel,
+} from "./queue-config-panels";
 import { QueueDialog } from "./queue-dialog";
 import { AgentStatusBadge } from "./queue-shared";
 import { QueueTierDialog } from "./queue-tier-dialog";
@@ -276,11 +281,11 @@ export function QueueDetail({ queueId }: { queueId: string }) {
 								return "—";
 							}
 							// The socket first, the row second. See the class header.
-							const status = (agentStates.byAgentId.get(tier.queueAgentId)?.status ??
-								agent.status) as QueueAgentStatus;
+							const entry = agentStates.byAgentId.get(tier.queueAgentId);
+							const status = (entry?.status ?? agent.status) as QueueAgentStatus;
 							return (
 								<div className="flex items-center gap-2">
-									<AgentStatusBadge status={status} />
+									<AgentStatusBadge status={status} reason={entry?.reason} />
 									<AgentSessionControls
 										agentId={agent.id}
 										agentName={agent.name}
@@ -333,6 +338,29 @@ export function QueueDetail({ queueId }: { queueId: string }) {
 						to change how one is reached or how hard the queue tries them.
 					</p>
 				}
+			/>
+
+			{/*
+			 * The three collections that decide what happens either side of a call.
+			 *
+			 * Below the memberships and not above them, because staffing is what somebody opens this
+			 * page for. They are `queues.write` — the queue's own grant — while the table above is
+			 * `queues.manage-agents`, so a supervisor who staffs the floor sees these read-only and an
+			 * administrator who configures the queue sees the table read-only. That is the API's split
+			 * and this page has honoured it since the tiers were the only child.
+			 */}
+			<QueueDispositionCodesPanel
+				queueId={queueId}
+				canWrite={canWrite}
+				dispositionRequired={row.dispositionRequired}
+			/>
+
+			<QueueSkillRequirementsPanel queueId={queueId} canWrite={canWrite} />
+
+			<QueueSurveyQuestionsPanel
+				queueId={queueId}
+				canWrite={canWrite}
+				surveyEnabled={row.surveyEnabled}
 			/>
 
 			<QueueDialog open={queueDialogOpen} onOpenChange={setQueueDialogOpen} queue={row} />

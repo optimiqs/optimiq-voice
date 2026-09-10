@@ -184,6 +184,7 @@ export function emptyAgentStats(agentId: string): AgentStatsRow {
 		wrapUpMs: 0,
 		averageWrapUpMs: 0,
 		wrapUpSamples: 0,
+		dispositions: [],
 		queues: [],
 	};
 }

@@ -4,10 +4,11 @@ import { useForm } from "@tanstack/react-form";
 import { useState } from "react";
 import { DestinationPicker } from "~/components/pbx/destination-picker";
 import { EntityFormDialog, FormSection } from "~/components/pbx/entity-form-dialog";
-import { ResourceSelect } from "~/components/pbx/resource-select";
-import { SwitchField, TextField } from "~/components/ui/form-fields";
+import { PromptSelect, ResourceSelect } from "~/components/pbx/resource-select";
+import { SelectField, SwitchField, TextField } from "~/components/ui/form-fields";
 import { useServerFieldErrors } from "~/lib/forms/server-errors";
 import { PBX_RESOURCES } from "~/lib/pbx/client";
+import { RECORDING_CONSENT_POLICIES, RECORDING_CONSENT_POLICY_LABELS } from "~/lib/pbx/contracts";
 import {
 	EMPTY_DESTINATION,
 	readDestination,
@@ -55,6 +56,8 @@ function defaultsFor(number: PhoneNumberRow | null): PhoneNumberFormValues {
 		label: number?.label ?? "",
 		callerIdNamePrefix: number?.callerIdNamePrefix ?? "",
 		recordEnabled: number?.recordEnabled ?? false,
+		recordingConsentPolicy: number?.recordingConsentPolicy ?? "",
+		recordingConsentPromptId: number?.recordingConsentPromptId ?? "",
 		emergencyAddressId: number?.emergencyAddressId ?? "",
 		voiceEnabled: number?.voiceEnabled ?? true,
 		faxEnabled: number?.faxEnabled ?? false,
@@ -103,6 +106,8 @@ export function PhoneNumberDialog({
 				label: parsed.label,
 				callerIdNamePrefix: parsed.callerIdNamePrefix,
 				recordEnabled: parsed.recordEnabled,
+				recordingConsentPolicy: parsed.recordingConsentPolicy,
+				recordingConsentPromptId: parsed.recordingConsentPromptId,
 				voiceEnabled: parsed.voiceEnabled,
 				faxEnabled: parsed.faxEnabled,
 				enabled: parsed.enabled,
@@ -252,6 +257,38 @@ export function PhoneNumberDialog({
 							field={field}
 							label="Record calls to this number"
 							disabled={mutation.isPending}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="recordingConsentPolicy">
+					{(field) => (
+						<SelectField
+							field={field}
+							label="Recording disclosure"
+							description="What the parties are told before recording starts. Leave it on the organization's setting unless this number needs its own."
+							disabled={mutation.isPending}
+							submitError={server.errors.recordingConsentPolicy}
+						>
+							<option value="">Use the organization's setting</option>
+							{RECORDING_CONSENT_POLICIES.map((value) => (
+								<option key={value} value={value}>
+									{RECORDING_CONSENT_POLICY_LABELS[value]}
+								</option>
+							))}
+						</SelectField>
+					)}
+				</form.Field>
+				<form.Field name="recordingConsentPromptId">
+					{(field) => (
+						<PromptSelect
+							id="numberConsentPromptId"
+							label="Disclosure prompt"
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="The organization's prompt"
+							description="Played as the disclosure when one is played at all."
+							disabled={mutation.isPending}
+							error={server.errors.recordingConsentPromptId}
 						/>
 					)}
 				</form.Field>

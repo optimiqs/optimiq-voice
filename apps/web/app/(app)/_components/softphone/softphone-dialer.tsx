@@ -4,9 +4,10 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { Button } from "~/components/ui/button";
 import { Input } from "~/components/ui/field";
-import { PhoneIcon } from "~/components/ui/icons";
+import { LockIcon, PhoneIcon } from "~/components/ui/icons";
 import { Spinner } from "~/components/ui/spinner";
 import { cn } from "~/lib/cn";
+import { encryptionLabel } from "~/lib/live/encryption";
 import { canPlaceCall } from "~/lib/softphone/call-state";
 import {
 	isRecordingControlVisible,
@@ -247,6 +248,7 @@ export function SoftphoneDialer() {
 							Hang up
 						</Button>
 					</div>
+					<EncryptionIndicator />
 					<RecordingControls />
 					<TransferControls />
 
@@ -447,6 +449,35 @@ export function SoftphoneDialer() {
  * "transferring", never "transferred", and the call simply ends. A failure keeps the call: the
  * first party comes back off hold and the panel says which step refused.
  */
+/**
+ * The padlock — shown only while the platform says this leg's audio is actually encrypted.
+ *
+ * ## Present or absent, never a red open padlock
+ *
+ * The indicator ASSERTS encryption and never asserts its absence. The engine writes the flag from
+ * the SRTP context the media plane installed, so its absence covers three different facts — plain
+ * RTP, a leg mid-negotiation, and a session that cannot read the `active-calls` topic — and an open
+ * padlock would state the first over all three. An estate that has not turned SRTP on would also
+ * get a warning icon on every call it ever makes, which is how an indicator becomes wallpaper.
+ *
+ * ## Why it is words as well as an icon
+ *
+ * A lock glyph alone is the most over-loaded symbol in software. The line beside it names the
+ * protocol, and the title says what is and is not being claimed — audio, not identity.
+ */
+function EncryptionIndicator() {
+	const phone = useSoftphone();
+	if (!phone.mediaEncrypted) {
+		return null;
+	}
+	return (
+		<div className="flex items-center gap-2" title={encryptionLabel(true)}>
+			<LockIcon aria-hidden className="size-3.5 text-success" />
+			<p className="text-xs text-muted-foreground">Media encrypted</p>
+		</div>
+	);
+}
+
 /**
  * The PCI pause — shown only while the platform says this call is being recorded.
  *

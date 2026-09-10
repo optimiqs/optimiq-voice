@@ -31,6 +31,15 @@ const TABS = [
 	 */
 	{ title: "Limits", url: routes.limits },
 	{ title: "Emergency", url: routes.emergencyAddresses },
+	/**
+	 * Messaging registration — the entry point for five screens, not one.
+	 *
+	 * One tab rather than five, because the settings bar is already ten entries wide and because the
+	 * four others (brand, campaigns, toll-free, opt-outs) are steps in ONE task: getting this
+	 * organization's numbers accepted by the carriers. The sub-navigation for them lives on the
+	 * page, where the order they must be done in can be shown.
+	 */
+	{ title: "Messaging", url: routes.messagingNumbers },
 	{ title: "My preferences", url: routes.mySettings },
 ] as const;
 
@@ -48,7 +57,14 @@ export function SettingsNav() {
 		<nav aria-label="Settings" className="border-b border-border">
 			<ul className="-mb-px flex gap-1">
 				{tabs.map((tab) => {
-					const active = pathname === tab.url;
+					/**
+					 * A tab stays current on its own descendants — `/settings/messaging/brand` is still
+					 * the Messaging tab. `/settings` itself is matched exactly, because it is a prefix of
+					 * every other tab and a `startsWith` check would light "General" up on all of them.
+					 */
+					const active =
+						pathname === tab.url ||
+						(tab.url !== routes.settings && pathname.startsWith(`${tab.url}/`));
 					return (
 						<li key={tab.url}>
 							<Link

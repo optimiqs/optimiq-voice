@@ -232,3 +232,57 @@ export function recordingsForLeg(
 function capitalize(value: string): string {
 	return value.length === 0 ? value : value.charAt(0).toUpperCase() + value.slice(1);
 }
+
+// ---------------------------------------------------------------------------------------------
+// STIR/SHAKEN — how an attestation READS
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * An attestation level, written as the letter AND what the letter means.
+ *
+ * The letter alone is the whole problem this function exists to solve. `A`/`B`/`C` are the words
+ * the SIP header uses, and they are meaningless to the person who actually reads this screen —
+ * somebody answering a traceback or a dispute, weeks after the call, who needs to know whether
+ * anybody vouched for the caller ID and how strongly. "B" tells them nothing; "B — partial" tells
+ * them the signer knew the customer but not that they had the right to this number.
+ *
+ * The letter is kept in front rather than dropped, because it is what the carrier's own paperwork
+ * and every traceback form will say, and a screen that only said "partial" could not be matched
+ * against them.
+ *
+ * Case is normalised because the value is stored verbatim from the wire and carriers send both.
+ * An unrecognised level is returned AS RECEIVED rather than coerced or hidden: this platform does
+ * not own the vocabulary, and a level it has no label for is still evidence.
+ */
+export function attestationLevelLabel(level: string): string {
+	switch (level.trim().toUpperCase()) {
+		case "A":
+			return "A — full attestation";
+		case "B":
+			return "B — partial attestation";
+		case "C":
+			return "C — gateway attestation";
+		default:
+			return level;
+	}
+}
+
+/**
+ * What entitled this platform to put the caller ID on an outbound call.
+ *
+ * A phrase and not a word, because the basis is the justification: it is the sentence that has to
+ * survive being quoted back in a traceback response. An unrecognised basis is returned as received,
+ * for the reason {@link attestationLevelLabel} gives.
+ */
+export function callerIdRightToUseLabel(basis: string): string {
+	switch (basis.trim().toLowerCase()) {
+		case "owned":
+			return "a number assigned to this organization";
+		case "verified":
+			return "an externally verified caller ID on file";
+		case "none":
+			return "no established right to use";
+		default:
+			return basis;
+	}
+}

@@ -15,6 +15,7 @@ import {
 import { formatDuration } from "~/lib/cdr/format";
 import { hasUsableWrapUp, talkSharePct } from "~/lib/cdr/reporting";
 import { PBX_RESOURCES } from "~/lib/pbx/client";
+import { QUEUE_DISPOSITION_UNSET } from "~/lib/pbx/contracts";
 import { usePbxRoster } from "../../_hooks/use-pbx-queries";
 import type { AgentStatsResult } from "../../_hooks/use-cdr-queries";
 import type { QueueAgentRow, QueueRow } from "~/lib/pbx/contracts";
@@ -86,6 +87,7 @@ export function AgentStatsTable({ stats }: { readonly stats: AgentStatsResult })
 							<TableHead className="text-right">Picked up in</TableHead>
 							<TableHead className="text-right">Caller waited</TableHead>
 							<TableHead className="text-right">Wrap-up</TableHead>
+							<TableHead>Closed as</TableHead>
 							<TableHead>Queues</TableHead>
 						</TableRow>
 					</TableHeader>
@@ -128,6 +130,40 @@ export function AgentStatsTable({ stats }: { readonly stats: AgentStatsResult })
 											>
 												Not enough data
 											</span>
+										)}
+									</TableCell>
+									{/*
+									 * The wrap-up codes this agent's calls closed as.
+									 *
+									 * Rendered as counts and NEVER as a share of `answered`: the two do not have
+									 * to agree. A leg dispositioned after the CDR consumer filed it keeps its
+									 * NULL, and a queue that started asking halfway through the window has both
+									 * kinds in it — so a percentage here would be a number the ledger cannot
+									 * support, on a page somebody takes into a performance conversation.
+									 *
+									 * `unset` is one of the codes and is shown as one, because "the agent did not
+									 * answer the question" is an outcome a supervisor wants to see rather than a
+									 * gap to hide.
+									 */}
+									<TableCell>
+										{row.dispositions.length === 0 ? (
+											<span className="text-xs text-muted-foreground">Not asked</span>
+										) : (
+											<div className="flex flex-wrap gap-1">
+												{row.dispositions.map((entry) => (
+													<Badge
+														key={entry.code}
+														tone={entry.code === QUEUE_DISPOSITION_UNSET ? "warning" : "neutral"}
+														title={
+															entry.code === QUEUE_DISPOSITION_UNSET
+																? "The wrap-up time ran out before a code was chosen."
+																: undefined
+														}
+													>
+														{entry.code} · {entry.count}
+													</Badge>
+												))}
+											</div>
 										)}
 									</TableCell>
 									<TableCell>

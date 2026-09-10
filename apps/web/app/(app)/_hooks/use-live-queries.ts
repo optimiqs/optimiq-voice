@@ -2,6 +2,7 @@
 
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { encryptedLegCount } from "~/lib/live/encryption";
 import { queueTopic } from "~/lib/live/protocol";
 import {
 	applyConferenceSnapshot,
@@ -151,6 +152,12 @@ export interface LiveCallsResult {
 	/** Distinct CALLS, not legs: a bridged call is two entries and one conversation. */
 	readonly callCount: number;
 	readonly answeredCount: number;
+	/**
+	 * Live LEGS carrying encrypted audio, as the engine reported the SRTP context the media plane
+	 * installed — not as a policy asked for it. Legs rather than calls because the two halves of one
+	 * bridged call routinely differ: a TLS handset on SRTP talking to a carrier on plain RTP.
+	 */
+	readonly encryptedLegs: number;
 	readonly loaded: boolean;
 	readonly permitted: boolean;
 }
@@ -182,6 +189,9 @@ export function useLiveActiveCalls(): LiveCallsResult {
 			legs,
 			callCount: countLiveCalls(legs),
 			answeredCount: answered.size,
+			// Legs and not calls — the two halves of one bridged call can disagree. See
+			// `lib/live/encryption.ts`.
+			encryptedLegs: encryptedLegCount(legs).encrypted,
 			loaded: state.loaded,
 			permitted,
 		};

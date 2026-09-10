@@ -17,8 +17,12 @@ import {
 	QUEUE_AGENT_CONTACT_KINDS as SERVER_QUEUE_AGENT_CONTACT_KINDS,
 	QUEUE_AGENT_STATUSES as SERVER_QUEUE_AGENT_STATUSES,
 	QUEUE_PRIORITY_MAX as SERVER_QUEUE_PRIORITY_MAX,
+	QUEUE_DISPOSITION_UNSET as SERVER_QUEUE_DISPOSITION_UNSET,
 	QUEUE_PRIORITY_MIN as SERVER_QUEUE_PRIORITY_MIN,
+	QUEUE_SKILL_LEVEL_MAX as SERVER_QUEUE_SKILL_LEVEL_MAX,
+	QUEUE_SKILL_LEVEL_MIN as SERVER_QUEUE_SKILL_LEVEL_MIN,
 	QUEUE_STRATEGIES as SERVER_QUEUE_STRATEGIES,
+	QUEUE_SURVEY_MAX_QUESTIONS as SERVER_QUEUE_SURVEY_MAX_QUESTIONS,
 	RECORD_POLICIES as SERVER_RECORD_POLICIES,
 	RING_GROUP_STRATEGIES as SERVER_RING_GROUP_STRATEGIES,
 	ROUTE_MATCH_KINDS as SERVER_ROUTE_MATCH_KINDS,
@@ -32,6 +36,7 @@ import {
 	VOICEMAIL_TRANSCRIPTION_STATUSES as SERVER_VOICEMAIL_TRANSCRIPTION_STATUSES,
 } from "@optimiq-voice/pbx-db";
 import {
+	RECORDING_CONSENT_POLICIES as SERVER_RECORDING_CONSENT_POLICIES,
 	ROUTING_CONTEXTS as SERVER_ROUTING_CONTEXTS,
 	ROUTING_TABLE_TO_ENTITY as SERVER_ROUTING_TABLES,
 } from "@optimiq-voice/routing";
@@ -53,11 +58,18 @@ import {
 	PROMPT_KINDS,
 	QUEUE_AGENT_CONTACT_KINDS,
 	QUEUE_AGENT_STATUSES,
+	QUEUE_DISPOSITION_UNSET,
 	QUEUE_EXIT_KEY_PATTERN,
 	QUEUE_PRIORITY_MAX,
 	QUEUE_PRIORITY_MIN,
+	QUEUE_SKILL_LEVEL_MAX,
+	QUEUE_SKILL_LEVEL_MIN,
 	QUEUE_STRATEGIES,
+	QUEUE_SURVEY_MAX_QUESTIONS,
+	QUEUE_TAG_PATTERN,
 	RECORD_POLICIES,
+	RECORDING_CONSENT_POLICIES,
+	RECORDING_CONSENT_POLICY_LABELS,
 	RING_GROUP_STRATEGIES,
 	ROUTE_MATCH_KINDS,
 	ROUTING_CONTEXTS,
@@ -110,6 +122,23 @@ describe("closed sets mirrored from @optimiq-voice/pbx-db", () => {
 
 	it("record policies match", () => {
 		expect(RECORD_POLICIES).toEqual([...SERVER_RECORD_POLICIES]);
+	});
+
+	/**
+	 * The disclosure vocabulary, which is a DIFFERENT question from `RECORD_POLICIES` above: that
+	 * decides whether a call is recorded, this decides what the parties are told about it. Drift here
+	 * would send a value the engine does not honour, and the symptom is silence on a call the screen
+	 * says announces.
+	 */
+	it("recording consent policies match, in order", () => {
+		expect(RECORDING_CONSENT_POLICIES).toEqual([...SERVER_RECORDING_CONSENT_POLICIES]);
+	});
+
+	/** Every policy has copy. A missing label renders as `undefined` in a select nobody can read. */
+	it("labels every consent policy the engine honours", () => {
+		for (const policy of SERVER_RECORDING_CONSENT_POLICIES) {
+			expect(RECORDING_CONSENT_POLICY_LABELS[policy]).toBeTruthy();
+		}
 	});
 
 	it("trunk kinds, statuses and transports match", () => {
@@ -207,6 +236,38 @@ describe("closed sets mirrored from @optimiq-voice/pbx-db", () => {
 		}
 		for (const refused of ["", "d", "E", "22", "*#", " 2", "2 "]) {
 			expect(QUEUE_EXIT_KEY_PATTERN.test(refused)).toBe(false);
+		}
+	});
+
+	/**
+	 * The skill scale, the survey ceiling and the reserved wrap-up code.
+	 *
+	 * Ranges and a literal rather than sets, and each drifts into a different failure: a skill scale
+	 * that disagreed would let a form save a `minLevel` no agent's `level` can reach, a survey
+	 * ceiling that drifted would offer a fourth question the unique index refuses, and a
+	 * `QUEUE_DISPOSITION_UNSET` that drifted would let a tenant define the code the wrap-up deadline
+	 * records — folding "nobody chose" and a real outcome into one row in every report.
+	 */
+	it("the skill scale, survey ceiling and reserved code match the database", () => {
+		expect(QUEUE_SKILL_LEVEL_MIN).toBe(SERVER_QUEUE_SKILL_LEVEL_MIN);
+		expect(QUEUE_SKILL_LEVEL_MAX).toBe(SERVER_QUEUE_SKILL_LEVEL_MAX);
+		expect(QUEUE_SURVEY_MAX_QUESTIONS).toBe(SERVER_QUEUE_SURVEY_MAX_QUESTIONS);
+		expect(QUEUE_DISPOSITION_UNSET).toBe(SERVER_QUEUE_DISPOSITION_UNSET);
+	});
+
+	/**
+	 * The tag shape the three check constraints share, mirrored the way the exit key's is.
+	 *
+	 * A skill and a disposition code are compared with `===` on the call path — a seat's skills
+	 * against a queue's requirements, a submitted code against the queue's vocabulary — so a browser
+	 * that accepted `Spanish` would fragment the vocabulary rather than fail.
+	 */
+	it("accepts a lower-case tag and refuses the spellings that would fragment it", () => {
+		for (const tag of ["sale", "tier2", "wrong-number", "mortgage_advice", "9to5"]) {
+			expect(QUEUE_TAG_PATTERN.test(tag)).toBe(true);
+		}
+		for (const refused of ["", "Spanish", "-lead", "_lead", "with space", "a".repeat(64)]) {
+			expect(QUEUE_TAG_PATTERN.test(refused)).toBe(false);
 		}
 	});
 
@@ -475,6 +536,13 @@ const RESOURCE_TABLES: Readonly<Record<string, string>> = {
 	 * and this map does not.
 	 */
 	"sip-acl-entries": "sip_acl_entry",
+	/**
+	 * Absent from `ROUTING_TABLE_TO_ENTITY` on the same terms, and worth stating for the same reason
+	 * `sip_acl_entry` is: a verified caller ID plainly affects calls, but it is read at SIGNING time
+	 * — when the platform decides what attestation an outbound call may carry — rather than compiled
+	 * into the artifact, so a write here must not claim the dial plan was republished.
+	 */
+	"verified-caller-ids": "verified_caller_id",
 	"paging-groups": "paging_group",
 	/**
 	 * A shared line IS a routing input — `shared_line` is in `ROUTING_TABLE_TO_ENTITY` (→ `sharedLines`)
@@ -542,6 +610,18 @@ const CHILD_TABLES: Readonly<Record<string, string>> = {
 	 * the two exceptions above exist only because two collections were both spelled `rules`.
 	 */
 	steps: "phrase_step",
+	/**
+	 * The queue's wrap-up, skill and survey collections, plus the AGENT's own skills.
+	 *
+	 * None of the four is in `ROUTING_TABLE_TO_ENTITY`, which puts them with `queue_tier`: they are
+	 * read at distribution time rather than compiled into a plan, so editing one must not evict the
+	 * tenant's artifact. `agent-skills` is the `key`/`segment` split — the URL is `/skills`, and a
+	 * second child spelled that way would collapse into one entry here.
+	 */
+	"disposition-codes": "queue_disposition_code",
+	"skill-requirements": "queue_skill_requirement",
+	"survey-questions": "queue_survey_question",
+	"agent-skills": "queue_agent_skill",
 };
 
 describe("affectsRouting, mirrored from @optimiq-voice/routing", () => {

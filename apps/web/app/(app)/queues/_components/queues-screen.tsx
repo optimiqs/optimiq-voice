@@ -7,6 +7,7 @@ import { QUEUE_TABS, type QueueTab } from "~/lib/routes";
 import { AgentConsole } from "./agent-console";
 import { QueueAgentsPanel } from "./queue-agents-panel";
 import { QueuesPanel } from "./queues-panel";
+import { AgentWrapUpPanel } from "./wrap-up-panel";
 
 /**
  * Queues and the agents who answer them: two views of one subject, on one page.
@@ -43,6 +44,13 @@ export function QueuesScreen() {
 			 * a feature that does not apply to them.
 			 */}
 			<AgentConsole />
+
+			{/*
+			 * Directly under the console, because it is the same strip's other half: the console says
+			 * whether you are taking calls, and this says what the last one was. It renders only while
+			 * the engine says a code is owed, so it is absent the rest of the shift.
+			 */}
+			<AgentWrapUpPanel />
 
 			<Tabs value={tab} onValueChange={(next) => void setTab(next as QueueTab)}>
 				<TabsList>

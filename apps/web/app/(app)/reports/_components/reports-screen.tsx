@@ -14,7 +14,7 @@ import {
 } from "~/lib/cdr/client";
 import { cn } from "~/lib/cn";
 import { usePermission } from "../../_context/session-context";
-import { useAgentStats, useCallVolume } from "../../_hooks/use-cdr-queries";
+import { useAgentStats, useCallVolume, useQueueStats } from "../../_hooks/use-cdr-queries";
 import {
 	RANGE_PRESET_LABELS,
 	RANGE_PRESETS,
@@ -23,6 +23,7 @@ import {
 } from "../../cdr/_components/time-range";
 import { AgentStatsTable } from "./agent-stats-table";
 import { CallVolumePanel } from "./call-volume-panel";
+import { QueueSurveyPanel } from "./queue-survey-panel";
 
 /**
  * Reports — the historical half of the reporting area, over one window.
@@ -70,6 +71,10 @@ export function ReportsScreen() {
 
 	const stats = useAgentStats({ from: range.from, to: range.to, wrapUpSeconds });
 	const volume = useCallVolume({ from: range.from, to: range.to, bucket });
+	// The same endpoint the wallboard's service level rides, and the same grant: the survey summary
+	// travels on the queue-statistics row because it is an aggregate over the same window and the
+	// same queues, and a second endpoint would have been a second window to keep in step.
+	const queues = useQueueStats({ from: range.from, to: range.to });
 
 	const presetId = useId();
 	const wrapUpId = useId();
@@ -199,6 +204,26 @@ export function ReportsScreen() {
 					<EmptyState
 						title="You cannot see agent statistics"
 						description="This table needs the permission that also opens the wallboard. Ask an administrator for queue monitoring."
+					/>
+				)}
+			</section>
+
+			<section className="flex flex-col gap-3">
+				<header>
+					<h2 className="text-sm font-semibold text-foreground">Post-call survey</h2>
+					<p className="max-w-prose text-xs text-muted-foreground">
+						What callers pressed when the queue asked them, after the agent hung up. Only queues
+						somebody actually rated appear, worst average first. A caller who pressed nothing is not
+						a zero — they are simply not counted, so a question can have fewer answers than the
+						queue had calls.
+					</p>
+				</header>
+				{canSeeAgents ? (
+					<QueueSurveyPanel stats={queues} />
+				) : (
+					<EmptyState
+						title="You cannot see survey results"
+						description="Survey results ride the same permission as the queue statistics above. Ask an administrator for queue monitoring."
 					/>
 				)}
 			</section>
