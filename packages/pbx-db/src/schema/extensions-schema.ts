@@ -12,6 +12,7 @@ import {
 import {
 	auditTimestampColumns,
 	tenantOrganizationIdColumn,
+	utcTimestamp,
 	uuidEntityId,
 	uuidV7PrimaryKey,
 } from "@optimiq-voice/db";
@@ -84,6 +85,39 @@ export const extension = pgTable.withRLS(
 		 */
 		sipSecretRef: text("sip_secret_ref").notNull(),
 		sipPasswordHa1: text("sip_password_ha1"),
+		/**
+		 * The handle this line authenticated with BEFORE its last rotation, kept until
+		 * {@link extension.sipSecretGraceUntil}.
+		 *
+		 * A rotation with no grace is an outage. The new password reaches the handset through a
+		 * provisioning fetch the handset decides the timing of — a reboot, a resync, its own
+		 * check-in interval — so between the moment this row changes and the moment that fetch
+		 * happens, the phone is holding a credential the platform has stopped accepting, and the
+		 * symptom is a desk phone that has silently stopped ringing. Every rotation would therefore
+		 * have to be scheduled against a reboot window, which is how credential rotation becomes a
+		 * thing nobody does.
+		 *
+		 * So both are accepted for a bounded interval and the OLD one is stored rather than the new
+		 * one being staged: the platform is authoritative for the new secret the instant the
+		 * rotation is written, which means the audit row, the provisioning render and the credential
+		 * reply all agree from that instant, and the only thing with a deadline on it is the value
+		 * that is on its way out. Staging the new one instead would leave a window in which the
+		 * rendered config and the accepted credential disagree, which is the bug this column exists
+		 * to prevent.
+		 *
+		 * NULL — which is every line that has never been rotated — means there is no second
+		 * credential, and the grace column is meaningless without it.
+		 */
+		sipSecretRefPrevious: text("sip_secret_ref_previous"),
+		/**
+		 * When the previous handle stops being accepted. NULL, or an instant already past, means it
+		 * is not accepted now.
+		 *
+		 * Read fail-CLOSED: the credential path compares against the current clock on every lookup
+		 * and never caches an answer past this instant, so a grace that has expired cannot be served
+		 * out of a cache that was warmed while it held.
+		 */
+		sipSecretGraceUntil: utcTimestamp("sip_secret_grace_until"),
 		/** Caller id presented on internal calls. */
 		callerIdName: text("caller_id_name"),
 		callerIdNumber: text("caller_id_number"),
@@ -114,6 +148,22 @@ export const extension = pgTable.withRLS(
 		forwardUnregisteredDestination: text("forward_unregistered_destination"),
 		followMe: jsonb("follow_me").$type<FollowMeConfig>(),
 		recordPolicy: text("record_policy").$type<RecordPolicy>().notNull().default("none"),
+		/**
+		 * Pause the tap while this endpoint's caller is typing digits — the PCI-DSS 3.4 reflex.
+		 *
+		 * A card number read aloud is a problem a policy can address; a card number KEYED into an
+		 * IVR is one only the recorder can, because the DTMF is in the audio and a stored tone is a
+		 * stored PAN. So the pause is armed per endpoint rather than per call: the desks that take
+		 * payments are a stable, small set, and asking an agent to remember a feature code mid-card
+		 * is a control that fails on the calls it exists for.
+		 *
+		 * `not null default false` and NOT nullable-inherit, unlike the consent columns: this is a
+		 * behaviour, not a posture to be resolved up a hierarchy, and off is what every extension did
+		 * before the column existed. The org-level setting is the fallback the compiler applies when
+		 * the extension says nothing louder than its default — see the resolution order in the
+		 * engine's recording gate.
+		 */
+		recordAutoPauseOnDtmf: boolean("record_auto_pause_on_dtmf").notNull().default(false),
 		mohClassId: uuidEntityId("moh_class_id").references(() => mohClass.id, {
 			onDelete: "set null",
 		}),

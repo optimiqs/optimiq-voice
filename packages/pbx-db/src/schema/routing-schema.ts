@@ -1,4 +1,14 @@
-import { boolean, index, integer, jsonb, pgTable, text, uniqueIndex } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import {
+	boolean,
+	check,
+	index,
+	integer,
+	jsonb,
+	pgTable,
+	text,
+	uniqueIndex,
+} from "drizzle-orm/pg-core";
 import {
 	auditTimestampColumns,
 	tenantOrganizationIdColumn,
@@ -7,7 +17,8 @@ import {
 } from "@optimiq-voice/db";
 import { tenantIsolationPolicy } from "../tenant";
 import { destinationCheck, destinationColumns, namedDestinationColumns } from "./columns";
-import { phoneNumber } from "./numbers-schema";
+import { prompt } from "./media-schema";
+import { phoneNumber, type RecordingConsentPolicy } from "./numbers-schema";
 import { pinSet } from "./pins-schema";
 import { timeCondition } from "./time-conditions-schema";
 import { translationRuleset } from "./translations-schema";
@@ -54,6 +65,26 @@ export const inboundRoute = pgTable.withRLS(
 			onDelete: "set null",
 		}),
 		recordEnabled: boolean("record_enabled").notNull().default(false),
+		/**
+		 * This route's consent posture, overriding both the DID it matched and the organization.
+		 * NULL — every pre-existing row — means "inherit", and that is the only reason it is nullable:
+		 * a `not null default 'none'` would turn silence into an assertion and make an inherited
+		 * policy indistinguishable from a deliberately disabled one.
+		 *
+		 * A route overrides its DID because a route is the narrower statement of intent: the same
+		 * number reaching the support queue and reaching a recorded-by-default sales line are two
+		 * different calls, and the row that chose the destination is the row that knows which.
+		 */
+		recordingConsentPolicy: text("recording_consent_policy").$type<RecordingConsentPolicy>(),
+		/**
+		 * The disclosure this route plays, falling back to the DID's, then the org's, then the seeded
+		 * system stem. `on delete set null` like every other prompt reference: losing a media file
+		 * costs the route its own wording, never the route itself, and the fallback still discloses.
+		 */
+		recordingConsentPromptId: uuidEntityId("recording_consent_prompt_id").references(
+			() => prompt.id,
+			{ onDelete: "set null" },
+		),
 		enabled: boolean("enabled").notNull().default(true),
 		...auditTimestampColumns(),
 	},
@@ -71,6 +102,12 @@ export const inboundRoute = pgTable.withRLS(
 		index("inbound_route_organization_time_condition_idx").on(
 			table.organizationId,
 			table.timeConditionId,
+		),
+		// NULL passes — it means "inherit", not "unspecified". Anything else must be a policy the
+		// compiler and the engine both understand; a typo is a call recorded without a disclosure.
+		check(
+			"inbound_route_recording_consent_policy_check",
+			sql`recording_consent_policy is null or recording_consent_policy in ('none', 'announce', 'announce-and-require-keypress')`,
 		),
 		destinationCheck("inbound_route"),
 		destinationCheck("inbound_route", "failover", true),

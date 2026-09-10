@@ -274,6 +274,17 @@ export const deviceLine = pgTable.withRLS(
 		/** Auth id rendered into the config; defaults to the extension number when NULL. */
 		authUser: text("auth_user"),
 		sipSecretRef: text("sip_secret_ref"),
+		/**
+		 * The line's pre-rotation handle and the instant it stops being accepted.
+		 *
+		 * The same pair, for the same reason, as `extension.sip_secret_ref_previous` — which carries
+		 * the full argument. It is duplicated on this table rather than being read through the
+		 * extension because the two secrets are independently rotatable: the credential path resolves
+		 * `coalesce(extension.sip_secret_ref, device_line.sip_secret_ref)`, so a line whose extension
+		 * has no handle authenticates entirely from this row and would otherwise have no grace at all.
+		 */
+		sipSecretRefPrevious: text("sip_secret_ref_previous"),
+		sipSecretGraceUntil: utcTimestamp("sip_secret_grace_until"),
 		serverAddress: text("server_address"),
 		serverPort: integer("server_port").notNull().default(5060),
 		transport: text("transport").$type<SipTransport>().notNull().default("udp"),

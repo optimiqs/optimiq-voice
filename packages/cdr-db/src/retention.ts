@@ -115,7 +115,10 @@ export function purgedRecordingSoftDeleteQuery(now: Date, ids: readonly string[]
 	return sql`
 		update "recordings"
 		set "deleted_at" = ${now.toISOString()}::timestamptz, "updated_at" = ${now.toISOString()}::timestamptz
-		where "id" = any(${ids}::uuid[])
+		where "id" in (${sql.join(
+			ids.map((id) => sql`${id}::uuid`),
+			sql`, `,
+		)})
 			and "deleted_at" is null
 		returning "id"
 	`;

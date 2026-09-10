@@ -91,21 +91,28 @@ describe("call_legs", () => {
 		// The ceiling moves only when a column is added deliberately; the point of the band is that
 		// the 90-column original was never copied wholesale, not that the number is frozen.
 		expect(config.columns.length).toBeGreaterThanOrEqual(35);
-		expect(config.columns.length).toBeLessThanOrEqual(50);
+		expect(config.columns.length).toBeLessThanOrEqual(60);
 		expect(config.columns.find((column) => column.name === "raw")?.notNull).toBe(true);
 	});
 
 	it("carries the reporting indexes the CDR explorer queries by", () => {
-		expect(config.indexes.map((entry) => entry.config.name).sort()).toEqual([
-			"call_legs_call_idx",
-			"call_legs_organization_from_idx",
-			"call_legs_organization_started_idx",
-			"call_legs_organization_to_idx",
-			"call_legs_queue_agent_idx",
-			"call_legs_queue_idx",
-			"call_legs_recording_idx",
-			"call_legs_related_call_idx",
-		]);
+		expect(config.indexes.map((entry) => entry.config.name).sort()).toEqual(
+			[
+				"call_legs_call_idx",
+				"call_legs_organization_from_idx",
+				"call_legs_organization_started_idx",
+				"call_legs_organization_to_idx",
+				"call_legs_queue_agent_idx",
+				"call_legs_queue_idx",
+				"call_legs_recording_idx",
+				"call_legs_related_call_idx",
+				// The three that deliberately do not lead with `organization_id`: a traceback is asked by
+				// a platform operator about a number, across every tenant at once. See the schema.
+				"call_legs_traceback_from_idx",
+				"call_legs_traceback_to_idx",
+				"call_legs_trunk_idx",
+			].sort(),
+		);
 	});
 
 	/**
@@ -292,6 +299,57 @@ describe("the queue leg", () => {
 				continue;
 			}
 			expect(CALL_DISPOSITIONS as readonly string[]).not.toContain(outcome);
+		}
+	});
+});
+
+/**
+ * Recording consent.
+ *
+ * Two tables carry it and they carry it differently, which is the thing worth pinning: `recordings`
+ * takes the whole record as one `jsonb` because it is read with the object it describes, and
+ * `call_legs` takes four flat columns because it is aggregated over. The second half is the sharper
+ * assertion — that those four columns have NO check constraints. `call_legs` is append-only and
+ * partitioned, so a rejected write is a call record that never existed; an outcome a newer engine
+ * knows and this schema does not must land on the row rather than fail it.
+ */
+describe("recording consent", () => {
+	const legConfig = getTableConfig(callLegs);
+	const legColumns = new Map(legConfig.columns.map((column) => [column.name, column]));
+	const recordingColumns = new Map(
+		getTableConfig(recordings).columns.map((column) => [column.name, column]),
+	);
+
+	const LEG_CONSENT_COLUMNS = [
+		"recording_consent",
+		"recording_consent_method",
+		"recording_consent_at",
+		"recording_consent_regions",
+	] as const;
+
+	it("keeps the recording's consent one nullable jsonb, the way `pauses` is", () => {
+		expect(recordingColumns.get("consent")?.notNull).toBe(false);
+		expect(recordingColumns.get("consent")?.hasDefault).toBe(false);
+		expect(recordingColumns.get("consent")?.getSQLType()).toBe("jsonb");
+	});
+
+	it("flattens the leg's consent into four nullable columns, because legs are aggregated", () => {
+		for (const name of LEG_CONSENT_COLUMNS) {
+			expect(legColumns.get(name), name).toBeDefined();
+			expect(legColumns.get(name)?.notNull, name).toBe(false);
+			expect(legColumns.get(name)?.hasDefault, name).toBe(false);
+		}
+		expect(legColumns.get("recording_consent_regions")?.getSQLType()).toBe("jsonb");
+	});
+
+	it("puts NO check on any of them, so an unknown future outcome reaches the row", () => {
+		const names = legConfig.checks.map((entry) => entry.name);
+
+		for (const column of LEG_CONSENT_COLUMNS) {
+			expect(
+				names.some((name) => name.includes(column)),
+				column,
+			).toBe(false);
 		}
 	});
 });

@@ -25,6 +25,18 @@ import type { SipTransport } from "./devices-schema";
 export const TRUNK_KINDS = ["register", "ip-auth"] as const;
 export type TrunkKind = (typeof TRUNK_KINDS)[number];
 
+/**
+ * How a trunk's media leg treats SDES-SRTP (RFC 4568), independently of the process-wide
+ * `MEDIAD_SRTP_POLICY` floor.
+ *
+ * A carrier is not a handset: one carrier terminates `sips:`/SAVP and the next answers a crypto
+ * line with a 488, so the policy that is right for the tenant's phones is the wrong one for their
+ * trunks. `prefer` offers SAVP and falls back; `require` refuses a plaintext answer; `none` never
+ * offers it. Absent means "use the media plane's default", which is what every existing trunk is.
+ */
+export const TRUNK_SRTP_POLICIES = ["none", "prefer", "require"] as const;
+export type TrunkSrtpPolicy = (typeof TRUNK_SRTP_POLICIES)[number];
+
 export const TRUNK_STATUSES = ["unknown", "up", "down", "degraded", "disabled"] as const;
 export type TrunkStatus = (typeof TRUNK_STATUSES)[number];
 
@@ -48,6 +60,11 @@ export const trunk = pgTable.withRLS(
 		transport: text("transport").$type<SipTransport>().notNull().default("udp"),
 		/** Comma-separated preference list, e.g. `PCMU,PCMA,OPUS`. */
 		codecPrefs: text("codec_prefs"),
+		/**
+		 * SDES-SRTP on this trunk's legs. NULL means the media plane's own default decides, which is
+		 * what every trunk written before this column existed means.
+		 */
+		srtpPolicy: text("srtp_policy").$type<TrunkSrtpPolicy>(),
 		/** Concurrency cap enforced by the engine before it offers a call to this trunk. */
 		maxChannels: integer("max_channels"),
 		callerIdNumberOverride: text("caller_id_number_override"),

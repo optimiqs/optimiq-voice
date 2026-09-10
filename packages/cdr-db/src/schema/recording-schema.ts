@@ -24,6 +24,29 @@ import { RECORDING_KINDS, type RecordingKind } from "./enums";
 const tenantScope = tenantOrganizationScope(cdrTenantContext);
 
 /**
+ * The consent record one recording carries, mirroring `RecordingConsentRecord` in
+ * `packages/routing/src/recording-consent.ts`.
+ *
+ * Mirrored rather than imported because this package cannot depend on routing, and structural
+ * rather than nominal on purpose: the column is `jsonb`, so what actually crosses the boundary is a
+ * shape, and a shape is what this interface has to describe. The string unions are deliberately
+ * WIDE where the payload is — `outcome` and `method` are literal unions because a value outside them
+ * is a bug in the writer, whereas `regions` is plain `string[]` because a jurisdiction this platform
+ * has not heard of must still land on the row.
+ */
+export interface RecordingConsentRow {
+	readonly outcome: "not-required" | "announced" | "accepted" | "declined";
+	readonly method: "none" | "announcement" | "keypress";
+	readonly policy: "none" | "announce" | "announce-and-require-keypress";
+	/** ISO 8601, stamped when the outcome was decided — not when the row was written. */
+	readonly at: string;
+	/** Which parties heard the announcement. */
+	readonly parties: readonly ("caller" | "callee")[];
+	readonly regions?: readonly string[];
+	readonly promptId?: string;
+}
+
+/**
  * `recordings` — metadata for every media object in the S3-compatible store.
  *
  * NOT partitioned and NOT append-only: rows are mutated by the retention lifecycle
@@ -65,6 +88,26 @@ export const recordings = pgTable.withRLS(
 		 * same thing to a reader and neither is worth distinguishing.
 		 */
 		pauses: jsonb("pauses").$type<{ startMs: number; endMs: number }[]>(),
+
+		/**
+		 * What consent this object was made under: the outcome, how it was reached, the policy that
+		 * asked for it, when it was decided, which parties heard the announcement, and the
+		 * jurisdictions that forced all-party treatment.
+		 *
+		 * This is the artifact's own defence. A recording is evidence of a conversation, and the
+		 * first question anyone asks about evidence obtained by recording is whether it was obtained
+		 * lawfully — a question the audio cannot answer and a configuration table cannot either,
+		 * because configuration is what the tenant believes TODAY and this row is about a call that
+		 * happened months ago under settings since changed. So the answer is stamped onto the row at
+		 * the moment the tap opened and is never recomputed.
+		 *
+		 * `jsonb` and not six columns, for the same reason `pauses` above is one column: it is read
+		 * whole with the row that owns it, nothing joins or filters on its parts, and splitting it
+		 * would spend six migrations to express one decision. Null on every row written before this
+		 * existed, and on every recording no consent was required for — the two mean the same thing
+		 * to a reader, which is that nobody was asked and nobody had to be.
+		 */
+		consent: jsonb("consent").$type<RecordingConsentRow>(),
 
 		/** When the retention policy allows the object to be purged. Null = keep indefinitely. */
 		retentionUntil: utcTimestamp("retention_until"),

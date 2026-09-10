@@ -385,6 +385,25 @@ export const pbxRelations = defineRelations(pbxTables, (r) => ({
 			to: r.translationRuleset.id,
 		}),
 	},
+
+	// --- Toll fraud and the shared counter -------------------------------------------------------
+	//
+	// Only the per-extension override has a relation. `toll_fraud_policy` and
+	// `toll_fraud_country_seen` are keyed on the organization alone, and `shared_rate_window` is
+	// keyed on an opaque `(scope, key)` pair whose `key` is deliberately not a foreign key — the
+	// whole point of a shared counter is that a new caller needs no migration, which a reference to
+	// one specific table would undo. Declared empty because `schema.spec.ts` asserts one key per
+	// table.
+	tollFraudPolicy: {},
+	tollFraudCountrySeen: {},
+	sharedRateWindow: {},
+	extensionTollFraudOverride: {
+		extension: r.one.extension({
+			from: r.extensionTollFraudOverride.extensionId,
+			to: r.extension.id,
+			optional: false,
+		}),
+	},
 }));
 
 export type PbxRelations = typeof pbxRelations;

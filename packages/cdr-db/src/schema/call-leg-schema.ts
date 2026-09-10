@@ -144,6 +144,26 @@ export const callLegs = pgTable.withRLS(
 		 */
 		queueAgentRef: uuidEntityId("queue_agent_ref"),
 		/**
+		 * The wrap-up code the agent chose for this call — `sale`, `escalated`, `unset`.
+		 *
+		 * The CODE and not the `queue_disposition_code` row id, for the reason `pin_label` beside it
+		 * is a label and not a foreign key: this database holds no `pbx-db` ids beyond the two refs
+		 * above, and a code reworded or retired in `pbx-db` six months later must not retroactively
+		 * rewrite what this call closed as. `pbx-db`'s `queue_call_disposition` keeps the id and is
+		 * the operational copy the console reads back; this is the reporting copy, and it is here so
+		 * that "every call that closed as escalated and took over four minutes" is one scan of one
+		 * ledger rather than a join across two databases.
+		 *
+		 * `unset` is a real value and means the wrap-up deadline passed with nobody choosing. NULL
+		 * means the queue asks no such question, or the leg never touched a queue at all — which is
+		 * most legs. The two are not the same fact and a default would have merged them.
+		 *
+		 * Written by an UPDATE after the leg row exists, and best-effort: the durable write is the
+		 * `pbx-db` row. A leg still in flight through the CDR consumer when the agent picks a code
+		 * simply keeps its NULL, and the report reads `unset`-like rather than wrong.
+		 */
+		queueDispositionCode: text("queue_disposition_code"),
+		/**
 		 * Which authorisation code opened the outbound route this call took.
 		 *
 		 * Two columns and not one, and NEITHER of them is the digits. A PIN on an outbound route is a
@@ -187,6 +207,46 @@ export const callLegs = pgTable.withRLS(
 		sipAttestation: text("sip_attestation"),
 		sipVerstat: text("sip_verstat"),
 		sipOrigId: text("sip_orig_id"),
+		/**
+		 * What THIS platform decided the outbound call was entitled to assert, and what backed it.
+		 *
+		 * The mirror image of the three columns above, and the distinction is the entire point of
+		 * having both. `sip_attestation` is what somebody else SAID about an inbound call and is
+		 * visibility only. `expected_attestation` is what we DECIDED about an outbound one — the
+		 * April 2026 FNPRM makes that decision the end-user provider's regardless of who holds the
+		 * signing certificate, so the reasoning has to be on our ledger and not only in the carrier's.
+		 *
+		 * `caller_id_right_to_use` is the fact the level was derived from: `owned` (a DID this
+		 * platform assigned, which is the A criterion), `verified` (an external number with a
+		 * documented verification, which is B), or NULL for a number nobody vouched for, which is C.
+		 * Two columns rather than one because an enforcement inquiry asks both questions — "what did
+		 * you assert" and "on what basis" — and a level with no basis recorded is the answer that
+		 * makes the inquiry longer.
+		 *
+		 * NULL on every inbound leg and on every leg written before the decision seam existed. No
+		 * check constraint, for the same reason the three columns above carry none: this table is
+		 * append-only and partitioned, a rejected insert is a call record that is simply gone, and a
+		 * value a newer engine writes into an older schema during a rolling deploy must reach a row
+		 * and read as unknown later rather than lose the leg.
+		 */
+		expectedAttestation: text("expected_attestation"),
+		callerIdRightToUse: text("caller_id_right_to_use"),
+		/**
+		 * The trunk the leg used, and the signalling peer at the other end of it.
+		 *
+		 * Both exist for the traceback, and neither is derivable from what was already here. A
+		 * traceback request names a number and a time window and asks who handed the call over; the
+		 * answer is a trunk and an IP, and until these columns existed answering it meant correlating
+		 * the ledger against sipd's logs by `sip_call_id` inside whatever retention window those logs
+		 * happened to have. The 24-hour clock is not a forensics budget.
+		 *
+		 * `trunk_ref` is a `pbx-db` id and, like every other `*_ref` on this table, is not a foreign
+		 * key — this database holds no `pbx-db` rows to point at. `signaling_address` is text and not
+		 * `inet` because it carries a port as often as not and because a malformed value from a peer
+		 * must reach a row rather than fail the insert.
+		 */
+		trunkRef: uuidEntityId("trunk_ref"),
+		signalingAddress: text("signaling_address"),
 		ivrRef: uuidEntityId("ivr_ref"),
 		ringGroupRef: uuidEntityId("ring_group_ref"),
 		/** Billing tag carried from the extension or trunk. */
@@ -224,6 +284,40 @@ export const callLegs = pgTable.withRLS(
 
 		/** S3 object key; joins to `recordings.object_key`. Null until a recording is finalized. */
 		recordingKey: text("recording_key"),
+
+		/**
+		 * The consent outcome for this leg, flattened out of the record `recordings.consent` holds
+		 * whole.
+		 *
+		 * Flattened here and not `jsonb`, because the two tables are asked different questions. A
+		 * recording is looked at one at a time and its consent read whole; legs are aggregated —
+		 * "how many calls last quarter were recorded after a declined consent", which is a `where`
+		 * over millions of partitioned rows and wants a column, not a `->>`.
+		 *
+		 * And it lives on the leg even when no recording does: a `declined` outcome means the tap
+		 * never opened, so there is no `recordings` row to carry it, and the ONLY durable trace that
+		 * the tenant asked and the caller said no is this leg. Dropping it would make a refusal
+		 * indistinguishable from a call nobody tried to record.
+		 *
+		 * No check constraints on any of the four, deliberately, and unlike every other value domain
+		 * on this table. `call_legs` is append-only and partitioned: a write that fails is a call
+		 * record that is simply gone, with no reconciliation path back to a hangup that happened
+		 * once. A consent outcome this build has never heard of — added by a newer engine writing
+		 * into an older schema during a rolling deploy — must reach a row and be read as unknown
+		 * later, rather than reject the whole leg. The vocabulary is enforced where it can be
+		 * enforced safely: on the configuration columns in `pbx-db`, and in the event schema.
+		 */
+		recordingConsent: text("recording_consent"),
+		/** How the outcome was reached: announcement, keypress, or none. See above for why untyped. */
+		recordingConsentMethod: text("recording_consent_method"),
+		/** When the outcome was decided, which is at recording-start and not at leg write. */
+		recordingConsentAt: utcTimestamp("recording_consent_at"),
+		/**
+		 * The jurisdictions that forced all-party treatment on this call, as ISO 3166-2 / `EU`
+		 * strings. `jsonb` rather than `text[]`: it is a short list read whole with the row, and it
+		 * is the one of the four that is genuinely open-ended.
+		 */
+		recordingConsentRegions: jsonb("recording_consent_regions").$type<string[]>(),
 		transcriptionStatus: text("transcription_status")
 			.$type<TranscriptionStatus>()
 			.notNull()
@@ -306,6 +400,34 @@ export const callLegs = pgTable.withRLS(
 		index("call_legs_queue_agent_idx")
 			.on(table.organizationId, table.queueAgentRef, table.startedAt.desc().nullsLast())
 			.where(sql`queue_agent_ref is not null`),
+
+		/**
+		 * The three indexes a traceback runs on, and the only ones on this table that do NOT lead
+		 * with `organization_id`.
+		 *
+		 * That is the whole reason they exist. Every other index here is shaped around a tenant
+		 * asking about its own calls, and the question an Industry Traceback Group request asks is
+		 * the opposite one: "who, anywhere on this platform, placed a call to +1-212-555-0100 between
+		 * 14:00 and 15:00 last Tuesday?" — asked by a platform operator who is not inside any tenant
+		 * and cannot be. Against `call_legs_organization_to_idx` that degrades to a scan of every
+		 * partition in the window; leading on the number instead makes it a seek per partition, with
+		 * `started_at` second so the range narrows inside the bucket without a sort.
+		 *
+		 * The FCC has already enforced this clock — a September 2025 group order against twelve
+		 * providers who certified a 24-hour traceback response and missed it — which is the argument
+		 * for paying the insert cost on every leg rather than making these partial. There is no
+		 * predicate that would make them smaller anyway: a traceback can name any number on the
+		 * platform, so the rows they must serve are all of them.
+		 *
+		 * `call_legs_trunk_idx` IS partial, because it can be: only a leg that crossed a carrier
+		 * names a trunk, and "which calls came in over this trunk" is asked about the handover point
+		 * rather than about a tenant.
+		 */
+		index("call_legs_traceback_to_idx").on(table.toNumber, table.startedAt.desc().nullsLast()),
+		index("call_legs_traceback_from_idx").on(table.fromNumber, table.startedAt.desc().nullsLast()),
+		index("call_legs_trunk_idx")
+			.on(table.trunkRef, table.startedAt.desc().nullsLast())
+			.where(sql`trunk_ref is not null`),
 
 		// Append-only ledger: SELECT + INSERT, two policies, no UPDATE/DELETE for the tenant role.
 		pgPolicy("call_legs_tenant_select", {

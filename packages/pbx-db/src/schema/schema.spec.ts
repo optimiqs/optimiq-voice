@@ -16,6 +16,7 @@ import {
 import { FAX_DIRECTIONS, FAX_MESSAGE_STATUSES } from "./fax-schema";
 import { FEATURE_CODE_ACTIONS } from "./features-schema";
 import { PROMPT_KINDS } from "./media-schema";
+import { RECORDING_CONSENT_POLICIES } from "./numbers-schema";
 import {
 	QUEUE_AGENT_STATUSES,
 	QUEUE_PRIORITY_MAX,
@@ -45,6 +46,7 @@ const CONST_TUPLES = {
 	QUEUE_AGENT_STATUSES,
 	QUEUE_STRATEGIES,
 	RECORD_POLICIES,
+	RECORDING_CONSENT_POLICIES,
 	SHARED_LINE_STRATEGIES,
 	SIP_ACL_SCOPES,
 	TIME_CONDITION_OVERRIDES,
@@ -209,6 +211,45 @@ describe("tenant tables", () => {
 		"fax_message_send_queue_idx",
 		// SIP authentication must resolve an organization before a tenant scope can be established.
 		"org_setting_sip_realm_global_key",
+		// The platform operator's onboarding queue, and the same argument the outbox indexes make: the
+		// question is "which KYC files ANYWHERE are still waiting on a reviewer?", asked on the
+		// untenanted handle by somebody who is not acting inside any tenant. An organization-first
+		// index cannot serve it. The tenant's own read is the unique index on `organization_id`, which
+		// does lead with it — and this table holds one row per organization, so the cost of being
+		// wrong about the shape here is a scan of a table the size of the customer list.
+		"organization_kyc_decision_idx",
+		// The outbound message send queue — the same argument `fax_message_send_queue_idx` makes, and
+		// it matters more here than anywhere else on this list because `message` is the busiest table
+		// in this schema. The send worker asks "which outbound messages ANYWHERE still owe a send?" on
+		// the untenanted handle with no session organization; an organization-first index could only
+		// be scanned in full for that. Partial over the two working statuses, so it is the size of the
+		// backlog — normally near-empty — rather than of the table.
+		"message_send_queue_idx",
+		// The messaging retention sweeper's index, and the same argument: "which message anywhere is
+		// past its retention date?" is the platform's question, not a tenant's, and leading with
+		// `organization_id` would make the sweep read every tenant's live rows to find the few that
+		// are not. Partial over the rows that have a policy at all, which on a deployment that has not
+		// set one is none of them.
+		"message_retention_idx",
+		// A messaging line is looked up by its E.164 with no tenant in hand, exactly as
+		// `phone_number_e164_global_key` is and for the same reason: an inbound message webhook
+		// arrives carrying a `to` and nothing else, so the lookup that decides whose message it is
+		// must have exactly one answer platform-wide. It inherits that guarantee from
+		// `phone_number`'s own global uniqueness rather than re-deriving it through a join under no
+		// tenant scope.
+		"messaging_number_e164_global_key",
+		// The three carrier-side registration ids, and they are global because the REGISTRY's ids are.
+		// A TCR brand id, a TCR campaign id and a carrier verification id are each unique at the
+		// authority that issues them, so two tenants holding one is not a configuration choice — it is
+		// a claim that cannot be true. Scoping these per tenant would let a redelivered status poll or
+		// a double-submit file the same registration twice under two organizations, and the send gate
+		// would then read whichever row it happened to find. The cost is the same one
+		// `phone_number_e164_global_key` documents: the second tenant gets a `23505` telling them the
+		// id is taken somewhere on the platform, and the error message says exactly that and nothing
+		// more.
+		"messaging_brand_carrier_brand_id_key",
+		"messaging_campaign_carrier_campaign_id_key",
+		"messaging_toll_free_verification_carrier_id_key",
 	]);
 
 	it("leads every composite index with organization_id so the tenant predicate is usable", () => {
@@ -1339,5 +1380,92 @@ describe("fax servers and messages", () => {
 		]);
 		expect(serverConfig.enableRLS).toBe(true);
 		expect(messageConfig.enableRLS).toBe(true);
+	});
+});
+
+/**
+ * Recording consent, across the four tables that configure it.
+ *
+ * What is worth pinning here is the asymmetry, because it is a decision and not an oversight. The
+ * two consent columns are NULLABLE with no default — NULL is "inherit", and a default would turn
+ * every pre-existing DID and route into one asserting a policy nobody chose. The two auto-pause
+ * booleans are `not null default false` — that is a behaviour with a correct off state, and off is
+ * what every extension and queue did before the columns existed.
+ *
+ * The check constraint is the other half: it has to admit NULL, or "inherit" becomes unwritable.
+ */
+describe("recording consent", () => {
+	const CONSENT_TABLES = [
+		["phone_number", pbxTables.phoneNumber],
+		["inbound_route", pbxTables.inboundRoute],
+	] as const;
+
+	it("mirrors the routing vocabulary exactly, since it cannot import it", () => {
+		expect([...RECORDING_CONSENT_POLICIES]).toEqual([
+			"none",
+			"announce",
+			"announce-and-require-keypress",
+		]);
+	});
+
+	it("keeps the policy nullable and defaultless on both, because NULL is `inherit`", () => {
+		for (const [name, table] of CONSENT_TABLES) {
+			const column = getTableConfig(table).columns.find(
+				(candidate) => candidate.name === "recording_consent_policy",
+			);
+
+			expect(column, name).toBeDefined();
+			expect(column?.notNull, name).toBe(false);
+			expect(column?.hasDefault, name).toBe(false);
+		}
+	});
+
+	it("admits NULL in the check, or the inherit case could not be written at all", () => {
+		for (const [name, table] of CONSENT_TABLES) {
+			const config = getTableConfig(table);
+			const check = config.checks.find(
+				(candidate) => candidate.name === `${name}_recording_consent_policy_check`,
+			);
+
+			expect(check, name).toBeDefined();
+			const sqlText = JSON.stringify(check?.value.queryChunks);
+			expect(sqlText.includes("recording_consent_policy is null"), name).toBe(true);
+			for (const policy of RECORDING_CONSENT_POLICIES) {
+				expect(sqlText.includes(`'${policy}'`), `${name}:${policy}`).toBe(true);
+			}
+		}
+	});
+
+	it("sets the consent prompt null on delete, so losing media costs wording and not the row", () => {
+		for (const [name, table] of CONSENT_TABLES) {
+			const config = getTableConfig(table);
+			const column = config.columns.find(
+				(candidate) => candidate.name === "recording_consent_prompt_id",
+			);
+
+			expect(column?.notNull, name).toBe(false);
+			expect(column?.getSQLType(), name).toBe("uuid");
+
+			const foreignKey = config.foreignKeys.find((candidate) =>
+				candidate.reference().columns.some((entry) => entry.name === "recording_consent_prompt_id"),
+			);
+			expect(foreignKey?.onDelete, name).toBe("set null");
+			expect(getTableName(foreignKey?.reference().foreignTable as Table), name).toBe("prompt");
+		}
+	});
+
+	it("arms the PCI auto-pause off by default on both the extension and the queue", () => {
+		for (const [name, table] of [
+			["extension", pbxTables.extension],
+			["queue", pbxTables.queue],
+		] as const) {
+			const column = getTableConfig(table).columns.find(
+				(candidate) => candidate.name === "record_auto_pause_on_dtmf",
+			);
+
+			expect(column, name).toBeDefined();
+			expect(column?.notNull, name).toBe(true);
+			expect(column?.default, name).toBe(false);
+		}
 	});
 });

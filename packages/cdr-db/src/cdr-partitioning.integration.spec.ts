@@ -15,6 +15,7 @@ import {
 	dropPartitionsBefore,
 	expiredRecordingsSelectQuery,
 	expiredRecordingsUpdateQuery,
+	purgedRecordingSoftDeleteQuery,
 	purgedRecordingTombstoneDeleteQuery,
 } from "./retention";
 import {
@@ -296,5 +297,50 @@ describe.skipIf(!CDR_INTEGRATION_TESTS_ENABLED)("cdr retention", () => {
 			purgedRecordingTombstoneDeleteQuery(new Date(Date.now() + 60_000)),
 		)) as { id: string }[];
 		expect(removed.map((row) => row.id)).toContain(expiringRecordingId);
+	});
+});
+
+describe.skipIf(!CDR_INTEGRATION_TESTS_ENABLED)("purged recording tombstones", () => {
+	const organizationId = createEntityId();
+	const recordingIds = [createEntityId(), createEntityId(), createEntityId()];
+	let database: CdrIntegrationDatabase;
+
+	beforeAll(async () => {
+		database = createCdrIntegrationDatabase();
+		await database.db.execute(sql`
+			insert into "recordings" ("id", "organization_id", "kind", "object_key")
+			values ${sql.join(
+				recordingIds.map(
+					(id) =>
+						sql`(${id}::uuid, ${organizationId}::uuid, 'call', ${`${organizationId}/${id}.wav`})`,
+				),
+				sql`, `,
+			)}
+		`);
+	});
+
+	afterAll(async () => {
+		await database.db.execute(deleteOrganizationRowsQuery([organizationId]));
+		await database.close();
+	});
+
+	it("tombstones every id in one batch and is a no-op on a re-run", async () => {
+		const purged = (await database.db.execute(
+			purgedRecordingSoftDeleteQuery(new Date(), recordingIds),
+		)) as { id: string }[];
+		expect(purged.map((row) => row.id).sort()).toEqual([...recordingIds].sort());
+
+		const rows = (await database.db.execute(sql`
+			select "id", "deleted_at" from "recordings" where "organization_id" = ${organizationId}::uuid
+		`)) as { id: string; deleted_at: Date | null }[];
+		expect(rows).toHaveLength(3);
+		for (const row of rows) {
+			expect(row.deleted_at).not.toBeNull();
+		}
+
+		const again = (await database.db.execute(
+			purgedRecordingSoftDeleteQuery(new Date(), recordingIds),
+		)) as { id: string }[];
+		expect(again).toHaveLength(0);
 	});
 });

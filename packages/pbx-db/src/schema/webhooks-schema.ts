@@ -19,14 +19,21 @@ import { tenantIsolationPolicy } from "../tenant";
  * health — none of which fits in `org_setting`, and all of which an administrator has to be able to
  * list, edit and switch off from a screen.
  *
- * ## The secret is stored, not hashed, and that is the only honest option
+ * ## The secret is encrypted, not hashed, and that is the only honest option
  *
  * Every other credential in this database is one-way: `sip_credential` keeps an HA1, `voicemail_box`
  * a scrypt PIN, `device` a token hash. This one cannot be, because the platform is the party that
- * must PRODUCE the signature on every delivery — an HMAC needs the key, not a verifier for it. The
- * mitigations are therefore about blast radius rather than storage: it never leaves the process in a
- * response body (`WEBHOOK_SUBSCRIPTION_RESOURCE.secretColumns`), it is redacted from both sides of
- * the audit diff, it signs one tenant's deliveries to one endpoint, and rotating it is a PATCH.
+ * must PRODUCE the signature on every delivery — an HMAC needs the key, not a verifier for it. What
+ * it CAN be is sealed, and it is: the column holds a `secret-cipher.ts` envelope under
+ * `PLATFORM_SECRET_ENCRYPTION_KEY`, the same shape an SSO client secret gets and for the same
+ * reason — a value the platform has to present again. `WebhooksService` seals on every write and the
+ * dispatcher opens it once per cache fill; a row written before this existed is still plaintext and
+ * is re-sealed lazily by that same fill, so a deployment converges without a migration window.
+ *
+ * The rest of the mitigations are about blast radius: it never leaves the process in a response body
+ * (`WEBHOOK_SUBSCRIPTION_RESOURCE.secretColumns`) except once, in the create response that mints it,
+ * it is redacted from both sides of the audit diff, it signs one tenant's deliveries to one
+ * endpoint, and rotating it is a PATCH.
  *
  * ## `event_selectors` is `jsonb` and not a child table
  *
@@ -58,7 +65,8 @@ export const webhookSubscription = pgTable.withRLS(
 		/** Where deliveries are POSTed. `https` in production; the API's DTO is what enforces that. */
 		url: text("url").notNull(),
 		/**
-		 * The HMAC-SHA256 signing key, stored because the platform is the signer. See the note above.
+		 * The HMAC-SHA256 signing key, ENCRYPTED at rest because the platform is the signer and so
+		 * cannot hash it. See the note above.
 		 */
 		secret: text("secret").notNull(),
 		/**

@@ -1,4 +1,5 @@
-import { boolean, index, pgTable, text, uniqueIndex } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { boolean, check, index, pgTable, text, uniqueIndex } from "drizzle-orm/pg-core";
 import {
 	auditTimestampColumns,
 	tenantOrganizationIdColumn,
@@ -9,6 +10,28 @@ import { tenantIsolationPolicy } from "../tenant";
 import { carrierCheck, carrierColumns } from "./carrier-schema";
 import { destinationCheck, destinationColumns } from "./columns";
 import { emergencyAddress } from "./emergency-schema";
+import { prompt } from "./media-schema";
+
+/**
+ * What a tenant asks of a call it records, before the recorder is allowed to exist.
+ *
+ * Mirrored here rather than imported: `packages/routing` owns the canonical vocabulary
+ * (`recording-consent.ts`) and this package cannot depend on it — the same arrangement
+ * `RECORD_POLICIES` lives under in `extensions-schema.ts`. The values are identical by contract and
+ * the spec pins the spelling, so the two copies cannot drift silently.
+ *
+ * `announce` plays a disclosure and records regardless; `announce-and-require-keypress` refuses to
+ * start the tap at all unless the party accepts. That difference is the whole reason this is an
+ * enum and not a boolean: consent that is asked for and consent that is merely announced are
+ * different legal postures, and a tenant in an all-party jurisdiction needs to be able to say which
+ * one they are taking.
+ */
+export const RECORDING_CONSENT_POLICIES = [
+	"none",
+	"announce",
+	"announce-and-require-keypress",
+] as const;
+export type RecordingConsentPolicy = (typeof RECORDING_CONSENT_POLICIES)[number];
 
 /**
  * DIDs. The physical table is `phone_number` rather than `number` because `number` reads as a
@@ -49,6 +72,31 @@ export const phoneNumber = pgTable.withRLS(
 		/** Prefixed onto the inbound caller-id name, e.g. `[Support] `. */
 		callerIdNamePrefix: text("caller_id_name_prefix"),
 		recordEnabled: boolean("record_enabled").notNull().default(false),
+		/**
+		 * This DID's consent posture, overriding the organization's. NULL — the default and the
+		 * value on every row written before this column existed — means "inherit the org", which is
+		 * why it is nullable rather than `not null default 'none'`: a default would make every
+		 * existing DID assert a policy nobody chose for it, and the compiler could no longer tell an
+		 * explicit `none` from silence when the org later says `announce`.
+		 *
+		 * Per-DID because jurisdiction follows the NUMBER. A tenant with a California DID and a Texas
+		 * DID has two different obligations on one account, and an org-wide setting can only satisfy
+		 * both by applying the stricter one to calls that never needed it.
+		 */
+		recordingConsentPolicy: text("recording_consent_policy").$type<RecordingConsentPolicy>(),
+		/**
+		 * The disclosure this DID plays. NULL falls back to the org's prompt and then to the seeded
+		 * system stem, so a tenant who never uploads anything still announces.
+		 *
+		 * `on delete set null` for the reason every other prompt reference uses it: deleting a media
+		 * file must not delete the DID that referenced it, and `restrict` would make retiring an old
+		 * greeting a puzzle. The cost is a fallback to the system stem, which still discloses — the
+		 * announcement degrades, it never disappears.
+		 */
+		recordingConsentPromptId: uuidEntityId("recording_consent_prompt_id").references(
+			() => prompt.id,
+			{ onDelete: "set null" },
+		),
 		emergencyAddressId: uuidEntityId("emergency_address_id").references(() => emergencyAddress.id, {
 			onDelete: "set null",
 		}),
@@ -82,6 +130,13 @@ export const phoneNumber = pgTable.withRLS(
 			table.organizationId,
 			table.carrierProvider,
 			table.carrierRef,
+		),
+		// NULL passes: it is "inherit the org", not an unspecified policy. Anything else must be one
+		// of the three the compiler and the engine both understand — a typo here is a call that
+		// silently records without disclosing.
+		check(
+			"phone_number_recording_consent_policy_check",
+			sql`recording_consent_policy is null or recording_consent_policy in ('none', 'announce', 'announce-and-require-keypress')`,
 		),
 		destinationCheck("phone_number"),
 		carrierCheck("phone_number"),
