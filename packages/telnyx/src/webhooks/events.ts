@@ -5,6 +5,12 @@ import {
 	isTelnyxFaxEvent,
 	telnyxFaxWebhookPayloadSchema,
 } from "../resources/faxes";
+import {
+	type TelnyxMessageEventType,
+	type TelnyxMessageWebhookPayload,
+	isTelnyxMessageEvent,
+	telnyxMessageWebhookPayloadSchema,
+} from "../resources/messages";
 import { numberOrderSchema } from "../resources/number-orders";
 
 /**
@@ -142,4 +148,35 @@ export function asFaxWebhook(event: TelnyxWebhookEvent): TelnyxFaxWebhook | unde
 		return undefined;
 	}
 	return { ...event, eventType: event.eventType, fax: fax.data };
+}
+
+/** The narrowed shape for any of the `message.*` events, inbound or outbound. */
+export interface TelnyxMessageWebhook extends TelnyxWebhookEvent {
+	readonly eventType: TelnyxMessageEventType;
+	readonly message: TelnyxMessageWebhookPayload;
+}
+
+/**
+ * Narrows a parsed event to a message event, or `undefined` when it is something else.
+ *
+ * Two gates, exactly as `asFaxWebhook`. First the `event_type` must be one of the three message
+ * events this integration models — an unmodelled `message.*` (Telnyx adds them) is logged-and-200'd,
+ * not acted on. Then the payload is re-validated with the message payload schema rather than
+ * trusted: a signed webhook body is still attacker-influenced input, and "signed by Telnyx" is not
+ * "shaped the way our message handler expects". A body that passes the signature but fails the
+ * schema is a shape drift to fix in `reference/telnyx-api.md`, surfaced by the consumer as an
+ * unhandled event rather than a crash.
+ *
+ * The delivery outcome is NOT in `eventType`: read it with `telnyxDeliveryStatus(webhook.message)`,
+ * which is the one place Telnyx's per-recipient vocabulary is translated into ours.
+ */
+export function asMessageWebhook(event: TelnyxWebhookEvent): TelnyxMessageWebhook | undefined {
+	if (!isTelnyxMessageEvent(event.eventType)) {
+		return undefined;
+	}
+	const message = telnyxMessageWebhookPayloadSchema.safeParse(event.payload);
+	if (!message.success) {
+		return undefined;
+	}
+	return { ...event, eventType: event.eventType, message: message.data };
 }

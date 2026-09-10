@@ -3,7 +3,13 @@ import {
 	type CredentialConnectionsResource,
 	makeCredentialConnections,
 } from "./resources/credential-connections";
+import { type E911AddressesResource, makeE911Addresses } from "./resources/e911-addresses";
 import { type FaxesResource, makeFaxes } from "./resources/faxes";
+import { makeMessages, type MessagesResource } from "./resources/messages";
+import {
+	makeMessagingProfiles,
+	type MessagingProfilesResource,
+} from "./resources/messaging-profiles";
 import { makeNumberOrders, type NumberOrdersResource } from "./resources/number-orders";
 import {
 	makeOutboundVoiceProfiles,
@@ -11,6 +17,11 @@ import {
 } from "./resources/outbound-voice-profiles";
 import { makePhoneNumbers, type PhoneNumbersResource } from "./resources/phone-numbers";
 import { makePortingOrders, type PortingOrdersResource } from "./resources/porting-orders";
+import { makeTenDlc, type TenDlcResource } from "./resources/ten-dlc";
+import {
+	makeTollFreeVerification,
+	type TollFreeVerificationResource,
+} from "./resources/toll-free-verification";
 import { createTelnyxTransport, type TelnyxClientOptions } from "./transport";
 
 /**
@@ -41,8 +52,26 @@ export interface TelnyxClient {
 	readonly portingOrders: PortingOrdersResource;
 	readonly credentialConnections: CredentialConnectionsResource;
 	readonly outboundVoiceProfiles: OutboundVoiceProfilesResource;
+	/**
+	 * The carrier's address book, and the E911 dispatchable-location validation that runs against
+	 * it. A sibling of `phoneNumbers` rather than part of it because an address outlives the DID
+	 * that cites it and is validated once, not per number.
+	 */
+	readonly e911Addresses: E911AddressesResource;
 	/** Programmable Fax: send a fax, read one back. Inbound arrives over the `fax.*` webhooks. */
 	readonly faxes: FaxesResource;
+	/** Programmable Messaging: send an SMS/MMS, read one back. Inbound arrives over `message.*`. */
+	readonly messages: MessagesResource;
+	/** Where a number's messaging webhooks go, and which DIDs are attached to that profile. */
+	readonly messagingProfiles: MessagingProfilesResource;
+	/**
+	 * Brand and campaign registration with The Campaign Registry. A sibling of `messagingProfiles`
+	 * rather than part of it: a profile is Telnyx configuration that takes effect immediately, while
+	 * a 10DLC registration is a third-party review that takes days and can be rejected.
+	 */
+	readonly tenDlc: TenDlcResource;
+	/** The toll-free equivalent of `tenDlc` — a different registry, a different contract. */
+	readonly tollFreeVerification: TollFreeVerificationResource;
 	/** Exposed for logging and for the verification script's "which server am I talking to". */
 	readonly baseUrl: string;
 }
@@ -56,7 +85,12 @@ export function createTelnyxClient(options: TelnyxClientOptions): TelnyxClient {
 		portingOrders: makePortingOrders(transport),
 		credentialConnections: makeCredentialConnections(transport),
 		outboundVoiceProfiles: makeOutboundVoiceProfiles(transport),
+		e911Addresses: makeE911Addresses(transport),
 		faxes: makeFaxes(transport),
+		messages: makeMessages(transport),
+		messagingProfiles: makeMessagingProfiles(transport),
+		tenDlc: makeTenDlc(transport),
+		tollFreeVerification: makeTollFreeVerification(transport),
 		baseUrl: transport.baseUrl,
 	};
 }

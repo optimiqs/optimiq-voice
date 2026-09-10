@@ -5,15 +5,23 @@
  * bundle. See `fake/server.ts` for what it is faithful about and what it is not.
  */
 
-export { type FakeTelnyxServer, startFakeTelnyxServer } from "./server";
+export { FAKE_BRAND_OTP_PIN, type FakeTelnyxServer, startFakeTelnyxServer } from "./server";
 export {
 	defaultInventory,
+	type FakeAddress,
+	type FakeAddressValidation,
 	type FakeConnection,
 	type FakeNumberInventoryEntry,
+	type FakeBrand,
+	type FakeCampaign,
+	type FakeMessage,
+	type FakeMessagingProfile,
 	type FakeOrder,
+	type FakePhoneNumberCampaign,
 	type FakePortingOrder,
 	type FakeProfile,
 	FakeTelnyxState,
+	type FakeTollFreeVerification,
 } from "./state";
 export {
 	signFakeTelnyxWebhook,

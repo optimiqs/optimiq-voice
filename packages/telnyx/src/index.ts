@@ -50,6 +50,22 @@ export {
 	type UpdateCredentialConnectionInput,
 } from "./resources/credential-connections";
 export {
+	assertAddressCountry,
+	type CreateE911AddressInput,
+	type E911AddressesResource,
+	type E911AddressFields,
+	isTelnyxAddressValid,
+	type ListE911AddressesQuery,
+	makeE911Addresses,
+	TELNYX_ADDRESS_VALIDATION_RESULTS,
+	type TelnyxAddress,
+	TelnyxAddressFormatError,
+	type TelnyxAddressValidation,
+	type TelnyxAddressValidationResult,
+	telnyxAddressSchema,
+	telnyxAddressValidationSchema,
+} from "./resources/e911-addresses";
+export {
 	assertFaxMedia,
 	type FaxesResource,
 	isTelnyxFaxEvent,
@@ -69,6 +85,42 @@ export {
 	telnyxFaxSchema,
 	telnyxFaxWebhookPayloadSchema,
 } from "./resources/faxes";
+export {
+	type CreateMessagingProfileInput,
+	makeMessagingProfiles,
+	messagingProfileSchema,
+	type MessagingProfilesResource,
+	type TelnyxMessagingProfile,
+	type TelnyxPhoneNumberMessaging,
+	telnyxPhoneNumberMessagingSchema,
+	type UpdateMessagingProfileInput,
+} from "./resources/messaging-profiles";
+export {
+	assertMessageContent,
+	isTelnyxMessageEvent,
+	makeMessages,
+	messageFromE164,
+	type MessagesResource,
+	type SendMessageInput,
+	TELNYX_MESSAGE_DIRECTIONS,
+	TELNYX_MESSAGE_EVENT_TYPES,
+	TELNYX_MESSAGE_EVENTS,
+	TELNYX_MESSAGE_TO_STATUSES,
+	TELNYX_MESSAGE_TYPES,
+	type TelnyxDeliveryStatus,
+	type TelnyxMessage,
+	type TelnyxMessageDirection,
+	type TelnyxMessageEventType,
+	type TelnyxMessageRecipient,
+	TelnyxMessageRequestError,
+	type TelnyxMessageToStatus,
+	type TelnyxMessageType,
+	type TelnyxMessageWebhookPayload,
+	telnyxDeliveryStatus,
+	telnyxMessageRecipientSchema,
+	telnyxMessageSchema,
+	telnyxMessageWebhookPayloadSchema,
+} from "./resources/messages";
 export {
 	type CreateNumberOrderInput,
 	numberOrderSchema,
@@ -120,6 +172,39 @@ export {
 	type TelnyxPortingOrderStatus,
 } from "./resources/porting-orders";
 export {
+	type CreateBrandInput,
+	type CreateCampaignInput,
+	makeTenDlc,
+	TELNYX_BRAND_IDENTITY_STATUSES,
+	TELNYX_CAMPAIGN_STATUSES,
+	TELNYX_ENTITY_TYPES,
+	type TelnyxBrand,
+	type TelnyxBrandIdentityStatus,
+	type TelnyxCampaign,
+	type TelnyxCampaignStatus,
+	type TelnyxEntityType,
+	type TelnyxPhoneNumberCampaign,
+	telnyxBrandSchema,
+	telnyxCampaignSchema,
+	telnyxPhoneNumberCampaignSchema,
+	type TenDlcResource,
+	type TriggerBrandOtpInput,
+} from "./resources/ten-dlc";
+export {
+	assertBusinessRegistrationCountry,
+	makeTollFreeVerification,
+	type SubmitTollFreeVerificationInput,
+	TELNYX_TOLL_FREE_VERIFICATION_STATUSES,
+	type TelnyxTollFreeVerification,
+	type TelnyxTollFreeVerificationStatus,
+	TelnyxTollFreeVerificationRequestError,
+	telnyxTollFreeVerificationSchema,
+	type TollFreeVerificationImage,
+	type TollFreeVerificationPhoneNumber,
+	type TollFreeVerificationResource,
+	type UpdateTollFreeVerificationInput,
+} from "./resources/toll-free-verification";
+export {
 	backoffDelayMs,
 	DEFAULT_RETRY_POLICY,
 	isRetryableStatus,
@@ -160,10 +245,12 @@ export {
 } from "./webhooks/signature";
 export {
 	asFaxWebhook,
+	asMessageWebhook,
 	asNumberOrderWebhook,
 	parseTelnyxWebhookEvent,
 	TELNYX_NUMBER_ORDER_EVENT,
 	type TelnyxFaxWebhook,
+	type TelnyxMessageWebhook,
 	type TelnyxNumberOrderWebhook,
 	type TelnyxWebhookEvent,
 } from "./webhooks/events";
