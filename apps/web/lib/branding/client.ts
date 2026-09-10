@@ -15,11 +15,12 @@
  * fallback is the honest default app, not a fake tenant.
  */
 
-import { apiFetch } from "../api-client";
+import { apiFetch, apiUpload } from "../api-client";
 import { toBranding, type Branding } from "./contracts";
 
 export const BRANDING_PATH = "/branding";
 export const BRANDING_BY_HOST_PATH = "/branding/by-host";
+export const BRANDING_LOGO_PATH = "/branding/logo";
 
 interface BrandingEnvelope {
 	readonly data: unknown;
@@ -37,6 +38,19 @@ export async function updateBranding(patch: Partial<Branding>): Promise<Branding
 		method: "PATCH",
 		body: JSON.stringify(patch),
 	});
+	return toBranding(data);
+}
+
+/**
+ * Upload a logo image and point the organization's brand at the stored object.
+ *
+ * `multipart/form-data` through {@link apiUpload} rather than {@link apiFetch}, for the reason that
+ * function documents: the browser owns the content type when the body is a `FormData`. The response
+ * is the RE-RESOLVED branding, carrying the object key the server minted, so the caller can seed the
+ * branding cache with it and never has to guess the key or re-read to learn it.
+ */
+export async function uploadBrandingLogo(file: File): Promise<Branding> {
+	const { data } = await apiUpload<BrandingEnvelope>(BRANDING_LOGO_PATH, file);
 	return toBranding(data);
 }
 

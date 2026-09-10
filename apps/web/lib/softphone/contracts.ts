@@ -79,13 +79,43 @@ export interface SoftphoneMedia {
 	readonly note: string;
 }
 
-/** The documented wire shape of `GET /api/v1/me/softphone`. */
-export interface SoftphoneCredentialsResponse {
+/**
+ * Why this caller has no softphone, as a value rather than a status code.
+ *
+ * Mirrors `apps/api/src/provisioning/softphone/softphone.service.ts#SoftphoneUnavailableReason`.
+ * The three are genuinely different situations with different sentences and different fixes, and
+ * branching on the name means a message change never breaks the mapping.
+ */
+export type SoftphoneUnavailableReason = "no-extension" | "no-realm" | "not-provisioned";
+
+/** The `configured: false` arm — a 200, because "you have no softphone" is a valid answer. */
+export interface SoftphoneUnavailableResponse {
+	readonly configured: false;
+	readonly reason: SoftphoneUnavailableReason;
+	/** @deprecated The status code this state used to be refused with. Read `reason`. */
+	readonly code: string;
+	readonly message: string;
+}
+
+/** The `configured: true` arm — everything a UA needs. */
+export interface SoftphoneConfiguredResponse {
+	readonly configured: true;
 	readonly extension: SoftphoneExtension;
 	readonly account: SoftphoneAccount;
 	readonly transport: SoftphoneTransport;
 	readonly media: SoftphoneMedia;
 }
+
+/**
+ * The documented wire shape of `GET /api/v1/me/softphone`.
+ *
+ * A discriminated union answered with 200 in every arm. It used to be the configured shape plus a
+ * 404 / 503 refusal, which meant "you hold no extension" — an ordinary fact about most users —
+ * arrived as a console error on every screen in the product. Narrow on `configured` first.
+ */
+export type SoftphoneCredentialsResponse =
+	| SoftphoneConfiguredResponse
+	| SoftphoneUnavailableResponse;
 
 /**
  * What the SIP user agent actually needs, fully resolved — no NULLs the UA would have to decide on.

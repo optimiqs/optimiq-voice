@@ -1,10 +1,12 @@
 import { apiFetch } from "../api-client";
 import type {
+	AgentStatsEnvelope,
 	CallDetail,
 	CallLegDetail,
 	CallLegRow,
 	CdrExportDownloadLink,
 	CdrExportRow,
+	CallVolumeEnvelope,
 	CdrExportStatus,
 	CursorEnvelope,
 	QueueStatsEnvelope,
@@ -146,6 +148,105 @@ export function queueStatsParams(query: QueueStatsQuery): Record<string, unknown
 export async function fetchQueueStats(query: QueueStatsQuery = {}): Promise<QueueStatsEnvelope> {
 	return await apiFetch<QueueStatsEnvelope>(
 		`/cdr/queue-stats?${cdrSearchParams(queueStatsParams(query))}`,
+	);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Agent statistics and call volume
+// ---------------------------------------------------------------------------------------------
+
+/** `DEFAULT_WRAP_UP_SECONDS` / `MAX_WRAP_UP_SECONDS`, mirrored from `agent-stats.ts`. */
+export const DEFAULT_WRAP_UP_SECONDS = 120;
+export const MAX_WRAP_UP_SECONDS = 3_600;
+/** `MAX_AGENT_STATS_GROUPS`. The GROUP ceiling, not a page size — there is no cursor here. */
+export const MAX_AGENT_STATS_GROUPS = 2_000;
+
+export interface AgentStatsQuery {
+	readonly from?: string | undefined;
+	readonly to?: string | undefined;
+	/** One agent (a `queue_agent` row id), or everyone who took a call in the window. */
+	readonly agentId?: string | undefined;
+	readonly queueId?: string | undefined;
+	readonly wrapUpSeconds?: number | undefined;
+	readonly limit?: number | undefined;
+}
+
+/**
+ * The parameters as the endpoint takes them, with the unset ones omitted.
+ *
+ * Pure and exported for the reason {@link queueStatsParams} is: this object IS the React Query
+ * cache key, so `agentId: ""` and no `agentId` have to be one entry rather than two. The wrap-up cap
+ * is CLAMPED here rather than sent and refused — somebody dragging a control past an hour meant
+ * "the maximum", not "an error" — which is the same trade the SLA control makes.
+ */
+export function agentStatsParams(query: AgentStatsQuery): Record<string, unknown> {
+	const wrapUpSeconds = query.wrapUpSeconds ?? DEFAULT_WRAP_UP_SECONDS;
+	return {
+		...(query.from === undefined ? {} : { from: query.from }),
+		...(query.to === undefined ? {} : { to: query.to }),
+		...(query.agentId === undefined || query.agentId === "" ? {} : { agentId: query.agentId }),
+		...(query.queueId === undefined || query.queueId === "" ? {} : { queueId: query.queueId }),
+		wrapUpSeconds: Math.min(MAX_WRAP_UP_SECONDS, Math.max(1, Math.round(wrapUpSeconds))),
+		...(query.limit === undefined
+			? {}
+			: { limit: Math.min(MAX_AGENT_STATS_GROUPS, Math.max(1, Math.round(query.limit))) }),
+	};
+}
+
+/**
+ * Per-agent handling over a window.
+ *
+ * Gated by `queues.monitor`, like {@link fetchQueueStats} and for the same argument the controller
+ * makes: counts and averages keyed on a seat id, with no call named anywhere in the response.
+ */
+export async function fetchAgentStats(query: AgentStatsQuery = {}): Promise<AgentStatsEnvelope> {
+	return await apiFetch<AgentStatsEnvelope>(
+		`/cdr/agent-stats?${cdrSearchParams(agentStatsParams(query))}`,
+	);
+}
+
+export const VOLUME_BUCKETS = ["hour", "day"] as const;
+export type VolumeBucket = (typeof VOLUME_BUCKETS)[number];
+export const DEFAULT_VOLUME_BUCKET: VolumeBucket = "hour";
+
+export const VOLUME_BUCKET_LABELS: Readonly<Record<VolumeBucket, string>> = {
+	hour: "By hour",
+	day: "By day",
+};
+
+export interface CallVolumeQuery {
+	readonly from?: string | undefined;
+	readonly to?: string | undefined;
+	readonly bucket?: VolumeBucket | undefined;
+}
+
+/**
+ * The grain is DEFAULTED here rather than left off, unlike every other optional parameter.
+ *
+ * It is not a filter — the server has its own default and the two agree — but it is the one
+ * parameter the page renders a label from, and an omitted grain would produce a chart whose axis
+ * said "By hour" because the client guessed while the server had decided. Sending it makes the
+ * cache key and the axis label the same fact.
+ */
+export function callVolumeParams(query: CallVolumeQuery): Record<string, unknown> {
+	return {
+		...(query.from === undefined ? {} : { from: query.from }),
+		...(query.to === undefined ? {} : { to: query.to }),
+		bucket: query.bucket ?? DEFAULT_VOLUME_BUCKET,
+	};
+}
+
+/**
+ * Bucketed call volume over a window.
+ *
+ * `cdr.read` — the UNSCOPED grant, and the only reporting fetch in this file that is not on the
+ * `.own` floor. The server argues why: there is no honest per-person version of "we took 400 calls
+ * this week", so there is no scoped variant to fall back to and a caller without the grant gets a
+ * 403 rather than a smaller number wearing the same label.
+ */
+export async function fetchCallVolume(query: CallVolumeQuery = {}): Promise<CallVolumeEnvelope> {
+	return await apiFetch<CallVolumeEnvelope>(
+		`/cdr/call-volume?${cdrSearchParams(callVolumeParams(query))}`,
 	);
 }
 

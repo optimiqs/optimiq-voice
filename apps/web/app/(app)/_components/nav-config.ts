@@ -174,6 +174,7 @@ export const NAV_SECTIONS: readonly NavSection[] = [
 			{ title: "Wallboard", url: routes.wallboard, icon: WallboardIcon },
 			{ title: "Recordings", url: routes.recordings, icon: RecordIcon },
 			{ title: "Call history", url: routes.cdr, icon: HistoryIcon },
+			{ title: "Reports", url: routes.reports, icon: GaugeIcon },
 			/**
 			 * The change ledger, alongside the other two read-only ledgers rather than in the settings
 			 * area.

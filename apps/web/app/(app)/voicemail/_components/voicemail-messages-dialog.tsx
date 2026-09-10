@@ -34,7 +34,13 @@ import {
 	useVoicemailMessages,
 	useVoicemailPlaybackUrl,
 } from "../../_hooks/use-voicemail-queries";
-import type { VoicemailBoxRow, VoicemailFolder, VoicemailMessageRow } from "~/lib/pbx/contracts";
+import { VoicemailForwardDialog } from "./voicemail-forward-dialog";
+import type {
+	VoicemailBoxRow,
+	VoicemailFolder,
+	VoicemailForwardMode,
+	VoicemailMessageRow,
+} from "~/lib/pbx/contracts";
 
 /**
  * The contents of one mailbox.
@@ -108,6 +114,14 @@ export function VoicemailMessagesDialog({
 	const setRead = useSetVoicemailMessageRead();
 	const remove = useDeleteVoicemailMessage();
 
+	// One dialog for both row actions: the destination question is the same, and only the sentence
+	// and the button label differ. `null` is what closes it, so the message it acts on and whether it
+	// is open are one fact rather than two that could disagree.
+	const [sending, setSending] = useState<{
+		readonly message: VoicemailMessageRow;
+		readonly mode: VoicemailForwardMode;
+	} | null>(null);
+
 	return (
 		<Dialog
 			open={open}
@@ -158,6 +172,9 @@ export function VoicemailMessagesDialog({
 						onToggleRead={(row) => {
 							setRead.mutate({ boxId: row.voicemailBoxId, messageId: row.id, read: !row.read });
 						}}
+						onForward={(row, mode) => {
+							setSending({ message: row, mode });
+						}}
 						onDelete={(row) => {
 							remove.mutate({
 								boxId: row.voicemailBoxId,
@@ -202,6 +219,18 @@ export function VoicemailMessagesDialog({
 					</div>
 				</DialogFooter>
 			</DialogContent>
+
+			<VoicemailForwardDialog
+				open={sending !== null}
+				onOpenChange={(next) => {
+					if (!next) {
+						setSending(null);
+					}
+				}}
+				sourceBoxId={box?.id ?? ""}
+				message={sending?.message ?? null}
+				mode={sending?.mode ?? "forward"}
+			/>
 		</Dialog>
 	);
 }
@@ -216,6 +245,7 @@ function MessagesTable({
 	canListen,
 	pending,
 	onToggleRead,
+	onForward,
 	onDelete,
 }: {
 	boxId: string;
@@ -227,6 +257,7 @@ function MessagesTable({
 	canListen: boolean;
 	pending: boolean;
 	onToggleRead: (row: VoicemailMessageRow) => void;
+	onForward: (row: VoicemailMessageRow, mode: VoicemailForwardMode) => void;
 	onDelete: (row: VoicemailMessageRow) => void;
 }) {
 	if (isPending) {
@@ -300,6 +331,26 @@ function MessagesTable({
 									>
 										{row.read ? "Mark unread" : "Mark read"}
 									</Button>
+								) : null}
+								{canWrite && row.folder !== "deleted" ? (
+									<>
+										<Button
+											size="sm"
+											variant="ghost"
+											disabled={pending}
+											onClick={() => onForward(row, "forward")}
+										>
+											Forward…
+										</Button>
+										<Button
+											size="sm"
+											variant="ghost"
+											disabled={pending}
+											onClick={() => onForward(row, "copy")}
+										>
+											Copy to…
+										</Button>
+									</>
 								) : null}
 								{canDelete ? (
 									<Button

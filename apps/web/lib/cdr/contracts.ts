@@ -299,6 +299,116 @@ export interface QueueStatsRow {
  * setting, so a page that showed neither would be reporting a percentage against a target the
  * reader cannot see.
  */
+/**
+ * One agent's numbers inside ONE queue, mirroring `AgentQueueStatsRow` in
+ * `apps/api/src/cdr/query/agent-stats.ts`.
+ *
+ * `queueId` is a uuid and stays one, for the reason {@link QueueStatsRow} gives — the ledger holds
+ * no queue names and the endpoint does not join `pbx-db` to invent them.
+ */
+export interface AgentQueueStatsRow {
+	readonly queueId: string;
+	readonly answered: number;
+	readonly talkTimeMs: number;
+	readonly averageTalkTimeMs: number;
+	/** How long the CALLER waited before this agent took it. See the server module for why. */
+	readonly averageAnswerWaitMs: number;
+}
+
+/**
+ * One agent's handling over a window, mirroring `AgentStatsRow`.
+ *
+ * ## `agentId` is a seat, not a person
+ *
+ * It is a `queue_agent` ROW id. The CDR database holds no user ids at all, so this app labels the
+ * rows from the queue-agent roster it has already fetched — the same one-HTTP-request-not-a-join
+ * arrangement the queue stats use for queue names. An agent removed from a queue since the window
+ * appears here as an id with no name, and that is the honest answer rather than a row dropped.
+ *
+ * ## Wrap-up is a PROXY and the UI has to say so
+ *
+ * Nothing on this platform records an after-call-work state. `wrapUpMs` is the gap between an
+ * agent's calls, CAPPED at `wrapUpSeconds` so a lunch break is not billed to the previous caller —
+ * see the server module for the whole argument. `wrapUpSamples` is how many gaps went into it, and
+ * a screen rendering the average without it is a screen inviting somebody to trust a mean of two.
+ */
+export interface AgentStatsRow {
+	readonly agentId: string;
+	readonly answered: number;
+	/** Billed talk time — answer to hangup. NOT `duration`, which includes the phone ringing. */
+	readonly talkTimeMs: number;
+	readonly averageTalkTimeMs: number;
+	/** The longest single call. An average hides exactly this, and the outliers live here. */
+	readonly longestTalkTimeMs: number;
+	readonly averageAnswerWaitMs: number;
+	/** Mean time from the agent's phone ringing to them picking it up. */
+	readonly averageRingTimeMs: number;
+	readonly wrapUpMs: number;
+	readonly averageWrapUpMs: number;
+	readonly wrapUpSamples: number;
+	/** Per-queue breakdown, busiest first. */
+	readonly queues: readonly AgentQueueStatsRow[];
+}
+
+export interface AgentStatsEnvelope {
+	readonly data: readonly AgentStatsRow[];
+	/** The cap the server applied, so a column can be labelled with the number that produced it. */
+	readonly wrapUpSeconds: number;
+	/**
+	 * The group ceiling was reached and the list is short.
+	 *
+	 * A flag and not a `nextCursor`: there is no next page. The server argues why a keyset cursor
+	 * over aggregate groups would be a correctness problem invented for a size problem a tenant's
+	 * agent roster does not have — so a screen's only correct response is to SAY the list is short.
+	 */
+	readonly truncated: boolean;
+	readonly range: { readonly from: string; readonly to: string };
+}
+
+/**
+ * One bucket of call volume, mirroring `CallVolumeRow` in `apps/api/src/cdr/query/call-volume.ts`.
+ *
+ * `answered` is `answered_at is not null` and NOT the reporting disposition, which a voicemail
+ * deposit also satisfies. That distinction is the difference between "we answered 80% of calls" and
+ * "80% of callers reached a mailbox", and the two must never be rendered under the same label.
+ */
+export interface CallVolumeRow {
+	/** The bucket's start instant, ISO, UTC. */
+	readonly bucket: string;
+	readonly total: number;
+	readonly inbound: number;
+	readonly outbound: number;
+	readonly internal: number;
+	readonly answered: number;
+	readonly unanswered: number;
+	/** Mean wall-clock leg length across every leg in the bucket. */
+	readonly averageDurationMs: number;
+	/** Mean billed length across ANSWERED legs only, so it does not track the answer rate. */
+	readonly averageBillsecMs: number;
+}
+
+/**
+ * Where the calls in one bucket went.
+ *
+ * A separate series rather than columns on {@link CallVolumeRow}, because `destination_type` is a
+ * domain that GROWS — `paging` was appended after the fact — and a type nobody routed to in the
+ * window is simply absent rather than a zero. A chart reading this has to tolerate both.
+ */
+export interface CallVolumeDestinationRow {
+	readonly bucket: string;
+	readonly destinationType: string;
+	readonly total: number;
+	readonly answered: number;
+}
+
+export interface CallVolumeEnvelope {
+	readonly data: readonly CallVolumeRow[];
+	readonly destinations: readonly CallVolumeDestinationRow[];
+	readonly bucket: string;
+	readonly truncated: boolean;
+	readonly range: { readonly from: string; readonly to: string };
+}
+
 export interface QueueStatsEnvelope {
 	readonly data: readonly QueueStatsRow[];
 	readonly slaSeconds: number;

@@ -1,5 +1,6 @@
 "use client";
 
+import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { PhoneIcon } from "~/components/ui/icons";
 import { cn } from "~/lib/cn";
@@ -18,10 +19,16 @@ import { SoftphoneDialer } from "./softphone-dialer";
  *
  * Renders NOTHING until the credentials query resolves an extension for the caller. A user who
  * holds no extension never sees a phone — the feature is gated on the one fact that makes it
- * meaningful, exactly as the brief asks.
+ * meaningful, exactly as the brief asks. The one exception is `no-realm`: that caller DOES hold an
+ * extension and the organization is a Settings edit away from a working phone, so the dock explains
+ * it rather than vanishing.
+ *
+ * It also stands down on `/softphone`, where the page mounts the same dialer in its own card.
+ * Mounting both put two keypads and two `aria-label="Number to dial"` inputs on one screen.
  */
 export function SoftphoneWidget() {
 	const phone = useSoftphone();
+	const pathname = usePathname();
 	const [open, setOpen] = useState(false);
 
 	const ringingIncoming =
@@ -35,7 +42,10 @@ export function SoftphoneWidget() {
 	}, [ringingIncoming]);
 
 	// The gate: no extension, no phone. `isLoading` also hides it until the answer is known.
-	if (phone.isLoading || !phone.extension) {
+	if (pathname === "/softphone") {
+		return null;
+	}
+	if (phone.isLoading || (!phone.extension && phone.unavailableFor !== "no-realm")) {
 		return null;
 	}
 

@@ -134,6 +134,7 @@ export const PAGE_PERMISSIONS: Readonly<Record<string, PageRequirement>> = {
 	 */
 	[routes.phrase("[id]")]: { permissions: ["recordings.read"] },
 	[routes.cdr]: { permissions: ["cdr.read", "cdr.read.own"] },
+	[routes.reports]: { permissions: ["cdr.read", "queues.monitor"] },
 	/**
 	 * The wallboard and, by ancestry, each queue's operator panel.
 	 *

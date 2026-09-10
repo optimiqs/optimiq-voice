@@ -11,6 +11,7 @@ import { toast } from "~/components/ui/toast";
 import {
 	clearVoicemailPin,
 	deleteVoicemailMessage,
+	forwardVoicemailMessage,
 	listVoicemailMessages,
 	mintVoicemailPlaybackUrl,
 	setVoicemailMessageRead,
@@ -22,6 +23,8 @@ import { queryKeys } from "~/lib/query-keys";
 import { useActiveOrganization } from "../_context/session-context";
 import type {
 	MutationEnvelope,
+	VoicemailForwardMode,
+	VoicemailForwardResult,
 	VoicemailMailboxSummary,
 	VoicemailMessageDeletion,
 	VoicemailMessagePage,
@@ -151,6 +154,46 @@ export function useDeleteVoicemailMessage(): UseMutationResult<
 		},
 		onError: (error) => {
 			toast.error(pbxToastMessage(error, "Could not delete the message"));
+		},
+	});
+}
+
+/**
+ * Forwards or copies a message into another mailbox.
+ *
+ * BOTH mailboxes are invalidated, not just the one on screen. A forward removes a row from the
+ * source and adds one to the target, so a cached page of the destination mailbox — which the user
+ * may well open next — would otherwise be missing the message they just sent to it.
+ */
+export function useForwardVoicemailMessage(): UseMutationResult<
+	VoicemailForwardResult,
+	Error,
+	MessageMutationInput & {
+		readonly targetBoxId: string;
+		readonly mode: VoicemailForwardMode;
+	}
+> {
+	const invalidate = useInvalidateMailbox();
+
+	return useMutation({
+		mutationFn: ({
+			boxId,
+			messageId,
+			targetBoxId,
+			mode,
+		}: MessageMutationInput & { targetBoxId: string; mode: VoicemailForwardMode }) =>
+			forwardVoicemailMessage(boxId, messageId, targetBoxId, mode),
+		onSuccess: async (result, variables) => {
+			await invalidate(variables.boxId);
+			await invalidate(variables.targetBoxId);
+			toast.success(
+				result.mode === "forward"
+					? `Message forwarded to mailbox ${result.mailbox.mailboxNumber}`
+					: `Message copied to mailbox ${result.mailbox.mailboxNumber}`,
+			);
+		},
+		onError: (error) => {
+			toast.error(pbxToastMessage(error, "Could not forward the message"));
 		},
 	});
 }

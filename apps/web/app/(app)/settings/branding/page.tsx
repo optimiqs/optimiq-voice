@@ -15,6 +15,7 @@ import {
 import { TextField } from "~/components/ui/form-fields";
 import { PageHeader } from "~/components/ui/page-header";
 import { LoadingPanel } from "~/components/ui/spinner";
+import { DEFAULT_BRANDING } from "~/lib/branding/contracts";
 import {
 	brandingFormSchema,
 	brandingToForm,
@@ -25,6 +26,7 @@ import { deriveBrandRoles, isHexColor } from "~/lib/branding/theme";
 import { RequirePermission } from "../../_components/require-permission";
 import { useBranding, useSaveBranding } from "../../_hooks/use-branding-queries";
 import { SettingsNav } from "../_components/settings-nav";
+import { BrandingLogoField } from "./_components/logo-field";
 
 /**
  * The white-label branding screen.
@@ -128,18 +130,13 @@ export default function BrandingSettingsPage() {
 										)}
 									</form.Field>
 
-									<form.Field name="logoObjectKey">
-										{(field) => (
-											<TextField
-												field={field}
-												label="Logo"
-												description="The logo's object-storage key, or an https/data: URL. Leave empty for the built-in mark. (Upload-to-key is a pending media seam.)"
-												placeholder="branding/acme-logo.svg  or  https://…"
-												disabled={save.isPending}
-												className="max-w-md"
-											/>
-										)}
-									</form.Field>
+									{/*
+									 * The logo is its OWN write, not a field on this form: the upload endpoint
+									 * stores the bytes and points the branding row at the key it minted, in one
+									 * request, and returns the re-resolved brand. So it sits inside the card and
+									 * outside the form's submit — see `_components/logo-field.tsx`.
+									 */}
+									<BrandingLogoField brand={loaded ?? DEFAULT_BRANDING} />
 
 									<div className="grid gap-5 sm:grid-cols-2">
 										<form.Field name="primaryColor">

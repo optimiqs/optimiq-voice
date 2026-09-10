@@ -114,6 +114,18 @@ export default function ApiKeysPage() {
 				<CardBody className="p-0">
 					{keys.isPending ? (
 						<LoadingPanel label="Loading API keys" />
+					) : keys.error ? (
+						// A refused read is not an empty list. `api-keys.read` is an organization-wide
+						// grant that the self-service `user` role does not hold, and that role still has
+						// this page in its navigation (it holds `api-keys.*.own`) — so "No API keys" here
+						// would tell a member their organization has none when the truth is that they may
+						// not see them.
+						<EmptyState
+							className="rounded-none border-0"
+							icon={<KeyIcon className="size-5" />}
+							title="API keys are not visible to you"
+							description={keys.error.message}
+						/>
 					) : keys.data && keys.data.length > 0 ? (
 						<TableContainer className="rounded-none border-0">
 							<Table>

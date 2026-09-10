@@ -144,12 +144,35 @@ describe("the form schemas", () => {
 			model: "",
 			label: "",
 			deviceProfileId: "",
+			emergencyAddressId: "",
+			emergencyLocationDetail: "",
 			settings: "",
 			enabled: true,
 		});
 		expect(parsed.model).toBeNull();
 		expect(parsed.label).toBeNull();
 		expect(parsed.deviceProfileId).toBeNull();
+		// The dispatchable location clears the same way. `null` and `""` are different requests to the
+		// API — one removes the address a responder would be read, the other is an invalid uuid — and
+		// only the first is what an emptied picker means.
+		expect(parsed.emergencyAddressId).toBeNull();
+		expect(parsed.emergencyLocationDetail).toBeNull();
+	});
+
+	it("keeps a dispatchable location the administrator actually typed", () => {
+		const parsed = deviceFormSchema.parse({
+			macAddress: "001565abcdef",
+			vendor: "yealink",
+			model: "",
+			label: "",
+			deviceProfileId: "",
+			emergencyAddressId: "019fd3c2-8888-7000-8000-000000000008",
+			emergencyLocationDetail: "  Floor 3, desk by the window  ",
+			settings: "",
+			enabled: true,
+		});
+		expect(parsed.emergencyAddressId).toBe("019fd3c2-8888-7000-8000-000000000008");
+		expect(parsed.emergencyLocationDetail).toBe("Floor 3, desk by the window");
 	});
 
 	it("refuses a vendor outside the catalogue", () => {

@@ -7,7 +7,11 @@
  * work, the WebSocket itself is integration and lives in `jssip-adapter.ts`.
  */
 
-import type { ResolvedSoftphoneCredentials, SoftphoneCredentialsResponse } from "./contracts";
+import type {
+	ResolvedSoftphoneCredentials,
+	SoftphoneConfiguredResponse,
+	SoftphoneUnavailableReason,
+} from "./contracts";
 
 /** The default sipd WSS port, from `apps/sipd`'s `SIPD_WSS_LISTEN_ADDR` (`0.0.0.0:8089`). */
 export const DEFAULT_SIPD_WSS_PORT = 8089;
@@ -36,7 +40,7 @@ export interface ShapeCredentialsOptions {
  * no browser SIP transport configured" rather than guessing a URL that will not connect.
  */
 export function resolveWssUrl(
-	response: SoftphoneCredentialsResponse,
+	response: SoftphoneConfiguredResponse,
 	options: ShapeCredentialsOptions = {},
 ): string | undefined {
 	const explicit = response.transport.wssUrl?.trim();
@@ -79,7 +83,7 @@ export function sipUriFor(username: string, realm: string): string {
  * UA that will only ever emit connection errors.
  */
 export function shapeSoftphoneCredentials(
-	response: SoftphoneCredentialsResponse,
+	response: SoftphoneConfiguredResponse,
 	options: ShapeCredentialsOptions = {},
 ): ResolvedSoftphoneCredentials {
 	const wssUrl = resolveWssUrl(response, options);
@@ -109,4 +113,70 @@ export function shapeSoftphoneCredentials(
 		mediaNote: media.note,
 		iceServers: media.iceServers?.map((server) => ({ ...server, urls: [...server.urls] })) ?? [],
 	};
+}
+
+/**
+ * Why the softphone is unavailable, and where an administrator fixes it.
+ *
+ * A pure function of the API's answer so the widget renders one sentence and the reasons stay
+ * testable without a React tree. `GET /me/softphone` answers 200 in every arm and names the state
+ * in `reason`, so that is what this branches on first — the three are genuinely different:
+ *   - `no-extension` — a stable fact about the CALLER. Nothing to fix in Settings; an administrator
+ *     has to assign one, which this user cannot do.
+ *   - `no-realm` — the ORGANIZATION has no SIP domain. There is no deployment default for a realm
+ *     (it identifies exactly one tenant), so this is a real configuration gap with a page that
+ *     fixes it.
+ *   - `not-provisioned` — the DEPLOYMENT has no SIP secret key. Nobody can fix it from this app.
+ * The `status` / `code` branches below stay as the compatibility fallback for an API that predates
+ * the union, and the last branch covers credentials that arrived but could not be shaped (no
+ * reachable WSS URL).
+ */
+export function softphoneUnavailability(input: {
+	readonly reason?: SoftphoneUnavailableReason;
+	readonly status?: number;
+	readonly code?: string;
+	readonly hasCredentials: boolean;
+	readonly resolved: boolean;
+}): { readonly reason: string | null; readonly href: string | null } {
+	switch (input.reason) {
+		case "no-extension":
+			return {
+				reason:
+					"No extension is assigned to you. An administrator has to assign one before you can " +
+					"make or take calls here.",
+				href: null,
+			};
+		case "no-realm":
+			return {
+				reason:
+					"SIP domain not configured for this organization. Set the calling domain in Settings.",
+				href: "/settings",
+			};
+		case "not-provisioned":
+			return {
+				reason:
+					"Browser calling is not configured on this deployment yet. It needs a SIP secret key " +
+					"on the API before any extension can register.",
+				href: null,
+			};
+		default:
+			break;
+	}
+	if (input.status === 404) {
+		return { reason: "No extension is assigned to you.", href: null };
+	}
+	if (input.code === "SOFTPHONE_NO_REALM") {
+		return {
+			reason:
+				"SIP domain not configured for this organization. Set the calling domain in Settings.",
+			href: "/settings",
+		};
+	}
+	if (input.hasCredentials && !input.resolved) {
+		return {
+			reason: "This deployment has no browser SIP transport (sipd WSS) configured yet.",
+			href: null,
+		};
+	}
+	return { reason: null, href: null };
 }

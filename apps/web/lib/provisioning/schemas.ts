@@ -102,6 +102,16 @@ export const deviceFormSchema = z.object({
 	model: optionalText(64),
 	label: optionalText(128),
 	deviceProfileId: z.string().transform((value) => (value.length === 0 ? null : value)),
+	/**
+	 * The dispatchable location: an emergency address, refined by a free-text desk detail.
+	 *
+	 * Both are ordinary optional fields here and the server is what refuses a caller who does not hold
+	 * `numbers.emergency` — deliberately, and not because the check was forgotten. The form cannot be
+	 * the gate: a permission enforced only in a browser is enforced nowhere, and mirroring it here
+	 * would add a second place for the two to disagree.
+	 */
+	emergencyAddressId: z.string().transform((value) => (value.length === 0 ? null : value)),
+	emergencyLocationDetail: optionalText(255),
 	settings: settingsTextField,
 	enabled: z.boolean(),
 });

@@ -39,8 +39,22 @@ describe("brandLogoSrc", () => {
 		).toBe("/api/v1/branding/logo?host=acme.example%3A3000");
 	});
 
-	it("returns null for a bare key with no host to resolve it (no broken image)", () => {
-		expect(brandLogoSrc(brand({ logoObjectKey: "branding/org/abc.png" }))).toBe(null);
-		expect(brandLogoSrc(brand({ logoObjectKey: "branding/org/abc.png" }), "  ")).toBe(null);
+	/**
+	 * The signed-in shell has no host to pass, and on the shared platform host there is nothing for
+	 * `readByHost` to resolve anyway — it goes through `custom_domain`. Returning `null` here is what
+	 * made an uploaded logo invisible to every tenant that is not on its own domain.
+	 */
+	it("turns a bare key with no host into the session-resolved logo route", () => {
+		expect(brandLogoSrc(brand({ logoObjectKey: "branding/org/abc.png" }))).toBe(
+			"/api/v1/branding/logo",
+		);
+		expect(brandLogoSrc(brand({ logoObjectKey: "branding/org/abc.png" }), "  ")).toBe(
+			"/api/v1/branding/logo",
+		);
+	});
+
+	it("still returns null when there is no key at all, so the caller shows the initial", () => {
+		expect(brandLogoSrc(brand({ logoObjectKey: null }))).toBe(null);
+		expect(brandLogoSrc(brand({ logoObjectKey: null }), "acme.example")).toBe(null);
 	});
 });

@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Badge } from "~/components/ui/badge";
 import { focusRingInset } from "~/components/ui/focus-ring";
-import { brandLogoSrc } from "~/lib/branding/contracts";
+import { brandingLogoPreviewSrc } from "~/lib/branding/logo";
 import { cn } from "~/lib/cn";
 import { canAccessPage } from "~/lib/page-permissions";
 import { useBrand } from "../_context/branding-context";
@@ -70,7 +70,7 @@ export function Sidebar() {
  */
 function BrandFooter() {
 	const brand = useBrand();
-	const logoSrc = brandLogoSrc(brand);
+	const logoSrc = brandingLogoPreviewSrc(brand, brand.logoObjectKey);
 	return (
 		<div className="flex items-center gap-2 px-2 pt-1 text-xs text-subtle-foreground">
 			{logoSrc ? (

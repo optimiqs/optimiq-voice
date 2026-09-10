@@ -14,6 +14,7 @@
  */
 
 import { z } from "zod";
+import { normalizeE164Message } from "@optimiq-voice/telephony";
 import { networkIssue, normalizeNetwork } from "./cidr";
 import {
 	CALL_BLOCK_ACTIONS,
@@ -29,6 +30,7 @@ import {
 	QUEUE_PRIORITY_MAX,
 	QUEUE_PRIORITY_MIN,
 	QUEUE_STRATEGIES,
+	CALLER_ID_PRESENTATIONS,
 	RECORD_POLICIES,
 	RING_GROUP_STRATEGIES,
 	ROUTE_MATCH_KINDS,
@@ -55,13 +57,30 @@ export const internalNumber = z
 	.max(16, "At most 16 digits")
 	.regex(/^[0-9]+$/u, "Digits only");
 
-/** E.164, `+` included — how every DID is stored. */
-export const e164 = z
-	.string()
-	.trim()
-	.min(2, "Required")
-	.max(20, "At most 20 characters")
-	.regex(/^\+[1-9]\d{1,18}$/u, "Must be E.164, e.g. +12125550100");
+/**
+ * E.164, `+` included — how every DID is stored, and what this field now PRODUCES rather than
+ * merely demands.
+ *
+ * The mirror of `shared/dto.ts`'s `e164`, and it has to normalise for the same reason the server
+ * does: a form that refused `+1 (212) 555-0100` made the person retype a number the machine can
+ * convert. It runs the same `@optimiq-voice/telephony` implementation, so the value the field
+ * settles on is byte-for-byte the value the API will store — which is what stops a form showing one
+ * spelling and the list showing another after a save.
+ *
+ * Like the server's, it passes no `defaultCallingCode`: a bare national number is still refused
+ * rather than guessed at.
+ */
+export const e164 = z.string().transform((value, context) => {
+	const { e164: normalized, message } = normalizeE164Message(value);
+	if (normalized === null) {
+		context.addIssue({
+			code: z.ZodIssueCode.custom,
+			message: `Must be E.164, e.g. +12125550100 — ${message}`,
+		});
+		return z.NEVER;
+	}
+	return normalized;
+});
 
 /** A dialable string: digits plus the characters a PBX actually dials. */
 export const dialableString = z
@@ -230,6 +249,14 @@ function extensionSchema(sipSecretRef: SecretRefField) {
 		callerIdName: optionalText(128),
 		callerIdNumber: optionalText(32),
 		outboundCallerIdNumber: optionalText(32),
+		/**
+		 * Withhold the number above on outbound calls — CLIR.
+		 *
+		 * A plain enum and not {@link optionalText}: the column is NOT NULL with an `allowed` default,
+		 * so there is no "unset" to encode. `restricted` is a standing withhold the caller lifts for
+		 * one call with `*82`.
+		 */
+		outboundCallerIdPresentation: z.enum(CALLER_ID_PRESENTATIONS),
 		tollClass: z.enum(TOLL_CLASSES),
 		recordPolicy: z.enum(RECORD_POLICIES),
 		/**
@@ -799,6 +826,26 @@ export const queueFormSchema = z.strictObject({
 			message: "A single DTMF digit: 0-9, *, #, or A-D",
 		})
 		.transform((value) => (value.length === 0 ? null : value)),
+	/**
+	 * Virtual hold. The accept key takes the same shape as {@link exitKey} and is normalised the
+	 * same way; it may not BE the exit key, and the compiler says so with a warning rather than
+	 * silently giving the digit to one of them.
+	 */
+	callbackEnabled: z.boolean(),
+	callbackKey: z
+		.string()
+		.trim()
+		.toUpperCase()
+		.refine((value) => value === "" || QUEUE_EXIT_KEY_PATTERN.test(value), {
+			message: "A single DTMF digit: 0-9, *, #, or A-D",
+		})
+		.transform((value) => (value.length === 0 ? null : value)),
+	callbackOfferAfterSeconds: optionalInt(0, 86_400),
+	callbackOfferPromptId: optionalReference(),
+	callbackConfirmPromptId: optionalReference(),
+	callbackMaxAttempts: optionalInt(1, 10),
+	callbackRetryDelaySeconds: optionalInt(30, 86_400),
+	callbackExpiresAfterSeconds: optionalInt(60, 604_800),
 	/** Higher dequeues first. Empty restores the server's default, like every other knob here. */
 	defaultPriority: optionalInt(QUEUE_PRIORITY_MIN, QUEUE_PRIORITY_MAX),
 	enabled: z.boolean(),

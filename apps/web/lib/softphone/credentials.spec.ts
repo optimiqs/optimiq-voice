@@ -4,8 +4,9 @@ import {
 	resolveWssUrl,
 	shapeSoftphoneCredentials,
 	sipUriFor,
+	softphoneUnavailability,
 } from "./credentials";
-import type { SoftphoneCredentialsResponse } from "./contracts";
+import type { SoftphoneConfiguredResponse } from "./contracts";
 
 /**
  * The credential-shaping seam, held against the wire shape it mirrors.
@@ -16,9 +17,10 @@ import type { SoftphoneCredentialsResponse } from "./contracts";
  */
 
 function response(
-	overrides: Partial<SoftphoneCredentialsResponse> = {},
-): SoftphoneCredentialsResponse {
+	overrides: Partial<SoftphoneConfiguredResponse> = {},
+): SoftphoneConfiguredResponse {
 	return {
+		configured: true,
 		extension: { id: "ext-1", number: "1001", label: "Reception", displayName: "Front Desk" },
 		account: {
 			username: "1001",
@@ -130,5 +132,66 @@ describe("shapeSoftphoneCredentials", () => {
 				pageOrigin: "http://localhost:3100",
 			}),
 		).toThrow(/WSS URL/u);
+	});
+});
+
+describe("why the softphone is unavailable", () => {
+	it("sends an administrator to Settings when the organization has no SIP domain", () => {
+		// There is no deployment-wide realm to fall back on — one realm names exactly one tenant — so
+		// the API names the state and the only useful answer is the page that fixes it.
+		expect(
+			softphoneUnavailability({ reason: "no-realm", hasCredentials: false, resolved: false }),
+		).toEqual({
+			reason:
+				"SIP domain not configured for this organization. Set the calling domain in Settings.",
+			href: "/settings",
+		});
+	});
+
+	it("offers no link for a caller who simply holds no extension", () => {
+		const { reason, href } = softphoneUnavailability({
+			reason: "no-extension",
+			hasCredentials: false,
+			resolved: false,
+		});
+		expect(reason).toContain("No extension is assigned to you");
+		expect(href).toBeNull();
+	});
+
+	it("names the deployment gap when browser calling was never provisioned", () => {
+		const { reason, href } = softphoneUnavailability({
+			reason: "not-provisioned",
+			hasCredentials: false,
+			resolved: false,
+		});
+		expect(reason).toContain("not configured on this deployment");
+		expect(href).toBeNull();
+	});
+
+	it("still maps the pre-union refusals, for an API that predates the 200 contract", () => {
+		expect(
+			softphoneUnavailability({ status: 404, hasCredentials: false, resolved: false }).reason,
+		).toContain("No extension is assigned to you");
+		expect(
+			softphoneUnavailability({
+				status: 503,
+				code: "SOFTPHONE_NO_REALM",
+				hasCredentials: false,
+				resolved: false,
+			}).href,
+		).toBe("/settings");
+	});
+
+	it("names the missing browser transport when credentials arrived but could not be shaped", () => {
+		const { reason, href } = softphoneUnavailability({ hasCredentials: true, resolved: false });
+		expect(reason).toContain("sipd WSS");
+		expect(href).toBeNull();
+	});
+
+	it("is silent when the softphone is available", () => {
+		expect(softphoneUnavailability({ hasCredentials: true, resolved: true })).toEqual({
+			reason: null,
+			href: null,
+		});
 	});
 });

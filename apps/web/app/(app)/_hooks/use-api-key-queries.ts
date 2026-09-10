@@ -2,7 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import { toast } from "~/components/ui/toast";
-import { apiKey, authErrorMessage } from "~/lib/auth-client";
+import { apiKey, authQueryError } from "~/lib/auth-client";
 import { queryKeys } from "~/lib/query-keys";
 
 /**
@@ -42,7 +42,7 @@ export function useApiKeys(organizationId: string | undefined): UseQueryResult<A
 				query: { organizationId: organizationId as string },
 			});
 			if (result.error) {
-				throw new Error(authErrorMessage(result.error));
+				throw authQueryError(result.error);
 			}
 			// `list` answers a paged envelope, not a bare array.
 			return (result.data?.apiKeys ?? []) as ApiKeySummary[];
@@ -65,7 +65,7 @@ export function useCreateApiKey(organizationId: string | undefined) {
 				...(expiresInDays === null ? {} : { expiresIn: expiresInDays * DAY_MS }),
 			});
 			if (result.error) {
-				throw new Error(authErrorMessage(result.error));
+				throw authQueryError(result.error);
 			}
 			return result.data;
 		},
@@ -83,7 +83,7 @@ export function useRevokeApiKey(organizationId: string | undefined) {
 		mutationFn: async (keyId: string) => {
 			const result = await apiKey.delete({ keyId });
 			if (result.error) {
-				throw new Error(authErrorMessage(result.error));
+				throw authQueryError(result.error);
 			}
 		},
 		onSuccess: async () => {

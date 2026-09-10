@@ -61,6 +61,15 @@ export interface DeviceRow extends EntityRow {
 	readonly label: string | null;
 	readonly deviceProfileId: string | null;
 	/**
+	 * Where this handset physically is — the RAY BAUM'S dispatchable location.
+	 *
+	 * A reference into `emergency-addresses`, refined by `emergencyLocationDetail`. `null` on both is
+	 * the ordinary state and means the dispatch falls back to the extension's number and then the DID,
+	 * which is the granularity that sent a responder to a building rather than a desk.
+	 */
+	readonly emergencyAddressId: string | null;
+	readonly emergencyLocationDetail: string | null;
+	/**
 	 * The NON-SECRET half of the provisioning token.
 	 *
 	 * Present in every read, and deliberately useless on its own: the secret half is stored only as

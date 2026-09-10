@@ -12,6 +12,8 @@ import {
 	createCdrExport,
 	deleteCdrExport,
 	deleteRecording,
+	fetchAgentStats,
+	fetchCallVolume,
 	fetchQueueStats,
 	getCall,
 	isSettledExportStatus,
@@ -21,6 +23,10 @@ import {
 	mintCdrExportDownloadUrl,
 	mintRecordingDownloadUrl,
 	queueStatsParams,
+	agentStatsParams,
+	callVolumeParams,
+	type AgentStatsQuery,
+	type CallVolumeQuery,
 	type CdrExportFilters,
 	type CdrExportListQuery,
 	type CdrListQuery,
@@ -31,8 +37,11 @@ import { pbxToastMessage } from "~/lib/pbx/errors";
 import { queryKeys } from "~/lib/query-keys";
 import { useActiveOrganization, usePermission } from "../_context/session-context";
 import type {
+	AgentStatsEnvelope,
+	AgentStatsRow,
 	CallDetail,
 	CallLegRow,
+	CallVolumeEnvelope,
 	CdrExportDownloadLink,
 	CdrExportRow,
 	CursorEnvelope,
@@ -188,6 +197,86 @@ export function useQueueStats(
 		range: result.data?.range,
 		slaSeconds: result.data?.slaSeconds,
 	};
+}
+
+/**
+ * Per-agent handling over a window.
+ *
+ * `enabled` on `queues.monitor`, matching the endpoint, for the reason {@link useQueueStats} is:
+ * asking without the grant puts a red line in the console for a request that can only 403.
+ *
+ * NOT polled, unlike the wallboard's service level, and that is the one deliberate difference
+ * between the two. A wallboard is a screen people watch and a moving number is the point; an agent
+ * report is a table somebody reads, sorts and acts on, and re-ordering rows under their cursor
+ * every thirty seconds is how a report stops being trusted. It refetches when the window changes,
+ * which is when the answer actually changed.
+ */
+export interface AgentStatsResult {
+	readonly query: UseQueryResult<AgentStatsEnvelope>;
+	readonly rows: readonly AgentStatsRow[];
+	/** Keyed by seat id, so a per-agent row is a lookup rather than a scan per render. */
+	readonly byAgentId: ReadonlyMap<string, AgentStatsRow>;
+	/** The group ceiling was reached: the list is short and the screen has to say so. */
+	readonly truncated: boolean;
+	readonly wrapUpSeconds: number | undefined;
+	readonly range: { readonly from: string; readonly to: string } | undefined;
+}
+
+export function useAgentStats(
+	query: AgentStatsQuery,
+	options: { readonly enabled?: boolean } = {},
+): AgentStatsResult {
+	const organizationId = useOrganizationId();
+	const permitted = usePermission("queues.monitor");
+	const params = agentStatsParams(query);
+
+	const result = useQuery({
+		queryKey: queryKeys.agentStats(organizationId, params),
+		queryFn: () => fetchAgentStats(query),
+		enabled: organizationId.length > 0 && permitted && (options.enabled ?? true),
+		placeholderData: (previous) => previous,
+	});
+
+	const rows = result.data?.data ?? [];
+	return {
+		query: result,
+		rows,
+		byAgentId: new Map(rows.map((row) => [row.agentId, row])),
+		truncated: result.data?.truncated ?? false,
+		wrapUpSeconds: result.data?.wrapUpSeconds,
+		range: result.data?.range,
+	};
+}
+
+export interface CallVolumeResult {
+	readonly query: UseQueryResult<CallVolumeEnvelope>;
+	readonly envelope: CallVolumeEnvelope | undefined;
+	readonly range: { readonly from: string; readonly to: string } | undefined;
+}
+
+/**
+ * Bucketed call volume over a window.
+ *
+ * `enabled` on `cdr.read` — the UNSCOPED grant, and the only query in this file gated on it. There
+ * is no honest per-person version of an organization's volume, so a holder of only `cdr.read.own`
+ * is not shown a smaller number under the same label; they are not shown the chart.
+ */
+export function useCallVolume(
+	query: CallVolumeQuery,
+	options: { readonly enabled?: boolean } = {},
+): CallVolumeResult {
+	const organizationId = useOrganizationId();
+	const permitted = usePermission("cdr.read");
+	const params = callVolumeParams(query);
+
+	const result = useQuery({
+		queryKey: queryKeys.callVolume(organizationId, params),
+		queryFn: () => fetchCallVolume(query),
+		enabled: organizationId.length > 0 && permitted && (options.enabled ?? true),
+		placeholderData: (previous) => previous,
+	});
+
+	return { query: result, envelope: result.data, range: result.data?.range };
 }
 
 export interface RecordingListResult {

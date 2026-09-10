@@ -7,7 +7,7 @@ import { ResourceSelect } from "~/components/pbx/resource-select";
 import { SelectField, SwitchField, TextField } from "~/components/ui/form-fields";
 import { useServerFieldErrors } from "~/lib/forms/server-errors";
 import { PBX_RESOURCES } from "~/lib/pbx/client";
-import { RECORD_POLICIES, TOLL_CLASSES } from "~/lib/pbx/contracts";
+import { CALLER_ID_PRESENTATIONS, RECORD_POLICIES, TOLL_CLASSES } from "~/lib/pbx/contracts";
 import {
 	followMeFieldErrors,
 	normalizeFollowMe,
@@ -72,6 +72,13 @@ const TOLL_CLASS_LABELS: Readonly<Record<(typeof TOLL_CLASSES)[number], string>>
 	premium: "Premium rate",
 };
 
+const CALLER_ID_PRESENTATION_LABELS: Readonly<
+	Record<(typeof CALLER_ID_PRESENTATIONS)[number], string>
+> = {
+	allowed: "Show my number",
+	restricted: "Withhold my number",
+};
+
 const RECORD_POLICY_LABELS: Readonly<Record<(typeof RECORD_POLICIES)[number], string>> = {
 	none: "Never record",
 	inbound: "Inbound calls",
@@ -89,6 +96,7 @@ function defaultsFor(extension: ExtensionRow | null): ExtensionFormValues {
 		callerIdName: extension?.callerIdName ?? "",
 		callerIdNumber: extension?.callerIdNumber ?? "",
 		outboundCallerIdNumber: extension?.outboundCallerIdNumber ?? "",
+		outboundCallerIdPresentation: extension?.outboundCallerIdPresentation ?? "allowed",
 		tollClass: extension?.tollClass ?? "national",
 		recordPolicy: extension?.recordPolicy ?? "none",
 		pickupGroup: extension?.pickupGroup ?? "",
@@ -176,6 +184,7 @@ export function ExtensionDialog({
 				callerIdName: parsed.callerIdName,
 				callerIdNumber: parsed.callerIdNumber,
 				outboundCallerIdNumber: parsed.outboundCallerIdNumber,
+				outboundCallerIdPresentation: parsed.outboundCallerIdPresentation,
 				tollClass: parsed.tollClass,
 				recordPolicy: parsed.recordPolicy,
 				/**
@@ -313,6 +322,24 @@ export function ExtensionDialog({
 							submitError={server.errors.outboundCallerIdNumber}
 							className="sm:col-span-2"
 						/>
+					)}
+				</form.Field>
+				<form.Field name="outboundCallerIdPresentation">
+					{(field) => (
+						<SelectField
+							field={field}
+							label="Outbound caller ID"
+							description="Withholding sends the call anonymously. The carrier still receives the number, and emergency calls always present it."
+							disabled={mutation.isPending}
+							submitError={server.errors.outboundCallerIdPresentation}
+							className="sm:col-span-2"
+						>
+							{CALLER_ID_PRESENTATIONS.map((value) => (
+								<option key={value} value={value}>
+									{CALLER_ID_PRESENTATION_LABELS[value]}
+								</option>
+							))}
+						</SelectField>
 					)}
 				</form.Field>
 			</FormSection>

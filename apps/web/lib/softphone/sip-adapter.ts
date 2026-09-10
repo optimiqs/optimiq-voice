@@ -19,7 +19,14 @@ export interface SipMediaSinks {
 export interface SipUserAgent {
 	/** Open the WebSocket and REGISTER. Emits `REGISTRATION_CHANGED` as it progresses. */
 	start(): void;
-	/** Unregister and close the socket. Idempotent. */
+	/**
+	 * Un-REGISTER (`Expires: 0`) and close the socket. Idempotent.
+	 *
+	 * This is what "Go offline" and the `pagehide` handler call. It matters that it is deliberate and
+	 * reachable: a WS binding is only usable over the socket that made it, so a tab that goes away
+	 * without this leaves a contact every later call to the extension forks to and gets `connection
+	 * refused` from — wasted originates and phantom CDR legs, until the registration lapses.
+	 */
 	stop(): void;
 	/** Place a call to `target` (a bare extension/number or a full SIP URI). */
 	call(target: string): void;
@@ -33,6 +40,24 @@ export interface SipUserAgent {
 	setMuted(muted: boolean): void;
 	/** Send a DTMF tone on the active call. */
 	sendDtmf(tone: string): void;
+	/**
+	 * Blind transfer: `REFER` the established call to `target` and let go of it.
+	 *
+	 * The transferor never learns whether the transferee answered — SIP's `NOTIFY` reports the REFER,
+	 * not the resulting call — so this ends with the call ending, and the UI must not promise more.
+	 */
+	transferBlind(target: string): void;
+	/**
+	 * Attended transfer, step one: hold the current call and place a CONSULTATION call to `target`.
+	 *
+	 * The consultation is a second dialog. It is deliberately not modelled as the softphone's one
+	 * `call` — the first party is still there, on hold, and must come back if the user cancels.
+	 */
+	startConsult(target: string): void;
+	/** Attended transfer, step two: `REFER` the first call to the consultation with `Replaces`. */
+	completeTransfer(): void;
+	/** Abandon the consultation: hang it up and take the first call off hold. */
+	cancelTransfer(): void;
 }
 
 export interface SipUserAgentOptions {

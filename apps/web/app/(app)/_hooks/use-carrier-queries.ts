@@ -9,17 +9,25 @@ import {
 } from "@tanstack/react-query";
 import { toast } from "~/components/ui/toast";
 import {
+	createPortingOrder,
 	fetchCarrierStatus,
+	fetchCnamListing,
+	fetchPortingOrders,
 	orderNumber,
 	provisionTrunk,
 	releaseNumber,
 	searchAvailableNumbers,
+	updateCnamListing,
 	type AvailableNumber,
 	type CarrierStatus,
+	type CnamListing,
+	type CreatePortingOrderBody,
 	type NumberSearchQuery,
 	type OrderNumberBody,
+	type PortingOrder,
 	type ProvisionTrunkBody,
 	type TrunkCredentials,
+	type UpdateCnamListingBody,
 } from "~/lib/carrier/client";
 import { pbxErrorCode, pbxToastMessage } from "~/lib/pbx/errors";
 import { queryKeys } from "~/lib/query-keys";
@@ -195,6 +203,100 @@ export function useProvisionTrunk(
 				return;
 			}
 			toast.error(pbxToastMessage(error, "Could not provision the trunk"));
+		},
+	});
+}
+
+/**
+ * Ports in flight.
+ *
+ * Unlike the number search, this one DOES run on mount: it is a read of work already filed, not a
+ * live inventory call that marks numbers orderable, and a port that has moved into `exception` is
+ * exactly the thing someone opening this tab needs to see without asking for it.
+ */
+export function usePortingOrders(): UseQueryResult<{
+	readonly data: readonly PortingOrder[];
+	readonly total: number;
+}> {
+	const organizationId = useOrganizationId();
+	return useQuery({
+		queryKey: queryKeys.carrierPortingOrders(organizationId),
+		queryFn: fetchPortingOrders,
+		enabled: organizationId.length > 0,
+	});
+}
+
+/**
+ * Files a port.
+ *
+ * The success toast counts the ORDERS, not the numbers, because the count can differ: the carrier
+ * splits a request into one order per losing carrier, and telling someone "1 port filed" when they
+ * are about to receive two FOC dates is how the second one goes unwatched.
+ */
+export function useCreatePortingOrder(): UseMutationResult<
+	{ readonly data: readonly PortingOrder[] },
+	Error,
+	CreatePortingOrderBody
+> {
+	const invalidate = useInvalidateAfterCarrierWrite("phone-numbers");
+	return useMutation({
+		mutationFn: (body: CreatePortingOrderBody) => createPortingOrder(body),
+		onSuccess: async (result) => {
+			await invalidate();
+			const count = result.data.length;
+			toast.success(count === 1 ? "Port filed" : `${count} ports filed`, {
+				description:
+					count === 1
+						? "Your carrier has it. Watch this tab for a firm cutover date — nothing changes until then."
+						: "Your carrier split these across the losing carriers, so each one gets its own cutover date.",
+			});
+		},
+		onError: (error) => {
+			if (isCarrierUnconfigured(error)) {
+				return;
+			}
+			toast.error(pbxToastMessage(error, "Could not file that port"));
+		},
+	});
+}
+
+/** One number's CNAM listing. Keyed per number, so opening a second one does not evict the first. */
+export function useCnamListing(phoneNumberId: string | null): UseQueryResult<CnamListing> {
+	const organizationId = useOrganizationId();
+	return useQuery({
+		queryKey: queryKeys.carrierCnam(organizationId, phoneNumberId ?? ""),
+		queryFn: () => fetchCnamListing(phoneNumberId ?? ""),
+		enabled: organizationId.length > 0 && phoneNumberId !== null,
+	});
+}
+
+/**
+ * Changes it.
+ *
+ * The carrier is the system of record — CNAM has no column here — so the mutation writes the
+ * response straight into the cache rather than invalidating and refetching. That is not an
+ * optimisation: the API's answer IS the post-write state, freshly re-read from the carrier, and a
+ * refetch would ask the same question again for a slower version of the same answer.
+ */
+export function useUpdateCnamListing(
+	phoneNumberId: string,
+): UseMutationResult<CnamListing, Error, UpdateCnamListingBody> {
+	const queryClient = useQueryClient();
+	const organizationId = useOrganizationId();
+	return useMutation({
+		mutationFn: (body: UpdateCnamListingBody) => updateCnamListing(phoneNumberId, body),
+		onSuccess: (listing) => {
+			queryClient.setQueryData(queryKeys.carrierCnam(organizationId, phoneNumberId), listing);
+			toast.success("Caller ID name saved", {
+				description:
+					"Carriers refresh their CNAM databases on their own schedule, so it can be a few days before every network shows the new name.",
+			});
+		},
+		onError: (error) => {
+			if (isCarrierUnconfigured(error)) {
+				return;
+			}
+			toast.error(pbxToastMessage(error, "Could not save the caller ID name"));
 		},
 	});
 }

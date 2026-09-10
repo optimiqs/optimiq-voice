@@ -15,6 +15,52 @@ import type { Permission } from "./permissions";
 export const API_BASE_PATH = "/api/v1";
 
 /**
+ * The API's own origin, when the deployment puts it somewhere other than this page's origin.
+ *
+ * Everything in this app is deliberately same-origin: `next.config.mjs` rewrites `/api/*` to
+ * `apps/api`, which keeps the better-auth session cookie first-party. Exactly one thing cannot go
+ * through that rewrite — the live socket. Next's `rewrites` are HTTP proxying and do not carry a
+ * WebSocket upgrade, so `ws://<page>/api/v1/live` never reaches the API and every live surface sits
+ * on "Reconnecting" forever wherever Next itself is the proxy (a `next dev` workstation, or a
+ * deployment that has no reverse proxy in front of both).
+ *
+ * So the socket needs the API's real origin, and this is where it comes from — the same variable
+ * the auth client already reads (`NEXT_PUBLIC_AUTH_BASE_URL`), plus an explicit
+ * `NEXT_PUBLIC_API_ORIGIN` for a deployment that wants to name it without moving better-auth's
+ * base URL. Empty when neither is set, which is the correct answer for the reverse-proxied shape:
+ * the page's own origin already reaches the API, upgrade included.
+ *
+ * `process.env.NEXT_PUBLIC_*` must be read as a literal member expression for Next to inline it
+ * into the browser bundle — do not refactor these into a lookup.
+ */
+export const API_ORIGIN = (
+	process.env.NEXT_PUBLIC_API_ORIGIN ??
+	process.env.NEXT_PUBLIC_AUTH_BASE_URL ??
+	""
+)
+	.trim()
+	.replace(/\/+$/u, "");
+
+/**
+ * The origin a browser socket should be opened against: the configured API origin, or the page's.
+ *
+ * `configured` defaults to {@link API_ORIGIN} and is a parameter only so a spec can drive it —
+ * `NEXT_PUBLIC_*` is inlined at build time and cannot be set from a test. A value that is not a
+ * parseable absolute URL is ignored rather than handed to `new URL()` at connect time — a typo in an environment variable should degrade to same-origin,
+ * not throw inside a socket constructor where the only symptom is a dead live feed.
+ */
+export function resolveApiOrigin(pageOrigin: string, configured: string = API_ORIGIN): string {
+	if (configured.length === 0) {
+		return pageOrigin;
+	}
+	try {
+		return new URL(configured).origin;
+	} catch {
+		return pageOrigin;
+	}
+}
+
+/**
  * A non-2xx response, carrying the status so callers can branch on 401 / 403 without parsing.
  *
  * `body` is the parsed payload, kept because the PBX area's failure taxonomy is a contract: a 422

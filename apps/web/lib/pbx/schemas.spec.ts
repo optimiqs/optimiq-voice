@@ -99,6 +99,7 @@ describe("optional text", () => {
 			callerIdName: "   ",
 			callerIdNumber: " 1001 ",
 			outboundCallerIdNumber: "",
+			outboundCallerIdPresentation: "allowed" as const,
 			tollClass: "national",
 			recordPolicy: "none",
 			pickupGroup: "",
@@ -127,6 +128,7 @@ describe("optional text", () => {
 			callerIdName: "",
 			callerIdNumber: "",
 			outboundCallerIdNumber: "",
+			outboundCallerIdPresentation: "allowed" as const,
 			tollClass: "national" as const,
 			recordPolicy: "none" as const,
 			pickupGroup: "",
@@ -152,6 +154,7 @@ describe("optional text", () => {
 			callerIdName: "",
 			callerIdNumber: "",
 			outboundCallerIdNumber: "",
+			outboundCallerIdPresentation: "allowed" as const,
 			tollClass: "national" as const,
 			recordPolicy: "none" as const,
 			pickupGroup: "",
@@ -181,6 +184,39 @@ describe("optional text", () => {
  * asserted rather than inherited: a group named `" "` would be a real group with one accidental
  * member, and `null` is the documented "no group, fall back to organization-wide pickup".
  */
+describe("the outbound caller-id presentation", () => {
+	const base = {
+		number: "1001",
+		label: "Alice",
+		sipSecretRef: "secret://x",
+		callerIdName: "",
+		callerIdNumber: "",
+		outboundCallerIdNumber: "",
+		outboundCallerIdPresentation: "allowed" as const,
+		tollClass: "national" as const,
+		recordPolicy: "none" as const,
+		pickupGroup: "",
+		callScreening: false,
+		callTimeoutSeconds: "",
+		maxRegistrations: "",
+		mohClassId: "",
+		voicemailEnabled: true,
+		doNotDisturb: false,
+		enabled: true,
+	};
+
+	it("accepts the two values the column allows, and nothing else", () => {
+		expect(extensionFormSchema.parse(base).outboundCallerIdPresentation).toBe("allowed");
+		expect(
+			extensionFormSchema.parse({ ...base, outboundCallerIdPresentation: "restricted" })
+				.outboundCallerIdPresentation,
+		).toBe("restricted");
+		expect(
+			extensionFormSchema.safeParse({ ...base, outboundCallerIdPresentation: "" }).success,
+		).toBe(false);
+	});
+});
+
 describe("the pickup group", () => {
 	const base = {
 		number: "1001",
@@ -189,6 +225,7 @@ describe("the pickup group", () => {
 		callerIdName: "",
 		callerIdNumber: "",
 		outboundCallerIdNumber: "",
+		outboundCallerIdPresentation: "allowed" as const,
 		tollClass: "national" as const,
 		recordPolicy: "none" as const,
 		pickupGroup: "",
@@ -526,6 +563,14 @@ describe("queueFormSchema", () => {
 		tierRuleNoAgentNoWait: false,
 		recordPolicy: "none" as const,
 		exitKey: "",
+		callbackEnabled: false,
+		callbackKey: "",
+		callbackOfferAfterSeconds: "",
+		callbackOfferPromptId: "",
+		callbackConfirmPromptId: "",
+		callbackMaxAttempts: "",
+		callbackRetryDelaySeconds: "",
+		callbackExpiresAfterSeconds: "",
 		defaultPriority: "",
 		enabled: true,
 	};
@@ -539,6 +584,36 @@ describe("queueFormSchema", () => {
 		expect(parsed.maxWaitSeconds).toBeNull();
 		expect(parsed.wrapUpSeconds).toBeNull();
 		expect(parsed.tierRuleWaitSeconds).toBeNull();
+	});
+
+	/**
+	 * Virtual hold. The accept key is normalised exactly as the exit key is, and for the same
+	 * reason: the engine compares it against a DTMF digit with `===`, so `d` and `D` are two
+	 * different keys everywhere below the form.
+	 */
+	it("normalises the callback key and refuses anything a phone cannot send", () => {
+		expect(queueFormSchema.parse({ ...base, callbackKey: " d " }).callbackKey).toBe("D");
+		expect(queueFormSchema.parse({ ...base, callbackKey: "" }).callbackKey).toBeNull();
+		expect(queueFormSchema.safeParse({ ...base, callbackKey: "12" }).success).toBe(false);
+		expect(queueFormSchema.safeParse({ ...base, callbackKey: "E" }).success).toBe(false);
+	});
+
+	it("keeps a zero offer delay, which means the offer is never announced", () => {
+		expect(
+			queueFormSchema.parse({ ...base, callbackOfferAfterSeconds: "0" }).callbackOfferAfterSeconds,
+		).toBe(0);
+		expect(queueFormSchema.parse(base).callbackOfferAfterSeconds).toBeNull();
+	});
+
+	it("bounds the callback knobs at the floors the compiler clamps to anyway", () => {
+		expect(queueFormSchema.safeParse({ ...base, callbackMaxAttempts: "0" }).success).toBe(false);
+		expect(queueFormSchema.safeParse({ ...base, callbackMaxAttempts: "11" }).success).toBe(false);
+		expect(queueFormSchema.safeParse({ ...base, callbackRetryDelaySeconds: "29" }).success).toBe(
+			false,
+		);
+		expect(queueFormSchema.safeParse({ ...base, callbackExpiresAfterSeconds: "59" }).success).toBe(
+			false,
+		);
 	});
 
 	/** 0 is a REAL value here — it disables the cap and makes callers wait indefinitely. */
@@ -1374,6 +1449,7 @@ const AUDIO_REFERENCE_FORMS = [
 			callerIdName: "",
 			callerIdNumber: "",
 			outboundCallerIdNumber: "",
+			outboundCallerIdPresentation: "allowed" as const,
 			tollClass: "national",
 			recordPolicy: "none",
 			pickupGroup: "",
@@ -1410,14 +1486,31 @@ const AUDIO_REFERENCE_FORMS = [
 			tierRuleNoAgentNoWait: false,
 			recordPolicy: "none",
 			exitKey: "",
+			callbackEnabled: false,
+			callbackKey: "",
+			callbackOfferAfterSeconds: "",
+			callbackOfferPromptId: "",
+			callbackConfirmPromptId: "",
+			callbackMaxAttempts: "",
+			callbackRetryDelaySeconds: "",
+			callbackExpiresAfterSeconds: "",
 			defaultPriority: "",
 			enabled: true,
 		},
 		/**
 		 * `agentWhisperPromptId` is the fourth, and it is the one that plays to the OTHER side of the
 		 * bridge — the answering agent alone, never the caller. Same helper, same null-on-blank rule.
+		 * The two callback prompts join them on the same terms: an emptied one means the offer or the
+		 * confirmation is not spoken, which has to reach the server as `null` rather than as silence.
 		 */
-		columns: ["mohClassId", "greetingPromptId", "announcePromptId", "agentWhisperPromptId"],
+		columns: [
+			"mohClassId",
+			"greetingPromptId",
+			"announcePromptId",
+			"agentWhisperPromptId",
+			"callbackOfferPromptId",
+			"callbackConfirmPromptId",
+		],
 	},
 	{
 		/**

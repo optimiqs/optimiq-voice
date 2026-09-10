@@ -63,8 +63,19 @@ const nextConfig = {
 	experimental: {
 		optimizePackageImports: ["@base-ui/react", "@tanstack/react-query", "@tanstack/react-table"],
 	},
+	/**
+	 * `/provision/*` is proxied alongside `/api/*` because the API hands a PHONE the URL it will
+	 * fetch its configuration from, built on `PROVISION_BASE_URL`, and that variable names the
+	 * public origin — this one. Without this rewrite the handset fetches the Next app, is redirected
+	 * to the sign-in page, and stores an HTML document as its config; the failure is silent on both
+	 * sides. The route is public by design (a token in the path is the credential), so no session
+	 * cookie is involved.
+	 */
 	async rewrites() {
-		return [{ source: "/api/:path*", destination: `${apiOrigin}/api/:path*` }];
+		return [
+			{ source: "/api/:path*", destination: `${apiOrigin}/api/:path*` },
+			{ source: "/provision/:path*", destination: `${apiOrigin}/provision/:path*` },
+		];
 	},
 	async headers() {
 		return [

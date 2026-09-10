@@ -9,8 +9,11 @@
  *
  * One call at a time, deliberately: a browser softphone is a single line, and a second INVITE while
  * one is up is refused at the adapter rather than modelled as a call-waiting stack this UI has no
- * controls for.
+ * controls for. The one exception is an ATTENDED TRANSFER's consultation, which is a second dialog
+ * by definition — it lives in `transfer.ts`'s own machine and never becomes `call`.
  */
+
+import { IDLE_TRANSFER, transferReducer, type TransferEvent, type TransferState } from "./transfer";
 
 export type RegistrationState =
 	| "unregistered"
@@ -41,7 +44,16 @@ export interface CallState {
 	readonly direction: CallDirection | null;
 	readonly peer: CallPeer | null;
 	readonly muted: boolean;
+	/** Held BY US. The button's own state. */
 	readonly onHold: boolean;
+	/**
+	 * Held by the OTHER party — a re-INVITE that turned their media direction to `sendonly`/`inactive`.
+	 *
+	 * Separate from {@link onHold} because they are separate facts with separate remedies: our hold
+	 * has a Resume button, theirs has nothing to press and only needs saying. Without this the held
+	 * party's panel read `Connected` through a silence it could not explain.
+	 */
+	readonly remoteHold: boolean;
 	/** Epoch ms when the dialog was confirmed, for a duration timer. `null` until `active`. */
 	readonly connectedAt: number | null;
 	/** Why the last call ended, for the ended card. `null` while a call is live. */
@@ -55,6 +67,7 @@ export interface SoftphoneState {
 	/** The last registration/transport error, surfaced once and cleared on the next success. */
 	readonly error: string | null;
 	readonly call: CallState;
+	readonly transfer: TransferState;
 }
 
 export const IDLE_CALL: CallState = {
@@ -63,6 +76,7 @@ export const IDLE_CALL: CallState = {
 	peer: null,
 	muted: false,
 	onHold: false,
+	remoteHold: false,
 	connectedAt: null,
 	endedReason: null,
 	dtmfSent: "",
@@ -72,6 +86,7 @@ export const INITIAL_SOFTPHONE_STATE: SoftphoneState = {
 	registration: "unregistered",
 	error: null,
 	call: IDLE_CALL,
+	transfer: IDLE_TRANSFER,
 };
 
 export type SoftphoneEvent =
@@ -85,10 +100,12 @@ export type SoftphoneEvent =
 	| { readonly type: "CALL_CONFIRMED"; readonly at: number }
 	| { readonly type: "CALL_ENDED"; readonly reason: string }
 	| { readonly type: "HOLD_CHANGED"; readonly onHold: boolean }
+	| { readonly type: "REMOTE_HOLD_CHANGED"; readonly onHold: boolean }
 	| { readonly type: "MUTE_CHANGED"; readonly muted: boolean }
 	| { readonly type: "DTMF_SENT"; readonly tone: string }
 	| { readonly type: "RESET_CALL" }
-	| { readonly type: "CLEAR_ERROR" };
+	| { readonly type: "CLEAR_ERROR" }
+	| TransferEvent;
 
 function startCall(direction: CallDirection, peer: CallPeer): CallState {
 	return { ...IDLE_CALL, status: "ringing", direction, peer };
@@ -142,10 +159,14 @@ export function softphoneReducer(state: SoftphoneState, event: SoftphoneEvent): 
 			}
 			return {
 				...state,
+				// A transfer that was still in flight goes with the call, EXCEPT a failed one: the reason
+				// it failed is the only thing that explains the call the user is still holding.
+				transfer: state.transfer.status === "failed" ? state.transfer : IDLE_TRANSFER,
 				call: {
 					...state.call,
 					status: "ended",
 					onHold: false,
+					remoteHold: false,
 					muted: false,
 					endedReason: event.reason,
 				},
@@ -156,6 +177,12 @@ export function softphoneReducer(state: SoftphoneState, event: SoftphoneEvent): 
 				return state;
 			}
 			return { ...state, call: { ...state.call, onHold: event.onHold } };
+
+		case "REMOTE_HOLD_CHANGED":
+			if (state.call.status !== "active") {
+				return state;
+			}
+			return { ...state, call: { ...state.call, remoteHold: event.onHold } };
 
 		case "MUTE_CHANGED":
 			if (state.call.status !== "active") {
@@ -178,6 +205,19 @@ export function softphoneReducer(state: SoftphoneState, event: SoftphoneEvent): 
 
 		case "CLEAR_ERROR":
 			return { ...state, error: null };
+
+		case "TRANSFER_REQUESTED":
+		case "CONSULT_CONFIRMED":
+		case "TRANSFER_COMPLETING":
+		case "TRANSFER_FAILED":
+		case "TRANSFER_CANCELLED": {
+			// A transfer only exists on an established call; the machine itself does not know that.
+			if (state.call.status !== "active" && event.type === "TRANSFER_REQUESTED") {
+				return state;
+			}
+			const transfer = transferReducer(state.transfer, event);
+			return transfer === state.transfer ? state : { ...state, transfer };
+		}
 
 		default: {
 			// Exhaustiveness: a new event type that is not handled fails the type-check here.

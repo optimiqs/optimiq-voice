@@ -99,12 +99,13 @@ export function toBranding(data: unknown): Branding {
  *   - a bare object key becomes the logo route for the `host` it was resolved by — the same host the
  *     pre-auth `by-host` branding read used, threaded in so the route resolves the SAME tenant's row
  *     server-side (a public caller never names an object, only its host);
- *   - an absent key, or a bare key with no host to resolve it, returns `null` and the caller shows
- *     the product initial.
+ *   - a bare key with NO host becomes the hostless logo route, which resolves the acting session's
+ *     own organization server-side — the signed-in shell's case, and the only way a tenant without
+ *     a custom domain ever sees the logo it uploaded;
+ *   - an absent key returns `null` and the caller shows the product initial.
  *
  * The route is same-origin — `next.config.mjs` rewrites `/api/*` to the API server — so a relative
- * path is correct and needs no origin. A bare key with no host is not turned into a route, because
- * the route would then have no tenant to resolve and would 404; the initial is the honest fallback.
+ * path is correct and needs no origin.
  */
 export function brandLogoSrc(brand: Branding, host?: string | null): string | null {
 	const key = brand.logoObjectKey;
@@ -115,8 +116,18 @@ export function brandLogoSrc(brand: Branding, host?: string | null): string | nu
 		return key;
 	}
 	const trimmedHost = host?.trim();
-	if (!trimmedHost) {
-		return null;
-	}
-	return `/api/v1/branding/logo?host=${encodeURIComponent(trimmedHost)}`;
+	/**
+	 * No host is the SIGNED-IN case, not a dead end.
+	 *
+	 * The sidebar renders inside the app shell and has no host to resolve by — and on the shared
+	 * platform host there would be nothing to resolve to anyway, because `readByHost` goes through
+	 * `custom_domain` and only a tenant with its own domain has one. Returning `null` here therefore
+	 * dropped every uploaded logo for every tenant that is not white-labelled onto its own domain:
+	 * the upload succeeded, the key was on the row, and no component ever asked for the bytes.
+	 * The hostless route resolves the acting session's organization server-side, which is exactly
+	 * whose logo the shell wants.
+	 */
+	return trimmedHost
+		? `/api/v1/branding/logo?host=${encodeURIComponent(trimmedHost)}`
+		: "/api/v1/branding/logo";
 }

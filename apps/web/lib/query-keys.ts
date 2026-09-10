@@ -196,6 +196,19 @@ export const queryKeys = {
 		["organizations", organizationId, "pbx", "phone-numbers", "carrier-search", query] as const,
 
 	/**
+	 * Ports in flight, and one number's CNAM listing.
+	 *
+	 * Both sit UNDER `pbx/phone-numbers` for the reason `carrierNumberSearch` does: the coarse
+	 * `pbxResource` invalidation that every number mutation already fires sweeps them, so a port
+	 * that just completed and a CNAM that was just changed cannot be left on screen as stale by a
+	 * write path that has no idea either view exists.
+	 */
+	carrierPortingOrders: (organizationId: string) =>
+		["organizations", organizationId, "pbx", "phone-numbers", "porting-orders"] as const,
+	carrierCnam: (organizationId: string, phoneNumberId: string) =>
+		["organizations", organizationId, "pbx", "phone-numbers", "cnam", phoneNumberId] as const,
+
+	/**
 	 * The reporting area, scoped by organization for the same reason everything else is.
 	 *
 	 * Unlike `pbx`, there is no mutation that invalidates these — `call_legs` is an append-only
@@ -229,6 +242,23 @@ export const queryKeys = {
 	 */
 	queueStats: (organizationId: string, query: Readonly<Record<string, unknown>>) =>
 		["organizations", organizationId, "cdr", "queue-stats", query] as const,
+	/**
+	 * Per-agent handling over a window (`GET /cdr/agent-stats`).
+	 *
+	 * Beside `queueStats` and under `cdr` for exactly the same reasons: it is the other half of the
+	 * same question, read from the same ledger, gated by the same `queues.monitor`, and it must not
+	 * survive an organization switch. The whole query — window, wrap-up cap, optional agent and
+	 * queue — is the last segment, because a different cap is a different answer.
+	 *
+	 * NOT polled, unlike `queueStats`. A wallboard is a screen people watch; an agent report is a
+	 * page somebody reads and then acts on, and re-sorting a table under a supervisor's cursor every
+	 * thirty seconds is the behaviour that makes a report feel untrustworthy.
+	 */
+	agentStats: (organizationId: string, query: Readonly<Record<string, unknown>>) =>
+		["organizations", organizationId, "cdr", "agent-stats", query] as const,
+	/** Bucketed call volume over a window (`GET /cdr/call-volume`). Not polled, same argument. */
+	callVolume: (organizationId: string, query: Readonly<Record<string, unknown>>) =>
+		["organizations", organizationId, "cdr", "call-volume", query] as const,
 	recordings: (organizationId: string) =>
 		["organizations", organizationId, "cdr", "recordings"] as const,
 	recordingList: (organizationId: string, query: Readonly<Record<string, unknown>>) =>

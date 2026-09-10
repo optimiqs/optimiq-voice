@@ -110,6 +110,8 @@ export const routes = {
 	callBlock: "/call-block",
 	recordings: "/recordings",
 	cdr: "/cdr",
+	/** Agent statistics and call volume over a window; read-only, beside the ledgers. */
+	reports: "/reports",
 	/**
 	 * The wallboard — every queue's line and service level, on one screen.
 	 *
@@ -355,8 +357,12 @@ export function deviceTabHref(tab: DeviceTab): string {
  * The `order` tab is rendered for everyone with `numbers.read` and its controls are gated on
  * `numbers.order` — hiding the tab entirely from a manager would leave them unable to see that
  * ordering exists, which is worse than showing them a panel that explains they cannot use it.
+ *
+ * The `porting` tab joins them on the same argument: taking over a number you already pay someone
+ * else for is a third view of "numbers", not a fourth sidebar entry, and it would have needed a
+ * `PAGE_PERMISSIONS` line duplicating `numbers.read` all over again.
  */
-export const NUMBER_TABS = ["numbers", "order"] as const;
+export const NUMBER_TABS = ["numbers", "order", "porting"] as const;
 
 export type NumberTab = (typeof NUMBER_TABS)[number];
 

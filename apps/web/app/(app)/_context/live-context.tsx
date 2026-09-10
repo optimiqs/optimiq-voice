@@ -10,6 +10,7 @@ import {
 	useState,
 	type ReactNode,
 } from "react";
+import { resolveApiOrigin } from "~/lib/api-client";
 import { LiveClient, type LiveStatus, type LiveTopicHandlers } from "~/lib/live/client";
 import { topicKind, type LiveTopic } from "~/lib/live/protocol";
 
@@ -42,33 +43,44 @@ interface LiveContextValue {
 const LiveContext = createContext<LiveContextValue | null>(null);
 
 export function LiveProvider({ children }: { children: ReactNode }) {
-	// `useState` with an initialiser, not `useMemo`: a memo may be discarded and recomputed, and a
-	// second client would be a second socket whose first one nobody closed.
-	const [client] = useState(() =>
-		typeof window === "undefined" ? null : new LiveClient({ origin: window.location.origin }),
-	);
+	/**
+	 * The client is created BY the effect that destroys it, not held in a `useState` initialiser.
+	 *
+	 * `destroy()` is permanent by contract — it stops reconnecting, which is what an unmounting shell
+	 * wants. A client created outside the effect therefore survives its own destruction: React's
+	 * StrictMode mounts, unmounts and remounts every effect in development, so the second mount
+	 * inherited a client that had already been stopped and would never open a socket again. That is
+	 * the "Reconnecting" every live page sat on locally, and it is exactly the bug StrictMode's
+	 * double-invoke exists to surface. Owning the client here makes the remount build a live one.
+	 */
+	const [client, setClient] = useState<LiveClient | null>(null);
 	const [status, setStatus] = useState<LiveStatus>("closed");
 	const [allowedTopicKinds, setAllowedTopicKinds] = useState<readonly string[]>([]);
 	const [welcomed, setWelcomed] = useState(false);
 
 	useEffect(() => {
-		if (client === null) {
-			return;
-		}
-		const detachStatus = client.onStatusChange(setStatus);
+		// The socket goes to the API's origin, not necessarily this page's: Next's `rewrites` proxy
+		// HTTP and cannot carry a WebSocket upgrade, so a deployment where Next is the proxy has to
+		// name the API. `resolveApiOrigin` falls back to the page origin, which is right behind a
+		// reverse proxy that forwards the upgrade. See `docs/native-calling-deployment.md`.
+		const created = new LiveClient({ origin: resolveApiOrigin(window.location.origin) });
+		setClient(created);
+		const detachStatus = created.onStatusChange(setStatus);
 		// `welcome` arrives a round trip AFTER the socket opens, so it needs its own notification:
 		// reading the allowed kinds on the status change would read them before the server had said
 		// anything, and there is no second status change to prompt a re-read.
-		const detachWelcome = client.onWelcome((kinds) => {
+		const detachWelcome = created.onWelcome((kinds) => {
 			setAllowedTopicKinds(kinds);
 			setWelcomed(true);
 		});
 		return () => {
 			detachStatus();
 			detachWelcome();
-			client.destroy();
+			setWelcomed(false);
+			setAllowedTopicKinds([]);
+			created.destroy();
 		};
-	}, [client]);
+	}, []);
 
 	const value = useMemo(
 		() => ({ client, status, allowedTopicKinds, welcomed }),
@@ -122,6 +134,19 @@ export function useLiveTopic(
 	// FLAG rather than on an empty list matters — a session legitimately allowed nothing would
 	// otherwise be treated as allowed everything.
 	const permitted = topic === null || (welcomed && allowedTopicKinds.includes(topicKind(topic)));
+
+	// Opening the socket is what MAKES the welcome frame arrive, and the client opens it lazily —
+	// on the first `subscribe`. Gating that subscribe on the welcome therefore closed a loop with
+	// nothing in it: no screen ever subscribed, so no socket was ever opened, so no welcome ever
+	// landed, and every live surface in the app sat on "Reconnecting" forever. Asking for the
+	// connection here keeps the laziness that matters — a page with no live topic still opens
+	// nothing — while letting the handshake that decides `permitted` actually happen.
+	useEffect(() => {
+		if (client === null || !enabled || permitted) {
+			return;
+		}
+		client.connect();
+	}, [client, enabled, permitted]);
 
 	useEffect(() => {
 		if (client === null || topic === null || !enabled || !permitted) {

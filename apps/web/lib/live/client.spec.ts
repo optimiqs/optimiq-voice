@@ -339,6 +339,40 @@ describe("LiveClient", () => {
 		expect(h.timersOfDelay(50_000)).toBe(0);
 	});
 
+	/**
+	 * `connect()` is the escape hatch out of a loop the lazy socket created: a screen may not
+	 * subscribe until the `welcome` frame says what it may watch, and the welcome only arrives on an
+	 * open socket. A caller that wants the handshake without a lease must therefore be able to open
+	 * one, and the welcome must reach it — see `app/(app)/_context/live-context.tsx`.
+	 */
+	it("opens a socket and delivers the welcome for a caller that holds no lease", () => {
+		const h = harness();
+		const kinds: string[][] = [];
+		h.client.onWelcome((topics) => kinds.push([...topics]));
+		h.client.connect();
+		expect(h.sockets).toHaveLength(1);
+		h.latest().open();
+		expect(h.latest().ops()).toEqual([]);
+		h.latest().deliver({
+			op: "welcome",
+			orgId: "org",
+			topics: ["queue", "agent-state"],
+			heartbeatMs: 25_000,
+			at: "t",
+		});
+		expect(kinds).toEqual([["queue", "agent-state"]]);
+		expect(h.client.allowedTopicKinds).toEqual(["queue", "agent-state"]);
+	});
+
+	it("reuses the socket a lease-less connect opened when a lease is then taken", () => {
+		const h = harness();
+		h.client.connect();
+		h.latest().open();
+		h.client.subscribe("registrations", {});
+		expect(h.sockets).toHaveLength(1);
+		expect(h.latest().ops()).toEqual(["subscribe"]);
+	});
+
 	it("closes everything on destroy and does not reconnect afterwards", () => {
 		const h = harness();
 		h.client.subscribe("registrations", {});

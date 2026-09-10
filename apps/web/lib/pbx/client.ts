@@ -73,6 +73,8 @@ import type {
 	TrunkRow,
 	VoicemailBoxRow,
 	VoicemailFolder,
+	VoicemailForwardMode,
+	VoicemailForwardResult,
 	VoicemailGreetingKind,
 	VoicemailGreetingRow,
 	VoicemailMessageDeletion,
@@ -1197,6 +1199,31 @@ export async function deleteVoicemailMessage(
 	return await apiFetch<VoicemailMessageDeletion>(
 		`/voicemail-boxes/${encodeURIComponent(boxId)}/messages/${encodeURIComponent(messageId)}${suffix}`,
 		{ method: "DELETE" },
+	);
+}
+
+/**
+ * Forwards or copies a message into another mailbox.
+ *
+ * `forward` removes the original once the copy is filed; `copy` leaves it. The server proves the
+ * target belongs to the same organization — a mailbox id from anywhere else is a 404, the same
+ * answer an id that never existed gets — so nothing here has to filter the picker for tenancy.
+ *
+ * A recorded introduction is deliberately absent: prepending a fresh recording to the forwarded
+ * audio needs a recording leg on the call path, which the control plane cannot fabricate.
+ */
+export async function forwardVoicemailMessage(
+	boxId: string,
+	messageId: string,
+	targetVoicemailBoxId: string,
+	mode: VoicemailForwardMode,
+): Promise<VoicemailForwardResult> {
+	return await apiFetch<VoicemailForwardResult>(
+		`/voicemail-boxes/${encodeURIComponent(boxId)}/messages/${encodeURIComponent(messageId)}/forward`,
+		{
+			method: "POST",
+			body: JSON.stringify({ targetVoicemailBoxId, mode }),
+		},
 	);
 }
 

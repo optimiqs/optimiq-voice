@@ -305,7 +305,7 @@ describe("closed sets mirrored from @optimiq-voice/pbx-db", () => {
 		expect(VOICEMAIL_GREETING_KINDS).toEqual([...SERVER_VOICEMAIL_GREETING_KINDS]);
 	});
 
-	/** Twenty of them. A missing one is a feature nobody can configure. */
+	/** Twenty-four of them. A missing one is a feature nobody can configure. */
 	it("feature code actions match", () => {
 		expect(FEATURE_CODE_ACTIONS).toEqual([...SERVER_FEATURE_CODE_ACTIONS]);
 	});

@@ -172,6 +172,10 @@ export const ORG_LIMIT_NAMES = [
 ] as const;
 export type OrgLimitName = (typeof ORG_LIMIT_NAMES)[number];
 
+/** Whether an extension's outbound number is shown to the far end — CLIR. */
+export const CALLER_ID_PRESENTATIONS = ["allowed", "restricted"] as const;
+export type CallerIdPresentation = (typeof CALLER_ID_PRESENTATIONS)[number];
+
 export const RECORD_POLICIES = ["none", "inbound", "outbound", "all", "on-demand"] as const;
 export type RecordPolicy = (typeof RECORD_POLICIES)[number];
 
@@ -315,6 +319,10 @@ export const FEATURE_CODE_ACTIONS = [
 	"agent-status",
 	"eavesdrop",
 	"transfer",
+	"hotdesk-login",
+	"hotdesk-logout",
+	"caller-id-presentation-restrict",
+	"caller-id-presentation-allow",
 ] as const;
 export type FeatureCodeAction = (typeof FEATURE_CODE_ACTIONS)[number];
 
@@ -407,6 +415,7 @@ export interface ExtensionRow extends EntityRow {
 	readonly callerIdNumber: string | null;
 	readonly outboundCallerIdName: string | null;
 	readonly outboundCallerIdNumber: string | null;
+	readonly outboundCallerIdPresentation: CallerIdPresentation;
 	readonly emergencyCallerIdName: string | null;
 	readonly emergencyCallerIdNumber: string | null;
 	readonly voicemailEnabled: boolean;
@@ -1070,6 +1079,22 @@ export interface QueueRow extends EntityRow {
 	readonly exitDestinationRef: string | null;
 	readonly exitDestinationData: DestinationData | null;
 	/**
+	 * Virtual hold: a waiting caller keeps their place and the platform calls them back.
+	 *
+	 * `callbackKey` is the digit that accepts, on the same one-character terms as `exitKey` and for
+	 * the same reason. It may not be the exit key — one digit cannot mean two things, and the
+	 * compiler gives it to the exit key with a warning when a tenant sets both.
+	 */
+	readonly callbackEnabled: boolean;
+	readonly callbackKey: string | null;
+	/** Seconds of waiting after which the offer plays unprompted. 0 means only on the key. */
+	readonly callbackOfferAfterSeconds: number;
+	readonly callbackOfferPromptId: string | null;
+	readonly callbackConfirmPromptId: string | null;
+	readonly callbackMaxAttempts: number;
+	readonly callbackRetryDelaySeconds: number;
+	readonly callbackExpiresAfterSeconds: number;
+	/**
 	 * The priority every caller entering this queue starts with, unless the destination that sent
 	 * them overrode it — an IVR option saying "press 2 if you are a platinum customer" is exactly
 	 * that override. Higher dequeues first; see {@link QUEUE_PRIORITY_MIN}.
@@ -1338,6 +1363,32 @@ export interface VoicemailMessageResult {
 export interface VoicemailMessageDeletion {
 	readonly data: { readonly id: string; readonly purged: boolean };
 	readonly mailbox: VoicemailMailboxSummary;
+}
+
+/**
+ * Which of the two things `POST …/messages/:id/forward` does.
+ *
+ * One verb with a mode rather than two endpoints, because they are the same operation: both file
+ * the audio and a row into another mailbox, and only `forward` then removes the original.
+ */
+export const VOICEMAIL_FORWARD_MODES = ["forward", "copy"] as const;
+export type VoicemailForwardMode = (typeof VOICEMAIL_FORWARD_MODES)[number];
+
+/**
+ * What a forward or a copy answers with.
+ *
+ * BOTH mailboxes' counts. A forward changes two lamps, and a screen handed only the destination's
+ * numbers would leave the badge on the box the user is looking at counting a message that has left
+ * it.
+ */
+export interface VoicemailForwardResult {
+	/** The copy, as it now sits in the target mailbox. */
+	readonly data: VoicemailMessageRow;
+	/** The TARGET box's counts after the operation. */
+	readonly mailbox: VoicemailMailboxSummary;
+	/** The SOURCE box's counts after the operation — unchanged on a copy. */
+	readonly source: VoicemailMailboxSummary;
+	readonly mode: VoicemailForwardMode;
 }
 
 /** A short-lived, anonymous URL an `<audio src>` can actually fetch. Minutes, not hours. */

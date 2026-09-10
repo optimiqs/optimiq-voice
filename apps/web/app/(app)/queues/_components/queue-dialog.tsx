@@ -81,6 +81,14 @@ function defaultsFor(queue: QueueRow | null): QueueFormValues {
 		tierRuleNoAgentNoWait: queue?.tierRuleNoAgentNoWait ?? false,
 		recordPolicy: queue?.recordPolicy ?? "none",
 		exitKey: queue?.exitKey ?? "",
+		callbackEnabled: queue?.callbackEnabled ?? false,
+		callbackKey: queue?.callbackKey ?? "",
+		callbackOfferAfterSeconds: numeric(queue?.callbackOfferAfterSeconds),
+		callbackOfferPromptId: queue?.callbackOfferPromptId ?? "",
+		callbackConfirmPromptId: queue?.callbackConfirmPromptId ?? "",
+		callbackMaxAttempts: numeric(queue?.callbackMaxAttempts),
+		callbackRetryDelaySeconds: numeric(queue?.callbackRetryDelaySeconds),
+		callbackExpiresAfterSeconds: numeric(queue?.callbackExpiresAfterSeconds),
 		defaultPriority: numeric(queue?.defaultPriority),
 		enabled: queue?.enabled ?? true,
 	};
@@ -174,6 +182,14 @@ export function QueueDialog({
 				tierRuleNoAgentNoWait: parsed.tierRuleNoAgentNoWait,
 				recordPolicy: parsed.recordPolicy,
 				exitKey: parsed.exitKey,
+				callbackEnabled: parsed.callbackEnabled,
+				callbackKey: parsed.callbackKey,
+				callbackOfferAfterSeconds: parsed.callbackOfferAfterSeconds,
+				callbackOfferPromptId: parsed.callbackOfferPromptId,
+				callbackConfirmPromptId: parsed.callbackConfirmPromptId,
+				callbackMaxAttempts: parsed.callbackMaxAttempts,
+				callbackRetryDelaySeconds: parsed.callbackRetryDelaySeconds,
+				callbackExpiresAfterSeconds: parsed.callbackExpiresAfterSeconds,
 				defaultPriority: parsed.defaultPriority,
 				enabled: parsed.enabled,
 				...writeDestination(timeoutDestination, "timeout"),
@@ -501,6 +517,114 @@ export function QueueDialog({
 							description="Played to the agent alone, before the caller is connected — usually the queue's name, so an agent staffing four queues knows which script to open with instead of guessing in front of the customer."
 							disabled={mutation.isPending}
 							error={errors.agentWhisperPromptId}
+						/>
+					)}
+				</form.Field>
+			</FormSection>
+
+			{/*
+			 * Virtual hold. Its own section rather than a line in "the caller hears", because the
+			 * decision an operator makes here is not about audio: it is whether this queue may promise
+			 * a call back at all, which is a promise the platform then has to keep.
+			 */}
+			<FormSection
+				title="Callback (virtual hold)"
+				description="Let a waiting caller hang up, keep their place, and be called back when an agent frees."
+				columns={1}
+			>
+				<form.Field name="callbackEnabled">
+					{(field) => (
+						<SwitchField
+							field={field}
+							label="Offer a callback"
+							description="Keep it off for a queue whose callers share one number — the held place is keyed by caller id, so the wrong person would be called back."
+							disabled={mutation.isPending}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="callbackKey">
+					{(field) => (
+						<TextField
+							field={field}
+							label="Key that accepts the offer"
+							placeholder="2"
+							description="A single DTMF digit. It may not be the exit key above — one digit cannot mean two things, and the exit key keeps it."
+							disabled={mutation.isPending}
+							submitError={errors.callbackKey}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="callbackOfferAfterSeconds">
+					{(field) => (
+						<TextField
+							field={field}
+							label="Announce the offer after (seconds)"
+							placeholder="0"
+							description="0 never announces it, so only a caller who already knows the key can take it."
+							disabled={mutation.isPending}
+							submitError={errors.callbackOfferAfterSeconds}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="callbackOfferPromptId">
+					{(field) => (
+						<PromptSelect
+							id="queueCallbackOfferPromptId"
+							label="Offer prompt"
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="Say nothing"
+							description="Press 2 to keep your place and we will call you back — or whatever the key above is. Without it the offer is never spoken."
+							disabled={mutation.isPending}
+							error={errors.callbackOfferPromptId}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="callbackConfirmPromptId">
+					{(field) => (
+						<PromptSelect
+							id="queueCallbackConfirmPromptId"
+							label="Confirmation prompt"
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="Say nothing"
+							description="Played once the place is held, just before the call ends."
+							disabled={mutation.isPending}
+							error={errors.callbackConfirmPromptId}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="callbackMaxAttempts">
+					{(field) => (
+						<TextField
+							field={field}
+							label="Attempts before giving up"
+							placeholder="3"
+							disabled={mutation.isPending}
+							submitError={errors.callbackMaxAttempts}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="callbackRetryDelaySeconds">
+					{(field) => (
+						<TextField
+							field={field}
+							label="Wait between attempts (seconds)"
+							placeholder="300"
+							disabled={mutation.isPending}
+							submitError={errors.callbackRetryDelaySeconds}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="callbackExpiresAfterSeconds">
+					{(field) => (
+						<TextField
+							field={field}
+							label="Forget the held place after (seconds)"
+							placeholder="3600"
+							description="Across every attempt. Past it the promise is gone and the place is released."
+							disabled={mutation.isPending}
+							submitError={errors.callbackExpiresAfterSeconds}
 						/>
 					)}
 				</form.Field>
