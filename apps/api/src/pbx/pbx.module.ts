@@ -101,6 +101,7 @@ import { PromptsService } from "./prompts/prompts.service";
 import { AgentStatePublisher } from "./queues/agent-state.publisher";
 import { QueueAgentSessionController } from "./queues/queue-agent-session.controller";
 import { QueueAgentSessionService } from "./queues/queue-agent-session.service";
+import { QueueCallbacksClient } from "./queues/queue-callbacks.client";
 import {
 	affectsQueueMembership,
 	QueueMembershipPublisher,
@@ -923,6 +924,7 @@ const logger = getLogger("api.pbx");
 		// `ClientProxy` can express, and a PCI pause whose availability must not ride a wallboard's
 		// watch.
 		CallControlClient,
+		QueueCallbacksClient,
 		CallRecordingService,
 		WebhooksService,
 		WebhookDispatcher,

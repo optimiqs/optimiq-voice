@@ -109,6 +109,40 @@ describe("the permission mapping", () => {
 	});
 
 	/**
+	 * The softphone's recording indicator, and the decision behind it.
+	 *
+	 * `active-calls` is the only producer of the `recording` / `recording-paused` flags a pause
+	 * control is drawn from. Gating it on `cdr.read` alone showed no indicator and no button to
+	 * somebody holding `calls.control` — the very grant the pause route itself requires — over a
+	 * recorder they are allowed to stop. Being told which calls are live is strictly less than being
+	 * able to pause any of their recordings.
+	 */
+	it("opens the live-calls feed to `calls.control` as well as `cdr.read`", () => {
+		expect(mayReadTopic(["calls.control"], { kind: "active-calls" })).to.equal(true);
+		expect(mayReadTopic(["cdr.read"], { kind: "active-calls" })).to.equal(true);
+		expect([...allowedTopicKinds(["calls.control"])]).to.deep.equal(["active-calls"]);
+	});
+
+	/** The alternate is one topic's, and does not leak into any other feed. */
+	it("does not open any other topic to `calls.control`", () => {
+		for (const kind of LIVE_TOPIC_KINDS) {
+			if (kind === "active-calls") {
+				continue;
+			}
+			const topic = (kind === "queue" ? { kind, queueId: QUEUE_ID } : { kind }) as LiveTopic;
+			expect(mayReadTopic(["calls.control"], topic)).to.equal(false);
+		}
+	});
+
+	/**
+	 * The `.own` rule survives the alternate: a scoped grant never opens an org-wide feed, and there
+	 * is no per-connection filter that could narrow one back down.
+	 */
+	it("still refuses the feed to a `.own`-scoped ledger grant", () => {
+		expect(mayReadTopic(["cdr.read.own"], { kind: "active-calls" })).to.equal(false);
+	});
+
+	/**
 	 * An owner sees everything, which is the trivial case and the one a regression would still pass.
 	 */
 	it("gives an owner every topic", () => {

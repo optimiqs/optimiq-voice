@@ -6,6 +6,7 @@ import {
 	Inject,
 	Param,
 	ParseUUIDPipe,
+	Optional,
 	Patch,
 	Post,
 	Query,
@@ -14,6 +15,7 @@ import { RequirePermissions } from "../../auth/require-permissions.decorator";
 import { Session } from "../../auth/session.decorator";
 import { parseDto } from "../shared/dto";
 import { listQuerySchema } from "../shared/pagination";
+import { QueueCallbacksClient } from "./queue-callbacks.client";
 import {
 	createQueueAgentDto,
 	createQueueDto,
@@ -38,6 +40,9 @@ export class QueuesController {
 	constructor(
 		@Inject(QueuesService) private readonly queues: QueuesService,
 		@Inject(QueueTiersService) private readonly tiers: QueueTiersService,
+		@Optional()
+		@Inject(QueueCallbacksClient)
+		private readonly callbacks?: QueueCallbacksClient,
 	) {}
 
 	@Get()
@@ -72,6 +77,27 @@ export class QueuesController {
 	@RequirePermissions("queues.delete")
 	async remove(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
 		return await this.queues.remove(session, id);
+	}
+
+	/**
+	 * The callbacks this queue still owes.
+	 *
+	 * `queues.read`, the same grant the queue itself is behind: a pending callback is the queue's
+	 * own state and says nothing an operator who may read the queue may not see. The queue is
+	 * fetched first, so an id from another tenant or one that never existed is a 404 before the
+	 * bucket is touched — the tenancy check, not a nicety.
+	 */
+	@Get(":id/callbacks")
+	@RequirePermissions("queues.read")
+	async listCallbacks(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
+		const queue = await this.queues.get(session, id);
+		const organizationId = queue.data.organizationId;
+		return {
+			data:
+				typeof organizationId === "string"
+					? ((await this.callbacks?.pendingFor(organizationId, id)) ?? [])
+					: [],
+		};
 	}
 
 	// --- tiers ---------------------------------------------------------------------------------

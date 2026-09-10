@@ -155,8 +155,19 @@ export interface LiveCallsResult {
 	readonly permitted: boolean;
 }
 
+/**
+ * Every live leg in the organization.
+ *
+ * `cdr.read` is the wallboard's grant and the topic's own. `calls.control` opens it too, and the
+ * server agrees (`LIVE_TOPIC_ALTERNATE_PERMISSIONS` in `apps/api`): this feed is the ONLY producer
+ * of the recording state the softphone's pause control is drawn from, so an agent who may pause a
+ * recording and may not read the call ledger was shown no indicator over a recorder they are
+ * allowed to stop. A client gate stricter than the server's would keep that hidden.
+ */
 export function useLiveActiveCalls(): LiveCallsResult {
-	const permitted = usePermission("cdr.read");
+	const readsLedger = usePermission("cdr.read");
+	const controlsCalls = usePermission("calls.control");
+	const permitted = readsLedger || controlsCalls;
 	const state = useKvTopic("active-calls", parseChannel, { enabled: permitted });
 
 	return useMemo(() => {

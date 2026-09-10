@@ -203,6 +203,60 @@ describe("picking this agent's recorded call out of the live feed", () => {
 	});
 });
 
+/**
+ * The whole decision, from one frame of the topic to what the panel draws.
+ *
+ * The topic is `active-calls`, whose rows are the engine's own channel snapshots: it is the only
+ * thing that carries `recording` / `recording-paused` to a browser, and it carries the agent's OWN
+ * leg — the engine stamps both sides of the bridge, so the row the softphone matches on is the one
+ * its own extension is on rather than the recorded party's. Its server-side gate is `cdr.read` OR
+ * `calls.control` (`LIVE_TOPIC_ALTERNATE_PERMISSIONS` in `apps/api`); on `cdr.read` alone an agent
+ * who may pause a recording was shown no control at all over a recorder they are allowed to stop.
+ */
+describe("the softphone's recording control, from one live-feed frame", () => {
+	/** One frame of the topic: the agent's own leg and the colleague's, both flagged. */
+	function frame(paused: boolean): RecordedLeg[] {
+		const flags = paused
+			? ["answered", "recording", "recording-paused"]
+			: ["answered", "recording"];
+		return [
+			leg({ flags, profile: { callerIdNumber: "2065550100", destinationNumber: "1002" } }),
+			leg({ flags }),
+		];
+	}
+
+	function fromFeed(paused: boolean): RecordingState {
+		const event = recordingEventForObservation(
+			IDLE_RECORDING,
+			observedRecording(frame(paused), AGENT),
+		);
+		return event === undefined ? IDLE_RECORDING : recordingReducer(IDLE_RECORDING, event);
+	}
+
+	it("shows the indicator and offers the pause for a recording nobody in this browser started", () => {
+		const state = fromFeed(false);
+		expect(state).toEqual({ status: "recording", callId: CALL, pending: false, error: null });
+		expect(isRecordingControlVisible(state)).toBe(true);
+		expect(recordingStatusLabel(state)).toBe("Recording");
+		expect(canPauseRecording(state)).toBe(true);
+	});
+
+	it("says so when the recorder is already paused, whoever paused it", () => {
+		const state = fromFeed(true);
+		expect(recordingStatusLabel(state)).toBe("Recording paused");
+		expect(canResumeRecording(state)).toBe(true);
+		expect(canPauseRecording(state)).toBe(false);
+	});
+
+	it("draws nothing when the feed is empty, which is what no grant looks like", () => {
+		// An agent whose token opens neither `cdr.read` nor `calls.control` gets no rows at all. The
+		// control is HIDDEN rather than shown over a recorder whose state nothing can see.
+		const event = recordingEventForObservation(IDLE_RECORDING, observedRecording([], AGENT));
+		expect(event).toBeUndefined();
+		expect(isRecordingControlVisible(IDLE_RECORDING)).toBe(false);
+	});
+});
+
 describe("turning an observation into an event", () => {
 	it("says nothing when the feed agrees with the control", () => {
 		const recording = fold([{ type: "RECORDING_OBSERVED", callId: CALL, paused: false }]);

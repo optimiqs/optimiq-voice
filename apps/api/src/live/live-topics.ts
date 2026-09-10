@@ -90,6 +90,28 @@ export const LIVE_TOPIC_PERMISSIONS = {
 } as const satisfies Record<LiveTopicKind, Permission>;
 
 /**
+ * A SECOND grant that also opens a topic. Additive: the map above still says what each topic is
+ * primarily for, and nothing is taken away.
+ *
+ * One entry, and the argument for it is the softphone's recording indicator. `active-calls` is the
+ * wallboard's feed and `cdr.read` is the right gate for a wallboard — but it is also the ONLY
+ * producer of the recording state a softphone's pause control is drawn from (the engine writes
+ * `recording` / `recording-paused` onto the channel snapshot and nothing else carries them to a
+ * browser). So an agent who may reach INSIDE a live call — `calls.control`, exactly what
+ * `POST /calls/:id/recording/{pause,resume}` requires — but who may not read the call ledger saw no
+ * feed, and therefore no indicator and no pause button, over a recorder they are allowed to stop.
+ *
+ * That is not a widening worth arguing about: `calls.control` already lets its holder pause the
+ * recording of any call in the tenant by id. Being told which calls are live is strictly less.
+ * `cdr.read.own` is deliberately NOT here — `hasPermission`'s rule is that a scoped grant never
+ * covers an unscoped requirement, and there is no per-connection filter that could turn an
+ * org-wide live feed into "calls you were on".
+ */
+export const LIVE_TOPIC_ALTERNATE_PERMISSIONS: Partial<Record<LiveTopicKind, Permission>> = {
+	"active-calls": "calls.control",
+};
+
+/**
  * The upstream this server has to be reading for a topic to produce anything.
  *
  * One topic can need two (`active-calls` reads the `channels` bucket for state AND the call event
@@ -203,6 +225,14 @@ export function permissionForTopic(topic: LiveTopic): Permission {
 	return LIVE_TOPIC_PERMISSIONS[topic.kind];
 }
 
+/** Every grant that opens a topic: its own, plus the alternate where there is one. */
+function permissionsForTopicKind(kind: LiveTopicKind): readonly Permission[] {
+	const alternate = LIVE_TOPIC_ALTERNATE_PERMISSIONS[kind];
+	return alternate === undefined
+		? [LIVE_TOPIC_PERMISSIONS[kind]]
+		: [LIVE_TOPIC_PERMISSIONS[kind], alternate];
+}
+
 export function sourcesForTopic(topic: LiveTopic): readonly LiveSource[] {
 	return LIVE_TOPIC_SOURCES[topic.kind];
 }
@@ -216,10 +246,16 @@ export function sourcesForTopic(topic: LiveTopic): readonly LiveSource[] {
  * filter that could turn an org-wide live feed into that.
  */
 export function mayReadTopic(granted: Iterable<string>, topic: LiveTopic): boolean {
-	return hasPermission(granted, permissionForTopic(topic));
+	const grants = [...granted];
+	return permissionsForTopicKind(topic.kind).some((permission) =>
+		hasPermission(grants, permission),
+	);
 }
 
 /** The topics a caller could subscribe to at all, for the `welcome` frame. */
 export function allowedTopicKinds(granted: Iterable<string>): readonly LiveTopicKind[] {
-	return LIVE_TOPIC_KINDS.filter((kind) => hasPermission(granted, LIVE_TOPIC_PERMISSIONS[kind]));
+	const grants = [...granted];
+	return LIVE_TOPIC_KINDS.filter((kind) =>
+		permissionsForTopicKind(kind).some((permission) => hasPermission(grants, permission)),
+	);
 }
