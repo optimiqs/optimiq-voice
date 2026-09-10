@@ -61,6 +61,10 @@ services:
       TELNYX_SIP_REGION: ${TELNYX_SIP_REGION:-us}
       TELNYX_WEBHOOK_URL:
       PROVISION_SIP_SECRET_KEY: ${PROVISION_SIP_SECRET_KEY:?Set the provisioning encryption key}
+      PLATFORM_SECRET_ENCRYPTION_KEY: ${PLATFORM_SECRET_ENCRYPTION_KEY:?Set the platform secret encryption key}
+      # The SIP edge a phone sends packets TO — deployment-wide, and NOT a tenant's realm. The
+      # domain an account registers INTO is per-organization (`org_setting sip/realm`); the API
+      # refuses to provision an organization that has configured none rather than borrowing this.
       PROVISION_SIP_SERVER: ${SIPD_REALM:?Set the public SIP domain}
       PROVISION_BASE_URL:
       PROVISION_SIP_TRANSPORT: ${PROVISION_SIP_TRANSPORT:-udp}
@@ -84,6 +88,15 @@ services:
       CDR_EXPORT_ROOT: /var/lib/optimiq/objects/exports
       PBX_MEDIA_OBJECT_ROOT: /var/lib/optimiq/objects
       PBX_VOICEMAIL_MEDIA_ROOT: /var/lib/optimiq/objects
+      # The Prometheus listener, on a socket of its own so the public ingress never carries it —
+      # the same shape sipd and mediad use for theirs. `0.0.0.0` rather than the loopback default
+      # because a scraper on the compose network is a different container; the port is not
+      # published, so it stays inside the network. See docs/native-calling-deployment.md.
+      API_METRICS_ADDR: 0.0.0.0:9200
+      # Call-record retention. Off, and the dry-run interlock is on: `DROP TABLE` against the
+      # billing ledger is not something a deployment starts doing because it was upgraded.
+      CDR_LEG_RETENTION_MONTHS: ${CDR_LEG_RETENTION_MONTHS:-0}
+      CDR_RETENTION_DRY_RUN: ${CDR_RETENTION_DRY_RUN:-true}
     volumes:
       - voice-objects:/var/lib/optimiq/objects
 
@@ -96,9 +109,11 @@ services:
       NODE_ENV: production
       OPTIMIQ_SERVICE: engine
       ENGINE_MEDIA_DRIVER: mediad
-      ENGINE_SIP_REALM: ${SIPD_REALM}
       ENGINE_MEDIAD_RPC_TIMEOUT_MS: ${ENGINE_MEDIAD_RPC_TIMEOUT_MS:-3000}
       ENGINE_MEDIA_OBJECT_ROOT: /var/lib/optimiq/objects
+      # The same decision as the API's, one port along: private socket, unpublished, `0.0.0.0`
+      # because a scraper on the compose network is a different container.
+      ENGINE_METRICS_ADDR: 0.0.0.0:9201
 
   web:
     environment:

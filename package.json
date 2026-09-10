@@ -36,19 +36,11 @@
 		"typecheck": "turbo run typecheck",
 		"format:check": "oxfmt --check \"apps/**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}\" \"packages/**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}\""
 	},
-	"nodemonConfig": {
-		"exec": "tsx",
-		"ext": "ts",
-		"ignore": "**/*.d.ts",
-		"watch": [
-			"apps/**",
-			"packages/**"
-		]
-	},
 	"devDependencies": {
 		"@commitlint/cli": "19.8.1",
 		"@commitlint/config-conventional": "19.8.1",
 		"@effect/language-service": "catalog:",
+		"@swc-node/register": "1.12.1",
 		"@types/chai": "5.2.3",
 		"@types/chai-as-promised": "8.0.2",
 		"@types/mocha": "10.0.10",
@@ -62,7 +54,6 @@
 		"husky": "9.1.7",
 		"lint-staged": "17.3.0",
 		"mocha": "11.7.6",
-		"nodemon": "3.1.14",
 		"oxfmt": "0.62.0",
 		"oxlint": "1.77.0",
 		"reflect-metadata": "catalog:",

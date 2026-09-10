@@ -85,6 +85,17 @@ jobs:
       - name: Typecheck
         run: pnpm exec turbo run typecheck
 
+      # The dev runner has to be semantically identical to production for dependency injection.
+      # A TypeScript runner that drops `emitDecoratorMetadata` breaks that silently: with no
+      # `design:paramtypes` a Nest constructor looks dependency-free, nothing is raised, and every
+      # provider injected by bare class type arrives as `undefined` until it is first touched. This
+      # walks both apps' module graphs under the `start:dev` runner and fails on any such parameter.
+      # Offline — only decorator metadata is read, nothing is instantiated or connected.
+      - name: Dependency-injection metadata
+        run: |
+          pnpm --filter @optimiq-voice/api run check:di
+          pnpm --filter @optimiq-voice/engine run check:di
+
   codegen-drift:
     name: events codegen drift
     runs-on: ubuntu-latest

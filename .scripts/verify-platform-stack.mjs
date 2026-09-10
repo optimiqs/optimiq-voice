@@ -111,7 +111,7 @@ try {
 		["-v", `${objects}:/tmp/recordings`, ...(mediaIP ? ["-p", "44000-44019:44000-44019/udp"] : [])]);
 	await until(() => run(["inspect", "--format", "{{.State.Health.Status}}", `${prefix}-mediad`]) === "healthy", "media startup");
 	start("engine", "optimiq-voice-audit/engine:local", { NODE_ENV: "production", ENGINE_MEDIA_DRIVER: "mediad", ENGINE_INSTANCE_ID: "stack-test-engine",
-		NATS_URL: "nats://nats:4222", NATS_ENGINE_USER: "engine-test", NATS_ENGINE_PASS: password, ENGINE_SIP_REALM: "test.example", LOG_LEVEL: "debug" });
+		NATS_URL: "nats://nats:4222", NATS_ENGINE_USER: "engine-test", NATS_ENGINE_PASS: password, LOG_LEVEL: "debug" });
 	start("web", "optimiq-voice-audit/web:local", { PORT: "3100", HOSTNAME: "0.0.0.0" }, ["-p", `127.0.0.1:${webPort}:3100`]);
 	await until(async () => (await fetch(`${origin}/api/auth/ok`)).ok, "API through Next proxy", 90000);
 	console.log("PASS: containerized web proxies to the full API");
@@ -132,15 +132,16 @@ try {
 	await request("PATCH", "/api/v1/org-settings/categories/sip", { realm: "test.example" });
 	const extension = await request("POST", "/api/v1/extensions", { number: "1001", label: "Test Desk", sipSecretRef: "secret://test/1001", enabled: true, voicemailEnabled: false });
 	assert.ok(extension.data.id);
-	assert.equal((await fetch(`${origin}/api/v1/me/softphone`, { headers: { Cookie: [...cookies].map(([key, value]) => `${key}=${value}`).join("; ") } })).status, 404);
+	assert.deepEqual({ ...(await request("GET", "/api/v1/me/softphone")), message: undefined }, { configured: false, reason: "no-extension", code: "SOFTPHONE_NO_EXTENSION", message: undefined });
 	const assignment = await request("POST", `/api/v1/extensions/${extension.data.id}/users`, { userId: signedUp.user.id, role: "primary" });
 	const softphone = await request("GET", "/api/v1/me/softphone");
+	assert.equal(softphone.configured, true);
 	assert.equal(softphone.extension.id, extension.data.id);
 	assert.equal(softphone.account.realm, "test.example");
 	assert.ok(softphone.account.password.length > 10);
 	await request("DELETE", `/api/v1/extensions/${extension.data.id}/users/${assignment.data.id}`);
-	assert.equal((await fetch(`${origin}/api/v1/me/softphone`, { headers: { Cookie: [...cookies].map(([key, value]) => `${key}=${value}`).join("; ") } })).status, 404);
-	console.log("PASS: assignment grants softphone credentials; removal denies further credential retrieval");
+	assert.deepEqual({ ...(await request("GET", "/api/v1/me/softphone")), message: undefined }, { configured: false, reason: "no-extension", code: "SOFTPHONE_NO_EXTENSION", message: undefined });
+	console.log("PASS: assignment grants softphone credentials; removal returns configured:false/no-extension");
 
 	const listed = await request("GET", "/api/v1/extensions");
 	assert.ok(listed.data.some(row => row.id === extension.data.id));

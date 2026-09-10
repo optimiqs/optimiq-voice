@@ -96,7 +96,8 @@ jobs:
         run: |
           export PLAYWRIGHT_MODULE="$RUNNER_TEMP/voice-browser/node_modules/playwright"
           pnpm exec tsx .scripts/verify-browser-calling.mts
-          export BROWSER_TURN_PUBLIC_IP="$(hostname -I | awk '{print $1}')"
+          BROWSER_TURN_PUBLIC_IP="$(hostname -I | awk '{print $1}')"
+          export BROWSER_TURN_PUBLIC_IP
           BROWSER_TURN_TRANSPORT=udp pnpm exec tsx .scripts/verify-browser-calling.mts
           BROWSER_TURN_TRANSPORT=tcp pnpm exec tsx .scripts/verify-browser-calling.mts
 

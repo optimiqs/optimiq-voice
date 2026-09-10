@@ -1,4 +1,4 @@
 {
-	"node-option": ["import=tsx"],
+	"node-option": ["import=@swc-node/register/esm-register"],
 	"ignore": ["**/node_modules/**"]
 }

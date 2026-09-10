@@ -1,7 +1,7 @@
 import { createServer } from "node:net";
 
 // A local, unauthenticated SMTP sink for disposable acceptance tests. Never forwards mail.
-export async function startTestSmtp() {
+export async function startTestSmtp({ port: requestedPort = 0 } = {}) {
 	const messages = [], sockets = new Set();
 	const server = createServer(socket => {
 		sockets.add(socket); socket.on("close", () => sockets.delete(socket));
@@ -22,6 +22,6 @@ export async function startTestSmtp() {
 			}
 		});
 	});
-	await new Promise(resolve => server.listen(0, "0.0.0.0", resolve));
+	await new Promise(resolve => server.listen(requestedPort, "0.0.0.0", resolve));
 	return { port: server.address().port, messages, close: async () => { for (const socket of sockets) socket.destroy(); await new Promise(resolve => server.close(resolve)); } };
 }
