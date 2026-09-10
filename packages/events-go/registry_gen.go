@@ -68,6 +68,7 @@ var EventTypes = []EventTypeInfo{
 	{Family: FamilyMedia, Type: EventTypeMediaRecordingFinished, SubjectTemplate: "media.evt.v1.<orgId>.<sessionId>.recording.finished"},
 	{Family: FamilyMedia, Type: EventTypeMediaDtmfReceived, SubjectTemplate: "media.evt.v1.<orgId>.<sessionId>.dtmf.received"},
 	{Family: FamilyTrunk, Type: EventTypeTrunkStatusChanged, SubjectTemplate: "trunk.evt.v1.<orgId>.<trunkId>.status.changed"},
+	{Family: FamilySecurity, Type: EventTypeSecurityFraudSignal, SubjectTemplate: "security.evt.v1.<orgId>.<subjectRef>.fraud-signal"},
 	{Family: FamilyCDR, Type: EventTypeCDRLegWrite, SubjectTemplate: "cdr.leg.v1.<orgId>"},
 	{Family: FamilyAudit, Type: EventTypeAuditRecorded, SubjectTemplate: "audit.evt.v1.<orgId>"},
 	{Family: FamilyProvision, Type: EventTypeProvisionDeviceRequested, SubjectTemplate: "provision.evt.v1.<orgId>"},
@@ -185,6 +186,8 @@ func NewDataFor(eventType string) any {
 		return new(MediaDtmfReceivedData)
 	case EventTypeTrunkStatusChanged:
 		return new(TrunkStatusChangedData)
+	case EventTypeSecurityFraudSignal:
+		return new(SecurityFraudSignalData)
 	case EventTypeCDRLegWrite:
 		return new(CDRLegWriteData)
 	case EventTypeAuditRecorded:
@@ -214,6 +217,8 @@ func NewRPCRequestFor(subject string) any {
 		return new(AuthzCheckRequest)
 	case SubjectVoicemailListRPC:
 		return new(VoicemailListRequest)
+	case SubjectAuthorizeOutboundRPC:
+		return new(AuthorizeOutboundRequest)
 	case SubjectExtensionFeatureRPC:
 		return new(ExtensionFeatureRequest)
 	case SubjectToggleFeatureRPC:
@@ -224,6 +229,10 @@ func NewRPCRequestFor(subject string) any {
 		return new(LastCallerRequest)
 	case SubjectFileGreetingRPC:
 		return new(FileGreetingRequest)
+	case SubjectQueueDispositionRPC:
+		return new(QueueDispositionRequest)
+	case SubjectQueueSurveyRPC:
+		return new(QueueSurveyRequest)
 	case SubjectSipCredentialRPC:
 		return new(SipCredentialRequest)
 	case SubjectSipTrunkCredentialRPC:
@@ -305,6 +314,8 @@ func NewRPCResponseFor(subject string) any {
 		return new(AuthzCheckResponse)
 	case SubjectVoicemailListRPC:
 		return new(VoicemailListResponse)
+	case SubjectAuthorizeOutboundRPC:
+		return new(AuthorizeOutboundResponse)
 	case SubjectExtensionFeatureRPC:
 		return new(ExtensionFeatureResponse)
 	case SubjectToggleFeatureRPC:
@@ -315,6 +326,10 @@ func NewRPCResponseFor(subject string) any {
 		return new(LastCallerResponse)
 	case SubjectFileGreetingRPC:
 		return new(FileGreetingResponse)
+	case SubjectQueueDispositionRPC:
+		return new(QueueDispositionResponse)
+	case SubjectQueueSurveyRPC:
+		return new(QueueSurveyResponse)
 	case SubjectSipCredentialRPC:
 		return new(SipCredentialResponse)
 	case SubjectSipTrunkCredentialRPC:

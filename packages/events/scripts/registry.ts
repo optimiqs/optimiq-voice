@@ -17,6 +17,7 @@ import { PROVISION_EVENT_DEFINITIONS } from "../src/schemas/provision-events";
 import { QUEUE_EVENT_DEFINITIONS } from "../src/schemas/queue-events";
 import { REGISTRATION_EVENT_DEFINITIONS } from "../src/schemas/registration-events";
 import { RPC_CONTRACTS } from "../src/schemas/rpc";
+import { SECURITY_EVENT_DEFINITIONS } from "../src/schemas/security-events";
 import { SIP_DIALOG_EVENT_DEFINITIONS } from "../src/schemas/sip-dialog-events";
 import {
 	agentStatusSchema,
@@ -315,6 +316,15 @@ export const EVENT_ENTRIES: readonly EventEntry[] = [
 	trunkEntry("status.changed", "TrunkStatusChanged"),
 
 	{
+		family: "security",
+		type: "fraud-signal",
+		goName: "SecurityFraudSignalData",
+		goConst: "EventTypeSecurityFraudSignal",
+		data: SECURITY_EVENT_DEFINITIONS["fraud-signal"].data,
+		subjectTemplate: "security.evt.v1.<orgId>.<subjectRef>.fraud-signal",
+	},
+
+	{
 		family: "cdr",
 		type: "cdr.leg.write",
 		goName: "CDRLegWriteData",
@@ -368,6 +378,13 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		request: RPC_CONTRACTS["rpc.voicemail.v1.list"].request,
 		response: RPC_CONTRACTS["rpc.voicemail.v1.list"].response,
 	},
+	{
+		subject: "rpc.pbx.v1.authorize-outbound",
+		goName: "AuthorizeOutbound",
+		timeoutMs: RPC_CONTRACTS["rpc.pbx.v1.authorize-outbound"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.pbx.v1.authorize-outbound"].request,
+		response: RPC_CONTRACTS["rpc.pbx.v1.authorize-outbound"].response,
+	},
 	// The handset's own feature state, and the `*69` lookup behind it. Both are TypeScript on both
 	// ends today, so these structs are documentation rather than a wire contract — emitted anyway,
 	// because the emitter's rule is "every RPC subject", and a subject that quietly opted out would
@@ -406,6 +423,22 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		timeoutMs: RPC_CONTRACTS["rpc.pbx.v1.file-greeting"].timeoutMs,
 		request: RPC_CONTRACTS["rpc.pbx.v1.file-greeting"].request,
 		response: RPC_CONTRACTS["rpc.pbx.v1.file-greeting"].response,
+	},
+	// The two after-call reports. TypeScript on both ends today, like the four above them, and
+	// emitted for the same stated reason: the emitter's rule is "every RPC subject".
+	{
+		subject: "rpc.pbx.v1.queue-disposition",
+		goName: "QueueDisposition",
+		timeoutMs: RPC_CONTRACTS["rpc.pbx.v1.queue-disposition"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.pbx.v1.queue-disposition"].request,
+		response: RPC_CONTRACTS["rpc.pbx.v1.queue-disposition"].response,
+	},
+	{
+		subject: "rpc.pbx.v1.queue-survey",
+		goName: "QueueSurvey",
+		timeoutMs: RPC_CONTRACTS["rpc.pbx.v1.queue-survey"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.pbx.v1.queue-survey"].request,
+		response: RPC_CONTRACTS["rpc.pbx.v1.queue-survey"].response,
 	},
 	{
 		subject: "rpc.sip.v1.credential",
@@ -765,6 +798,7 @@ function assertRegistryComplete(): void {
 		["voicemail", VOICEMAIL_EVENT_DEFINITIONS],
 		["media", MEDIA_EVENT_DEFINITIONS],
 		["trunk", TRUNK_EVENT_DEFINITIONS],
+		["security", SECURITY_EVENT_DEFINITIONS],
 		["cdr", CDR_EVENT_DEFINITIONS],
 		["audit", AUDIT_EVENT_DEFINITIONS],
 		["provision", PROVISION_EVENT_DEFINITIONS],
@@ -806,6 +840,7 @@ export const FAMILY_ORDER: readonly EventFamily[] = [
 	"media",
 	"trunk",
 	"cdr",
+	"security",
 	"audit",
 	"provision",
 ];
@@ -819,6 +854,7 @@ export const FAMILY_FILE: Readonly<Record<EventFamily, string>> = {
 	voicemail: "voicemail_events",
 	media: "media_events",
 	trunk: "trunk_events",
+	security: "security_events",
 	cdr: "cdr_events",
 	audit: "audit_events",
 	provision: "provision_events",

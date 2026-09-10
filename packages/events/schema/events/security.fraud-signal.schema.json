@@ -1,0 +1,68 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"kind": {
+			"type": "string",
+			"enum": [
+				"international-minutes-spike",
+				"high-risk-prefix",
+				"short-call-burst",
+				"registration-source-spread",
+				"international-concurrency-exceeded",
+				"international-minutes-exceeded",
+				"destination-country-blocked",
+				"new-country-hold",
+				"off-hours-international-lock"
+			]
+		},
+		"severity": {
+			"type": "string",
+			"enum": ["info", "warning", "critical"]
+		},
+		"action": {
+			"type": "string",
+			"enum": ["none", "call-refused", "extension-suspended"]
+		},
+		"extensionId": {
+			"type": "string",
+			"format": "uuid",
+			"pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+		},
+		"extensionNumber": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 32
+		},
+		"destination": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 32
+		},
+		"destinationCountry": {
+			"type": "string",
+			"minLength": 2,
+			"maxLength": 2
+		},
+		"observed": {
+			"type": "number",
+			"minimum": 0
+		},
+		"threshold": {
+			"type": "number",
+			"minimum": 0
+		},
+		"windowSeconds": {
+			"type": "integer",
+			"minimum": 1,
+			"maximum": 86400
+		},
+		"summary": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 512
+		}
+	},
+	"required": ["kind", "severity", "action", "summary"],
+	"additionalProperties": false
+}

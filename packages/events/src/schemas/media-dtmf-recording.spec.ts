@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { channelRecordStartedDataSchema, recordingConsentSchema } from "./call-events";
 import {
 	makeMediaEvent,
 	mediaDtmfReceivedDataSchema,
@@ -343,5 +344,78 @@ describe("media.evt.v1 dtmf.received", () => {
 				durationMs: -1,
 			}).success,
 		).toBe(false);
+	});
+});
+
+/**
+ * Rung 5, and the reason the recording rungs above exist at all: what the caller was told before
+ * the media bug was armed. The record mirrors `RecordingConsentRecord` in `packages/routing` —
+ * mirrored rather than imported, so these assertions are what keeps the two copies honest.
+ */
+describe("channel.record.started — the consent record", () => {
+	const LEG = "018f2b7c-0000-7000-8000-0000000000cc";
+	const PROMPT = "018f2b7c-0000-7000-8000-0000000000ee";
+	const start = {
+		legId: LEG,
+		recordingId: SESSION,
+		objectKey: "recordings/org/2026/call.wav",
+		kind: "call" as const,
+	};
+
+	it("stays optional, so a producer that predates consent handling still validates", () => {
+		expect(channelRecordStartedDataSchema.parse(start)).toEqual(start);
+	});
+
+	it("carries the whole record through, jurisdictions and prompt included", () => {
+		const consent = {
+			outcome: "accepted" as const,
+			method: "keypress" as const,
+			policy: "announce-and-require-keypress" as const,
+			at: "2026-01-01T00:00:00.000Z",
+			parties: ["caller", "callee"] as ("caller" | "callee")[],
+			regions: ["US-CA", "EU"],
+			promptId: PROMPT,
+		};
+		const parsed = channelRecordStartedDataSchema.parse({ ...start, consent });
+		expect(parsed.consent).toEqual(consent);
+	});
+
+	it("mirrors routing's three vocabularies exactly", () => {
+		expect(recordingConsentSchema.shape.outcome.options).toEqual([
+			"not-required",
+			"announced",
+			"accepted",
+			"declined",
+		]);
+		expect(recordingConsentSchema.shape.method.options).toEqual([
+			"none",
+			"announcement",
+			"keypress",
+		]);
+		expect(recordingConsentSchema.shape.policy.options).toEqual([
+			"none",
+			"announce",
+			"announce-and-require-keypress",
+		]);
+	});
+
+	const base = {
+		outcome: "announced" as const,
+		method: "announcement" as const,
+		policy: "announce" as const,
+		at: "2026-01-01T00:00:00.000Z",
+		parties: ["caller"] as ("caller" | "callee")[],
+	};
+
+	it.each([
+		["an outcome outside the vocabulary", { outcome: "pending" }],
+		["a method outside the vocabulary", { method: "telepathy" }],
+		["a party that is neither end of the call", { parties: ["supervisor"] }],
+		["a timestamp that is not ISO 8601", { at: "just now" }],
+		// Bounded on purpose: a jurisdiction list is a handful of entries, and an unbounded array on
+		// a bus message is a memory budget nobody set.
+		["more regions than any tenant has", { regions: Array.from({ length: 17 }, () => "US-CA") }],
+	])("rejects %s", (_label, override) => {
+		expect(recordingConsentSchema.safeParse({ ...base, ...override }).success).toBe(false);
 	});
 });

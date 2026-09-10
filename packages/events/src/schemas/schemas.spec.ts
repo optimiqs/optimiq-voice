@@ -494,12 +494,51 @@ describe("cdr.leg.write", () => {
 		expect(event.data.answeredAt).toBeNull();
 	});
 
+	/**
+	 * The consent projection: four flat columns a report groups by, on a leg that may carry no
+	 * recording at all. The `declined` case is the one the columns exist for — there is no
+	 * `recordings` row to file it beside, so the leg is the only record that the platform asked.
+	 */
+	it("pins the recording-consent columns, including on a leg that was never recorded", () => {
+		const event = makeCdrLegWriteEvent({
+			orgId: ORG,
+			source: "engine",
+			data: {
+				...core,
+				recordingConsent: "declined",
+				recordingConsentMethod: "keypress",
+				recordingConsentAt: AT,
+				recordingConsentRegions: ["US-CA", "EU"],
+			},
+		});
+		expect(event.data.recordingConsent).toBe("declined");
+		expect(event.data.recordingConsentRegions).toEqual(["US-CA", "EU"]);
+	});
+
+	it("accepts the consent columns null, which is every leg written before consent existed", () => {
+		const event = makeCdrLegWriteEvent({
+			orgId: ORG,
+			source: "engine",
+			data: {
+				...core,
+				recordingConsent: null,
+				recordingConsentMethod: null,
+				recordingConsentAt: null,
+				recordingConsentRegions: null,
+			},
+		});
+		expect(event.data.recordingConsent).toBeNull();
+	});
+
 	it.each([
 		["a non-v7 leg id", { id: "6f9619ff-8b86-d011-b42d-00c04fc964ff" }],
 		["a missing partition key", { startedAt: undefined }],
 		["a negative billsec", { billsecMs: -1 }],
 		["an upper-case destination type", { destinationType: "EXTENSION" }],
 		["an unknown direction", { direction: "sideways" }],
+		["a consent outcome outside the vocabulary", { recordingConsent: "maybe" }],
+		["a consent method outside the vocabulary", { recordingConsentMethod: "shrug" }],
+		["a consent timestamp that is not ISO 8601", { recordingConsentAt: "yesterday" }],
 	])("rejects %s", (_label, override) => {
 		expect(() =>
 			makeCdrLegWriteEvent({

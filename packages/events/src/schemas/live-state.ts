@@ -614,6 +614,12 @@ export const trunkDirectoryEntrySchema = z
 		 */
 		maxChannels: z.int().min(1).max(10_000).optional(),
 		callerIdNumberOverride: z.string().max(64).optional(),
+		/**
+		 * SDES-SRTP (RFC 4568) on this trunk's legs, overriding the media plane's process-wide
+		 * default. ABSENT means "let the media plane decide", which is what every entry written
+		 * before this field existed means — that is what keeps the field additive.
+		 */
+		srtpPolicy: z.enum(["none", "prefer", "require"]).optional(),
 		/** A disabled trunk stays in the bucket and is not dialled. Removal is a DELETE. */
 		enabled: z.boolean().default(true),
 		updatedAt: z.number(),

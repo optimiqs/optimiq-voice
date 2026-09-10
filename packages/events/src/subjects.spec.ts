@@ -11,9 +11,11 @@ import {
 	isEventName,
 	isQueueEvent,
 	isRegistrationEvent,
+	isMessagingEvent,
 	isSubjectToken,
 	isTrunkEvent,
 	matchesSubject,
+	MESSAGING_EVENTS,
 	parseSubject,
 	parseSubjectOrThrow,
 	QUEUE_EVENTS,
@@ -34,6 +36,7 @@ const CALL = "018f2b7c-0000-7000-8000-0000000000bb";
 const QUEUE = "018f2b7c-0000-7000-8000-0000000000cc";
 const TRUNK = "018f2b7c-0000-7000-8000-0000000000dd";
 const LEG = "018f2b7c-0000-7000-8000-0000000000ee";
+const CONVERSATION = "018f2b7c-0000-7000-8000-0000000000ff";
 const AOR_HASH = aorSubjectToken("sip:1001@acme.example.com");
 
 describe("subject roots", () => {
@@ -46,8 +49,10 @@ describe("subject roots", () => {
 			queue: "queue.evt.v1",
 			voicemail: "voicemail.evt.v1",
 			media: "media.evt.v1",
+			messaging: "messaging.evt.v1",
 			trunk: "trunk.evt.v1",
 			cdrLeg: "cdr.leg.v1",
+			security: "security.evt.v1",
 			audit: "audit.evt.v1",
 			provision: "provision.evt.v1",
 		});
@@ -55,11 +60,14 @@ describe("subject roots", () => {
 			routingResolve: "rpc.routing.v1.resolve",
 			authzCheck: "rpc.authz.v1.check",
 			voicemailList: "rpc.voicemail.v1.list",
+			pbxAuthorizeOutbound: "rpc.pbx.v1.authorize-outbound",
 			pbxExtensionFeature: "rpc.pbx.v1.extension-feature",
 			pbxToggleFeature: "rpc.pbx.v1.toggle-feature",
 			pbxHotDesk: "rpc.pbx.v1.hot-desk",
 			pbxLastCaller: "rpc.pbx.v1.last-caller",
 			pbxFileGreeting: "rpc.pbx.v1.file-greeting",
+			pbxQueueDisposition: "rpc.pbx.v1.queue-disposition",
+			pbxQueueSurvey: "rpc.pbx.v1.queue-survey",
 			sipCredential: "rpc.sip.v1.credential",
 			sipTrunkCredential: "rpc.sip.v1.trunk-credential",
 			sipTransfer: "rpc.sip.v1.transfer",
@@ -112,9 +120,11 @@ describe("subject roots", () => {
 			"call",
 			"cdr",
 			"media",
+			"messaging",
 			"provision",
 			"queue",
 			"registration",
+			"security",
 			"sipDialog",
 			"trunk",
 			"voicemail",
@@ -138,6 +148,9 @@ describe("subjectFor", () => {
 		);
 		expect(subjectFor.trunk(ORG, TRUNK, "status.changed")).toBe(
 			`trunk.evt.v1.${ORG}.${TRUNK}.status.changed`,
+		);
+		expect(subjectFor.messaging(ORG, CONVERSATION, "message.received")).toBe(
+			`messaging.evt.v1.${ORG}.${CONVERSATION}.message.received`,
 		);
 		expect(subjectFor.cdrLeg(ORG)).toBe(`cdr.leg.v1.${ORG}`);
 		expect(subjectFor.audit(ORG)).toBe(`audit.evt.v1.${ORG}`);
@@ -690,5 +703,45 @@ describe("event-name guards", () => {
 			"call.paging.started",
 			"call.paging.ended",
 		]);
+	});
+});
+
+describe("messaging subjects", () => {
+	it("round-trips every builder through parseSubject", () => {
+		for (const event of MESSAGING_EVENTS) {
+			const subject = subjectFor.messaging(ORG, CONVERSATION, event);
+			expect(parseSubject(subject)).toEqual({
+				kind: "messaging",
+				family: "messaging",
+				version: SUBJECT_VERSION,
+				orgId: ORG,
+				conversationId: CONVERSATION,
+				event,
+			});
+			expect(eventFamilyForSubject(subject)).toBe("messaging");
+		}
+	});
+
+	it("builds filters that match the subjects they are meant to", () => {
+		const subject = subjectFor.messaging(ORG, CONVERSATION, "message.delivered");
+		expect(matchesSubject(subjectFilterFor.allMessaging(), subject)).toBe(true);
+		expect(matchesSubject(subjectFilterFor.messagingInOrg(ORG), subject)).toBe(true);
+		expect(matchesSubject(subjectFilterFor.messagingConversation(ORG, CONVERSATION), subject)).toBe(
+			true,
+		);
+		expect(
+			matchesSubject(subjectFilterFor.messagingEventInOrg(ORG, "message.delivered"), subject),
+		).toBe(true);
+		// The per-event filter is one event name, not the family: `message.received` must miss.
+		expect(
+			matchesSubject(subjectFilterFor.messagingEventInOrg(ORG, "message.received"), subject),
+		).toBe(false);
+		expect(matchesSubject(subjectFilterFor.messagingInOrg(CALL), subject)).toBe(false);
+	});
+
+	it("narrows only the event names it declares", () => {
+		expect(isMessagingEvent("message.received")).toBe(true);
+		expect(isMessagingEvent("message.delivered")).toBe(true);
+		expect(isMessagingEvent("message.failed")).toBe(false);
 	});
 });

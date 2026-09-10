@@ -21,11 +21,14 @@ const (
 	SubjectRoutingResolveRPC        = "rpc.routing.v1.resolve"
 	SubjectAuthzCheckRPC            = "rpc.authz.v1.check"
 	SubjectVoicemailListRPC         = "rpc.voicemail.v1.list"
+	SubjectAuthorizeOutboundRPC     = "rpc.pbx.v1.authorize-outbound"
 	SubjectExtensionFeatureRPC      = "rpc.pbx.v1.extension-feature"
 	SubjectToggleFeatureRPC         = "rpc.pbx.v1.toggle-feature"
 	SubjectHotDeskRPC               = "rpc.pbx.v1.hot-desk"
 	SubjectLastCallerRPC            = "rpc.pbx.v1.last-caller"
 	SubjectFileGreetingRPC          = "rpc.pbx.v1.file-greeting"
+	SubjectQueueDispositionRPC      = "rpc.pbx.v1.queue-disposition"
+	SubjectQueueSurveyRPC           = "rpc.pbx.v1.queue-survey"
 	SubjectSipCredentialRPC         = "rpc.sip.v1.credential"
 	SubjectSipTrunkCredentialRPC    = "rpc.sip.v1.trunk-credential"
 	SubjectSipTransferRPC           = "rpc.sip.v1.transfer"
@@ -66,11 +69,14 @@ const (
 	TimeoutRoutingResolveRPC        = 2000 * time.Millisecond
 	TimeoutAuthzCheckRPC            = 1000 * time.Millisecond
 	TimeoutVoicemailListRPC         = 3000 * time.Millisecond
+	TimeoutAuthorizeOutboundRPC     = 400 * time.Millisecond
 	TimeoutExtensionFeatureRPC      = 5000 * time.Millisecond
 	TimeoutToggleFeatureRPC         = 5000 * time.Millisecond
 	TimeoutHotDeskRPC               = 8000 * time.Millisecond
 	TimeoutLastCallerRPC            = 3000 * time.Millisecond
 	TimeoutFileGreetingRPC          = 5000 * time.Millisecond
+	TimeoutQueueDispositionRPC      = 2000 * time.Millisecond
+	TimeoutQueueSurveyRPC           = 2000 * time.Millisecond
 	TimeoutSipCredentialRPC         = 500 * time.Millisecond
 	TimeoutSipTrunkCredentialRPC    = 5000 * time.Millisecond
 	TimeoutSipTransferRPC           = 2000 * time.Millisecond
@@ -260,6 +266,21 @@ func (v VoicemailListResponseMessagesFolder) Valid() bool {
 }
 
 func (v VoicemailListResponseMessagesFolder) String() string { return string(v) }
+
+// AuthorizeOutboundRequest is the request body of rpc.pbx.v1.authorize-outbound.
+type AuthorizeOutboundRequest struct {
+	OrgID           string     `json:"orgId"`
+	ExtensionNumber *string    `json:"extensionNumber,omitempty"`
+	DialedNumber    string     `json:"dialedNumber"`
+	At              *EventTime `json:"at,omitempty"`
+}
+
+// AuthorizeOutboundResponse is the reply body of rpc.pbx.v1.authorize-outbound.
+type AuthorizeOutboundResponse struct {
+	Allowed bool    `json:"allowed"`
+	Reason  *string `json:"reason,omitempty"`
+	Detail  *string `json:"detail,omitempty"`
+}
 
 // ExtensionFeatureRequest is the request body of rpc.pbx.v1.extension-feature.
 type ExtensionFeatureRequest struct {
@@ -541,6 +562,43 @@ func (v FileGreetingResponseKind) Valid() bool {
 
 func (v FileGreetingResponseKind) String() string { return string(v) }
 
+// QueueDispositionRequest is the request body of rpc.pbx.v1.queue-disposition.
+type QueueDispositionRequest struct {
+	OrgID   string `json:"orgId"`
+	QueueID string `json:"queueId"`
+	AgentID string `json:"agentId"`
+	CallID  string `json:"callId"`
+	Code    string `json:"code"`
+	Auto    bool   `json:"auto"`
+}
+
+// QueueDispositionResponse is the reply body of rpc.pbx.v1.queue-disposition.
+type QueueDispositionResponse struct {
+	Recorded bool    `json:"recorded"`
+	Reason   *string `json:"reason,omitempty"`
+}
+
+// QueueSurveyRequest is the request body of rpc.pbx.v1.queue-survey.
+type QueueSurveyRequest struct {
+	OrgID   string                      `json:"orgId"`
+	QueueID string                      `json:"queueId"`
+	AgentID string                      `json:"agentId"`
+	CallID  string                      `json:"callId"`
+	Answers []QueueSurveyRequestAnswers `json:"answers"`
+}
+
+// QueueSurveyRequestAnswers is a payload fragment of the contract.
+type QueueSurveyRequestAnswers struct {
+	QuestionID string `json:"questionId"`
+	Digit      string `json:"digit"`
+}
+
+// QueueSurveyResponse is the reply body of rpc.pbx.v1.queue-survey.
+type QueueSurveyResponse struct {
+	Recorded int     `json:"recorded"`
+	Reason   *string `json:"reason,omitempty"`
+}
+
 // SipCredentialRequest is the request body of rpc.sip.v1.credential.
 type SipCredentialRequest struct {
 	Realm         string        `json:"realm"`
@@ -557,6 +615,7 @@ type SipCredentialResponse struct {
 	Username         *string `json:"username,omitempty"`
 	Realm            *string `json:"realm,omitempty"`
 	Ha1              *string `json:"ha1,omitempty"`
+	Ha1Previous      *string `json:"ha1Previous,omitempty"`
 	DeviceID         *string `json:"deviceId,omitempty"`
 	ExtensionID      *string `json:"extensionId,omitempty"`
 	MaxRegistrations *int    `json:"maxRegistrations,omitempty"`
@@ -1443,12 +1502,13 @@ func (v EngineRenegotiateResponseReason) String() string { return string(v) }
 
 // MediaAllocateSessionRequest is the request body of rpc.media.v1.allocate-session.
 type MediaAllocateSessionRequest struct {
-	SessionID string                               `json:"sessionId"`
-	OrgID     string                               `json:"orgId"`
-	CallID    string                               `json:"callId"`
-	LegID     *string                              `json:"legId,omitempty"`
-	SDPOffer  string                               `json:"sdpOffer"`
-	Direction MediaAllocateSessionRequestDirection `json:"direction"`
+	SessionID  string                                 `json:"sessionId"`
+	OrgID      string                                 `json:"orgId"`
+	CallID     string                                 `json:"callId"`
+	LegID      *string                                `json:"legId,omitempty"`
+	SDPOffer   string                                 `json:"sdpOffer"`
+	Direction  MediaAllocateSessionRequestDirection   `json:"direction"`
+	SrtpPolicy *MediaAllocateSessionRequestSrtpPolicy `json:"srtpPolicy,omitempty"`
 }
 
 // MediaAllocateSessionRequestDirection is the closed vocabulary of MediaAllocateSessionRequest.direction.
@@ -1476,20 +1536,44 @@ func (v MediaAllocateSessionRequestDirection) Valid() bool {
 
 func (v MediaAllocateSessionRequestDirection) String() string { return string(v) }
 
+// MediaAllocateSessionRequestSrtpPolicy is the closed vocabulary of MediaAllocateSessionRequest.srtpPolicy.
+type MediaAllocateSessionRequestSrtpPolicy string
+
+const (
+	MediaAllocateSessionRequestSrtpPolicyPrefer  MediaAllocateSessionRequestSrtpPolicy = "prefer"
+	MediaAllocateSessionRequestSrtpPolicyRequire MediaAllocateSessionRequestSrtpPolicy = "require"
+	MediaAllocateSessionRequestSrtpPolicyDisable MediaAllocateSessionRequestSrtpPolicy = "disable"
+)
+
+// MediaAllocateSessionRequestSrtpPolicyValues lists every member of the vocabulary, in contract order.
+var MediaAllocateSessionRequestSrtpPolicyValues = []MediaAllocateSessionRequestSrtpPolicy{
+	MediaAllocateSessionRequestSrtpPolicyPrefer,
+	MediaAllocateSessionRequestSrtpPolicyRequire,
+	MediaAllocateSessionRequestSrtpPolicyDisable,
+}
+
+// Valid reports whether v is a member of the MediaAllocateSessionRequestSrtpPolicy vocabulary.
+func (v MediaAllocateSessionRequestSrtpPolicy) Valid() bool {
+	return slices.Contains(MediaAllocateSessionRequestSrtpPolicyValues, v)
+}
+
+func (v MediaAllocateSessionRequestSrtpPolicy) String() string { return string(v) }
+
 // MediaAllocateSessionResponse is the reply body of rpc.media.v1.allocate-session.
 type MediaAllocateSessionResponse struct {
-	Ok                        bool                                `json:"ok"`
-	SessionID                 string                              `json:"sessionId"`
-	SDPAnswer                 *string                             `json:"sdpAnswer,omitempty"`
-	InstanceID                *string                             `json:"instanceId,omitempty"`
-	Address                   *string                             `json:"address,omitempty"`
-	RtpPort                   *int                                `json:"rtpPort,omitempty"`
-	RtcpPort                  *int                                `json:"rtcpPort,omitempty"`
-	Ssrc                      *int                                `json:"ssrc,omitempty"`
-	Codec                     *MediaAllocateSessionResponseCodec  `json:"codec,omitempty"`
-	TelephoneEventPayloadType *int                                `json:"telephoneEventPayloadType,omitempty"`
-	Reason                    *MediaAllocateSessionResponseReason `json:"reason,omitempty"`
-	Error                     *string                             `json:"error,omitempty"`
+	Ok                        bool                                         `json:"ok"`
+	SessionID                 string                                       `json:"sessionId"`
+	SDPAnswer                 *string                                      `json:"sdpAnswer,omitempty"`
+	InstanceID                *string                                      `json:"instanceId,omitempty"`
+	Address                   *string                                      `json:"address,omitempty"`
+	RtpPort                   *int                                         `json:"rtpPort,omitempty"`
+	RtcpPort                  *int                                         `json:"rtcpPort,omitempty"`
+	Ssrc                      *int                                         `json:"ssrc,omitempty"`
+	Codec                     *MediaAllocateSessionResponseCodec           `json:"codec,omitempty"`
+	TelephoneEventPayloadType *int                                         `json:"telephoneEventPayloadType,omitempty"`
+	MediaEncryption           *MediaAllocateSessionResponseMediaEncryption `json:"mediaEncryption,omitempty"`
+	Reason                    *MediaAllocateSessionResponseReason          `json:"reason,omitempty"`
+	Error                     *string                                      `json:"error,omitempty"`
 }
 
 // MediaAllocateSessionResponseCodec is the closed vocabulary of MediaAllocateSessionResponse.codec.
@@ -1512,6 +1596,27 @@ func (v MediaAllocateSessionResponseCodec) Valid() bool {
 }
 
 func (v MediaAllocateSessionResponseCodec) String() string { return string(v) }
+
+// MediaAllocateSessionResponseMediaEncryption is the closed vocabulary of MediaAllocateSessionResponse.mediaEncryption.
+type MediaAllocateSessionResponseMediaEncryption string
+
+const (
+	MediaAllocateSessionResponseMediaEncryptionEncrypted MediaAllocateSessionResponseMediaEncryption = "encrypted"
+	MediaAllocateSessionResponseMediaEncryptionPlaintext MediaAllocateSessionResponseMediaEncryption = "plaintext"
+)
+
+// MediaAllocateSessionResponseMediaEncryptionValues lists every member of the vocabulary, in contract order.
+var MediaAllocateSessionResponseMediaEncryptionValues = []MediaAllocateSessionResponseMediaEncryption{
+	MediaAllocateSessionResponseMediaEncryptionEncrypted,
+	MediaAllocateSessionResponseMediaEncryptionPlaintext,
+}
+
+// Valid reports whether v is a member of the MediaAllocateSessionResponseMediaEncryption vocabulary.
+func (v MediaAllocateSessionResponseMediaEncryption) Valid() bool {
+	return slices.Contains(MediaAllocateSessionResponseMediaEncryptionValues, v)
+}
+
+func (v MediaAllocateSessionResponseMediaEncryption) String() string { return string(v) }
 
 // MediaAllocateSessionResponseReason is the closed vocabulary of MediaAllocateSessionResponse.reason.
 type MediaAllocateSessionResponseReason string
@@ -1546,12 +1651,13 @@ func (v MediaAllocateSessionResponseReason) String() string { return string(v) }
 
 // MediaCreateOfferRequest is the request body of rpc.media.v1.create-offer.
 type MediaCreateOfferRequest struct {
-	SessionID string                            `json:"sessionId"`
-	Transport *MediaCreateOfferRequestTransport `json:"transport,omitempty"`
-	OrgID     string                            `json:"orgId"`
-	CallID    string                            `json:"callId"`
-	LegID     *string                           `json:"legId,omitempty"`
-	Direction MediaCreateOfferRequestDirection  `json:"direction"`
+	SessionID  string                             `json:"sessionId"`
+	Transport  *MediaCreateOfferRequestTransport  `json:"transport,omitempty"`
+	OrgID      string                             `json:"orgId"`
+	CallID     string                             `json:"callId"`
+	LegID      *string                            `json:"legId,omitempty"`
+	Direction  MediaCreateOfferRequestDirection   `json:"direction"`
+	SrtpPolicy *MediaCreateOfferRequestSrtpPolicy `json:"srtpPolicy,omitempty"`
 }
 
 // MediaCreateOfferRequestTransport is the closed vocabulary of MediaCreateOfferRequest.transport.
@@ -1600,20 +1706,65 @@ func (v MediaCreateOfferRequestDirection) Valid() bool {
 
 func (v MediaCreateOfferRequestDirection) String() string { return string(v) }
 
+// MediaCreateOfferRequestSrtpPolicy is the closed vocabulary of MediaCreateOfferRequest.srtpPolicy.
+type MediaCreateOfferRequestSrtpPolicy string
+
+const (
+	MediaCreateOfferRequestSrtpPolicyPrefer  MediaCreateOfferRequestSrtpPolicy = "prefer"
+	MediaCreateOfferRequestSrtpPolicyRequire MediaCreateOfferRequestSrtpPolicy = "require"
+	MediaCreateOfferRequestSrtpPolicyDisable MediaCreateOfferRequestSrtpPolicy = "disable"
+)
+
+// MediaCreateOfferRequestSrtpPolicyValues lists every member of the vocabulary, in contract order.
+var MediaCreateOfferRequestSrtpPolicyValues = []MediaCreateOfferRequestSrtpPolicy{
+	MediaCreateOfferRequestSrtpPolicyPrefer,
+	MediaCreateOfferRequestSrtpPolicyRequire,
+	MediaCreateOfferRequestSrtpPolicyDisable,
+}
+
+// Valid reports whether v is a member of the MediaCreateOfferRequestSrtpPolicy vocabulary.
+func (v MediaCreateOfferRequestSrtpPolicy) Valid() bool {
+	return slices.Contains(MediaCreateOfferRequestSrtpPolicyValues, v)
+}
+
+func (v MediaCreateOfferRequestSrtpPolicy) String() string { return string(v) }
+
 // MediaCreateOfferResponse is the reply body of rpc.media.v1.create-offer.
 type MediaCreateOfferResponse struct {
-	Ok                        bool                            `json:"ok"`
-	SessionID                 string                          `json:"sessionId"`
-	SDPOffer                  *string                         `json:"sdpOffer,omitempty"`
-	InstanceID                *string                         `json:"instanceId,omitempty"`
-	Address                   *string                         `json:"address,omitempty"`
-	RtpPort                   *int                            `json:"rtpPort,omitempty"`
-	RtcpPort                  *int                            `json:"rtcpPort,omitempty"`
-	Ssrc                      *int                            `json:"ssrc,omitempty"`
-	TelephoneEventPayloadType *int                            `json:"telephoneEventPayloadType,omitempty"`
-	Reason                    *MediaCreateOfferResponseReason `json:"reason,omitempty"`
-	Error                     *string                         `json:"error,omitempty"`
+	Ok                        bool                                     `json:"ok"`
+	SessionID                 string                                   `json:"sessionId"`
+	SDPOffer                  *string                                  `json:"sdpOffer,omitempty"`
+	InstanceID                *string                                  `json:"instanceId,omitempty"`
+	Address                   *string                                  `json:"address,omitempty"`
+	RtpPort                   *int                                     `json:"rtpPort,omitempty"`
+	RtcpPort                  *int                                     `json:"rtcpPort,omitempty"`
+	Ssrc                      *int                                     `json:"ssrc,omitempty"`
+	TelephoneEventPayloadType *int                                     `json:"telephoneEventPayloadType,omitempty"`
+	MediaEncryption           *MediaCreateOfferResponseMediaEncryption `json:"mediaEncryption,omitempty"`
+	Reason                    *MediaCreateOfferResponseReason          `json:"reason,omitempty"`
+	Error                     *string                                  `json:"error,omitempty"`
 }
+
+// MediaCreateOfferResponseMediaEncryption is the closed vocabulary of MediaCreateOfferResponse.mediaEncryption.
+type MediaCreateOfferResponseMediaEncryption string
+
+const (
+	MediaCreateOfferResponseMediaEncryptionEncrypted MediaCreateOfferResponseMediaEncryption = "encrypted"
+	MediaCreateOfferResponseMediaEncryptionPlaintext MediaCreateOfferResponseMediaEncryption = "plaintext"
+)
+
+// MediaCreateOfferResponseMediaEncryptionValues lists every member of the vocabulary, in contract order.
+var MediaCreateOfferResponseMediaEncryptionValues = []MediaCreateOfferResponseMediaEncryption{
+	MediaCreateOfferResponseMediaEncryptionEncrypted,
+	MediaCreateOfferResponseMediaEncryptionPlaintext,
+}
+
+// Valid reports whether v is a member of the MediaCreateOfferResponseMediaEncryption vocabulary.
+func (v MediaCreateOfferResponseMediaEncryption) Valid() bool {
+	return slices.Contains(MediaCreateOfferResponseMediaEncryptionValues, v)
+}
+
+func (v MediaCreateOfferResponseMediaEncryption) String() string { return string(v) }
 
 // MediaCreateOfferResponseReason is the closed vocabulary of MediaCreateOfferResponse.reason.
 type MediaCreateOfferResponseReason string
@@ -1648,19 +1799,44 @@ func (v MediaCreateOfferResponseReason) String() string { return string(v) }
 
 // MediaAcceptAnswerRequest is the request body of rpc.media.v1.accept-answer.
 type MediaAcceptAnswerRequest struct {
-	SessionID string `json:"sessionId"`
-	SDPAnswer string `json:"sdpAnswer"`
+	SessionID  string                              `json:"sessionId"`
+	SDPAnswer  string                              `json:"sdpAnswer"`
+	SrtpPolicy *MediaAcceptAnswerRequestSrtpPolicy `json:"srtpPolicy,omitempty"`
 }
+
+// MediaAcceptAnswerRequestSrtpPolicy is the closed vocabulary of MediaAcceptAnswerRequest.srtpPolicy.
+type MediaAcceptAnswerRequestSrtpPolicy string
+
+const (
+	MediaAcceptAnswerRequestSrtpPolicyPrefer  MediaAcceptAnswerRequestSrtpPolicy = "prefer"
+	MediaAcceptAnswerRequestSrtpPolicyRequire MediaAcceptAnswerRequestSrtpPolicy = "require"
+	MediaAcceptAnswerRequestSrtpPolicyDisable MediaAcceptAnswerRequestSrtpPolicy = "disable"
+)
+
+// MediaAcceptAnswerRequestSrtpPolicyValues lists every member of the vocabulary, in contract order.
+var MediaAcceptAnswerRequestSrtpPolicyValues = []MediaAcceptAnswerRequestSrtpPolicy{
+	MediaAcceptAnswerRequestSrtpPolicyPrefer,
+	MediaAcceptAnswerRequestSrtpPolicyRequire,
+	MediaAcceptAnswerRequestSrtpPolicyDisable,
+}
+
+// Valid reports whether v is a member of the MediaAcceptAnswerRequestSrtpPolicy vocabulary.
+func (v MediaAcceptAnswerRequestSrtpPolicy) Valid() bool {
+	return slices.Contains(MediaAcceptAnswerRequestSrtpPolicyValues, v)
+}
+
+func (v MediaAcceptAnswerRequestSrtpPolicy) String() string { return string(v) }
 
 // MediaAcceptAnswerResponse is the reply body of rpc.media.v1.accept-answer.
 type MediaAcceptAnswerResponse struct {
-	Ok                        bool                             `json:"ok"`
-	SessionID                 string                           `json:"sessionId"`
-	Codec                     *MediaAcceptAnswerResponseCodec  `json:"codec,omitempty"`
-	TelephoneEventPayloadType *int                             `json:"telephoneEventPayloadType,omitempty"`
-	InstanceID                *string                          `json:"instanceId,omitempty"`
-	Reason                    *MediaAcceptAnswerResponseReason `json:"reason,omitempty"`
-	Error                     *string                          `json:"error,omitempty"`
+	Ok                        bool                                      `json:"ok"`
+	SessionID                 string                                    `json:"sessionId"`
+	Codec                     *MediaAcceptAnswerResponseCodec           `json:"codec,omitempty"`
+	TelephoneEventPayloadType *int                                      `json:"telephoneEventPayloadType,omitempty"`
+	MediaEncryption           *MediaAcceptAnswerResponseMediaEncryption `json:"mediaEncryption,omitempty"`
+	InstanceID                *string                                   `json:"instanceId,omitempty"`
+	Reason                    *MediaAcceptAnswerResponseReason          `json:"reason,omitempty"`
+	Error                     *string                                   `json:"error,omitempty"`
 }
 
 // MediaAcceptAnswerResponseCodec is the closed vocabulary of MediaAcceptAnswerResponse.codec.
@@ -1683,6 +1859,27 @@ func (v MediaAcceptAnswerResponseCodec) Valid() bool {
 }
 
 func (v MediaAcceptAnswerResponseCodec) String() string { return string(v) }
+
+// MediaAcceptAnswerResponseMediaEncryption is the closed vocabulary of MediaAcceptAnswerResponse.mediaEncryption.
+type MediaAcceptAnswerResponseMediaEncryption string
+
+const (
+	MediaAcceptAnswerResponseMediaEncryptionEncrypted MediaAcceptAnswerResponseMediaEncryption = "encrypted"
+	MediaAcceptAnswerResponseMediaEncryptionPlaintext MediaAcceptAnswerResponseMediaEncryption = "plaintext"
+)
+
+// MediaAcceptAnswerResponseMediaEncryptionValues lists every member of the vocabulary, in contract order.
+var MediaAcceptAnswerResponseMediaEncryptionValues = []MediaAcceptAnswerResponseMediaEncryption{
+	MediaAcceptAnswerResponseMediaEncryptionEncrypted,
+	MediaAcceptAnswerResponseMediaEncryptionPlaintext,
+}
+
+// Valid reports whether v is a member of the MediaAcceptAnswerResponseMediaEncryption vocabulary.
+func (v MediaAcceptAnswerResponseMediaEncryption) Valid() bool {
+	return slices.Contains(MediaAcceptAnswerResponseMediaEncryptionValues, v)
+}
+
+func (v MediaAcceptAnswerResponseMediaEncryption) String() string { return string(v) }
 
 // MediaAcceptAnswerResponseReason is the closed vocabulary of MediaAcceptAnswerResponse.reason.
 type MediaAcceptAnswerResponseReason string

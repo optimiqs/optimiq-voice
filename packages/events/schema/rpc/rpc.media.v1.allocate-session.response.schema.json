@@ -48,6 +48,10 @@
 			"minimum": 0,
 			"maximum": 127
 		},
+		"mediaEncryption": {
+			"type": "string",
+			"enum": ["encrypted", "plaintext"]
+		},
 		"reason": {
 			"type": "string",
 			"enum": [

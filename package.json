@@ -33,6 +33,7 @@
 		"stop:services": "cross-env docker compose -f compose.yaml -f compose.dev.yaml down",
 		"pretest": ".scripts/check-preconditions.sh",
 		"test": "cross-env LOG_LEVEL=silent LOG_PRETTY=false LOGS_LEVEL=none NODE_ENV=development mocha --timeout 30000 --ignore 'apps/**/*.integration.test.ts' --ignore 'packages/**/*.integration.test.ts' 'apps/**/*.test.ts' 'packages/**/*.test.ts'",
+		"check:nats": "node .scripts/check-nats-grants.mjs",
 		"typecheck": "turbo run typecheck",
 		"format:check": "oxfmt --check \"apps/**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}\" \"packages/**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}\""
 	},

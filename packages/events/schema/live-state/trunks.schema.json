@@ -62,6 +62,10 @@
 			"type": "string",
 			"maxLength": 64
 		},
+		"srtpPolicy": {
+			"type": "string",
+			"enum": ["none", "prefer", "require"]
+		},
 		"enabled": {
 			"default": true,
 			"type": "boolean"

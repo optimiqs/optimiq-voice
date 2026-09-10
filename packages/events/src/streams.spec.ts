@@ -11,6 +11,7 @@ import {
 	KV_BUCKETS,
 	kvKeyFor,
 	kvOptionsFor,
+	MESSAGING_STREAM,
 	millisToNanos,
 	nanosToMillis,
 	PROVISION_STREAM,
@@ -84,8 +85,10 @@ describe("stream definitions", () => {
 			"MEDIA",
 			"TRUNKS",
 			"CDR",
+			"SECURITY",
 			"AUDIT",
 			"PROVISION",
+			"MESSAGING",
 		]);
 	});
 
@@ -106,6 +109,7 @@ describe("stream definitions", () => {
 			subjectFor.cdrLeg(ORG),
 			subjectFor.audit(ORG),
 			subjectFor.provision(ORG),
+			subjectFor.messaging(ORG, createEntityId(), "message.received"),
 		];
 		for (const sample of samples) {
 			const owners = EVENT_STREAMS.filter((stream) =>
@@ -113,6 +117,15 @@ describe("stream definitions", () => {
 			);
 			expect(owners).toHaveLength(1);
 		}
+	});
+
+	it("declares MESSAGING as a durable-inbox stream, not a live feed", () => {
+		expect(EVENT_STREAMS).toContain(MESSAGING_STREAM);
+		// A dropped inbound is a text nobody sees and a dropped receipt is an outcome nobody can
+		// report — neither is superseded by a newer event, so the write is refused instead.
+		expect(MESSAGING_STREAM.discard).toBe("new");
+		expect(MESSAGING_STREAM.maxAgeMs).toBe(30 * 24 * 60 * 60_000);
+		expect(MESSAGING_STREAM.subjects).toEqual(["messaging.evt.v1.>"]);
 	});
 
 	it("keeps the ledgers on discard:new and the live feeds on discard:old", () => {

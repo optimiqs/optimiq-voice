@@ -145,12 +145,116 @@ type ChannelDTMFData struct {
 // Subject: calls.evt.v1.<orgId>.<callId>.channel.record.started
 // Envelope: Envelope[ChannelRecordStartedData]
 type ChannelRecordStartedData struct {
-	LegID       string        `json:"legId"`
-	RecordingID string        `json:"recordingId"`
-	ObjectKey   string        `json:"objectKey"`
-	Kind        RecordingKind `json:"kind"`
-	Stereo      *bool         `json:"stereo,omitempty"`
+	LegID       string                       `json:"legId"`
+	RecordingID string                       `json:"recordingId"`
+	ObjectKey   string                       `json:"objectKey"`
+	Kind        RecordingKind                `json:"kind"`
+	Stereo      *bool                        `json:"stereo,omitempty"`
+	Consent     *ChannelRecordStartedConsent `json:"consent,omitempty"`
 }
+
+// ChannelRecordStartedConsent is a payload fragment of the contract.
+type ChannelRecordStartedConsent struct {
+	Outcome  ChannelRecordStartedConsentOutcome   `json:"outcome"`
+	Method   ChannelRecordStartedConsentMethod    `json:"method"`
+	Policy   ChannelRecordStartedConsentPolicy    `json:"policy"`
+	At       EventTime                            `json:"at"`
+	Parties  []ChannelRecordStartedConsentParties `json:"parties"`
+	Regions  []string                             `json:"regions,omitempty"`
+	PromptID *string                              `json:"promptId,omitempty"`
+}
+
+// ChannelRecordStartedConsentOutcome is the closed vocabulary of ChannelRecordStartedConsent.outcome.
+type ChannelRecordStartedConsentOutcome string
+
+const (
+	ChannelRecordStartedConsentOutcomeNotRequired ChannelRecordStartedConsentOutcome = "not-required"
+	ChannelRecordStartedConsentOutcomeAnnounced   ChannelRecordStartedConsentOutcome = "announced"
+	ChannelRecordStartedConsentOutcomeAccepted    ChannelRecordStartedConsentOutcome = "accepted"
+	ChannelRecordStartedConsentOutcomeDeclined    ChannelRecordStartedConsentOutcome = "declined"
+)
+
+// ChannelRecordStartedConsentOutcomeValues lists every member of the vocabulary, in contract order.
+var ChannelRecordStartedConsentOutcomeValues = []ChannelRecordStartedConsentOutcome{
+	ChannelRecordStartedConsentOutcomeNotRequired,
+	ChannelRecordStartedConsentOutcomeAnnounced,
+	ChannelRecordStartedConsentOutcomeAccepted,
+	ChannelRecordStartedConsentOutcomeDeclined,
+}
+
+// Valid reports whether v is a member of the ChannelRecordStartedConsentOutcome vocabulary.
+func (v ChannelRecordStartedConsentOutcome) Valid() bool {
+	return slices.Contains(ChannelRecordStartedConsentOutcomeValues, v)
+}
+
+func (v ChannelRecordStartedConsentOutcome) String() string { return string(v) }
+
+// ChannelRecordStartedConsentMethod is the closed vocabulary of ChannelRecordStartedConsent.method.
+type ChannelRecordStartedConsentMethod string
+
+const (
+	ChannelRecordStartedConsentMethodNone         ChannelRecordStartedConsentMethod = "none"
+	ChannelRecordStartedConsentMethodAnnouncement ChannelRecordStartedConsentMethod = "announcement"
+	ChannelRecordStartedConsentMethodKeypress     ChannelRecordStartedConsentMethod = "keypress"
+)
+
+// ChannelRecordStartedConsentMethodValues lists every member of the vocabulary, in contract order.
+var ChannelRecordStartedConsentMethodValues = []ChannelRecordStartedConsentMethod{
+	ChannelRecordStartedConsentMethodNone,
+	ChannelRecordStartedConsentMethodAnnouncement,
+	ChannelRecordStartedConsentMethodKeypress,
+}
+
+// Valid reports whether v is a member of the ChannelRecordStartedConsentMethod vocabulary.
+func (v ChannelRecordStartedConsentMethod) Valid() bool {
+	return slices.Contains(ChannelRecordStartedConsentMethodValues, v)
+}
+
+func (v ChannelRecordStartedConsentMethod) String() string { return string(v) }
+
+// ChannelRecordStartedConsentPolicy is the closed vocabulary of ChannelRecordStartedConsent.policy.
+type ChannelRecordStartedConsentPolicy string
+
+const (
+	ChannelRecordStartedConsentPolicyNone                       ChannelRecordStartedConsentPolicy = "none"
+	ChannelRecordStartedConsentPolicyAnnounce                   ChannelRecordStartedConsentPolicy = "announce"
+	ChannelRecordStartedConsentPolicyAnnounceAndRequireKeypress ChannelRecordStartedConsentPolicy = "announce-and-require-keypress"
+)
+
+// ChannelRecordStartedConsentPolicyValues lists every member of the vocabulary, in contract order.
+var ChannelRecordStartedConsentPolicyValues = []ChannelRecordStartedConsentPolicy{
+	ChannelRecordStartedConsentPolicyNone,
+	ChannelRecordStartedConsentPolicyAnnounce,
+	ChannelRecordStartedConsentPolicyAnnounceAndRequireKeypress,
+}
+
+// Valid reports whether v is a member of the ChannelRecordStartedConsentPolicy vocabulary.
+func (v ChannelRecordStartedConsentPolicy) Valid() bool {
+	return slices.Contains(ChannelRecordStartedConsentPolicyValues, v)
+}
+
+func (v ChannelRecordStartedConsentPolicy) String() string { return string(v) }
+
+// ChannelRecordStartedConsentParties is the closed vocabulary of ChannelRecordStartedConsent.parties.
+type ChannelRecordStartedConsentParties string
+
+const (
+	ChannelRecordStartedConsentPartiesCaller ChannelRecordStartedConsentParties = "caller"
+	ChannelRecordStartedConsentPartiesCallee ChannelRecordStartedConsentParties = "callee"
+)
+
+// ChannelRecordStartedConsentPartiesValues lists every member of the vocabulary, in contract order.
+var ChannelRecordStartedConsentPartiesValues = []ChannelRecordStartedConsentParties{
+	ChannelRecordStartedConsentPartiesCaller,
+	ChannelRecordStartedConsentPartiesCallee,
+}
+
+// Valid reports whether v is a member of the ChannelRecordStartedConsentParties vocabulary.
+func (v ChannelRecordStartedConsentParties) Valid() bool {
+	return slices.Contains(ChannelRecordStartedConsentPartiesValues, v)
+}
+
+func (v ChannelRecordStartedConsentParties) String() string { return string(v) }
 
 // ChannelRecordStoppedData is the payload of the "channel.record.stopped" event.
 //

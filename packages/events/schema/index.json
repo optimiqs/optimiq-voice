@@ -10,8 +10,10 @@
 		"queue": "queue.evt.v1",
 		"voicemail": "voicemail.evt.v1",
 		"media": "media.evt.v1",
+		"messaging": "messaging.evt.v1",
 		"trunk": "trunk.evt.v1",
 		"cdrLeg": "cdr.leg.v1",
+		"security": "security.evt.v1",
 		"audit": "audit.evt.v1",
 		"provision": "provision.evt.v1"
 	},
@@ -374,6 +376,13 @@
 			"goType": "TrunkStatusChangedData"
 		},
 		{
+			"family": "security",
+			"type": "fraud-signal",
+			"subject": "security.evt.v1.<orgId>.<subjectRef>.fraud-signal",
+			"dataSchema": "events/security.fraud-signal.schema.json",
+			"goType": "SecurityFraudSignalData"
+		},
+		{
 			"family": "cdr",
 			"type": "cdr.leg.write",
 			"subject": "cdr.leg.v1.<orgId>",
@@ -442,6 +451,14 @@
 			"goResponseType": "VoicemailListResponse"
 		},
 		{
+			"subject": "rpc.pbx.v1.authorize-outbound",
+			"timeoutMs": 400,
+			"requestSchema": "rpc/rpc.pbx.v1.authorize-outbound.request.schema.json",
+			"responseSchema": "rpc/rpc.pbx.v1.authorize-outbound.response.schema.json",
+			"goRequestType": "AuthorizeOutboundRequest",
+			"goResponseType": "AuthorizeOutboundResponse"
+		},
+		{
 			"subject": "rpc.pbx.v1.extension-feature",
 			"timeoutMs": 5000,
 			"requestSchema": "rpc/rpc.pbx.v1.extension-feature.request.schema.json",
@@ -480,6 +497,22 @@
 			"responseSchema": "rpc/rpc.pbx.v1.file-greeting.response.schema.json",
 			"goRequestType": "FileGreetingRequest",
 			"goResponseType": "FileGreetingResponse"
+		},
+		{
+			"subject": "rpc.pbx.v1.queue-disposition",
+			"timeoutMs": 2000,
+			"requestSchema": "rpc/rpc.pbx.v1.queue-disposition.request.schema.json",
+			"responseSchema": "rpc/rpc.pbx.v1.queue-disposition.response.schema.json",
+			"goRequestType": "QueueDispositionRequest",
+			"goResponseType": "QueueDispositionResponse"
+		},
+		{
+			"subject": "rpc.pbx.v1.queue-survey",
+			"timeoutMs": 2000,
+			"requestSchema": "rpc/rpc.pbx.v1.queue-survey.request.schema.json",
+			"responseSchema": "rpc/rpc.pbx.v1.queue-survey.response.schema.json",
+			"goRequestType": "QueueSurveyRequest",
+			"goResponseType": "QueueSurveyResponse"
 		},
 		{
 			"subject": "rpc.sip.v1.credential",

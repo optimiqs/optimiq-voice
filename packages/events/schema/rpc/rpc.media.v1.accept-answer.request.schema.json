@@ -11,6 +11,10 @@
 			"type": "string",
 			"minLength": 1,
 			"maxLength": 16384
+		},
+		"srtpPolicy": {
+			"type": "string",
+			"enum": ["prefer", "require", "disable"]
 		}
 	},
 	"required": ["sessionId", "sdpAnswer"],

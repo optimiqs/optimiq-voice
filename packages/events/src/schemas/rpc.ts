@@ -355,6 +355,86 @@ export type ExtensionFeature = z.infer<typeof extensionFeatureSchema>;
 export type ExtensionFeatureRequest = z.infer<typeof extensionFeatureRequestSchema>;
 export type ExtensionFeatureResponse = z.infer<typeof extensionFeatureResponseSchema>;
 
+/**
+ * `rpc.pbx.v1.authorize-outbound` — the toll-fraud gate, asked by the engine at dial time.
+ *
+ * ## Why this is not on the artifact
+ *
+ * The CEILINGS are: `CompiledRoutingSettings.tollFraud` carries them, because they are configuration
+ * and the engine holds no database handle. What cannot be is everything this request exists to
+ * consult — the rolling international-minute counters, the live concurrency gauge, the countries the
+ * organization has been seen calling, and the per-extension override and suspension. All four change
+ * between compiles by definition, and an artifact carrying them would be wrong the moment it was
+ * published.
+ *
+ * ## Fail OPEN, and that is not a hedge
+ *
+ * The responder answers `allowed: true` when it cannot reach its own counter store, and the engine
+ * treats a timeout the same way. That is deliberate and it is the harder half of the design to
+ * accept: it means a control-plane outage disarms the fraud control. The alternative is that a slow
+ * database bars every international call on the platform, which is a total outbound outage with no
+ * fraud in progress — a strictly larger incident, arriving faster, at every tenant at once. The
+ * detector (`security.evt.v1` `fraud-signal`) is the backstop that still notices afterwards.
+ *
+ * The deadline is short for the same reason: this runs before ringback, so a request held open is a
+ * caller listening to silence.
+ */
+export const authorizeOutboundRequestSchema = z.object({
+	orgId: z.uuid(),
+	/**
+	 * The calling extension's dialable NUMBER, not its id.
+	 *
+	 * The engine addresses extensions by number everywhere on the call path — that is what the plan
+	 * carries and what the artifact indexes — and an id would make this the one request that needs a
+	 * lookup the engine has no way to do. The responder resolves it, and treats it as a CLAIM to be
+	 * checked inside the tenant rather than as an identity, exactly as `extension-feature` does.
+	 *
+	 * Absent for a call with no extension behind it — a trunk-to-trunk hop, or an API-originated
+	 * leg — in which case only the ORGANIZATION policy applies.
+	 */
+	extensionNumber: z.string().min(1).max(32).optional(),
+	/** The destination as the dial plan canonicalised it. Not E.164 is never international. */
+	dialedNumber: z.string().min(1).max(32),
+	/**
+	 * The engine's clock, for the off-hours window. Absent means the responder uses its own.
+	 *
+	 * Carried so a replayed or delayed request evaluates against the instant the CALL happened,
+	 * which matters for exactly one rule — the off-hours lock is the only thing here that depends on
+	 * what time it is rather than on how much has been spent.
+	 */
+	at: z.iso.datetime().optional(),
+});
+
+export const authorizeOutboundResponseSchema = z.object({
+	allowed: z.boolean(),
+	/**
+	 * Why not — one of `TOLL_FRAUD_REFUSAL_REASONS` in
+	 * `apps/api/src/pbx/toll-fraud/toll-fraud.policy.ts`.
+	 *
+	 * A plain string rather than an enum here, on the same rule the event families follow: a v1.n
+	 * responder may name a reason a v1.0 engine has never heard of, and a schema that rejected it
+	 * would turn an additive control into a dropped reply — which, on this path, fails CLOSED and
+	 * bars the call. The engine logs whatever it is given and hangs up with one cause.
+	 */
+	reason: z.string().min(1).max(64).optional(),
+	/** One sentence for the operator's log and the walk notes. Never shown to a caller. */
+	detail: z.string().max(256).optional(),
+});
+
+export type AuthorizeOutboundRequest = z.infer<typeof authorizeOutboundRequestSchema>;
+export type AuthorizeOutboundResponse = z.infer<typeof authorizeOutboundResponseSchema>;
+
+export const AUTHORIZE_OUTBOUND_RPC = defineRpc(
+	RPC_SUBJECTS.pbxAuthorizeOutbound,
+	authorizeOutboundRequestSchema,
+	authorizeOutboundResponseSchema,
+	// 400ms. This sits between the dial-plan walk and the first INVITE, so every millisecond here is
+	// silence on the caller's ear before ringback. The responder's work is three indexed reads on
+	// one connection; anything beyond this is a database in trouble, and the engine's timeout
+	// behaviour for that case is to proceed — see the header on failing open.
+	400,
+);
+
 export const EXTENSION_FEATURE_RPC = defineRpc(
 	RPC_SUBJECTS.pbxExtensionFeature,
 	extensionFeatureRequestSchema,
@@ -728,6 +808,118 @@ export const FILE_GREETING_RPC = defineRpc(
 );
 
 // ---------------------------------------------------------------------------------------------
+// rpc.pbx.v1.queue-disposition — engine → api, when a wrap-up window closes with nothing chosen
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The blank an expired wrap-up leaves behind.
+ *
+ * The same string `pbx-db`'s `queue_call_disposition` stores, restated here rather than imported
+ * for the reason {@link VOICEMAIL_GREETING_KINDS} is: this package is the contract and must not
+ * depend on the control plane's schema package.
+ */
+export const QUEUE_DISPOSITION_UNSET_CODE = "unset";
+
+/**
+ * `unset`, and nothing else, reported as `auto`.
+ *
+ * The distributor is entitled to make exactly ONE report on this subject, and it is the absence of
+ * an answer. An engine that could name a real code here would be a second, unauthenticated way to
+ * write an agent's after-call work — the agent's own console session is the first and is the one
+ * that carries an identity — so `code` and `auto` are pinned rather than open, and the pinning is
+ * in the CONTRACT so that both ends refuse the same payloads.
+ */
+export const queueDispositionRequestSchema = z.object({
+	orgId: z.uuid(),
+	queueId: z.uuid(),
+	agentId: z.uuid(),
+	callId: z.uuid(),
+	code: z.literal(QUEUE_DISPOSITION_UNSET_CODE),
+	auto: z.literal(true),
+});
+
+export const queueDispositionResponseSchema = z.object({
+	/** False means the agent had already chosen a code. Not an error — see `reason`. */
+	recorded: z.boolean(),
+	reason: z.string().max(256).optional(),
+});
+
+export type QueueDispositionRequest = z.infer<typeof queueDispositionRequestSchema>;
+export type QueueDispositionResponse = z.infer<typeof queueDispositionResponseSchema>;
+
+export const QUEUE_DISPOSITION_RPC = defineRpc(
+	RPC_SUBJECTS.pbxQueueDisposition,
+	queueDispositionRequestSchema,
+	queueDispositionResponseSchema,
+	// Two seconds, and shorter than every other `pbx` subject here on purpose: nobody is waiting on
+	// this. The wrap-up has already ended, the agent is already back in distribution, and the caller
+	// left minutes ago — so a deadline generous enough to survive a slow write buys nothing, while a
+	// tight one frees the engine's detached task instead of holding it against a broker that is
+	// unwell. What is lost on a timeout is one `unset` row, which the responder's own idempotence
+	// lets the engine re-report.
+	2_000,
+);
+
+// ---------------------------------------------------------------------------------------------
+// rpc.pbx.v1.queue-survey — engine → api, when the caller has finished pressing digits
+// ---------------------------------------------------------------------------------------------
+
+/** The inclusive digit range one survey question accepts, as `pbx-db` checks it on the row. */
+export const QUEUE_SURVEY_MIN_ANSWER_VALUE = 1;
+export const QUEUE_SURVEY_MAX_ANSWER_VALUE = 5;
+
+/**
+ * One question and the digit the caller pressed for it.
+ *
+ * `digit` is the STRING the leg's DTMF buffer produced rather than a number, because that is what
+ * the engine has and converting it at the far end keeps one place where "6" is refused instead of
+ * two places that might disagree. A question the caller never reached is simply absent: a zero
+ * would average into the score as the worst possible rating rather than as an absence.
+ */
+export const queueSurveyAnswerSchema = z.object({
+	questionId: z.uuid(),
+	digit: z.string().regex(/^[1-5]$/),
+});
+
+/**
+ * A whole caller's survey, in one message.
+ *
+ * One request for every answer rather than one per question, because they were all given by the
+ * same caller about the same call and arrive together at the end of the script — and because a
+ * per-question request would make a partially-recorded survey a state the responder had to reason
+ * about. `answers` may be short; it may never be empty, since a survey nobody answered produces no
+ * report at all.
+ */
+export const queueSurveyRequestSchema = z.object({
+	orgId: z.uuid(),
+	queueId: z.uuid(),
+	agentId: z.uuid(),
+	callId: z.uuid(),
+	answers: z.array(queueSurveyAnswerSchema).min(1).max(8),
+});
+
+export const queueSurveyResponseSchema = z.object({
+	/** How many rows this report actually wrote. Short of `answers` after a replay, which is fine. */
+	recorded: z.int().min(0),
+	/** Why some answer was refused, for the log. A refusal is a bug worth surfacing, not a retry. */
+	reason: z.string().max(256).optional(),
+});
+
+export type QueueSurveyAnswer = z.infer<typeof queueSurveyAnswerSchema>;
+export type QueueSurveyRequest = z.infer<typeof queueSurveyRequestSchema>;
+export type QueueSurveyResponse = z.infer<typeof queueSurveyResponseSchema>;
+
+export const QUEUE_SURVEY_RPC = defineRpc(
+	RPC_SUBJECTS.pbxQueueSurvey,
+	queueSurveyRequestSchema,
+	queueSurveyResponseSchema,
+	// The same two seconds the subject above gets, for the same reason and one more: this is up to
+	// three inserts against a unique index rather than one, and if that cannot finish inside two
+	// seconds the database is the problem rather than the deadline.
+	2_000,
+);
+
+// ---------------------------------------------------------------------------------------------
 // rpc.sip.v1.credential — sipd → api, on every REGISTER that answers a digest challenge
 // ---------------------------------------------------------------------------------------------
 
@@ -792,6 +984,29 @@ export const sipCredentialResponseSchema = z.object({
 	ha1: z
 		.string()
 		.regex(/^[0-9a-f]{32}$/, "ha1 must be 32 lower-case hex characters")
+		.optional(),
+	/**
+	 * The digest of the PREVIOUS password, while a rotation's grace period is still open.
+	 *
+	 * Additive and optional: a registrar that ignores it behaves exactly as it always has, which is
+	 * why this is not a contract break. A registrar that honours it accepts EITHER digest, and that
+	 * is what makes credential rotation something an operator can actually do.
+	 *
+	 * The problem it solves: the new password reaches a handset through a provisioning fetch the
+	 * HANDSET decides the timing of — a reboot, a resync, its own check-in interval. Between the
+	 * moment the control plane rotates and the moment that fetch happens, the phone holds a
+	 * credential the platform has stopped accepting, and the symptom is a desk phone that has
+	 * silently stopped ringing. Without a grace window, every rotation has to be scheduled against a
+	 * reboot window, which is how credential rotation becomes a thing nobody does.
+	 *
+	 * The window is bounded by the control plane and enforced there: this field is simply ABSENT
+	 * once the grace has expired. A reply carrying it is also never cacheable past the grace, which
+	 * the responder handles by marking such replies uncacheable — so an edge cannot keep accepting
+	 * an expired credential out of a cache warmed while it was valid.
+	 */
+	ha1Previous: z
+		.string()
+		.regex(/^[0-9a-f]{32}$/, "ha1Previous must be 32 lower-case hex characters")
 		.optional(),
 	deviceId: z.uuid().optional(),
 	extensionId: z.uuid().optional(),
@@ -2013,6 +2228,15 @@ export const mediaAllocateSessionRequestSchema = z.object({
 	 * downgrade would put a held caller back into the conversation.
 	 */
 	direction: z.enum(["sendrecv", "sendonly", "recvonly", "inactive"]).default("sendrecv"),
+	/**
+	 * SDES-SRTP (RFC 4568) for THIS leg, overriding the media plane's `MEDIAD_SRTP_POLICY` floor.
+	 *
+	 * Absent means "let the media plane decide", which is exactly what every caller written before
+	 * this field existed asks for — that is what keeps the field additive. It exists because a
+	 * carrier and a handset need different answers on the same process: a trunk that terminates
+	 * `sips:` can be held to `require` while the tenant's phones stay on `prefer`.
+	 */
+	srtpPolicy: z.enum(["prefer", "require", "disable"]).optional(),
 });
 
 export const mediaAllocateSessionResponseSchema = z.object({
@@ -2035,6 +2259,12 @@ export const mediaAllocateSessionResponseSchema = z.object({
 	codec: mediaCodecSchema.optional(),
 	/** The negotiated RFC 4733 telephone-event payload type, when the offer carried one. */
 	telephoneEventPayloadType: z.int().min(0).max(127).optional(),
+	/**
+	 * Whether this leg's media is actually encrypted, as opposed to what the policy asked for. It
+	 * is derived from the SRTP context that was installed, so it is what a softphone or wallboard
+	 * renders a lock icon from. A leg whose offer has not been answered yet reads `plaintext`.
+	 */
+	mediaEncryption: z.enum(["encrypted", "plaintext"]).optional(),
 	reason: mediaRefusalReasonSchema.optional(),
 	error: z.string().max(512).optional(),
 });
@@ -2087,6 +2317,15 @@ export const mediaCreateOfferRequestSchema = z.object({
 	 * for the re-negotiation cases that arrive with slice 5. Defaulted, never assumed.
 	 */
 	direction: z.enum(["sendrecv", "sendonly", "recvonly", "inactive"]).default("sendrecv"),
+	/**
+	 * SDES-SRTP (RFC 4568) for THIS leg, overriding the media plane's `MEDIAD_SRTP_POLICY` floor.
+	 *
+	 * Absent means "let the media plane decide", which is exactly what every caller written before
+	 * this field existed asks for — that is what keeps the field additive. It exists because a
+	 * carrier and a handset need different answers on the same process: a trunk that terminates
+	 * `sips:` can be held to `require` while the tenant's phones stay on `prefer`.
+	 */
+	srtpPolicy: z.enum(["prefer", "require", "disable"]).optional(),
 });
 
 export const mediaCreateOfferResponseSchema = z.object({
@@ -2104,6 +2343,12 @@ export const mediaCreateOfferResponseSchema = z.object({
 	ssrc: z.int().min(0).max(4_294_967_295).optional(),
 	/** The RFC 4733 telephone-event payload type the offer proposes. */
 	telephoneEventPayloadType: z.int().min(0).max(127).optional(),
+	/**
+	 * Whether this leg's media is actually encrypted, as opposed to what the policy asked for. It
+	 * is derived from the SRTP context that was installed, so it is what a softphone or wallboard
+	 * renders a lock icon from. A leg whose offer has not been answered yet reads `plaintext`.
+	 */
+	mediaEncryption: z.enum(["encrypted", "plaintext"]).optional(),
 	reason: mediaRefusalReasonSchema.optional(),
 	error: z.string().max(512).optional(),
 });
@@ -2134,6 +2379,11 @@ export const mediaAcceptAnswerRequestSchema = z.object({
 	...mediaCommandShape,
 	/** The callee's answer, verbatim. See {@link sdpSchema}. */
 	sdpAnswer: sdpSchema,
+	/**
+	 * SDES-SRTP (RFC 4568) for THIS leg, overriding the media plane's `MEDIAD_SRTP_POLICY` floor.
+	 * Absent means "let the media plane decide" — see {@link mediaCreateOfferRequestSchema}.
+	 */
+	srtpPolicy: z.enum(["prefer", "require", "disable"]).optional(),
 });
 
 export const mediaAcceptAnswerResponseSchema = z.object({
@@ -2143,6 +2393,11 @@ export const mediaAcceptAnswerResponseSchema = z.object({
 	codec: mediaCodecSchema.optional(),
 	/** The negotiated RFC 4733 telephone-event payload type, when the answer carried one. */
 	telephoneEventPayloadType: z.int().min(0).max(127).optional(),
+	/**
+	 * Whether this leg's media is actually encrypted, once the answer has settled it. See
+	 * {@link mediaCreateOfferResponseSchema}.
+	 */
+	mediaEncryption: z.enum(["encrypted", "plaintext"]).optional(),
 	instanceId: z.string().min(1).max(128).optional(),
 	reason: mediaRefusalReasonSchema.optional(),
 	error: z.string().max(512).optional(),
@@ -4181,11 +4436,14 @@ export const RPC_CONTRACTS = {
 	[RPC_SUBJECTS.routingResolve]: ROUTING_RESOLVE_RPC,
 	[RPC_SUBJECTS.authzCheck]: AUTHZ_CHECK_RPC,
 	[RPC_SUBJECTS.voicemailList]: VOICEMAIL_LIST_RPC,
+	[RPC_SUBJECTS.pbxAuthorizeOutbound]: AUTHORIZE_OUTBOUND_RPC,
 	[RPC_SUBJECTS.pbxExtensionFeature]: EXTENSION_FEATURE_RPC,
 	[RPC_SUBJECTS.pbxToggleFeature]: TOGGLE_FEATURE_RPC,
 	[RPC_SUBJECTS.pbxHotDesk]: HOT_DESK_RPC,
 	[RPC_SUBJECTS.pbxLastCaller]: LAST_CALLER_RPC,
 	[RPC_SUBJECTS.pbxFileGreeting]: FILE_GREETING_RPC,
+	[RPC_SUBJECTS.pbxQueueDisposition]: QUEUE_DISPOSITION_RPC,
+	[RPC_SUBJECTS.pbxQueueSurvey]: QUEUE_SURVEY_RPC,
 	[RPC_SUBJECTS.sipCredential]: SIP_CREDENTIAL_RPC,
 	[RPC_SUBJECTS.sipTrunkCredential]: SIP_TRUNK_CREDENTIAL_RPC,
 	[RPC_SUBJECTS.sipTransfer]: SIP_TRANSFER_RPC,

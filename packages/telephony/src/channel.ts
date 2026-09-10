@@ -62,6 +62,20 @@ export const CHANNEL_FLAGS = [
 	// `recordingStateOf` in `@optimiq-voice/events`, which is the reader's half of that rule.
 	"recording",
 	"recording-paused",
+	/**
+	 * This leg's media is ACTUALLY encrypted — SRTP is installed, not merely asked for.
+	 *
+	 * A flag rather than a field for the reason the two recording flags are: the snapshot is already
+	 * mirrored into the `channels` bucket on every change and already reaches the live topic the
+	 * wallboard and the softphone read, and `liveChannelSchema.flags` is a `z.array(z.string())`, so
+	 * a new member costs no wire change and no store change — only the UI that labels flags.
+	 *
+	 * ABSENT means "not encrypted, or not yet negotiated", and a renderer must not read the two
+	 * apart from this flag alone: a lock shown on a ringing leg would be a claim about a session
+	 * nobody has installed. The engine sets it only when the media plane reports the SRTP context it
+	 * built, and CLEARS it if a re-INVITE drops the encryption.
+	 */
+	"encrypted",
 ] as const;
 
 export type ChannelFlag = (typeof CHANNEL_FLAGS)[number];

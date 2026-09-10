@@ -37,6 +37,7 @@ import {
 	parseSubject,
 	QUEUE_EVENTS,
 	QUEUE_SCOPE_ALL,
+	SECURITY_SCOPE_ORG,
 	REGISTRATION_EVENTS,
 	RPC_SUBJECTS,
 	SUBJECT_ROOTS,
@@ -1131,6 +1132,9 @@ const SAMPLE_STRINGS: readonly string[] = [
 	"1",
 	"0",
 	"#",
+	// An ISO-3166 alpha-2, for the two-character fields. Late in the list so it is only reached
+	// by a schema that pins the length to two — every earlier candidate is longer or shorter.
+	"GB",
 	"",
 ];
 
@@ -1228,6 +1232,9 @@ const SUBJECT_TOKENS: Readonly<Record<string, string>> = {
 	mailboxId: MAILBOX_A,
 	sessionId: SESSION_A,
 	trunkId: TRUNK_A,
+	// The org-wide scope token rather than an extension id: it is the value the API publishes
+	// for a tenant-wide finding, and pinning the golden to it keeps the reserved token covered.
+	subjectRef: SECURITY_SCOPE_ORG,
 };
 
 function subjectFromTemplate(template: string): string {

@@ -15,21 +15,22 @@ import (
 
 // TrunkDirectoryEntry is the API projection stored in the trunks KV bucket.
 type TrunkDirectoryEntry struct {
-	TrunkID                string                  `json:"trunkId"`
-	OrgID                  string                  `json:"orgId"`
-	Name                   string                  `json:"name"`
-	Kind                   TrunkDirectoryEntryKind `json:"kind"`
-	SIPDomain              string                  `json:"sipDomain"`
-	SIPProxy               string                  `json:"sipProxy"`
-	OutboundProxy          *string                 `json:"outboundProxy,omitempty"`
-	AuthUser               *string                 `json:"authUser,omitempty"`
-	SecretRef              *string                 `json:"secretRef,omitempty"`
-	Transport              SIPTransport            `json:"transport"`
-	RegisterExpiresSeconds int                     `json:"registerExpiresSeconds"`
-	MaxChannels            *int                    `json:"maxChannels,omitempty"`
-	CallerIDNumberOverride *string                 `json:"callerIdNumberOverride,omitempty"`
-	Enabled                bool                    `json:"enabled"`
-	UpdatedAt              float64                 `json:"updatedAt"`
+	TrunkID                string                         `json:"trunkId"`
+	OrgID                  string                         `json:"orgId"`
+	Name                   string                         `json:"name"`
+	Kind                   TrunkDirectoryEntryKind        `json:"kind"`
+	SIPDomain              string                         `json:"sipDomain"`
+	SIPProxy               string                         `json:"sipProxy"`
+	OutboundProxy          *string                        `json:"outboundProxy,omitempty"`
+	AuthUser               *string                        `json:"authUser,omitempty"`
+	SecretRef              *string                        `json:"secretRef,omitempty"`
+	Transport              SIPTransport                   `json:"transport"`
+	RegisterExpiresSeconds int                            `json:"registerExpiresSeconds"`
+	MaxChannels            *int                           `json:"maxChannels,omitempty"`
+	CallerIDNumberOverride *string                        `json:"callerIdNumberOverride,omitempty"`
+	SrtpPolicy             *TrunkDirectoryEntrySrtpPolicy `json:"srtpPolicy,omitempty"`
+	Enabled                bool                           `json:"enabled"`
+	UpdatedAt              float64                        `json:"updatedAt"`
 
 	// Extra carries every key outside the pinned contract, verbatim. The TS schema is a
 	// z.looseObject (see cdr-events.ts) precisely so a producer running ahead of the
@@ -71,6 +72,7 @@ var knownKeysTrunkDirectoryEntry = map[string]struct{}{
 	"registerExpiresSeconds": {},
 	"maxChannels":            {},
 	"callerIdNumberOverride": {},
+	"srtpPolicy":             {},
 	"enabled":                {},
 	"updatedAt":              {},
 }
@@ -95,6 +97,29 @@ func (v TrunkDirectoryEntryKind) Valid() bool {
 }
 
 func (v TrunkDirectoryEntryKind) String() string { return string(v) }
+
+// TrunkDirectoryEntrySrtpPolicy is the closed vocabulary of TrunkDirectoryEntry.srtpPolicy.
+type TrunkDirectoryEntrySrtpPolicy string
+
+const (
+	TrunkDirectoryEntrySrtpPolicyNone    TrunkDirectoryEntrySrtpPolicy = "none"
+	TrunkDirectoryEntrySrtpPolicyPrefer  TrunkDirectoryEntrySrtpPolicy = "prefer"
+	TrunkDirectoryEntrySrtpPolicyRequire TrunkDirectoryEntrySrtpPolicy = "require"
+)
+
+// TrunkDirectoryEntrySrtpPolicyValues lists every member of the vocabulary, in contract order.
+var TrunkDirectoryEntrySrtpPolicyValues = []TrunkDirectoryEntrySrtpPolicy{
+	TrunkDirectoryEntrySrtpPolicyNone,
+	TrunkDirectoryEntrySrtpPolicyPrefer,
+	TrunkDirectoryEntrySrtpPolicyRequire,
+}
+
+// Valid reports whether v is a member of the TrunkDirectoryEntrySrtpPolicy vocabulary.
+func (v TrunkDirectoryEntrySrtpPolicy) Valid() bool {
+	return slices.Contains(TrunkDirectoryEntrySrtpPolicyValues, v)
+}
+
+func (v TrunkDirectoryEntrySrtpPolicy) String() string { return string(v) }
 
 // SIPACLEntry is one rule in the sip-acl KV bucket: the edge's admission boundary.
 type SIPACLEntry struct {

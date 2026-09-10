@@ -91,6 +91,17 @@ CDR_EXPORT_ROOT=${STACK_HOME}/exports
 CDR_RECORDING_URL_SECRET=${CDR_RECORDING_URL_SECRET}
 PBX_MEDIA_OBJECT_ROOT=${STACK_HOME}/objects
 PBX_VOICEMAIL_MEDIA_ROOT=${STACK_HOME}/objects
+# Two-way SMS/MMS. The 'fake' driver is an in-process carrier double: it accepts sends, records
+# them, and can be driven to deliver a signed inbound webhook. It is the only way to exercise
+# messaging locally: the real path needs a Telnyx account, a vetted 10DLC brand, an approved
+# campaign and a webhook URL the public internet can reach. The secret below signs the fake's
+# deliveries, so it is fixed rather than generated: a proof script has to sign one too.
+MESSAGING_DRIVER=fake
+MESSAGING_FAKE_WEBHOOK_SECRET=fake-messaging-secret
+MESSAGING_OBJECT_ROOT=${STACK_HOME}/objects/messaging
+MESSAGING_SEND_POLL_INTERVAL_MS=1000
+MESSAGING_MEDIA_URL_SECRET=${CDR_RECORDING_URL_SECRET}
+MESSAGING_PUBLIC_BASE_URL=http://127.0.0.1:${API_PORT}
 EOF
 
 cat > "$ENV_DIR/engine.env" <<EOF

@@ -175,6 +175,32 @@ export const PERMISSIONS = [
 	"faxes.send",
 
 	/**
+	 * Two-way SMS/MMS on business numbers, and the A2P registration behind it.
+	 *
+	 * A trio, and the split is not the usual read/write/delete. There is no `messaging.delete`:
+	 * a conversation is a record of what a consumer and this tenant said to each other, and it is
+	 * the evidence in a TCPA complaint. It is removed by RETENTION — a time-scoped policy an
+	 * administrator sets once and the sweeper enforces — never by a button someone can press after
+	 * an awkward exchange. Making "delete this thread" a grant would be handing out the ability to
+	 * destroy the tenant's own defence.
+	 *
+	 * `send` is split from `manage` on the same argument `faxes.send` and `numbers.order` make: it
+	 * spends money on the PSTN and it puts the tenant's name in front of a consumer. It is also the
+	 * grant an agent plausibly holds while holding none of the others — answering the business line
+	 * is the job, and registering a 10DLC brand is not.
+	 *
+	 * `manage` is the registration and configuration half: which DIDs carry text, the brand and its
+	 * EIN, campaigns and their sample messages, toll-free verification, and the suppression list.
+	 * Two of those are why it sits with an administrator rather than a manager. The brand form
+	 * carries a government business identifier, and the opt-out list is the one place on this
+	 * platform where somebody can REMOVE a consumer's recorded "stop texting me" — a re-subscribe is
+	 * a claim that consent was given again, and it should be answerable by a named person.
+	 */
+	"messaging.read",
+	"messaging.send",
+	"messaging.manage",
+
+	/**
 	 * The day/night switch, and the one grant in this registry that a receptionist holds.
 	 *
 	 * `toggle` is separate from `write` because the two are different jobs done by different people.
@@ -406,6 +432,32 @@ export const PERMISSIONS = [
 	"audit.read",
 
 	/**
+	 * The carrier-compliance record: the organization's KYC file, and the caller ids it may present.
+	 *
+	 * Its own resource rather than a ride on `settings.*`, on the argument the audit entry above
+	 * makes and one more of its own. A KYC file holds a legal entity name, a registered address and
+	 * a tax identifier, and `settings.read` is held by every self-service role so that a user's
+	 * preferences screen renders — putting a tax id behind it would hand the company's registration
+	 * documents to the narrowest role in the registry.
+	 *
+	 * Three tenant-side entries and one platform one, and the split is the whole point. A tenant
+	 * SUBMITS a KYC file and records the numbers it claims a right to use; it never decides whether
+	 * either is acceptable. `compliance.review` is that decision and it is cross-organization by
+	 * construction — the reviewer is the platform operator, acting on somebody else's tenant. It
+	 * carries no `.all` suffix because the scope set names a REACH within a resource a tenant also
+	 * holds, and no tenant holds a narrower "review my own KYC"; the boundary is expressed the way
+	 * `org-limits.write` expresses its own, by sitting in {@link OWNER_ONLY_PERMISSIONS}.
+	 * `compliance.traceback` is separate from it
+	 * because the two are different jobs on different clocks: an onboarding review is deliberate and
+	 * occasional, and a traceback is a 24-hour statutory clock that an on-call operator has to be
+	 * able to answer without also holding the authority to approve a customer.
+	 */
+	"compliance.read",
+	"compliance.write",
+	"compliance.review",
+	"compliance.traceback",
+
+	/**
 	 * The SIP edge's network policy: CIDR allow/deny entries, and the authentication-failure log.
 	 *
 	 * Its own resource rather than a ride on `settings.*`, on exactly the argument the audit entry
@@ -434,6 +486,41 @@ export const PERMISSIONS = [
 	 */
 	"security.read",
 	"security.write",
+	/**
+	 * Rotating a line's SIP secret, and setting one by hand.
+	 *
+	 * A THIRD entry on `security`, and the case for splitting it out of `security.write` is the one
+	 * that decided it: `security.write` opens a network to the SIP authenticator, which is a change
+	 * an administrator makes while looking at a CIDR list. This one invalidates a credential a
+	 * physical handset is holding — the blast radius is a desk phone that stops working, on a
+	 * schedule the phone chooses, and doing it to every extension in a tenant at once is an outage
+	 * nobody can reverse by editing a row back. The grace period is what makes it survivable; the
+	 * separate grant is what makes it deliberate.
+	 *
+	 * It is not a ride on `extensions.write` either, and that WAS the first draft. That grant is
+	 * configuration — a display name, a voicemail flag, a forwarding number — held by everyone who
+	 * administers phones. This one is the credential itself.
+	 */
+	"security.rotate-credentials",
+	/**
+	 * Spend and velocity controls on international calling: the ceilings, the geo lists, the
+	 * off-hours lock, and the per-extension overrides and suspensions.
+	 *
+	 * TWO entries, and its own resource rather than a third pair on `security`, because `security`
+	 * is the NETWORK boundary — which addresses may reach the SIP edge — and this is a COMMERCIAL
+	 * one: how many minutes, to which countries, at what hours. They are read by different people
+	 * during different incidents. The network rules are opened during a carrier turn-up by whoever
+	 * runs the edge; the spend caps are tuned by whoever gets the invoice, and the person who
+	 * investigates a fraud alert is the second of those.
+	 *
+	 * Not a ride on `org-limits.*` either, though the shape is nearly identical, and the reason is
+	 * the reason `org-limits.write` is owner-only: that grant is a QUOTA an owner sets against what
+	 * the tenant bought, and raising it is a commercial act. Folding fraud controls into it would
+	 * mean that raising a sales quota also widens a fraud window, and that the person who tunes a
+	 * fraud threshold — which happens during an incident, at speed — has to be the owner.
+	 */
+	"toll-fraud.read",
+	"toll-fraud.write",
 
 	/**
 	 * Outbound webhook subscriptions — where this platform's events are delivered, and with what key.
@@ -1158,6 +1245,36 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 		],
 	},
 	{
+		resource: "messaging",
+		label: "Messaging",
+		description:
+			"Two-way SMS and MMS on business numbers: the inbox, the act of sending, and the 10DLC " +
+			"brand, campaigns, toll-free verification and opt-out list that make sending legal.",
+		permissions: [
+			{
+				permission: "messaging.read",
+				label: "View messages",
+				description:
+					"Read conversation threads on the organization's messaging numbers, and see which " +
+					"numbers are registered to send.",
+			},
+			{
+				permission: "messaging.send",
+				label: "Send messages",
+				description:
+					"Send an SMS or MMS from a registered business number. Blocked automatically for a " +
+					"recipient who has opted out.",
+			},
+			{
+				permission: "messaging.manage",
+				label: "Manage messaging registration",
+				description:
+					"Enable messaging on a number, register the 10DLC brand and campaigns, submit " +
+					"toll-free verification, and edit the opt-out list.",
+			},
+		],
+	},
+	{
 		resource: "call-flows",
 		label: "Call flows",
 		description:
@@ -1366,6 +1483,41 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 		],
 	},
 	{
+		resource: "compliance",
+		label: "Carrier compliance",
+		description:
+			"The know-your-customer file, the caller ids this organization may present, and the " +
+			"platform-operator surfaces that review them and answer traceback requests.",
+		permissions: [
+			{
+				permission: "compliance.read",
+				label: "View the compliance record",
+				description:
+					"Read the organization's KYC file, its onboarding decision, and the caller ids it has " +
+					"a recorded right to present.",
+			},
+			{
+				permission: "compliance.write",
+				label: "Manage the compliance record",
+				description:
+					"Submit or amend the KYC file, and record an external caller id's verification.",
+			},
+			{
+				permission: "compliance.review",
+				label: "Review onboarding decisions",
+				description:
+					"Approve, reject or send back any organization's KYC file. Platform operators only.",
+			},
+			{
+				permission: "compliance.traceback",
+				label: "Answer traceback requests",
+				description:
+					"Query calls to or from a number across every organization, and export the answer. " +
+					"Platform operators only.",
+			},
+		],
+	},
+	{
 		resource: "security",
 		label: "Security",
 		description:
@@ -1383,6 +1535,38 @@ export const PERMISSION_CATALOG: readonly PermissionGroup[] = [
 				label: "Manage network ACLs",
 				description:
 					"Create and edit CIDR rules. Opening a network here lets it reach the SIP authenticator.",
+			},
+			{
+				permission: "security.rotate-credentials",
+				label: "Rotate SIP credentials",
+				description:
+					"Issue a new SIP secret for an extension or a device line, or set one by hand. The " +
+					"old secret keeps working for a short grace period so the handset can pick the new " +
+					"one up; after that the phone stops registering until it does.",
+			},
+		],
+	},
+	{
+		resource: "toll-fraud",
+		label: "Toll-fraud controls",
+		description:
+			"Spend and velocity limits on international calling, the countries this organization may " +
+			"reach, and the per-extension overrides and suspensions enforced against them.",
+		permissions: [
+			{
+				permission: "toll-fraud.read",
+				label: "View fraud controls",
+				description:
+					"See the organization's international spend limits, geo rules, current usage against " +
+					"them, and which extensions are suspended.",
+			},
+			{
+				permission: "toll-fraud.write",
+				label: "Manage fraud controls",
+				description:
+					"Set international minute and concurrency ceilings, allow and deny countries, the " +
+					"off-hours lock, and per-extension overrides. Suspend or restore an extension's " +
+					"outbound calling.",
 			},
 		],
 	},
@@ -1614,6 +1798,22 @@ const AGENT_PERMISSIONS = [
 	"queues.join.own",
 	"queues.monitor",
 	"conferences.read",
+	/**
+	 * An agent READS the shared inbox and does not send from it — and the asymmetry is this role's
+	 * own rule rather than a judgement about messaging.
+	 *
+	 * `AGENT_PERMISSIONS` is constrained by an invariant the spec enforces: an end-user role may hold
+	 * only `own`-scoped, read or monitor grants. `messaging.send` is organization-wide, exactly as
+	 * `calls.originate` is — it says "put this tenant's name in front of any consumer, from any
+	 * registered number" — so it belongs one rung up, with the manager, until a `messaging.send.own`
+	 * scoped against the agent's assigned numbers exists to soften it. That scoped grant is the same
+	 * thing `calls.originate.own` is waiting on, and it is absent for the same reason: nothing serves
+	 * it yet.
+	 *
+	 * The read is safe and load-bearing. An agent who cannot see the thread cannot answer the phone
+	 * call it turns into, and a shared business inbox nobody on the floor can read is a mailbox.
+	 */
+	"messaging.read",
 	// An agent parks calls with `*5`, so the lot list has to be readable to render where a call went.
 	"park-lots.read",
 	/**
@@ -1723,6 +1923,16 @@ const MANAGER_PERMISSIONS = [
 	 * `org-limits.write` is owner-only and is excluded from `ADMIN_PERMISSIONS` as well.
 	 */
 	"org-limits.read",
+	/**
+	 * Read, and NOT write — the same split as `pin-sets.read` two entries up, for the same reason.
+	 *
+	 * "Why can this phone not call Germany?" is a question a manager fields, and a manager who
+	 * cannot see the answer experiences the control as a dial tone that gives up. Changing the
+	 * ceiling is the other thing: it decides how much of the tenant's money a compromised handset
+	 * can spend before the platform stops it, and it belongs with somebody who can be named when
+	 * the bill arrives.
+	 */
+	"toll-fraud.read",
 	"queues.write",
 	"queues.manage-agents",
 	"voicemail.read",
@@ -1750,6 +1960,13 @@ const MANAGER_PERMISSIONS = [
 	"faxes.read",
 	"faxes.write",
 	"faxes.send",
+	/**
+	 * The manager sends the texts, because `messaging.send` is organization-wide and
+	 * `AGENT_PERMISSIONS` may hold only `own`-scoped or read grants — the same ceiling that keeps
+	 * `calls.originate` here. `messaging.manage` stays with the administrator: it carries the brand's
+	 * EIN and the power to remove a consumer's recorded STOP.
+	 */
+	"messaging.send",
 	"recordings.read",
 	"recordings.download",
 	"cdr.read",
@@ -1826,6 +2043,15 @@ const MANAGER_PERMISSIONS = [
 const OWNER_ONLY_PERMISSIONS: ReadonlySet<string> = new Set<Permission>([
 	"settings.write.all",
 	"org-limits.write",
+	/**
+	 * Neither is an administrator's, and neither is really an owner's either — both are the platform
+	 * operator's, and they sit here for the same reason `settings.write.all` does: this model has no
+	 * narrower boundary to express until the reseller hierarchy gives one a home. A tenant approving
+	 * its own KYC file would make the file worthless, and a tenant answering a traceback would be
+	 * reading another tenant's calls.
+	 */
+	"compliance.review",
+	"compliance.traceback",
 ]);
 
 const ADMIN_PERMISSIONS = PERMISSIONS.filter(

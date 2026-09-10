@@ -41,8 +41,10 @@ const (
 	SubjectRootQueue        = "queue.evt." + SubjectVersion
 	SubjectRootVoicemail    = "voicemail.evt." + SubjectVersion
 	SubjectRootMedia        = "media.evt." + SubjectVersion
+	SubjectRootMessaging    = "messaging.evt." + SubjectVersion
 	SubjectRootTrunk        = "trunk.evt." + SubjectVersion
 	SubjectRootCDRLeg       = "cdr.leg." + SubjectVersion
+	SubjectRootSecurity     = "security.evt." + SubjectVersion
 	SubjectRootAudit        = "audit.evt." + SubjectVersion
 	SubjectRootProvision    = "provision.evt." + SubjectVersion
 )
@@ -50,6 +52,12 @@ const (
 // QueueScopeAll is the reserved queue-scope token for events that belong to the org rather than to
 // one queue — in practice agent.state, since an agent has one status across every tier they sit in.
 const QueueScopeAll = "_all"
+
+// SecurityScopeOrg is the reserved security-scope token for a signal that belongs to the
+// ORGANIZATION rather than to one extension — a tenant-wide minutes spike with no single account
+// behind it. Same idiom as QueueScopeAll: the subject's middle token is the thing the signal is
+// ABOUT, and inventing an extension id for a finding that has none would make the subject lie.
+const SecurityScopeOrg = "_org"
 
 // EventFamily identifies a family by its SUBJECT. An envelope's `type` is unique within its family
 // only: "registered" means nothing without sip.reg.v1.… around it.
@@ -63,8 +71,10 @@ const (
 	FamilyQueue        EventFamily = "queue"
 	FamilyVoicemail    EventFamily = "voicemail"
 	FamilyMedia        EventFamily = "media"
+	FamilyMessaging    EventFamily = "messaging"
 	FamilyTrunk        EventFamily = "trunk"
 	FamilyCDR          EventFamily = "cdr"
+	FamilySecurity     EventFamily = "security"
 	FamilyAudit        EventFamily = "audit"
 	FamilyProvision    EventFamily = "provision"
 )
@@ -76,8 +86,10 @@ var EventFamilies = []EventFamily{
 	FamilyQueue,
 	FamilyVoicemail,
 	FamilyMedia,
+	FamilyMessaging,
 	FamilyTrunk,
 	FamilyCDR,
+	FamilySecurity,
 	FamilyAudit,
 	FamilyProvision,
 }
@@ -367,6 +379,42 @@ func TrunkSubject(orgID, trunkID, event string) (string, error) {
 	return SubjectRootTrunk + "." + org + "." + trunk + "." + name, nil
 }
 
+// MessagingSubject builds messaging.evt.v1.<orgId>.<conversationId>.<event>. The middle token is
+// the conversation, not the message: a thread is the unit an inbox subscribes to.
+func MessagingSubject(orgID, conversationID, event string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	conversation, err := token("conversationId", conversationID)
+	if err != nil {
+		return "", err
+	}
+	name, err := eventName(event)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootMessaging + "." + org + "." + conversation + "." + name, nil
+}
+
+// SecuritySubject builds security.evt.v1.<orgId>.<subjectRef>.<event>, where subjectRef is
+// SecurityScopeOrg or the extension id the signal is about.
+func SecuritySubject(orgID, subjectRef, event string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	ref, err := token("subjectRef", subjectRef)
+	if err != nil {
+		return "", err
+	}
+	name, err := eventName(event)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootSecurity + "." + org + "." + ref + "." + name, nil
+}
+
 // CDRLegSubject builds cdr.leg.v1.<orgId> — a single ordered subject per org.
 func CDRLegSubject(orgID string) (string, error) {
 	org, err := token("orgId", orgID)
@@ -649,6 +697,43 @@ func AllCDRLegsFilter() string { return SubjectRootCDRLeg + ".*" }
 // CDRLegsInOrgFilter matches one org's CDR subject.
 func CDRLegsInOrgFilter(orgID string) (string, error) { return CDRLegSubject(orgID) }
 
+// AllMessagingFilter matches every org's messaging events — the MESSAGING stream's subject list.
+func AllMessagingFilter() string { return SubjectRootMessaging + ".>" }
+
+// MessagingInOrgFilter matches one org's messaging events.
+func MessagingInOrgFilter(orgID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootMessaging + "." + org + ".>", nil
+}
+
+// MessagingConversationFilter matches one thread's events.
+func MessagingConversationFilter(orgID, conversationID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	conversation, err := token("conversationId", conversationID)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootMessaging + "." + org + "." + conversation + ".>", nil
+}
+
+// AllSecurityFilter matches every org's security signals.
+func AllSecurityFilter() string { return SubjectRootSecurity + ".>" }
+
+// SecurityInOrgFilter matches one org's security signals.
+func SecurityInOrgFilter(orgID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootSecurity + "." + org + ".>", nil
+}
+
 // AllAuditFilter matches every org's audit subject.
 func AllAuditFilter() string { return SubjectRootAudit + ".*" }
 
@@ -672,8 +757,10 @@ const (
 	KindQueue        SubjectKind = "queue"
 	KindVoicemail    SubjectKind = "voicemail"
 	KindMedia        SubjectKind = "media"
+	KindMessaging    SubjectKind = "messaging"
 	KindTrunk        SubjectKind = "trunk"
 	KindCDRLeg       SubjectKind = "cdr-leg"
+	KindSecurity     SubjectKind = "security"
 	KindAudit        SubjectKind = "audit"
 	KindProvision    SubjectKind = "provision"
 	KindRPC          SubjectKind = "rpc"
@@ -703,6 +790,10 @@ type ParsedSubject struct {
 	SessionID string
 	// TrunkID is set for KindTrunk.
 	TrunkID string
+	// ConversationID is set for KindMessaging.
+	ConversationID string
+	// SubjectRef is set for KindSecurity: SecurityScopeOrg, or the extension id the signal is about.
+	SubjectRef string
 	// Event is the (possibly dotted) event name, for the four per-entity families.
 	//
 	// A plain string, not a checked vocabulary member: a v1.n producer may emit an event name a
@@ -782,6 +873,16 @@ func ParseSubject(subject string) (ParsedSubject, bool) {
 	case prefix == "cdr.leg" && len(rest) == 1:
 		return ParsedSubject{
 			Kind: KindCDRLeg, Family: string(FamilyCDR), Version: version, OrgID: rest[0],
+		}, true
+	case prefix == "messaging.evt" && len(rest) >= 3:
+		return ParsedSubject{
+			Kind: KindMessaging, Family: string(FamilyMessaging), Version: version,
+			OrgID: rest[0], ConversationID: rest[1], Event: strings.Join(rest[2:], "."),
+		}, true
+	case prefix == "security.evt" && len(rest) >= 3:
+		return ParsedSubject{
+			Kind: KindSecurity, Family: string(FamilySecurity), Version: version,
+			OrgID: rest[0], SubjectRef: rest[1], Event: strings.Join(rest[2:], "."),
 		}, true
 	case prefix == "audit.evt" && len(rest) == 1:
 		return ParsedSubject{

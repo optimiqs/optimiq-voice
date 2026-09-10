@@ -21,36 +21,40 @@ const (
 // Subject: cdr.leg.v1.<orgId>
 // Envelope: Envelope[CDRLegWriteData]
 type CDRLegWriteData struct {
-	ID               string                     `json:"id"`
-	CallID           string                     `json:"callId"`
-	Leg              LegSide                    `json:"leg"`
-	OriginatingLegID *string                    `json:"originatingLegId,omitempty"`
-	BridgeLegID      *string                    `json:"bridgeLegId,omitempty"`
-	Direction        CallDirection              `json:"direction"`
-	FromNumber       string                     `json:"fromNumber"`
-	FromName         *string                    `json:"fromName,omitempty"`
-	ToNumber         string                     `json:"toNumber"`
-	DestinationType  string                     `json:"destinationType"`
-	DestinationRef   *string                    `json:"destinationRef,omitempty"`
-	StartedAt        EventTime                  `json:"startedAt"`
-	AnsweredAt       *EventTime                 `json:"answeredAt,omitempty"`
-	EndedAt          *EventTime                 `json:"endedAt,omitempty"`
-	DurationMs       int                        `json:"durationMs"`
-	BillsecMs        int                        `json:"billsecMs"`
-	HangupCause      string                     `json:"hangupCause"`
-	HangupCauseCode  int                        `json:"hangupCauseCode"`
-	HangupSide       *HangupSide                `json:"hangupSide,omitempty"`
-	Disposition      string                     `json:"disposition"`
-	QueueRef         *string                    `json:"queueRef,omitempty"`
-	QueueWaitMs      *int                       `json:"queueWaitMs,omitempty"`
-	QueueOutcome     *CDRLegWriteQueueOutcome   `json:"queueOutcome,omitempty"`
-	QueueAgentRef    *string                    `json:"queueAgentRef,omitempty"`
-	RelatedCallID    *string                    `json:"relatedCallId,omitempty"`
-	AuthPinOrdinal   *int                       `json:"authPinOrdinal,omitempty"`
-	AuthPinLabel     *string                    `json:"authPinLabel,omitempty"`
-	SIPAttestation   *CDRLegWriteSIPAttestation `json:"sipAttestation,omitempty"`
-	SIPVerstat       *string                    `json:"sipVerstat,omitempty"`
-	SIPOrigID        *string                    `json:"sipOrigId,omitempty"`
+	ID                      string                             `json:"id"`
+	CallID                  string                             `json:"callId"`
+	Leg                     LegSide                            `json:"leg"`
+	OriginatingLegID        *string                            `json:"originatingLegId,omitempty"`
+	BridgeLegID             *string                            `json:"bridgeLegId,omitempty"`
+	Direction               CallDirection                      `json:"direction"`
+	FromNumber              string                             `json:"fromNumber"`
+	FromName                *string                            `json:"fromName,omitempty"`
+	ToNumber                string                             `json:"toNumber"`
+	DestinationType         string                             `json:"destinationType"`
+	DestinationRef          *string                            `json:"destinationRef,omitempty"`
+	StartedAt               EventTime                          `json:"startedAt"`
+	AnsweredAt              *EventTime                         `json:"answeredAt,omitempty"`
+	EndedAt                 *EventTime                         `json:"endedAt,omitempty"`
+	DurationMs              int                                `json:"durationMs"`
+	BillsecMs               int                                `json:"billsecMs"`
+	HangupCause             string                             `json:"hangupCause"`
+	HangupCauseCode         int                                `json:"hangupCauseCode"`
+	HangupSide              *HangupSide                        `json:"hangupSide,omitempty"`
+	Disposition             string                             `json:"disposition"`
+	QueueRef                *string                            `json:"queueRef,omitempty"`
+	QueueWaitMs             *int                               `json:"queueWaitMs,omitempty"`
+	QueueOutcome            *CDRLegWriteQueueOutcome           `json:"queueOutcome,omitempty"`
+	QueueAgentRef           *string                            `json:"queueAgentRef,omitempty"`
+	RelatedCallID           *string                            `json:"relatedCallId,omitempty"`
+	AuthPinOrdinal          *int                               `json:"authPinOrdinal,omitempty"`
+	AuthPinLabel            *string                            `json:"authPinLabel,omitempty"`
+	SIPAttestation          *CDRLegWriteSIPAttestation         `json:"sipAttestation,omitempty"`
+	SIPVerstat              *string                            `json:"sipVerstat,omitempty"`
+	SIPOrigID               *string                            `json:"sipOrigId,omitempty"`
+	RecordingConsent        *CDRLegWriteRecordingConsent       `json:"recordingConsent,omitempty"`
+	RecordingConsentMethod  *CDRLegWriteRecordingConsentMethod `json:"recordingConsentMethod,omitempty"`
+	RecordingConsentAt      *EventTime                         `json:"recordingConsentAt,omitempty"`
+	RecordingConsentRegions []string                           `json:"recordingConsentRegions,omitempty"`
 
 	// Extra carries every key outside the pinned contract, verbatim. The TS schema is a
 	// z.looseObject (see cdr-events.ts) precisely so a producer running ahead of the
@@ -79,36 +83,40 @@ func (v *CDRLegWriteData) UnmarshalJSON(data []byte) error {
 }
 
 var knownKeysCDRLegWriteData = map[string]struct{}{
-	"id":               {},
-	"callId":           {},
-	"leg":              {},
-	"originatingLegId": {},
-	"bridgeLegId":      {},
-	"direction":        {},
-	"fromNumber":       {},
-	"fromName":         {},
-	"toNumber":         {},
-	"destinationType":  {},
-	"destinationRef":   {},
-	"startedAt":        {},
-	"answeredAt":       {},
-	"endedAt":          {},
-	"durationMs":       {},
-	"billsecMs":        {},
-	"hangupCause":      {},
-	"hangupCauseCode":  {},
-	"hangupSide":       {},
-	"disposition":      {},
-	"queueRef":         {},
-	"queueWaitMs":      {},
-	"queueOutcome":     {},
-	"queueAgentRef":    {},
-	"relatedCallId":    {},
-	"authPinOrdinal":   {},
-	"authPinLabel":     {},
-	"sipAttestation":   {},
-	"sipVerstat":       {},
-	"sipOrigId":        {},
+	"id":                      {},
+	"callId":                  {},
+	"leg":                     {},
+	"originatingLegId":        {},
+	"bridgeLegId":             {},
+	"direction":               {},
+	"fromNumber":              {},
+	"fromName":                {},
+	"toNumber":                {},
+	"destinationType":         {},
+	"destinationRef":          {},
+	"startedAt":               {},
+	"answeredAt":              {},
+	"endedAt":                 {},
+	"durationMs":              {},
+	"billsecMs":               {},
+	"hangupCause":             {},
+	"hangupCauseCode":         {},
+	"hangupSide":              {},
+	"disposition":             {},
+	"queueRef":                {},
+	"queueWaitMs":             {},
+	"queueOutcome":            {},
+	"queueAgentRef":           {},
+	"relatedCallId":           {},
+	"authPinOrdinal":          {},
+	"authPinLabel":            {},
+	"sipAttestation":          {},
+	"sipVerstat":              {},
+	"sipOrigId":               {},
+	"recordingConsent":        {},
+	"recordingConsentMethod":  {},
+	"recordingConsentAt":      {},
+	"recordingConsentRegions": {},
 }
 
 // CDRLegWriteQueueOutcome is the closed vocabulary of CDRLegWriteData.queueOutcome.
@@ -164,3 +172,51 @@ func (v CDRLegWriteSIPAttestation) Valid() bool {
 }
 
 func (v CDRLegWriteSIPAttestation) String() string { return string(v) }
+
+// CDRLegWriteRecordingConsent is the closed vocabulary of CDRLegWriteData.recordingConsent.
+type CDRLegWriteRecordingConsent string
+
+const (
+	CDRLegWriteRecordingConsentNotRequired CDRLegWriteRecordingConsent = "not-required"
+	CDRLegWriteRecordingConsentAnnounced   CDRLegWriteRecordingConsent = "announced"
+	CDRLegWriteRecordingConsentAccepted    CDRLegWriteRecordingConsent = "accepted"
+	CDRLegWriteRecordingConsentDeclined    CDRLegWriteRecordingConsent = "declined"
+)
+
+// CDRLegWriteRecordingConsentValues lists every member of the vocabulary, in contract order.
+var CDRLegWriteRecordingConsentValues = []CDRLegWriteRecordingConsent{
+	CDRLegWriteRecordingConsentNotRequired,
+	CDRLegWriteRecordingConsentAnnounced,
+	CDRLegWriteRecordingConsentAccepted,
+	CDRLegWriteRecordingConsentDeclined,
+}
+
+// Valid reports whether v is a member of the CDRLegWriteRecordingConsent vocabulary.
+func (v CDRLegWriteRecordingConsent) Valid() bool {
+	return slices.Contains(CDRLegWriteRecordingConsentValues, v)
+}
+
+func (v CDRLegWriteRecordingConsent) String() string { return string(v) }
+
+// CDRLegWriteRecordingConsentMethod is the closed vocabulary of CDRLegWriteData.recordingConsentMethod.
+type CDRLegWriteRecordingConsentMethod string
+
+const (
+	CDRLegWriteRecordingConsentMethodNone         CDRLegWriteRecordingConsentMethod = "none"
+	CDRLegWriteRecordingConsentMethodAnnouncement CDRLegWriteRecordingConsentMethod = "announcement"
+	CDRLegWriteRecordingConsentMethodKeypress     CDRLegWriteRecordingConsentMethod = "keypress"
+)
+
+// CDRLegWriteRecordingConsentMethodValues lists every member of the vocabulary, in contract order.
+var CDRLegWriteRecordingConsentMethodValues = []CDRLegWriteRecordingConsentMethod{
+	CDRLegWriteRecordingConsentMethodNone,
+	CDRLegWriteRecordingConsentMethodAnnouncement,
+	CDRLegWriteRecordingConsentMethodKeypress,
+}
+
+// Valid reports whether v is a member of the CDRLegWriteRecordingConsentMethod vocabulary.
+func (v CDRLegWriteRecordingConsentMethod) Valid() bool {
+	return slices.Contains(CDRLegWriteRecordingConsentMethodValues, v)
+}
+
+func (v CDRLegWriteRecordingConsentMethod) String() string { return string(v) }

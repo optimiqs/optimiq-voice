@@ -20,6 +20,7 @@ import { createHash } from "node:crypto";
  * media.evt.v1.<orgId>.<sessionId>.<event>   event = session.ended | session.rtp-timeout |
  *                                                    playback.finished | recording.finished |
  *                                                    dtmf.received
+ * messaging.evt.v1.<orgId>.<conversationId>.<event>  event = message.received | message.delivered
  * trunk.evt.v1.<orgId>.<trunkId>.<event>     event = status.changed
  * cdr.leg.v1.<orgId>                         one subject per org; event type is in the envelope
  * audit.evt.v1.<orgId>
@@ -29,6 +30,8 @@ import { createHash } from "node:crypto";
  * rpc.pbx.v1.extension-feature               engine -> api; a handset writing its own state
  * rpc.pbx.v1.last-caller                     engine -> api; `*69`, answered from cdr-db
  * rpc.pbx.v1.file-greeting                   engine -> api; `*99`, a recorded greeting filed
+ * rpc.pbx.v1.queue-disposition               engine -> api; the wrap-up nobody chose a code for
+ * rpc.pbx.v1.queue-survey                    engine -> api; what a caller pressed after the call
  * rpc.sip.v1.credential
  * rpc.sip.v1.invite                          sipd -> engine; ADMISSION only (queue group)
  * rpc.sip.v1.ring.<sipdInstanceTok>          engine -> sipd; the instance HOLDING the dialog
@@ -89,8 +92,37 @@ export const SUBJECT_ROOTS = {
 	queue: `queue.evt.${SUBJECT_VERSION}`,
 	voicemail: `voicemail.evt.${SUBJECT_VERSION}`,
 	media: `media.evt.${SUBJECT_VERSION}`,
+	/**
+	 * SMS/MMS on a messaging number — `messaging.evt.v1.<orgId>.<conversationId>.<event>`.
+	 *
+	 * The middle token is the CONVERSATION and not the message, which is the one decision this root
+	 * makes. A conversation is what a consumer subscribes to (an open thread in an agent's client,
+	 * a CRM screen-pop watching one customer) and what JetStream orders for you: per-subject
+	 * ordering means an inbound and its delivery receipt cannot be seen out of order by anybody
+	 * watching one thread. Keying by message id would give every message its own subject, one
+	 * message long, and make "follow this conversation" a filter nobody can express.
+	 *
+	 * `conversationId` is therefore subject-carried and does NOT appear in the payloads, on this
+	 * package's standing rule — the same one `mailboxId`, `queueId` and `callId` follow: one copy,
+	 * in the address. A consumer that wants it reads it back with {@link parseSubject}.
+	 */
+	messaging: `messaging.evt.${SUBJECT_VERSION}`,
 	trunk: `trunk.evt.${SUBJECT_VERSION}`,
 	cdrLeg: `cdr.leg.${SUBJECT_VERSION}`,
+	/**
+	 * Security SIGNALS from the control plane — today `fraud-signal`, the toll-fraud detector's
+	 * output.
+	 *
+	 * A root of its own rather than a member of `audit.evt`, and the difference is the one that
+	 * matters for anything downstream: an audit row says a PERSON changed something and is written
+	 * inside that change's transaction, while this says the PLATFORM noticed something and is
+	 * written by a process nobody asked. They have different retention (a signal is worth thirty
+	 * days; a change ledger is worth four hundred), different volume, and — decisively — different
+	 * audiences: `subjects.ts`'s webhook note explains at length why `audit` is deliberately not
+	 * deliverable to a tenant endpoint, and a fraud alert is exactly the thing a tenant DOES want
+	 * a callback for. One root per stream, which is how every other family here is shaped.
+	 */
+	security: `security.evt.${SUBJECT_VERSION}`,
 	audit: `audit.evt.${SUBJECT_VERSION}`,
 	provision: `provision.evt.${SUBJECT_VERSION}`,
 } as const;
@@ -109,6 +141,22 @@ export const RPC_SUBJECTS = {
 	 * is a write, unlike every other subject the engine calls, which is why the responder treats
 	 * `extensionNumber` as a CLAIM to be resolved rather than as an identity to be trusted.
 	 */
+	/**
+	 * "May this extension dial this number right now?" — `apps/engine` → `apps/api`, on the outbound
+	 * call-setup path, before the first INVITE.
+	 *
+	 * A request-reply rather than a fact on the artifact, and both exist for different halves of the
+	 * same control. The CEILINGS are compiled into `CompiledRoutingSettings.tollFraud` because they
+	 * are configuration and the engine holds no database handle. The COUNTERS are not: rolling
+	 * international minutes and simultaneous international legs change between compiles by
+	 * definition, and an artifact that carried them would be stale the moment it was published.
+	 *
+	 * So the engine asks. The responder is the only process with both the counter store and the
+	 * per-extension override, and it FAILS OPEN on its own errors — an unreachable counter must not
+	 * bar every international call on the platform, which is a strictly worse outage than the fraud
+	 * it would be preventing.
+	 */
+	pbxAuthorizeOutbound: `rpc.pbx.${SUBJECT_VERSION}.authorize-outbound`,
 	pbxExtensionFeature: `rpc.pbx.${SUBJECT_VERSION}.extension-feature`,
 	/**
 	 * An ORGANIZATION-wide toggle dialled from a handset — a call flow's day/night switch and a time
@@ -153,6 +201,31 @@ export const RPC_SUBJECTS = {
 	 * forwarding is not thereby a process that may replace what a mailbox says.
 	 */
 	pbxFileGreeting: `rpc.pbx.${SUBJECT_VERSION}.file-greeting`,
+	/**
+	 * The wrap-up window that closed with nobody choosing a code: `apps/engine` → `apps/api`.
+	 *
+	 * The engine is the only process that knows a wrap-up deadline expired — it owns the timer that
+	 * ends it — and the control plane is the only one that can file the row. A request-reply rather
+	 * than a `queue.evt.v1` event because the whole content of the message is "nobody chose": an
+	 * event would have needed a durable consumer and an at-least-once story for a fact whose retry
+	 * the engine can simply own, and the reply is something it can log and drop.
+	 *
+	 * Its own subject rather than a member of the feature family for the reason each of those has
+	 * one: the ability to file an agent's after-call work is not the ability to change a mailbox's
+	 * greeting, and the two must be withdrawable one at a time.
+	 */
+	pbxQueueDisposition: `rpc.pbx.${SUBJECT_VERSION}.queue-disposition`,
+	/**
+	 * What a caller pressed in the post-call survey: `apps/engine` → `apps/api`.
+	 *
+	 * Separate from the subject above even though both are filed as one call ends, because they are
+	 * facts about opposite ends of it — one is the AGENT's wrap-up code, one is the CALLER's rating
+	 * of them — and they are collected minutes apart by two independent detached tasks. Folding them
+	 * into one subject would mean a report that could carry either, so the responder would have to
+	 * decide which halves of its payload it believed, and a tenant who wanted surveys without
+	 * dispositions could not be granted one without the other.
+	 */
+	pbxQueueSurvey: `rpc.pbx.${SUBJECT_VERSION}.queue-survey`,
 	sipCredential: `rpc.sip.${SUBJECT_VERSION}.credential`,
 	/** Carrier digest derivation. Only sipd may request it; the API retains the carrier password. */
 	sipTrunkCredential: `rpc.sip.${SUBJECT_VERSION}.trunk-credential`,
@@ -690,6 +763,20 @@ export const MEDIA_SESSION_EVENTS = [
 export type MediaSessionEvent = (typeof MEDIA_SESSION_EVENTS)[number];
 
 /**
+ * Messaging vocabulary — SMS and MMS on a tenant's messaging numbers.
+ *
+ * Two members, one per DIRECTION of interest, and the asymmetry in their names is deliberate.
+ * `message.received` is an inbound arriving from the carrier. `message.delivered` is the DELIVERY
+ * RECEIPT for something the tenant sent — one fact with an outcome on it, which is why there is no
+ * `message.failed` beside it; see {@link messagingMessageDeliveredDataSchema} for the argument.
+ *
+ * There is deliberately no `message.sent`: the accepted-by-us moment is the API call's own
+ * response, and publishing it would be telling the caller something it is still holding.
+ */
+export const MESSAGING_EVENTS = ["message.received", "message.delivered"] as const;
+export type MessagingEvent = (typeof MESSAGING_EVENTS)[number];
+
+/**
  * Trunk vocabulary — the SIP edge's verdict on a carrier, written back to the control plane.
  *
  * One member, and the name is doing deliberate work: `status.changed` is a TRANSITION, not a
@@ -703,6 +790,26 @@ export type MediaSessionEvent = (typeof MEDIA_SESSION_EVENTS)[number];
  */
 export const TRUNK_EVENTS = ["status.changed"] as const;
 export type TrunkEvent = (typeof TRUNK_EVENTS)[number];
+
+/**
+ * Security signals — `security.evt.v1.<orgId>.<subjectRef>.<event>`.
+ *
+ * One member today. It is a LIST rather than a literal for the reason every other family here is
+ * one: a second signal (a registration flood, a credential-stuffing burst) joins by appending, and
+ * consumers that parse against the family schema need no release.
+ */
+export const SECURITY_EVENTS = ["fraud-signal"] as const;
+export type SecurityEvent = (typeof SECURITY_EVENTS)[number];
+
+/**
+ * Reserved security-scope token for a signal that belongs to the ORGANIZATION rather than to one
+ * extension — a tenant-wide minutes spike with no single account behind it.
+ *
+ * The same idiom, and the same reason, as {@link QUEUE_SCOPE_ALL}: the subject's middle token is
+ * the thing the signal is ABOUT, a consumer subscribed to `security.evt.v1.<org>.>` sees both
+ * scopes, and inventing an extension id for a finding that has none would make the subject lie.
+ */
+export const SECURITY_SCOPE_ORG = "_org";
 
 /**
  * Reserved queue-scope token for events that belong to the org rather than to one queue —
@@ -722,8 +829,10 @@ export const EVENT_FAMILIES = [
 	"queue",
 	"voicemail",
 	"media",
+	"messaging",
 	"trunk",
 	"cdr",
+	"security",
 	"audit",
 	"provision",
 ] as const;
@@ -918,6 +1027,15 @@ export const subjectFor = {
 		return `${SUBJECT_ROOTS.media}.${assertToken("orgId", orgId)}.${assertToken("sessionId", sessionId)}.${assertEvent(event)}`;
 	},
 	/**
+	 * `messaging.evt.v1.<orgId>.<conversationId>.<event>` — one SMS/MMS thread's traffic.
+	 *
+	 * `conversationId` and not `messageId`: see {@link SUBJECT_ROOTS.messaging}. It is the address,
+	 * so it is absent from every payload in the family.
+	 */
+	messaging(orgId: string, conversationId: string, event: MessagingEvent | (string & {})): string {
+		return `${SUBJECT_ROOTS.messaging}.${assertToken("orgId", orgId)}.${assertToken("conversationId", conversationId)}.${assertEvent(event)}`;
+	},
+	/**
 	 * `trunk.evt.v1.<orgId>.<trunkId>.<event>` — a carrier trunk's reachability transitions.
 	 *
 	 * `trunkId` is the `trunk` row id, not the trunk's name: the name is what the media server
@@ -931,6 +1049,10 @@ export const subjectFor = {
 	/** `cdr.leg.v1.<orgId>` — a single ordered subject per org; the CDR writer consumes it. */
 	cdrLeg(orgId: string): string {
 		return `${SUBJECT_ROOTS.cdrLeg}.${assertToken("orgId", orgId)}`;
+	},
+	/** `security.evt.v1.<orgId>.<subjectRef>.<event>` — `subjectRef` is {@link SECURITY_SCOPE_ORG} or an extension id. */
+	security(orgId: string, subjectRef: string, event: string): string {
+		return `${SUBJECT_ROOTS.security}.${assertToken("orgId", orgId)}.${assertToken("subjectRef", subjectRef)}.${assertEvent(event)}`;
 	},
 	/** `audit.evt.v1.<orgId>` */
 	audit(orgId: string): string {
@@ -1193,6 +1315,28 @@ export const subjectFilterFor = {
 		return `${SUBJECT_ROOTS.media}.${assertToken("orgId", orgId)}.*.${assertEvent(event)}`;
 	},
 
+	/** Every messaging event, every org — the MESSAGING stream's own subject list. */
+	allMessaging(): string {
+		return `${SUBJECT_ROOTS.messaging}.>`;
+	},
+	messagingInOrg(orgId: string): string {
+		return `${SUBJECT_ROOTS.messaging}.${assertToken("orgId", orgId)}.>`;
+	},
+	/** Every event of one thread — what an open conversation in an agent's client watches. */
+	messagingConversation(orgId: string, conversationId: string): string {
+		return `${SUBJECT_ROOTS.messaging}.${assertToken("orgId", orgId)}.${assertToken("conversationId", conversationId)}.>`;
+	},
+	/**
+	 * One event name across every conversation of one org.
+	 *
+	 * The event names are DOTTED, so the tail is two tokens and the conversation wildcard is a
+	 * single `*` — the same seven-token arithmetic {@link subjectFilterFor.trunkStatusInOrg}
+	 * spells out, and the same one that governs the broker grants in `config/nats.conf`.
+	 */
+	messagingEventInOrg(orgId: string, event: MessagingEvent | (string & {})): string {
+		return `${SUBJECT_ROOTS.messaging}.${assertToken("orgId", orgId)}.*.${assertEvent(event)}`;
+	},
+
 	/** Every trunk event, every org — the TRUNKS stream's own subject list. */
 	allTrunks(): string {
 		return `${SUBJECT_ROOTS.trunk}.>`;
@@ -1221,6 +1365,15 @@ export const subjectFilterFor = {
 		return subjectFor.cdrLeg(orgId);
 	},
 
+	allSecurity(): string {
+		return `${SUBJECT_ROOTS.security}.>`;
+	},
+	securityInOrg(orgId: string): string {
+		return `${SUBJECT_ROOTS.security}.${assertToken("orgId", orgId)}.>`;
+	},
+	securityEvent(orgId: string, event: string): string {
+		return `${SUBJECT_ROOTS.security}.${assertToken("orgId", orgId)}.*.${assertEvent(event)}`;
+	},
 	allAudit(): string {
 		return `${SUBJECT_ROOTS.audit}.*`;
 	},
@@ -1287,6 +1440,14 @@ export type ParsedSubject =
 			readonly event: string;
 	  }
 	| {
+			readonly kind: "messaging";
+			readonly family: "messaging";
+			readonly version: string;
+			readonly orgId: string;
+			readonly conversationId: string;
+			readonly event: string;
+	  }
+	| {
 			readonly kind: "trunk";
 			readonly family: "trunk";
 			readonly version: string;
@@ -1299,6 +1460,15 @@ export type ParsedSubject =
 			readonly family: "cdr";
 			readonly version: string;
 			readonly orgId: string;
+	  }
+	| {
+			readonly kind: "security";
+			readonly family: "security";
+			readonly version: string;
+			readonly orgId: string;
+			/** {@link SECURITY_SCOPE_ORG}, or the extension id the signal is about. */
+			readonly subjectRef: string;
+			readonly event: string;
 	  }
 	| {
 			readonly kind: "audit";
@@ -1405,12 +1575,34 @@ export function parseSubject(subject: string): ParsedSubject | undefined {
 		const [orgId, sessionId, ...event] = rest as [string, string, ...string[]];
 		return { kind: "media", family: "media", version, orgId, sessionId, event: event.join(".") };
 	}
+	if (prefix === "messaging.evt" && rest.length >= 3) {
+		const [orgId, conversationId, ...event] = rest as [string, string, ...string[]];
+		return {
+			kind: "messaging",
+			family: "messaging",
+			version,
+			orgId,
+			conversationId,
+			event: event.join("."),
+		};
+	}
 	if (prefix === "trunk.evt" && rest.length >= 3) {
 		const [orgId, trunkId, ...event] = rest as [string, string, ...string[]];
 		return { kind: "trunk", family: "trunk", version, orgId, trunkId, event: event.join(".") };
 	}
 	if (prefix === "cdr.leg" && rest.length === 1) {
 		return { kind: "cdr-leg", family: "cdr", version, orgId: rest[0] as string };
+	}
+	if (prefix === "security.evt" && rest.length >= 3) {
+		const [orgId, subjectRef, ...event] = rest as [string, string, ...string[]];
+		return {
+			kind: "security",
+			family: "security",
+			version,
+			orgId,
+			subjectRef,
+			event: event.join("."),
+		};
 	}
 	if (prefix === "audit.evt" && rest.length === 1) {
 		return { kind: "audit", family: "audit", version, orgId: rest[0] as string };
@@ -1474,6 +1666,14 @@ export function isVoicemailEvent(value: string): value is VoicemailEvent {
 
 export function isMediaSessionEvent(value: string): value is MediaSessionEvent {
 	return (MEDIA_SESSION_EVENTS as readonly string[]).includes(value);
+}
+
+export function isMessagingEvent(value: string): value is MessagingEvent {
+	return (MESSAGING_EVENTS as readonly string[]).includes(value);
+}
+
+export function isSecurityEvent(value: string): value is SecurityEvent {
+	return (SECURITY_EVENTS as readonly string[]).includes(value);
 }
 
 export function isTrunkEvent(value: string): value is TrunkEvent {

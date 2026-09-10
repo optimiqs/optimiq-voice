@@ -8,8 +8,10 @@
 		"queue": "queue.evt.v1",
 		"voicemail": "voicemail.evt.v1",
 		"media": "media.evt.v1",
+		"messaging": "messaging.evt.v1",
 		"trunk": "trunk.evt.v1",
 		"cdrLeg": "cdr.leg.v1",
+		"security": "security.evt.v1",
 		"audit": "audit.evt.v1",
 		"provision": "provision.evt.v1"
 	},
@@ -17,11 +19,14 @@
 		"routingResolve": "rpc.routing.v1.resolve",
 		"authzCheck": "rpc.authz.v1.check",
 		"voicemailList": "rpc.voicemail.v1.list",
+		"pbxAuthorizeOutbound": "rpc.pbx.v1.authorize-outbound",
 		"pbxExtensionFeature": "rpc.pbx.v1.extension-feature",
 		"pbxToggleFeature": "rpc.pbx.v1.toggle-feature",
 		"pbxHotDesk": "rpc.pbx.v1.hot-desk",
 		"pbxLastCaller": "rpc.pbx.v1.last-caller",
 		"pbxFileGreeting": "rpc.pbx.v1.file-greeting",
+		"pbxQueueDisposition": "rpc.pbx.v1.queue-disposition",
+		"pbxQueueSurvey": "rpc.pbx.v1.queue-survey",
 		"sipCredential": "rpc.sip.v1.credential",
 		"sipTrunkCredential": "rpc.sip.v1.trunk-credential",
 		"sipTransfer": "rpc.sip.v1.transfer",
@@ -852,6 +857,20 @@
 			"numReplicas": 1
 		},
 		{
+			"name": "SECURITY",
+			"description": "Control-plane security signals: toll-fraud detections and their auto-actions.",
+			"subjects": ["security.evt.v1.>"],
+			"retention": "limits",
+			"storage": "file",
+			"discard": "old",
+			"maxAgeMs": 2592000000,
+			"maxMsgs": -1,
+			"maxBytes": 1073741824,
+			"maxMsgsPerSubject": -1,
+			"duplicateWindowMs": 120000,
+			"numReplicas": 1
+		},
+		{
 			"name": "AUDIT",
 			"description": "Control-plane audit trail (plan §3.5, §5 T1 audit log).",
 			"subjects": ["audit.evt.v1.*"],
@@ -877,6 +896,20 @@
 			"maxBytes": 1073741824,
 			"maxMsgsPerSubject": -1,
 			"duplicateWindowMs": 120000,
+			"numReplicas": 1
+		},
+		{
+			"name": "MESSAGING",
+			"description": "SMS/MMS inbound and delivery-receipt events consumed durably by apps/api.",
+			"subjects": ["messaging.evt.v1.>"],
+			"retention": "limits",
+			"storage": "file",
+			"discard": "new",
+			"maxAgeMs": 2592000000,
+			"maxMsgs": -1,
+			"maxBytes": 2147483648,
+			"maxMsgsPerSubject": -1,
+			"duplicateWindowMs": 600000,
 			"numReplicas": 1
 		}
 	],
@@ -1387,6 +1420,11 @@
 			"family": "trunk",
 			"type": "status.changed",
 			"goType": "TrunkStatusChangedData"
+		},
+		{
+			"family": "security",
+			"type": "fraud-signal",
+			"goType": "SecurityFraudSignalData"
 		},
 		{
 			"family": "cdr",
@@ -2079,7 +2117,16 @@
 					"recordingId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
 					"objectKey": "1001",
 					"kind": "call",
-					"stereo": true
+					"stereo": true,
+					"consent": {
+						"outcome": "not-required",
+						"method": "none",
+						"policy": "none",
+						"at": "2026-08-05T10:00:00.000Z",
+						"parties": ["caller"],
+						"regions": ["1001"],
+						"promptId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+					}
 				}
 			}
 		},
@@ -2984,10 +3031,35 @@
 			}
 		},
 		{
+			"name": "synthetic.security.fraud-signal",
+			"goType": "SecurityFraudSignalData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1033",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "security.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293._org.fraud-signal",
+				"type": "fraud-signal",
+				"source": "codegen",
+				"data": {
+					"kind": "international-minutes-spike",
+					"severity": "info",
+					"action": "none",
+					"extensionId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"extensionNumber": "1001",
+					"destination": "1001",
+					"destinationCountry": "GB",
+					"observed": 0,
+					"threshold": 0,
+					"windowSeconds": 1,
+					"summary": "1001"
+				}
+			}
+		},
+		{
 			"name": "synthetic.cdr.cdr.leg.write",
 			"goType": "CDRLegWriteData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1033",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1034",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "cdr.leg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -3023,7 +3095,11 @@
 					"authPinLabel": "1001",
 					"sipAttestation": "A",
 					"sipVerstat": "1001",
-					"sipOrigId": "1001"
+					"sipOrigId": "1001",
+					"recordingConsent": "not-required",
+					"recordingConsentMethod": "none",
+					"recordingConsentAt": "2026-08-05T10:00:00.000Z",
+					"recordingConsentRegions": ["1001"]
 				}
 			}
 		},
@@ -3031,7 +3107,7 @@
 			"name": "synthetic.audit.audit.recorded",
 			"goType": "AuditRecordedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1034",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1035",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "audit.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -3067,7 +3143,7 @@
 			"name": "synthetic.provision.device.requested",
 			"goType": "ProvisionDeviceRequestedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1035",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1036",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "provision.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -3087,7 +3163,7 @@
 			"name": "synthetic.provision.device.rendered",
 			"goType": "ProvisionDeviceRenderedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1036",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1037",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "provision.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -3111,7 +3187,7 @@
 			"name": "synthetic.provision.device.rejected",
 			"goType": "ProvisionDeviceRejectedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1037",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1038",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "provision.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -3131,7 +3207,7 @@
 			"name": "synthetic.provision.credential.invalidated",
 			"goType": "ProvisionCredentialInvalidatedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1038",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1039",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "provision.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -3219,6 +3295,21 @@
 				"newCount": 0,
 				"savedCount": 0,
 				"reason": "1001"
+			}
+		},
+		{
+			"subject": "rpc.pbx.v1.authorize-outbound",
+			"goType": "AuthorizeOutbound",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"extensionNumber": "1001",
+				"dialedNumber": "1001",
+				"at": "2026-08-05T10:00:00.000Z"
+			},
+			"response": {
+				"allowed": true,
+				"reason": "1001",
+				"detail": "1001"
 			}
 		},
 		{
@@ -3318,6 +3409,42 @@
 			}
 		},
 		{
+			"subject": "rpc.pbx.v1.queue-disposition",
+			"goType": "QueueDisposition",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"queueId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"agentId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"code": "unset",
+				"auto": true
+			},
+			"response": {
+				"recorded": true,
+				"reason": "1001"
+			}
+		},
+		{
+			"subject": "rpc.pbx.v1.queue-survey",
+			"goType": "QueueSurvey",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"queueId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"agentId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"answers": [
+					{
+						"questionId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+						"digit": "1"
+					}
+				]
+			},
+			"response": {
+				"recorded": 0,
+				"reason": "1001"
+			}
+		},
+		{
 			"subject": "rpc.sip.v1.credential",
 			"goType": "SipCredential",
 			"request": {
@@ -3333,6 +3460,7 @@
 				"username": "1001",
 				"realm": "1001",
 				"ha1": "0192c7a14b8e7f218b3c9d0e1f2a3c00",
+				"ha1Previous": "0192c7a14b8e7f218b3c9d0e1f2a3c00",
 				"deviceId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
 				"extensionId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
 				"maxRegistrations": 1,
@@ -3628,7 +3756,8 @@
 				"callId": "1001",
 				"legId": "1001",
 				"sdpOffer": "1001",
-				"direction": "sendrecv"
+				"direction": "sendrecv",
+				"srtpPolicy": "prefer"
 			},
 			"response": {
 				"ok": true,
@@ -3641,6 +3770,7 @@
 				"ssrc": 0,
 				"codec": "PCMU",
 				"telephoneEventPayloadType": 0,
+				"mediaEncryption": "encrypted",
 				"reason": "bad_request",
 				"error": "1001"
 			}
@@ -3654,7 +3784,8 @@
 				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
 				"callId": "1001",
 				"legId": "1001",
-				"direction": "sendrecv"
+				"direction": "sendrecv",
+				"srtpPolicy": "prefer"
 			},
 			"response": {
 				"ok": true,
@@ -3666,6 +3797,7 @@
 				"rtcpPort": 1,
 				"ssrc": 0,
 				"telephoneEventPayloadType": 0,
+				"mediaEncryption": "encrypted",
 				"reason": "bad_request",
 				"error": "1001"
 			}
@@ -3675,13 +3807,15 @@
 			"goType": "MediaAcceptAnswer",
 			"request": {
 				"sessionId": "1001",
-				"sdpAnswer": "1001"
+				"sdpAnswer": "1001",
+				"srtpPolicy": "prefer"
 			},
 			"response": {
 				"ok": true,
 				"sessionId": "1001",
 				"codec": "PCMU",
 				"telephoneEventPayloadType": 0,
+				"mediaEncryption": "encrypted",
 				"instanceId": "1001",
 				"reason": "bad_request",
 				"error": "1001"

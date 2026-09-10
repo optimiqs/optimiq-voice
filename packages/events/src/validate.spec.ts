@@ -5,13 +5,15 @@ import { makeAuditEvent } from "./schemas/audit-events";
 import { makeCallEvent } from "./schemas/call-events";
 import { makeCdrLegWriteEvent } from "./schemas/cdr-events";
 import { makeMediaEvent } from "./schemas/media-events";
+import { makeMessagingEvent } from "./schemas/messaging-events";
 import { makeProvisionEvent } from "./schemas/provision-events";
 import { makeQueueEvent } from "./schemas/queue-events";
 import { makeRegistrationEvent } from "./schemas/registration-events";
+import { makeSecurityEvent } from "./schemas/security-events";
 import { makeSipDialogEvent } from "./schemas/sip-dialog-events";
 import { makeTrunkEvent } from "./schemas/trunk-events";
 import { makeVoicemailEvent } from "./schemas/voicemail-events";
-import { EVENT_FAMILIES, RPC_SUBJECTS, subjectFor } from "./subjects";
+import { EVENT_FAMILIES, RPC_SUBJECTS, SECURITY_SCOPE_ORG, subjectFor } from "./subjects";
 import {
 	anyEventSchema,
 	assertEventSubjectMatches,
@@ -29,6 +31,7 @@ const LEG = createEntityId();
 const QUEUE = createEntityId();
 const MAILBOX = createEntityId();
 const SESSION = createEntityId();
+const CONVERSATION = createEntityId();
 
 const callEvent = makeCallEvent("channel.answered", {
 	orgId: ORG,
@@ -102,6 +105,20 @@ const samples = {
 			durationMs: 30_000,
 		},
 	}),
+	messaging: makeMessagingEvent("message.received", {
+		orgId: ORG,
+		conversationId: CONVERSATION,
+		source: "api",
+		data: {
+			messageId: createEntityId(),
+			messagingNumberId: createEntityId(),
+			fromE164: "+15551230000",
+			toE164: "+15559990000",
+			kind: "SMS",
+			body: "are you open on saturday?",
+			receivedAt: "2026-08-05T10:00:00.000Z",
+		},
+	}),
 	trunk: makeTrunkEvent("status.changed", {
 		orgId: ORG,
 		trunkId: createEntityId(),
@@ -125,6 +142,20 @@ const samples = {
 			hangupCause: "NORMAL_CLEARING",
 			hangupCauseCode: 16,
 			disposition: "answered",
+		},
+	}),
+	security: makeSecurityEvent("fraud-signal", {
+		orgId: ORG,
+		subjectRef: SECURITY_SCOPE_ORG,
+		source: "api",
+		data: {
+			kind: "international-minutes-spike",
+			severity: "warning",
+			action: "none",
+			observed: 240,
+			threshold: 60,
+			windowSeconds: 3_600,
+			summary: "240 international minutes in the last hour against a 60-minute ceiling.",
 		},
 	}),
 	audit: makeAuditEvent({
@@ -322,5 +353,34 @@ describe("forward compatibility", () => {
 		expect(() =>
 			validateEvent(subjectFor.call(ORG, CALL, "channel.teleported"), unknownType),
 		).toThrow(EventValidationError);
+	});
+});
+
+describe("messaging events", () => {
+	it("derives the conversation subject from the input", () => {
+		const event = makeMessagingEvent("message.delivered", {
+			orgId: ORG,
+			conversationId: CONVERSATION,
+			source: "api",
+			data: {
+				messageId: createEntityId(),
+				messagingNumberId: createEntityId(),
+				fromE164: "+15559990000",
+				toE164: "+15551230000",
+				status: "failed",
+				errorReason: "handset unreachable",
+				occurredAt: "2026-08-05T10:00:01.000Z",
+			},
+		});
+		expect(event.subject).toBe(subjectFor.messaging(ORG, CONVERSATION, "message.delivered"));
+		expect(validateEvent(event.subject, overTheWire(event))).toEqual(event);
+	});
+
+	it("rejects a type outside the family union", () => {
+		const stray = {
+			...overTheWire(samples.messaging),
+			type: "message.failed",
+		};
+		expect(EVENT_SCHEMAS_BY_FAMILY.messaging.safeParse(stray).success).toBe(false);
 	});
 });

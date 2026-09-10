@@ -31,6 +31,10 @@
 			"default": "sendrecv",
 			"type": "string",
 			"enum": ["sendrecv", "sendonly", "recvonly", "inactive"]
+		},
+		"srtpPolicy": {
+			"type": "string",
+			"enum": ["prefer", "require", "disable"]
 		}
 	},
 	"required": ["sessionId", "orgId", "callId", "sdpOffer", "direction"],

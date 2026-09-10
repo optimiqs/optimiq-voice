@@ -191,6 +191,42 @@ export const cdrLegWriteDataSchema = z.looseObject({
 	sipAttestation: z.enum(["A", "B", "C"]).nullish(),
 	sipVerstat: z.string().max(64).nullish(),
 	sipOrigId: z.string().max(128).nullish(),
+
+	// --- what the caller was told, and what they answered ---------------------------------------
+	/**
+	 * The recording consent this leg carried, flattened into four columns.
+	 *
+	 * ## Why the ledger carries it at all, when `recordings.consent` already does
+	 *
+	 * Because the interesting call is the one with NO recording. A caller who declined produces a leg
+	 * and no recording row, and that leg is the only evidence that the platform asked and was told
+	 * no — which is precisely the record a tenant needs when somebody later asks why a call was not
+	 * recorded, or asserts that it was. Filing it only beside the audio would keep it for every
+	 * outcome except the one it exists to prove.
+	 *
+	 * ## Why four columns and not the whole object
+	 *
+	 * These are what a report groups and filters by, and `call_legs` is a partitioned table a
+	 * reporting API queries with SQL — an outcome inside jsonb is an outcome nobody indexes. The full
+	 * `recordingConsentSchema` (`call-events.ts`) record still travels on `channel.record.started` and is stored
+	 * whole on `recordings.consent`; this is the projection of it that answers questions about calls,
+	 * rather than about files. `parties`, `policy` and `promptId` are deliberately not here: they
+	 * describe how the announcement was delivered, which nobody aggregates.
+	 *
+	 * ## Why `recordingConsent` is an enum and the columns beneath it are not
+	 *
+	 * The outcome is the discriminator every report groups by, so an unrecognised value there would
+	 * be a silent bucket. `recordingConsentRegions` is free-form strings because a jurisdiction list
+	 * is tenant configuration and a new subdivision must reach a record rather than fail a write on
+	 * an append-only ledger — the same argument `sipVerstat` makes one block up.
+	 *
+	 * All four absent on every leg written before consent existed, and on every leg of a tenant that
+	 * has never switched it on, which is most of them.
+	 */
+	recordingConsent: z.enum(["not-required", "announced", "accepted", "declined"]).nullish(),
+	recordingConsentMethod: z.enum(["none", "announcement", "keypress"]).nullish(),
+	recordingConsentAt: z.iso.datetime().nullish(),
+	recordingConsentRegions: z.array(z.string().max(16)).max(16).nullish(),
 });
 
 export const CDR_LEG_WRITE = defineEvent("cdr", "cdr.leg.write", cdrLegWriteDataSchema);

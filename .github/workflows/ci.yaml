@@ -96,6 +96,14 @@ jobs:
           pnpm --filter @optimiq-voice/api run check:di
           pnpm --filter @optimiq-voice/engine run check:di
 
+      # A stream, KV bucket or durable consumer added without the matching `config/nats.conf` grant
+      # boots cleanly and then does not work: the broker refuses the publish on the connection's
+      # error channel, not to the caller. This derives the requirement from the code and the
+      # `@optimiq-voice/events` catalogue and fails with the exact subject lines that are missing.
+      # Offline — nothing connects to a broker.
+      - name: NATS JetStream grants
+        run: pnpm run check:nats
+
   codegen-drift:
     name: events codegen drift
     runs-on: ubuntu-latest

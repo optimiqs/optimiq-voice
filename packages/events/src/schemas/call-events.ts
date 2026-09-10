@@ -92,6 +92,41 @@ export const channelDtmfDataSchema = z.object({
 	source: dtmfSourceSchema,
 });
 
+/**
+ * What the platform asked of the caller before it started recording, and what they answered.
+ *
+ * ## Why the literals are written out here
+ *
+ * This mirrors `RecordingConsentRecord` in `packages/routing`, which is where the vocabulary is
+ * declared — the compiler bakes the POLICY into the artifact and the engine stamps the OUTCOME onto
+ * the leg, so both ends have to speak the same three words. It is mirrored and not imported because
+ * `packages/events` depends on nothing but `telephony`: every producer and every consumer on the bus
+ * imports this package, and making the wire contract depend on the routing compiler would drag the
+ * compiler into processes that never route a call. The mirror is checked by the tests on both sides;
+ * an import would be a dependency nobody can remove later.
+ *
+ * ## Why it travels whole
+ *
+ * The four facts are only meaningful together. `declined` with no `method` cannot be told apart from
+ * a producer that forgot the field, and an `at` with no outcome dates nothing. `regions` is the one
+ * that answers the question an auditor actually asks — why a call whose tenant configured no
+ * announcement was announced anyway — and it is bounded at 16 for the same reason `parties` is
+ * bounded at 4: a jurisdiction list is a handful of entries, and an unbounded array on a bus message
+ * is a memory budget nobody set.
+ */
+export const recordingConsentSchema = z.object({
+	outcome: z.enum(["not-required", "announced", "accepted", "declined"]),
+	method: z.enum(["none", "announcement", "keypress"]),
+	policy: z.enum(["none", "announce", "announce-and-require-keypress"]),
+	/** When the outcome was decided — not when the recording started; a decline starts none. */
+	at: z.iso.datetime(),
+	parties: z.array(z.enum(["caller", "callee"])).max(4),
+	/** The jurisdictions that forced all-party treatment. Absent when none did. */
+	regions: z.array(z.string().max(16)).max(16).optional(),
+	/** The prompt row that was played. Absent when the engine used its seeded stem. */
+	promptId: z.uuid().optional(),
+});
+
 /** `channel.record.started` — a media bug is now writing to `objectKey`. */
 export const channelRecordStartedDataSchema = z.object({
 	legId: z.uuid(),
@@ -101,6 +136,17 @@ export const channelRecordStartedDataSchema = z.object({
 	kind: recordingKindSchema,
 	/** True when each leg is written to its own channel (per-leg stereo). */
 	stereo: z.boolean().optional(),
+	/**
+	 * The consent that authorised this recording, landing on `cdr-db` `recordings.consent`.
+	 *
+	 * It rides the START and not the stop because it is the fact that made the start legitimate, and
+	 * a recording that is still running is exactly when somebody may ask. Absent means a producer
+	 * that predates consent handling, or a media plane that cannot announce — never "consent was
+	 * refused", because a refusal starts no recording and therefore publishes no `record.started` at
+	 * all. Optional for that reason, and because an old consumer that ignores the key writes the row
+	 * it always wrote.
+	 */
+	consent: recordingConsentSchema.optional(),
 });
 
 /** `channel.record.stopped` — the object is final; the CDR's `recordingKey` can be set. */

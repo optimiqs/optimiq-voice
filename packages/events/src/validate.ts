@@ -4,9 +4,11 @@ import { auditEventSchema } from "./schemas/audit-events";
 import { callEventSchema } from "./schemas/call-events";
 import { cdrEventSchema } from "./schemas/cdr-events";
 import { mediaEventSchema } from "./schemas/media-events";
+import { messagingEventSchema } from "./schemas/messaging-events";
 import { provisionEventSchema } from "./schemas/provision-events";
 import { queueEventSchema } from "./schemas/queue-events";
 import { registrationEventSchema } from "./schemas/registration-events";
+import { securityEventSchema } from "./schemas/security-events";
 import { sipDialogEventSchema } from "./schemas/sip-dialog-events";
 import { trunkEventSchema } from "./schemas/trunk-events";
 import { voicemailEventSchema } from "./schemas/voicemail-events";
@@ -29,8 +31,10 @@ export const EVENT_SCHEMAS_BY_FAMILY = {
 	queue: queueEventSchema,
 	voicemail: voicemailEventSchema,
 	media: mediaEventSchema,
+	messaging: messagingEventSchema,
 	trunk: trunkEventSchema,
 	cdr: cdrEventSchema,
+	security: securityEventSchema,
 	audit: auditEventSchema,
 	provision: provisionEventSchema,
 } as const satisfies Record<EventFamily, z.ZodType>;
@@ -45,8 +49,10 @@ export const anyEventSchema = z.union([
 	queueEventSchema,
 	voicemailEventSchema,
 	mediaEventSchema,
+	messagingEventSchema,
 	trunkEventSchema,
 	cdrEventSchema,
+	securityEventSchema,
 	auditEventSchema,
 	provisionEventSchema,
 ]);
@@ -198,7 +204,8 @@ export function validateEvent(
 	options: ValidateEventOptions = {},
 ): AnyEventEnvelope {
 	const result = safeValidateEvent(subject, payload, options);
-	if (!result.success) {
+	// An explicit comparison narrows the union under `strictNullChecks: false` too (apps/api).
+	if (result.success === false) {
 		throw result.error;
 	}
 	return result.data;

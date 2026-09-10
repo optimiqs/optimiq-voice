@@ -220,6 +220,33 @@ export const MEDIA_STREAM: StreamDefinition = {
 };
 
 /**
+ * `MESSAGING` — SMS/MMS arrivals and delivery receipts on the tenant's messaging numbers.
+ *
+ * `discard: new` for the reason VOICEMAIL gives, in messaging's own terms: a `message.received`
+ * the broker silently dropped is a customer's text nobody in the tenant will ever see, and a
+ * dropped `message.delivered` is a message whose outcome nobody can report — the sender is left
+ * looking at a row that says "sending" forever. Neither is a fact a newer event supersedes, so the
+ * stream refuses the WRITE instead and the publisher gets an error it can retry and alert on.
+ *
+ * 30 days, matching VOICEMAIL and CDR: it is how far back an inbox fan-out can be rebuilt from the
+ * log alone.
+ */
+export const MESSAGING_STREAM: StreamDefinition = {
+	name: "MESSAGING",
+	description: "SMS/MMS inbound and delivery-receipt events consumed durably by apps/api.",
+	subjects: [subjectFilterFor.allMessaging()],
+	retention: "limits",
+	storage: "file",
+	discard: "new",
+	maxAgeMs: 30 * DAY_MS,
+	maxMsgs: -1,
+	maxBytes: 2 * GIB,
+	maxMsgsPerSubject: -1,
+	duplicateWindowMs: 10 * MINUTE_MS,
+	numReplicas: 1,
+};
+
+/**
  * `TRUNKS` — carrier reachability transitions on their way to the `trunk.status*` columns.
  *
  * Modelled on `REGISTRATIONS`, because it is the same kind of stream one hop out: the edge's
@@ -266,6 +293,30 @@ export const CDR_STREAM: StreamDefinition = {
 	numReplicas: 1,
 };
 
+/**
+ * `SECURITY` — what the platform noticed. Alert-shaped, so it discards OLD.
+ *
+ * Thirty days rather than the audit stream's four hundred: a fraud signal is actionable while the
+ * incident is open and is evidence for as long as the investigation runs, and after that the audit
+ * row the same detector wrote is the durable record. `discard: "old"` for the same reason every
+ * alert stream carries it — a stream that refuses new messages when it fills is a detector that
+ * goes quiet during the attack that filled it.
+ */
+export const SECURITY_STREAM: StreamDefinition = {
+	name: "SECURITY",
+	description: "Control-plane security signals: toll-fraud detections and their auto-actions.",
+	subjects: [subjectFilterFor.allSecurity()],
+	retention: "limits",
+	storage: "file",
+	discard: "old",
+	maxAgeMs: 30 * DAY_MS,
+	maxMsgs: -1,
+	maxBytes: 1 * GIB,
+	maxMsgsPerSubject: -1,
+	duplicateWindowMs: 2 * MINUTE_MS,
+	numReplicas: 1,
+};
+
 /** `AUDIT` — who changed what. Compliance retention; never discards old messages. */
 export const AUDIT_STREAM: StreamDefinition = {
 	name: "AUDIT",
@@ -308,8 +359,10 @@ export const EVENT_STREAMS: readonly StreamDefinition[] = [
 	MEDIA_STREAM,
 	TRUNKS_STREAM,
 	CDR_STREAM,
+	SECURITY_STREAM,
 	AUDIT_STREAM,
 	PROVISION_STREAM,
+	MESSAGING_STREAM,
 ];
 
 /** Returns a copy of `definition` with a production replica count (3 or 5). */

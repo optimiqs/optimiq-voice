@@ -222,6 +222,46 @@ var CDRStream = StreamDefinition{
 	NumReplicas:       1,
 }
 
+// SecurityStream carries what the platform noticed: toll-fraud detections and their auto-actions.
+//
+// Thirty days rather than the audit stream's four hundred: a fraud signal is actionable while the
+// incident is open and after that the audit row the same detector wrote is the durable record.
+// DiscardOld for the reason every alert stream carries it — a stream that refuses new messages when
+// it fills is a detector that goes quiet during the attack that filled it.
+var SecurityStream = StreamDefinition{
+	Name:              "SECURITY",
+	Description:       "Control-plane security signals: toll-fraud detections and their auto-actions.",
+	Subjects:          []string{AllSecurityFilter()},
+	Retention:         RetentionLimits,
+	Storage:           StorageFile,
+	Discard:           DiscardOld,
+	MaxAge:            30 * 24 * time.Hour,
+	MaxMsgs:           Unlimited,
+	MaxBytes:          1 * gib,
+	MaxMsgsPerSubject: Unlimited,
+	DuplicateWindow:   2 * time.Minute,
+	NumReplicas:       1,
+}
+
+// MessagingStream carries SMS/MMS inbound and delivery-receipt events for apps/api's durable inbox
+// writer. Thirty days, like VOICEMAIL and CDR: how far back an inbox fan-out can be rebuilt from the
+// log alone. DiscardNew because a delivery receipt or an inbound message must never be dropped for
+// a newer one.
+var MessagingStream = StreamDefinition{
+	Name:              "MESSAGING",
+	Description:       "SMS/MMS inbound and delivery-receipt events consumed durably by apps/api.",
+	Subjects:          []string{AllMessagingFilter()},
+	Retention:         RetentionLimits,
+	Storage:           StorageFile,
+	Discard:           DiscardNew,
+	MaxAge:            30 * 24 * time.Hour,
+	MaxMsgs:           Unlimited,
+	MaxBytes:          2 * gib,
+	MaxMsgsPerSubject: Unlimited,
+	DuplicateWindow:   10 * time.Minute,
+	NumReplicas:       1,
+}
+
 // AuditStream records who changed what. Compliance retention; never discards old messages.
 var AuditStream = StreamDefinition{
 	Name:              "AUDIT",
@@ -265,8 +305,10 @@ var EventStreams = []StreamDefinition{
 	MediaStream,
 	TrunksStream,
 	CDRStream,
+	SecurityStream,
 	AuditStream,
 	ProvisionStream,
+	MessagingStream,
 }
 
 // StreamByName looks a stream definition up by its JetStream name.

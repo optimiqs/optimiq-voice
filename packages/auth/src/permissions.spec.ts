@@ -181,11 +181,40 @@ describe("PERMISSIONS", () => {
 	 * `ring-groups.write` nor on `paging-groups.write`. No `send`- or `toggle`-shaped fourth grant,
 	 * because managing a shared line is one job. That moves the ceiling to keep the same four spare.
 	 *
+	 * Carrier compliance then spent four: `compliance.read`/`write` are the tenant's own KYC file and
+	 * the caller ids it claims a right to present — a read/write pair and no delete, because a
+	 * compliance record is amended and never removed — and `compliance.review`/`traceback` are the
+	 * platform operator's two jobs on it. Neither of the last two rides `settings.write.all`: that
+	 * grant is "change a default for every organization", and reading one tenant's calls to answer a
+	 * statutory 24-hour clock is a different power that an on-call operator must be able to hold
+	 * without also holding the authority to approve a customer. That lands the model on 125, so the
+	 * ceiling moves to keep the same four spare it has always left.
+	 *
+	 * Toll-fraud controls then spent three. Two are `toll-fraud.read`/`write`: spend and velocity
+	 * caps on international calling, which are neither `security.*` (that is the NETWORK boundary —
+	 * which addresses may reach the SIP edge — read by whoever runs the edge during a carrier
+	 * turn-up) nor `org-limits.*` (that is a commercial QUOTA whose write is owner-only, and folding
+	 * fraud thresholds into it would mean tuning one mid-incident requires the owner). The third is
+	 * `security.rotate-credentials`, which IS on `security` and is deliberately not part of
+	 * `security.write`: opening a CIDR is a change made while looking at a list, while invalidating
+	 * the credential a physical handset is holding is an outage on a schedule the handset chooses.
+	 *
+	 * Two-way messaging then spent three, and the interesting part is the trio it did NOT spend.
+	 * `messaging.read`/`send`/`manage` — the inbox, the act of texting a consumer, and the 10DLC
+	 * brand/campaign/toll-free/opt-out configuration behind it. `send` splits from `manage` on the
+	 * argument `faxes.send` and `numbers.order` already made: it spends carrier money and puts the
+	 * tenant's name in front of a member of the public. There is deliberately no `messaging.delete`:
+	 * a conversation is the tenant's own evidence in a TCPA complaint, so it is removed by a
+	 * time-scoped RETENTION policy an administrator sets, never by a grant somebody can press after
+	 * an awkward exchange — which is the first `.delete` this registry has refused on those grounds
+	 * rather than on power grounds. That lands the model on 131, so the ceiling stays at 135 and
+	 * still leaves the same four spare it has always left.
+	 *
 	 * The instruction stands unchanged for whatever comes next.
 	 */
 	it("stays within the size the collapsed FusionPBX model targets", () => {
 		expect(PERMISSIONS.length).toBeGreaterThanOrEqual(60);
-		expect(PERMISSIONS.length).toBeLessThanOrEqual(124);
+		expect(PERMISSIONS.length).toBeLessThanOrEqual(135);
 	});
 
 	it("contains no duplicates", () => {
