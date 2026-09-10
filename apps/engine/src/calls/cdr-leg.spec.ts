@@ -1,7 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import { cdrLegWriteDataSchema } from "@optimiq-voice/events";
 import { isUuidV7EntityId } from "@optimiq-voice/identifiers";
-import { attestationOf, authorizationOf, buildCdrLegWrite, dispositionFor } from "./cdr-leg";
+import {
+	attestationOf,
+	authorizationOf,
+	buildCdrLegWrite,
+	dispositionFor,
+	presentedCallerIdNumber,
+	recordingConsentOf,
+} from "./cdr-leg";
 import type { ChannelSnapshot } from "@optimiq-voice/telephony";
 
 const ORG = "0195c0f0-1c2f-7000-8000-000000000001";
@@ -342,5 +349,141 @@ describe("buildCdrLegWrite — the SIP Call-ID", () => {
 		const data = buildCdrLegWrite(base);
 
 		expect("sipCallId" in data).toBe(false);
+	});
+});
+
+describe("recordingConsentOf", () => {
+	it("reads a full consent verdict off the leg's variables", () => {
+		expect(
+			recordingConsentOf({
+				OPTIMIQ_RECORDING_CONSENT: "accepted",
+				OPTIMIQ_RECORDING_CONSENT_METHOD: "keypress",
+				OPTIMIQ_RECORDING_CONSENT_AT: "2026-01-01T00:00:00.000Z",
+				OPTIMIQ_RECORDING_CONSENT_REGIONS: '["US-CA","EU"]',
+			}),
+		).toEqual({
+			recordingConsent: "accepted",
+			recordingConsentMethod: "keypress",
+			recordingConsentAt: "2026-01-01T00:00:00.000Z",
+			recordingConsentRegions: ["US-CA", "EU"],
+		});
+	});
+
+	it("keeps a decline, which is the row with no recording behind it", () => {
+		expect(
+			recordingConsentOf({
+				OPTIMIQ_RECORDING_CONSENT: "declined",
+				OPTIMIQ_RECORDING_CONSENT_METHOD: "keypress",
+			}),
+		).toMatchObject({ recordingConsent: "declined", recordingConsentMethod: "keypress" });
+	});
+
+	it("reports nothing at all without an outcome — half a verdict is not a verdict", () => {
+		expect(recordingConsentOf({})).toEqual({});
+		expect(
+			recordingConsentOf({
+				OPTIMIQ_RECORDING_CONSENT_METHOD: "announcement",
+				OPTIMIQ_RECORDING_CONSENT_AT: "2026-01-01T00:00:00.000Z",
+			}),
+		).toEqual({});
+		expect(recordingConsentOf({ OPTIMIQ_RECORDING_CONSENT: "maybe" })).toEqual({});
+	});
+
+	it("drops a method outside the vocabulary and keeps the outcome", () => {
+		expect(
+			recordingConsentOf({
+				OPTIMIQ_RECORDING_CONSENT: "announced",
+				OPTIMIQ_RECORDING_CONSENT_METHOD: "telepathy",
+			}),
+		).toEqual({ recordingConsent: "announced" });
+	});
+
+	it("survives a regions variable a media server mangled", () => {
+		expect(
+			recordingConsentOf({
+				OPTIMIQ_RECORDING_CONSENT: "announced",
+				OPTIMIQ_RECORDING_CONSENT_REGIONS: "not json",
+			}),
+		).toEqual({ recordingConsent: "announced" });
+		expect(
+			recordingConsentOf({
+				OPTIMIQ_RECORDING_CONSENT: "announced",
+				OPTIMIQ_RECORDING_CONSENT_REGIONS: '{"US-CA":true}',
+			}),
+		).toEqual({ recordingConsent: "announced" });
+	});
+});
+
+describe("buildCdrLegWrite — the consent columns", () => {
+	const base = {
+		leg: "a" as const,
+		direction: "inbound" as const,
+		hangupCause: "NORMAL_CLEARING" as const,
+		hangupCauseCode: 16,
+		hangupSide: "caller" as const,
+		endedAt: 1_010_000,
+	};
+
+	it("lands all four columns on the ledger", () => {
+		const variables = {
+			OPTIMIQ_RECORDING_CONSENT: "announced",
+			OPTIMIQ_RECORDING_CONSENT_METHOD: "announcement",
+			OPTIMIQ_RECORDING_CONSENT_AT: "2026-01-01T00:00:00.000Z",
+			OPTIMIQ_RECORDING_CONSENT_REGIONS: '["US-CA"]',
+		};
+		const data = buildCdrLegWrite({
+			...base,
+			snapshot: snapshot({ variables }),
+			...recordingConsentOf(variables),
+		});
+
+		expect(data.recordingConsent).toBe("announced");
+		expect(data.recordingConsentMethod).toBe("announcement");
+		expect(data.recordingConsentAt).toBe("2026-01-01T00:00:00.000Z");
+		expect(data.recordingConsentRegions).toEqual(["US-CA"]);
+		expect(cdrLegWriteDataSchema.safeParse(data).success).toBe(true);
+	});
+
+	it("omits every key on a leg nobody recorded, which is most of them", () => {
+		const data = buildCdrLegWrite({ ...base, snapshot: snapshot(), ...recordingConsentOf({}) });
+
+		expect("recordingConsent" in data).toBe(false);
+		expect("recordingConsentMethod" in data).toBe(false);
+		expect("recordingConsentAt" in data).toBe(false);
+		expect("recordingConsentRegions" in data).toBe(false);
+		expect(cdrLegWriteDataSchema.safeParse(data).success).toBe(true);
+	});
+});
+
+/**
+ * The effective caller id, off the composition the media server was handed.
+ *
+ * `call_legs.from_number` on the trunk leg of a handset-originated call filed the EXTENSION number
+ * (`7001`) while the carrier saw the route's E.164 (`+13125557001`), which is why
+ * `AttestationPolicyService`'s backfill — guarded to act only on an already-E.164 `from_number`,
+ * because looking up `7001` would miss and stamp **C** on a call attested **A** — never fired on the
+ * calls it exists for.
+ */
+describe("presentedCallerIdNumber", () => {
+	it("takes the number out of a named identity, and never the name", () => {
+		expect(presentedCallerIdNumber('"Ada Lovelace" <+13125557001>')).toBe("+13125557001");
+	});
+
+	it("takes a bare number as it stands", () => {
+		expect(presentedCallerIdNumber("+13125557001")).toBe("+13125557001");
+	});
+
+	it("returns nothing for a name-only identity, rather than putting a name in an E.164 column", () => {
+		expect(presentedCallerIdNumber('"Ada Lovelace"')).toBeUndefined();
+	});
+
+	it("returns nothing for an absent or empty identity, so the leg keeps what it had", () => {
+		expect(presentedCallerIdNumber(undefined)).toBeUndefined();
+		expect(presentedCallerIdNumber("   ")).toBeUndefined();
+		expect(presentedCallerIdNumber('"Ada" <>')).toBeUndefined();
+	});
+
+	it("trims, because a composition may carry the media server's spacing", () => {
+		expect(presentedCallerIdNumber('"Ada" < +13125557001 >')).toBe("+13125557001");
 	});
 });

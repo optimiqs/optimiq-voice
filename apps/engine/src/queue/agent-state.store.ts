@@ -346,6 +346,12 @@ export class AgentStateStore implements AgentStatePort {
 				: {}),
 			...(request.legId === undefined ? {} : { legId: request.legId }),
 			...(request.queueId === undefined ? {} : { queueId: request.queueId }),
+			...(request.dispositionCallId === undefined
+				? {}
+				: { dispositionCallId: request.dispositionCallId }),
+			...(request.dispositionRequired === undefined
+				? {}
+				: { dispositionRequired: request.dispositionRequired }),
 			...(request.reason === undefined ? {} : { reason: request.reason }),
 		};
 

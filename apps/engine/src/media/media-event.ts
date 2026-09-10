@@ -188,6 +188,47 @@ export interface MediaLegUnheldEvent {
 	readonly channelId: string;
 }
 
+/**
+ * A prompt this engine started has stopped, and how much of it actually reached the far end.
+ *
+ * ## Why this member exists when `PlaybackStarted` does not
+ *
+ * The rule this file states — a union member is a deliberate act with a consumer attached — is what
+ * kept playback out of it for as long as nothing above the seam waited for a prompt to end. One
+ * consumer now does, and only one: `CallControl.announceConsent` writes a COMPLIANCE RECORD naming
+ * the parties the recording-disclosure prompt reached. It used to stamp that record when
+ * `MediaPort.play` resolved, and `play` resolves on acceptance — so a WebRTC party whose ICE and
+ * DTLS had not finished was recorded as "announced to" while `mediad` was logging `playedMs 0` and
+ * dropping every frame. A record that can be wrong about the one claim it exists to make is the
+ * consumer this member was owed to.
+ *
+ * Everything else on the platform still does not wait: an IVR greeting the caller talks over did
+ * its job, and the verb executor must not hold a fiber for the length of a prompt. So this member
+ * is republished onto a playback signal bus and read by whoever asked, exactly as
+ * `recording-finished` is — it is the closest precedent, and it exists for the same reason.
+ *
+ * ## `playedMs` is optional, and the absence means something
+ *
+ * Only the process that wrote the packets can say how much audio left the machine. `mediad`
+ * measures it. Asterisk does not: its `PlaybackFinished` carries a state and no duration. Absent
+ * therefore means "this media plane does not measure delivery", which a consumer must be able to
+ * tell from `0`, "nothing was delivered" — conflating them would refuse every announcement on an
+ * ARI deployment on the strength of a number that driver never had.
+ */
+export interface MediaPlaybackFinishedEvent {
+	readonly type: "playback-finished";
+	/** The leg the prompt was played at. */
+	readonly channelId: string;
+	/** The reference the ENGINE assigned on `play`; every driver echoes it back verbatim. */
+	readonly playbackRef: string;
+	/** How much audio reached the far end, in ms. Absent when the driver cannot measure it. */
+	readonly playedMs?: number;
+	/** The media plane's own word for why it stopped, verbatim, because it is the evidence. */
+	readonly reason: string;
+	/** Whatever the media plane could say about a failure. */
+	readonly detail?: string;
+}
+
 /** Recording began. Named, not id'd — the name is also how it is stopped. See `RecordRequest`. */
 export interface MediaRecordingStartedEvent {
 	readonly type: "recording-started";
@@ -261,6 +302,7 @@ export type MediaEvent =
 	| MediaVariableSetEvent
 	| MediaLegHeldEvent
 	| MediaLegUnheldEvent
+	| MediaPlaybackFinishedEvent
 	| MediaRecordingStartedEvent
 	| MediaRecordingFinishedEvent
 	| MediaRecordingFailedEvent
@@ -270,7 +312,7 @@ export type MediaEvent =
  * The event names, as data.
  *
  * For assertions and for the `mediad` wire contract to enumerate against, so that "the engine
- * consumes twelve events" is a fact a test can check rather than a claim in a comment.
+ * consumes fourteen events" is a fact a test can check rather than a claim in a comment.
  */
 export const MEDIA_EVENT_TYPES = [
 	"leg-arrived",
@@ -282,6 +324,7 @@ export const MEDIA_EVENT_TYPES = [
 	"variable-set",
 	"leg-held",
 	"leg-unheld",
+	"playback-finished",
 	"recording-started",
 	"recording-finished",
 	"recording-failed",

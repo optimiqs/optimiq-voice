@@ -4,7 +4,7 @@ import { fakeAgent, fakeMembership, makeFakeQueueServices } from "./queue-servic
 import { penaltySecondsFor, QueueSession } from "./queue-session";
 import type { FakeQueueServices } from "./queue-services.fake";
 import type { QueueCallPort, QueueDialAttempt, QueueDialOutcome } from "./queue-session";
-import type { QueueMembership, QueueMembershipAgent } from "@optimiq-voice/events";
+import type { AgentStateEntry, QueueMembership, QueueMembershipAgent } from "@optimiq-voice/events";
 import type { QueuePlanNode } from "@optimiq-voice/routing";
 
 /**
@@ -69,6 +69,8 @@ interface HarnessOptions {
 	/** The media plane refuses the recording. The call must still connect. */
 	readonly recordingFails?: boolean;
 	readonly recordingThrows?: boolean;
+	/** The caller went with the agent: the walker's detach resolves `false` and no survey is asked. */
+	readonly callerDetachFails?: boolean;
 }
 
 interface Harness {
@@ -78,6 +80,8 @@ interface Harness {
 	/** Queues the session told the callback sweep about. */
 	readonly registered: readonly { readonly orgId: string; readonly queueId: string }[];
 	readonly timeline: string[];
+	/** What each `startRecording` was asked for — the per-queue PCI auto-pause flag, or nothing. */
+	readonly recordingRequests: ({ readonly autoPauseOnDtmf?: boolean } | undefined)[];
 	readonly dialled: QueueDialAttempt[][];
 	readonly notes: string[];
 	readonly clock: { now: number };
@@ -85,6 +89,16 @@ interface Harness {
 	runNextReleaseRetry(): Promise<void>;
 	/** Fires the wrap-up hook the bridge registered, as the agent leg's death would. */
 	endAgentLeg(): void;
+	/** Queues digits for the caller to press, as the signal watch would feed them. */
+	press(...digits: readonly string[]): void;
+	/** What each `bridge` call asked for — `keepCallerOnPeerEnd` when the queue has a survey. */
+	readonly bridgeOptions: ({ readonly keepCallerOnPeerEnd?: boolean } | undefined)[];
+	/** How many times the session released the caller's own leg through `endCaller`. */
+	readonly callersEnded: { count: number };
+	/** The caller's digit source: whether it is still fed, and how often it was closed. */
+	readonly digits: { open: boolean; released: number };
+	/** Agent-state point reads the session made. The disposition poll is the only source of them. */
+	readonly stateReads: { count: number };
 }
 
 function harness(options: HarnessOptions = {}): Harness {
@@ -167,6 +181,15 @@ function harness(options: HarnessOptions = {}): Harness {
 		};
 	}
 
+	const stateReads = { count: 0 };
+	{
+		const readState = services.agents.readState;
+		services.agents.readState = async (orgId, agentId) => {
+			stateReads.count += 1;
+			return readState(orgId, agentId);
+		};
+	}
+
 	const registered: { orgId: string; queueId: string }[] = [];
 	services.callbacks = {
 		register: (orgId, queueId) => {
@@ -175,13 +198,27 @@ function harness(options: HarnessOptions = {}): Harness {
 	};
 
 	const timeline: string[] = [];
+	const recordingRequests: ({ readonly autoPauseOnDtmf?: boolean } | undefined)[] = [];
 	const notes: string[] = [];
 	const dialled: QueueDialAttempt[][] = [];
 	const script = [...(options.dials ?? [{ kind: "no-answer" as const }])];
 	const pressed = [...(options.digits ?? [])];
 	const state = { tearingDown: false, iterations: 0 };
 	const budget = options.budget ?? 20;
-	let onAgentLegEnded: (() => void) | undefined;
+	let onAgentLegEnded: ((detached: Promise<boolean>) => void) | undefined;
+	/** What `bridge` was asked to do with the caller when the agent leg ends. */
+	const bridgeOptions: ({ readonly keepCallerOnPeerEnd?: boolean } | undefined)[] = [];
+	/** Legs the walker released through `endCaller` — the survey's own cleanup. */
+	const callersEnded = { count: 0 };
+	/**
+	 * The digit source's own lifetime, modelled as the walker implements it: one signal-bus watch
+	 * that stops feeding the array the moment it is released. A fake that ignored `releaseDigits`
+	 * would poll happily after the source was closed — which is exactly how the survey's digits went
+	 * missing live while every spec passed.
+	 */
+	const digits = { open: true, released: 0 };
+	/** What the fake's `detached` promise resolves to; `true` is a caller kept out of the bridge. */
+	const detachOutcome = { value: options.callerDetachFails === true ? false : true };
 	const scheduledReleaseRetries: {
 		readonly delayMs: number;
 		readonly run: () => Promise<void>;
@@ -264,18 +301,30 @@ function harness(options: HarnessOptions = {}): Harness {
 		hangupAnsweredAgent: async (mediaChannelId) => {
 			timeline.push(`hangup:${mediaChannelId}`);
 		},
-		bridge: async (mediaChannelId, onEnded) => {
+		bridge: async (mediaChannelId, onEnded, bridgeOpts) => {
 			timeline.push(`bridge:${mediaChannelId}`);
+			bridgeOptions.push(bridgeOpts);
 			onAgentLegEnded = onEnded;
 			return options.bridgeFails !== true;
 		},
-		pollDigit: () => pressed.shift(),
+		endCaller: async () => {
+			timeline.push("caller:end");
+			callersEnded.count += 1;
+			await Promise.resolve();
+		},
+		pollDigit: () => (digits.open ? pressed.shift() : undefined),
+		releaseDigits: () => {
+			digits.open = false;
+			digits.released += 1;
+			pressed.length = 0;
+		},
 		// On the SAME timeline as the bridge, for the reason the whisper is: what a recording spec is
 		// about is the ORDER — the tap is taken after the two legs are joined, because there is
 		// nothing to tap before that — and a separate recorder would let a recording started against a
 		// bridge that never happened pass.
-		startRecording: async () => {
+		startRecording: async (request) => {
 			timeline.push("record:start");
+			recordingRequests.push(request);
 			if (options.recordingThrows === true) {
 				throw new Error("the media server refused a tap");
 			}
@@ -311,6 +360,7 @@ function harness(options: HarnessOptions = {}): Harness {
 		services,
 		registered,
 		timeline,
+		recordingRequests,
 		dialled,
 		notes,
 		clock,
@@ -323,8 +373,15 @@ function harness(options: HarnessOptions = {}): Harness {
 			await retry.run();
 		},
 		endAgentLeg: () => {
-			onAgentLegEnded?.();
+			onAgentLegEnded?.(Promise.resolve(detachOutcome.value));
 		},
+		press: (...digits) => {
+			pressed.push(...digits);
+		},
+		bridgeOptions,
+		callersEnded,
+		digits,
+		stateReads,
 	};
 }
 
@@ -462,6 +519,32 @@ describe("joining a queue", () => {
 		const outcome = await h.session.run();
 		expect(outcome.kind).toBe("answered");
 		expect(h.notes.join(" ")).toContain("recording could not be started");
+	});
+
+	/**
+	 * PCI. The per-queue column was compiled and read by nothing: the orchestrator resolves
+	 * auto-pause from `extensionsByNumber[destination]`, and a queue number is not an extension, so
+	 * a queue that asked for auto-pause got the organization default instead of its own answer.
+	 */
+	it("carries the queue's own DTMF auto-pause flag into the recording request", async () => {
+		for (const recordAutoPauseOnDtmf of [true, false] as const) {
+			const h = harness({
+				node: { recordPolicy: "all", recordAutoPauseOnDtmf },
+				dials: [{ kind: "answer" }],
+			});
+			await h.session.run();
+			expect(h.recordingRequests).toEqual([{ autoPauseOnDtmf: recordAutoPauseOnDtmf }]);
+		}
+	});
+
+	/**
+	 * `undefined` is not `false`. A queue with no opinion must leave the organization-wide setting
+	 * standing, which is what an empty request means to the orchestrator.
+	 */
+	it("asks for nothing when the queue has no auto-pause opinion", async () => {
+		const h = harness({ node: { recordPolicy: "all" }, dials: [{ kind: "answer" }] });
+		await h.session.run();
+		expect(h.recordingRequests).toEqual([{}]);
 	});
 
 	it("does not record a bridge that failed, because there is nothing to tap", async () => {
@@ -1601,5 +1684,439 @@ describe("virtual hold", () => {
 		).toBe(false);
 		const again = await h.services.waiting.dueCallbacks(ORG, h.node.queueId, h.clock.now);
 		expect(again[0]?.callback?.attempts).toBe(1);
+	});
+});
+
+// =================================================================================================
+// RONA
+// =================================================================================================
+
+describe("RONA", () => {
+	it("leaves a queue without it on the consecutive-count model", async () => {
+		const h = harness({
+			agents: [
+				fakeAgent("a", { maxNoAnswer: 3, noAnswerDelaySeconds: 30 }),
+				fakeAgent("b", { position: 2 }),
+			],
+			dials: [{ kind: "no-answer" }, { kind: "answer" }],
+		});
+		await h.session.run();
+		const release = h.services.agents.transitions.find(
+			(transition) => transition.agentId === "a" && transition.to === "available",
+		);
+		expect(release).toMatchObject({ from: "ringing", noAnswerCount: 1 });
+		expect(release?.reason).toBeUndefined();
+		expect(h.services.agents.statusOf("a")).toBe("available");
+	});
+
+	it("benches the agent on ONE no-answer when the queue has it on", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { maxNoAnswer: 3 }), fakeAgent("b", { position: 2 })],
+			membership: { ronaEnabled: true },
+			dials: [{ kind: "no-answer" }, { kind: "answer" }],
+		});
+		const outcome = await h.session.run();
+
+		expect(outcome).toMatchObject({ kind: "answered", agentId: "b" });
+		const benched = h.services.agents.transitions.find(
+			(transition) => transition.agentId === "a" && transition.to === "unavailable",
+		);
+		expect(benched).toMatchObject({ from: "ringing", reason: "rona" });
+		expect(h.notes.join(" ")).toContain("RONA");
+	});
+
+	it("offers the caller to the next agent and never back to the benched one", async () => {
+		const h = harness({
+			agents: [fakeAgent("a"), fakeAgent("b", { position: 2 })],
+			membership: { ronaEnabled: true },
+			dials: [{ kind: "no-answer" }, { kind: "answer" }],
+		});
+		await h.session.run();
+		expect(h.dialled.map((attempt) => attempt.map((entry) => entry.agentId))).toEqual([
+			["a"],
+			["b"],
+		]);
+	});
+
+	it("still uses the busy penalty for a busy phone, and does not bench it", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { busyDelaySeconds: 60 }), fakeAgent("b", { position: 2 })],
+			membership: { ronaEnabled: true },
+			dials: [{ kind: "busy" }, { kind: "answer" }],
+		});
+		await h.session.run();
+		const release = h.services.agents.transitions.find(
+			(transition) => transition.agentId === "a" && transition.to === "available",
+		);
+		// A busy phone is on another call, not unanswered — so no count, no bench, just the delay.
+		expect(release?.noAnswerCount).toBeUndefined();
+		expect(release?.availableAt).toBe(START + 20_000 + 60_000);
+		expect(
+			h.services.agents.transitions.some(
+				(transition) => transition.agentId === "a" && transition.to === "unavailable",
+			),
+		).toBe(false);
+	});
+});
+
+// =================================================================================================
+// Wrap-up dispositions
+// =================================================================================================
+
+const CODES = [
+	{
+		id: "0195c0f0-1c2f-7000-8000-0000000000d1",
+		code: "sale",
+		label: "Sale",
+		position: 1,
+	},
+];
+
+async function settle(): Promise<void> {
+	await new Promise((resolve) => {
+		setTimeout(resolve, 0);
+	});
+}
+
+describe("wrap-up dispositions", () => {
+	it("carries the call being coded and the queue's insistence into the wrap-up write", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { wrapUpSeconds: 10 })],
+			membership: { dispositionCodes: CODES, dispositionRequired: true },
+			dials: [{ kind: "answer" }],
+		});
+		await h.session.run();
+		h.endAgentLeg();
+		await Promise.resolve();
+		const wrapUp = h.services.agents.transitions.find((transition) => transition.to === "wrap-up");
+		expect(wrapUp).toMatchObject({ dispositionCallId: CALL_ID, dispositionRequired: true });
+	});
+
+	it("sets no disposition fields at all for a queue that asks no question", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { wrapUpSeconds: 10 })],
+			membership: { dispositionRequired: true },
+			dials: [{ kind: "answer" }],
+		});
+		await h.session.run();
+		h.endAgentLeg();
+		await Promise.resolve();
+		const wrapUp = h.services.agents.transitions.find((transition) => transition.to === "wrap-up");
+		expect(wrapUp?.dispositionCallId).toBeUndefined();
+		expect(wrapUp?.dispositionRequired).toBeUndefined();
+		expect(h.services.afterCall.dispositions).toEqual([]);
+	});
+
+	it("ends wrap-up the moment a required code is picked, rather than at the deadline", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { wrapUpSeconds: 30 })],
+			membership: { dispositionCodes: CODES, dispositionRequired: true },
+			dials: [{ kind: "answer" }],
+		});
+		await h.session.run();
+		const answeredAt = h.clock.now;
+		h.endAgentLeg();
+		await Promise.resolve();
+		// The console's write, which is the API's and not the engine's — hence straight onto the entry.
+		const entry = h.services.agents.entries.get("a") as AgentStateEntry;
+		h.services.agents.entries.set("a", { ...entry, dispositionCode: "sale" });
+		await settle();
+
+		expect(h.services.agents.statusOf("a")).toBe("available");
+		expect(h.services.afterCall.dispositions).toEqual([
+			{
+				orgId: ORG,
+				queueId: h.node.queueId,
+				callId: CALL_ID,
+				agentId: "a",
+				code: "sale",
+				auto: false,
+			},
+		]);
+		// One poll interval, not the whole thirty seconds.
+		expect(h.clock.now).toBe(answeredAt + 1_000);
+	});
+
+	it("files `unset` at the deadline when nobody codes the call", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { wrapUpSeconds: 5 })],
+			membership: { dispositionCodes: CODES, dispositionRequired: true },
+			dials: [{ kind: "answer" }],
+		});
+		await h.session.run();
+		const answeredAt = h.clock.now;
+		h.endAgentLeg();
+		await settle();
+
+		expect(h.services.afterCall.dispositions).toMatchObject([{ code: "unset", auto: true }]);
+		expect(h.services.agents.statusOf("a")).toBe("available");
+		expect(h.clock.now).toBe(answeredAt + 5_000);
+	});
+
+	it("never polls the agent's entry for a queue that does not insist", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { wrapUpSeconds: 5 })],
+			membership: { dispositionCodes: CODES, dispositionRequired: false },
+			dials: [{ kind: "answer" }],
+		});
+		await h.session.run();
+		const before = h.stateReads.count;
+		h.endAgentLeg();
+		await settle();
+
+		expect(h.stateReads.count).toBe(before);
+		expect(h.services.afterCall.dispositions).toEqual([]);
+		expect(h.services.agents.statusOf("a")).toBe("available");
+	});
+});
+
+// =================================================================================================
+// The post-call survey
+// =================================================================================================
+
+const SURVEY = {
+	introPromptId: "0195c0f0-1c2f-7000-8000-0000000000e0",
+	questions: [
+		{
+			id: "0195c0f0-1c2f-7000-8000-0000000000f1",
+			position: 1 as const,
+			promptId: "0195c0f0-1c2f-7000-8000-0000000000f9",
+			label: "How did we do?",
+		},
+	],
+};
+
+describe("the post-call survey", () => {
+	it("asks the caller once the agent's leg has gone and reports what they pressed", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { wrapUpSeconds: 0 })],
+			membership: { wrapUpSeconds: 0, survey: SURVEY },
+			dials: [{ kind: "answer" }],
+		});
+		await h.session.run();
+		h.press("4");
+		h.endAgentLeg();
+		await settle();
+
+		expect(h.timeline).toContain("play:sound:0195c0f0-1c2f-7000-8000-0000000000e0");
+		expect(h.services.afterCall.surveys).toMatchObject([
+			{
+				callId: CALL_ID,
+				agentId: "a",
+				answers: [{ questionId: SURVEY.questions[0]?.id, digit: "4" }],
+			},
+		]);
+	});
+
+	/**
+	 * The defect this closes: the agent's hangup tore the bridge down AND hung the caller up, so
+	 * there was nobody left to ask. The queue now asks for the caller to be kept out of the bridge —
+	 * and only when it actually has a survey, because a kept caller with nothing to say to them is a
+	 * call that never ends.
+	 */
+	it("asks for the caller to be kept out of the bridge, and only when there is a survey", async () => {
+		const withSurvey = harness({
+			agents: [fakeAgent("a", { wrapUpSeconds: 0 })],
+			membership: { wrapUpSeconds: 0, survey: SURVEY },
+			dials: [{ kind: "answer" }],
+		});
+		await withSurvey.session.run();
+		expect(withSurvey.bridgeOptions).toEqual([{ keepCallerOnPeerEnd: true }]);
+
+		const without = harness({
+			agents: [fakeAgent("a", { wrapUpSeconds: 0 })],
+			membership: { wrapUpSeconds: 0 },
+			dials: [{ kind: "answer" }],
+		});
+		await without.session.run();
+		expect(without.bridgeOptions).toEqual([{}]);
+	});
+
+	/**
+	 * The other half of asking for a kept caller: a leg detached for a survey has nobody left to end
+	 * it, so the survey owns releasing it — on every exit, including the ones that report nothing.
+	 */
+	it("releases the caller's own leg once the survey is over", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { wrapUpSeconds: 0 })],
+			membership: { wrapUpSeconds: 0, survey: SURVEY },
+			dials: [{ kind: "answer" }],
+		});
+		await h.session.run();
+		h.press("4");
+		h.endAgentLeg();
+		await settle();
+
+		expect(h.callersEnded.count).toBe(1);
+		// The order is the assertion: the caller is released AFTER the questions, not instead of them.
+		expect(h.timeline.indexOf("caller:end")).toBeGreaterThan(
+			h.timeline.indexOf("play:sound:0195c0f0-1c2f-7000-8000-0000000000e0"),
+		);
+	});
+
+	/**
+	 * The defect the live run found, and the reason the fake above models the source's lifetime: the
+	 * walker closed the caller's DTMF watch in a `finally` around `run`, which returns the moment the
+	 * caller is BRIDGED — minutes before the survey polls it. Every keypress an answering caller made
+	 * went to a source nobody was watching, and `queue_survey_response` stayed empty for the feature's
+	 * whole history while these specs passed.
+	 */
+	it("keeps the caller's digit source open past `run`, and closes it once the survey is over", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { wrapUpSeconds: 0 })],
+			membership: { wrapUpSeconds: 0, survey: SURVEY },
+			dials: [{ kind: "answer" }],
+		});
+		await h.session.run();
+		// Still open with the call up: the questions have not been asked yet.
+		expect(h.digits).toMatchObject({ open: true, released: 0 });
+
+		h.press("4");
+		h.endAgentLeg();
+		await settle();
+
+		expect(h.digits).toMatchObject({ open: false, released: 1 });
+		expect(h.services.afterCall.surveys).toMatchObject([
+			{ answers: [{ questionId: SURVEY.questions[0]?.id, digit: "4" }] },
+		]);
+	});
+
+	it("closes the digit source with the session when the queue has no survey", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { wrapUpSeconds: 0 })],
+			membership: { wrapUpSeconds: 0 },
+			dials: [{ kind: "answer" }],
+		});
+		await h.session.run();
+
+		expect(h.digits).toMatchObject({ open: false, released: 1 });
+	});
+
+	/** A survey that never gets to ask anything still owns closing the source it was left open for. */
+	it("closes the digit source when the caller went with the agent", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { wrapUpSeconds: 0 })],
+			membership: { wrapUpSeconds: 0, survey: SURVEY },
+			dials: [{ kind: "answer" }],
+			callerDetachFails: true,
+		});
+		await h.session.run();
+		expect(h.digits.open).toBe(true);
+
+		h.endAgentLeg();
+		await settle();
+
+		expect(h.digits).toMatchObject({ open: false, released: 1 });
+		expect(h.services.afterCall.surveys).toEqual([]);
+	});
+
+	it("releases the caller even when they answered nothing", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { wrapUpSeconds: 0 })],
+			membership: { wrapUpSeconds: 0, survey: SURVEY },
+			dials: [{ kind: "answer" }],
+		});
+		await h.session.run();
+		h.endAgentLeg();
+		await settle();
+
+		expect(h.services.afterCall.surveys).toEqual([]);
+		expect(h.callersEnded.count).toBe(1);
+	});
+
+	/**
+	 * The caller went with the agent after all — a media plane that could not detach them, or a
+	 * caller who hung up in the same instant. Nothing is played into a bridge that is still standing,
+	 * and the walk says why.
+	 */
+	it("asks nothing when the caller could not be kept, and says so", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { wrapUpSeconds: 0 })],
+			membership: { wrapUpSeconds: 0, survey: SURVEY },
+			dials: [{ kind: "answer" }],
+			callerDetachFails: true,
+		});
+		await h.session.run();
+		h.press("4");
+		h.endAgentLeg();
+		await settle();
+
+		expect(h.timeline).not.toContain("play:sound:0195c0f0-1c2f-7000-8000-0000000000e0");
+		expect(h.services.afterCall.surveys).toEqual([]);
+		expect(h.notes.join(" ")).toContain("went with the agent's");
+	});
+
+	/**
+	 * The wrap-up must not wait on the detach. An agent's after-call timer starts when their call
+	 * ended, not two media-server round trips later.
+	 */
+	it("starts the agent's wrap-up without waiting for the caller's detach", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { wrapUpSeconds: 30 })],
+			membership: { wrapUpSeconds: 30, survey: SURVEY },
+			dials: [{ kind: "answer" }],
+		});
+		await h.session.run();
+		h.endAgentLeg();
+		// The AGENT-leg hook settle only: one microtask drain, not the survey's whole run. If the
+		// wrap-up waited on the detach it would not have happened yet at this point.
+		await settleAgentLegHook();
+
+		expect(h.services.agents.transitions.some((transition) => transition.to === "wrap-up")).toBe(
+			true,
+		);
+	});
+
+	it("asks nothing at all when the queue has no survey", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { wrapUpSeconds: 0 })],
+			membership: { wrapUpSeconds: 0 },
+			dials: [{ kind: "answer" }],
+		});
+		await h.session.run();
+		h.press("4");
+		h.endAgentLeg();
+		await settle();
+
+		expect(h.services.afterCall.surveys).toEqual([]);
+	});
+});
+
+// =================================================================================================
+// Skills
+// =================================================================================================
+
+describe("skills-based routing", () => {
+	it("rings only the agent who clears the merged bar, and notes when nobody does", async () => {
+		const h = harness({
+			agents: [
+				fakeAgent("a", { skills: [{ skill: "spanish", level: 2 }] }),
+				fakeAgent("b", { position: 2, skills: [{ skill: "spanish", level: 5 }] }),
+			],
+			membership: {
+				tierRulesApply: false,
+				skillRequirements: [{ skill: "spanish", minLevel: 3, relaxAfterSeconds: 0 }],
+			},
+			node: { requiredSkills: [{ skill: "spanish", minLevel: 5, relaxAfterSeconds: 0 }] },
+			dials: [{ kind: "answer" }],
+		});
+		const outcome = await h.session.run();
+		expect(outcome).toMatchObject({ kind: "answered", agentId: "b" });
+	});
+
+	it("says so on the walk when the skills are the only reason nobody was reachable", async () => {
+		const h = harness({
+			agents: [fakeAgent("a", { skills: [{ skill: "spanish", level: 1 }] })],
+			membership: {
+				tierRulesApply: false,
+				skillRequirements: [{ skill: "spanish", minLevel: 5, relaxAfterSeconds: 0 }],
+			},
+			node: { maxWaitSeconds: 5 },
+		});
+		await h.session.run();
+		const notes = h.notes.filter((note) => note.includes("skill requirements"));
+		// Once per stay, not once per pass.
+		expect(notes).toHaveLength(1);
+		expect(notes[0]).toContain("spanish>=5");
 	});
 });

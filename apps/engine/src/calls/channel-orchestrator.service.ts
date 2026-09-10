@@ -6,6 +6,7 @@ import { createEntityId } from "@optimiq-voice/identifiers";
 import { getLogger } from "@optimiq-voice/logging";
 import { resolveInbound, resolveInternal, resolveOutbound } from "@optimiq-voice/routing";
 import { hangupCauseCode, isDtmfDigit } from "@optimiq-voice/telephony";
+import { PlaybackSignalBus, playbackSignalKey } from "../media/playback-signals";
 import { SplitPlaneMediaPort } from "../media/split-plane.port";
 import { CallControlService as EngineCallControlService } from "../nats/call-control.service";
 import { CallEventPublisher } from "../nats/call-event-publisher.service";
@@ -25,6 +26,7 @@ import { SessionVerbService } from "../nats/session-verb.service";
 import { SipInviteService } from "../nats/sip-invite.service";
 import { SipTransferService } from "../nats/sip-transfer.service";
 import { AgentStateStore } from "../queue/agent-state.store";
+import { QueueAfterCallClient } from "../queue/queue-after-call.client";
 import { QueueCallbackScheduler } from "../queue/queue-callback.scheduler";
 import { QueueEventPublisher } from "../queue/queue-event-publisher.service";
 import { QueueMembershipSource } from "../queue/queue-membership.source";
@@ -36,12 +38,14 @@ import { DidIndexSource } from "../routing/did-index.source";
 import { ExtensionFeatureRpcPort } from "../routing/extension-feature.source";
 import { HotDeskRpcPort } from "../routing/hot-desk.source";
 import { LastCallerRpcSource } from "../routing/last-caller.source";
+import { resolveMediaRefOr } from "../routing/media-refs";
 import { ParkRegistry } from "../routing/park-registry";
 import { PlanWalker } from "../routing/plan-walker";
 import { RoutingArtifactSource } from "../routing/routing-artifact.source";
 import { SharedLineRegistry } from "../routing/shared-line-registry";
 import { SupervisorAuthzRpcPort } from "../routing/supervisor-authz.source";
 import { ToggleFeatureRpcPort } from "../routing/toggle-feature.source";
+import { TollFraudGuardRpcPort } from "../routing/toll-fraud-guard.source";
 import { TrunkCapacityRegistry } from "../routing/trunk-capacity";
 import { TrunkStatusPublisher } from "../routing/trunk-status.publisher";
 import { VoicemailGreetingRpcPort } from "../routing/voicemail-greeting.source";
@@ -52,7 +56,14 @@ import { DtmfRegistry } from "../verbs/dtmf-registry";
 import { callDirectionFrom, dialStringOr, hangupSideFor } from "./ari-mapping";
 import { CallControl, pickupGroupFilter } from "./call-control";
 import { CallControlRegistry } from "./call-control-registry";
-import { attestationOf, authorizationOf, buildCdrLegWrite, queueLegOf } from "./cdr-leg";
+import {
+	attestationOf,
+	authorizationOf,
+	buildCdrLegWrite,
+	presentedCallerIdNumber,
+	queueLegOf,
+	recordingConsentOf,
+} from "./cdr-leg";
 import { ChannelAggregate } from "./channel-aggregate";
 import {
 	callIdForAriChannel,
@@ -67,6 +78,7 @@ import {
 import { ChannelRegistry } from "./channel-registry";
 import { MidCallFeatureRuntime } from "./mid-call-features";
 import { planOriginate, planQueueCallback } from "./originate-plan";
+import { resolveRecordingConsent } from "./recording-consent";
 import type { EngineEnv } from "../config/engine-env";
 import type { MediaChannelSnapshot, MediaEvent } from "../media/media-event";
 import type { MediaDirection, MediaPort } from "../media/media-port";
@@ -100,6 +112,7 @@ import type {
 	RouteOutcome,
 	RouteRequest,
 	SharedLine,
+	StartRecordingRequest,
 	SupervisionTarget,
 } from "./call-control";
 import type {
@@ -250,6 +263,32 @@ const QUEUE_AGENT_REF_VARIABLE = "OPTIMIQ_QUEUE_AGENT_REF";
  * snapshot an instance taking over a failover reads.
  */
 const BRIDGE_PEER_VARIABLE = "OPTIMIQ_BRIDGE_PEER_LEG_ID";
+/**
+ * The consent verdict, mirrored onto the leg exactly as the queue's is.
+ *
+ * Four variables and not one JSON blob, because these are read by `cdr-leg.ts` straight into four
+ * columns and a blob would put a parse between the teardown path and the ledger. The regions are
+ * the exception and are JSON, because a list has no other honest encoding in a string map — and
+ * `recordingConsentOf` treats a malformed one as absent rather than as a failure.
+ *
+ * Written for EVERY outcome including `declined`, which is the one that has no recording to hang
+ * off and is therefore the one that would otherwise vanish.
+ */
+const RECORDING_CONSENT_VARIABLE = "OPTIMIQ_RECORDING_CONSENT";
+const RECORDING_CONSENT_METHOD_VARIABLE = "OPTIMIQ_RECORDING_CONSENT_METHOD";
+const RECORDING_CONSENT_AT_VARIABLE = "OPTIMIQ_RECORDING_CONSENT_AT";
+const RECORDING_CONSENT_REGIONS_VARIABLE = "OPTIMIQ_RECORDING_CONSENT_REGIONS";
+/**
+ * How long the PCI auto-pause waits for the digits to stop before resuming the recording.
+ *
+ * Three seconds, chosen from what it is hiding: a caller reading a sixteen-digit card number over
+ * DTMF pauses between groups, and a window shorter than the gap between `4111` and `1111` resumes
+ * the recording in the middle of the number — which is worse than not pausing at all, because the
+ * file then contains half a PAN and a compliance report that says the pause worked. Every digit
+ * refreshes the window, so the cost of a generous one is a few seconds of silence after the last
+ * keypress rather than a pause that ends early.
+ */
+const DEFAULT_RECORDING_AUTO_RESUME_MS = 3_000;
 /** Stable terminal identities and progress persisted for an acknowledged retry after failover. */
 const CDR_ID_VARIABLE = "OPTIMIQ_CDR_ID";
 const CDR_EVENT_ID_VARIABLE = "OPTIMIQ_CDR_EVENT_ID";
@@ -334,6 +373,16 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	private draining = false;
 	/** Monotonic: channels taken over from a replica proved dead by its instance lease. */
 	private adoptedFromDeadPeers = 0;
+	/**
+	 * Where a prompt's ENDING is republished — one bus, constructed here rather than injected.
+	 *
+	 * It has exactly two participants: this class, which emits, and the {@link CallControl} this
+	 * class builds, which watches. Making it a Nest provider would have added a positional
+	 * constructor argument to a class whose spec harnesses construct it positionally, to give two
+	 * objects with one owner between them a shared instance they already have. `public` so a spec
+	 * can drive a dispatch and observe the republish without reaching into the class.
+	 */
+	readonly playbackSignals = new PlaybackSignalBus();
 	/** Hold, transfer, park, pickup and on-demand recording, over the ports below. */
 	private readonly control: CallControl;
 	/** Calls this instance has handed to an external application. See `application-sessions.ts`. */
@@ -354,6 +403,18 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	 * call it was armed for. See {@link ChannelOrchestrator.armCallDurationCeiling}.
 	 */
 	private readonly durationCeilings = new Map<string, ReturnType<typeof setTimeout>>();
+	/**
+	 * One PCI quiet-window timer per PAUSED recording, keyed by the recorded leg's media channel id.
+	 *
+	 * Bounded by the number of recordings currently paused by digits, which is bounded by the number
+	 * of live recordings: an entry is created only when a pause is applied and is deleted by the
+	 * resume, by the leg's teardown and by the drain. The key is the RECORDED leg rather than the leg
+	 * the digits arrived on, because a digit pressed by either party pauses the one recorder, and
+	 * keying by the presser would arm two timers that raced to resume the same file.
+	 */
+	private readonly recordingAutoResume = new Map<string, ReturnType<typeof setTimeout>>();
+	/** The quiet window itself. A field so a spec can shorten it; see {@link DEFAULT_RECORDING_AUTO_RESUME_MS}. */
+	private readonly recordingAutoResumeMs: number = DEFAULT_RECORDING_AUTO_RESUME_MS;
 	/**
 	 * The setup cut-off, per admitted leg that has produced no response yet.
 	 *
@@ -450,10 +511,25 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		 * session verb channel is the surface.
 		 */
 		@Optional() private readonly recordingControl?: EngineCallControlService,
+		/**
+		 * Where a wrap-up code and a caller's survey answers go. Optional and last on the same terms
+		 * as everything above it; absent is an engine that still runs both — the timer expires, the
+		 * questions are asked — and notes on the walk that it had nowhere to file the result, which is
+		 * what `QueueAfterCallPort` documents and what every engine did before this client existed.
+		 */
+		@Optional() private readonly queueAfterCall?: QueueAfterCallClient,
+		/**
+		 * The outbound spend/velocity/geo gate, asked before the first INVITE leaves. Optional and
+		 * last on the same terms as everything above it: absent is an engine that places outbound
+		 * calls exactly as it did before the gate existed, which is what `TollFraudGuardPort`'s own
+		 * absent arm documents.
+		 */
+		@Optional() private readonly tollFraudGuard?: TollFraudGuardRpcPort,
 	) {
 		this.control = new CallControl({
 			media: this.media,
 			signals: this.signals,
+			playbacks: this.playbackSignals,
 			parks: this.parks,
 			host: this.callControlHost(),
 			// The mid-call half of a shared line. Optional on `CallControlDependencies`, so a spec that
@@ -597,6 +673,69 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		this.recordingControl?.attach({
 			control: async (request) => await this.controlCallRecording(request),
 		});
+		// The media plane's verdict on each leg's encryption, as a channel flag. Wired here rather
+		// than read at the answer, because the fact arrives inside media RPCs this class is not the
+		// caller of — a `183`, a re-INVITE, the settle of a B-leg's answer — and a poll would have to
+		// guess when. The mirror write is what carries it to the wallboard and the softphone, which
+		// read the `channels` bucket and the live topic and nothing else.
+		if (this.media instanceof SplitPlaneMediaPort) {
+			this.media.onMediaEncryption = (legId, encryption) => {
+				const aggregate = this.registry.byAriChannelId(legId);
+				if (aggregate === undefined || aggregate.isTearingDown) {
+					return;
+				}
+				if (encryption === "encrypted") {
+					aggregate.addFlag("encrypted");
+				} else {
+					// CLEARED, not left standing: a re-INVITE that drops the crypto line leaves a leg
+					// whose audio is in the clear, and a lock icon that survives that is worse than no
+					// lock icon at all.
+					aggregate.removeFlag("encrypted");
+				}
+				void this.jetstream.putChannel(aggregate.snapshot);
+			};
+		}
+	}
+
+	/**
+	 * `require` when this organization holds TLS-registered handsets to SDES-SRTP, and nothing at all
+	 * otherwise.
+	 *
+	 * ## Why the transport decides
+	 *
+	 * A handset that already encrypts its SIGNALLING is one whose vendor and firmware support SRTP,
+	 * so refusing its plain-RTP offer is telling a tenant about a misconfiguration. A phone
+	 * registered over UDP has its SDES keys travelling in the clear in the offer anyway, so holding
+	 * it to `require` would buy the confidentiality of a key anyone on the path has already read —
+	 * a lock drawn on a door with the key taped to it. `ws` counts with `wss` and `tls`: a browser
+	 * softphone's signalling is a WebSocket, and its media is DTLS-SRTP whatever this says.
+	 *
+	 * ## Why a trunk is excluded
+	 *
+	 * A carrier's leg carries its own per-trunk policy (`trunk.srtp_policy`), decided per carrier by
+	 * whoever signed the interconnect. An organization-wide handset setting reaching a carrier leg
+	 * would let a tenant's phone-fleet decision break an interconnect they do not own.
+	 *
+	 * ## Failing OPEN
+	 *
+	 * An artifact that cannot be read leaves the policy absent — the media plane's own floor. The
+	 * alternative is that an unwell control plane starts refusing every TLS handset's call, which
+	 * converts a degraded read path into a total inbound outage for the tenants who took the
+	 * hardening. The same argument the toll-fraud guard makes, for the same reason.
+	 */
+	private async handsetSrtpPolicy(
+		organizationId: string,
+		request: SipInviteRequest,
+	): Promise<"require" | undefined> {
+		if (request.trunkId !== undefined) {
+			return undefined;
+		}
+		const transport = request.transport;
+		if (transport !== "tls" && transport !== "wss" && transport !== "ws") {
+			return undefined;
+		}
+		const artifact = await this.routing.get(organizationId).catch(() => undefined);
+		return artifact?.settings.requireSrtpForTlsPhones === true ? "require" : undefined;
 	}
 
 	/** Live legs this instance is handling. `/healthz` and the drain both read it. */
@@ -1078,6 +1217,21 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				return;
 			case "leg-unheld":
 				await this.onPhoneHold(event.channelId, false);
+				return;
+			case "playback-finished":
+				// Republished on the PLAYBACK's own key, beside the recording signals below and for the
+				// same reason: the fact belongs to whoever asked for it, and almost nobody does. One
+				// consumer waits here — `CallControl.announceConsent`, which counts a party as
+				// announced to only when the media plane reports it delivered audio to that party —
+				// and every other prompt on the platform (greetings, menus, music) has no waiter, so
+				// the emit finds no key and costs a map lookup.
+				this.playbackSignals.emit(playbackSignalKey(event.playbackRef), {
+					kind: "playback-finished",
+					playbackRef: event.playbackRef,
+					reason: event.reason,
+					...(event.playedMs === undefined ? {} : { playedMs: event.playedMs }),
+					...(event.detail === undefined ? {} : { detail: event.detail }),
+				});
 				return;
 			case "recording-started":
 				this.signals.emit(recordingSignalKey(event.recordingName), {
@@ -1663,6 +1817,10 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				...(this.queueCallbacks === undefined
 					? {}
 					: { callbacks: queueCallbackPort(this.queueCallbacks, extra.queueNumbers) }),
+				// The after-call records. Optional here for the reason it is optional on the port: both
+				// reports are made once the call is over, so an engine without one loses a wrap-up row
+				// and a caller's rating rather than a call.
+				...(this.queueAfterCall === undefined ? {} : { afterCall: this.queueAfterCall }),
 			},
 			control: this.walkerCallControlFor(aggregate),
 			// The `application` destination. `run` blocks for the length of the session — see
@@ -1702,6 +1860,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				},
 			},
 			trunkCapacity: this.trunkCapacity,
+			...(this.tollFraudGuard === undefined ? {} : { tollFraudGuard: this.tollFraudGuard }),
 			onDestination: async (destination) => {
 				await this.recordDestination(aggregate, destination);
 			},
@@ -2192,6 +2351,10 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		}
 
 		const leg = this.controlledLeg(recorded.aggregate);
+		// Whatever the verb is, the agent has just taken the decision by hand: a stop leaves nothing to
+		// resume, and an explicit pause or resume must not be undone three seconds later by a window
+		// the last card digit armed.
+		this.disarmRecordingAutoResume(recorded.aggregate.ariChannelId);
 		const result =
 			request.verb === "stopRecord"
 				? await this.control.stopRecording(leg)
@@ -2301,6 +2464,29 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 					void this.jetstream.putChannel(aggregate.snapshot);
 				}
 			},
+			markConsent: (leg, record) => {
+				const aggregate = this.registry.byDomainChannelId(leg.legId);
+				if (aggregate === undefined) {
+					this.logger.warn(
+						{ legId: leg.legId, outcome: record.outcome },
+						"could not file a consent verdict: this instance no longer holds the leg",
+					);
+					return;
+				}
+				// The RECORDED leg alone, and deliberately unlike `markRecording` above. That one
+				// mirrors a live INDICATOR, which every party on the call has to see; this is a ledger
+				// fact about one leg's recording, and stamping it on the peer as well would file two
+				// consent rows for one question and double every count in the compliance report.
+				aggregate.setVariable(RECORDING_CONSENT_VARIABLE, record.outcome);
+				aggregate.setVariable(RECORDING_CONSENT_METHOD_VARIABLE, record.method);
+				aggregate.setVariable(RECORDING_CONSENT_AT_VARIABLE, record.at);
+				if (record.regions !== undefined && record.regions.length > 0) {
+					aggregate.setVariable(
+						RECORDING_CONSENT_REGIONS_VARIABLE,
+						JSON.stringify([...record.regions]),
+					);
+				}
+			},
 			route: async (leg, request) => await this.routeLeg(leg, request),
 			parkLotFor: async (leg, lotRef) => await this.parkLotFor(leg, lotRef),
 			parkLotForSlot: async (leg, slot) => await this.parkLotForSlot(leg, slot),
@@ -2312,8 +2498,17 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 	private walkerCallControlFor(aggregate: ChannelAggregate): WalkerCallControl {
 		const leg = this.controlledLeg(aggregate);
 		return {
-			startRecording: async () => {
-				const outcome = await this.control.startRecording(leg);
+			startRecording: async (request) => {
+				const resolved = await this.recordingRequestFor(aggregate, request?.direction);
+				const outcome = await this.control.startRecording(leg, {
+					...resolved,
+					// A node with its own answer — a queue's `record_auto_pause_on_dtmf` — wins over the
+					// destination-extension/organization fallback `recordingRequestFor` computes. Absent
+					// leaves that fallback exactly as it was.
+					...(request?.autoPauseOnDtmf === undefined
+						? {}
+						: { autoPauseOnDtmf: request.autoPauseOnDtmf }),
+				});
 				return outcome.result;
 			},
 			park: async (request) => {
@@ -2783,7 +2978,13 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 					leg: "b",
 					profile: {
 						callerIdName: aLeg.snapshot.profile.callerIdName,
-						callerIdNumber: aLeg.snapshot.profile.callerIdNumber,
+						// The identity this leg was told to PRESENT, not the one the A-leg carries. On a
+						// trunk leg those differ — the route, the trunk or the ELIN replaces the extension
+						// number with an E.164 — and the ledger's `from_number` has to be what the carrier
+						// saw. See `presentedCallerIdNumber`. Absent (an extension leg, a name-only
+						// identity) falls back to the A-leg's, which is what every leg filed before.
+						callerIdNumber:
+							presentedCallerIdNumber(leg.callerId) ?? aLeg.snapshot.profile.callerIdNumber,
 						ani: aLeg.snapshot.profile.ani,
 						destinationNumber: leg.destinationNumber,
 						context: aLeg.snapshot.profile.context,
@@ -2840,6 +3041,17 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				bLeg.setVariable(BRIDGE_PEER_VARIABLE, aLeg.channelId);
 				aLeg.setVariable(BRIDGE_PEER_VARIABLE, bLeg.channelId);
 				void this.jetstream.putChannel(bLeg.snapshot);
+				void this.jetstream.putChannel(aLeg.snapshot);
+			},
+			unbridged: (mediaChannelId) => {
+				// The mirror of `bridged`, and the reason it exists: `endBridgePeer` sends a BYE to
+				// whatever this stamp names when a leg ends, so a caller detached for a post-call
+				// survey was hung up by the AGENT's teardown a second after being kept. Cleared on
+				// both sides, exactly as park clears it before it moves a caller to a lot. The B-leg's
+				// snapshot is not re-mirrored: it is already tearing down and its entry is about to go.
+				const bLeg = this.registry.byAriChannelId(mediaChannelId);
+				bLeg?.clearVariable(BRIDGE_PEER_VARIABLE);
+				aLeg.clearVariable(BRIDGE_PEER_VARIABLE);
 				void this.jetstream.putChannel(aLeg.snapshot);
 			},
 		};
@@ -3357,6 +3569,175 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		return this.registry.byDomainChannelId(originatingLegId)?.ariChannelId;
 	}
 
+	/**
+	 * Everything a recording start needs from the artifact, resolved once at start time.
+	 *
+	 * ## Why here and not in `CallControl`
+	 *
+	 * `CallControl` holds no artifact and no database handle — that is the whole reason it takes a
+	 * host. Consent and the PCI rule are both pure functions of the compiled configuration plus the
+	 * two numbers on the call, and this class is the only one that can fetch the first half. So the
+	 * decision is made here and travels as data; the runtime below plays prompts and counts digits
+	 * and never asks what a tenant configured.
+	 *
+	 * ## Why an artifact that cannot be read is not a refusal
+	 *
+	 * No artifact — routing disabled, a cache miss the broker could not serve, an organization
+	 * mid-provisioning — resolves to no consent and no auto-pause, which is precisely what every
+	 * release before this one did on those calls. A recording gate that failed CLOSED here would
+	 * turn a routing outage into "no call can be recorded", and a recording that does not happen is
+	 * evidence that does not exist. The gate exists to make recordings honest, not to make them
+	 * conditional on the artifact cache.
+	 *
+	 * ## The PCI precedence, most specific first
+	 *
+	 * The extension the call is REACHING beats the org, because the extension is where a tenant
+	 * expresses "this is the desk that takes card numbers" and the org default is what they set for
+	 * everyone else. The index is consulted rather than the plan node for the reason
+	 * `ExtensionIndexEntry.recordAutoPauseOnDtmf` states: this path holds a dialled NUMBER and has
+	 * not walked to a node.
+	 */
+	private async recordingRequestFor(
+		aggregate: ChannelAggregate,
+		/**
+		 * Stated by the node that asked, when it knows better than the leg. A `trunk-dial` node does:
+		 * a handset's own A-leg is labelled `internal`, so without this an outbound recorded call
+		 * announced to nobody. See `WalkerCallControl.startRecording`.
+		 */
+		direction?: "inbound" | "outbound",
+	): Promise<StartRecordingRequest> {
+		const artifact = await this.routing.get(aggregate.organizationId).catch(() => undefined);
+		if (artifact === undefined) {
+			return {};
+		}
+		const profile = aggregate.snapshot.profile;
+		const destination = profile.destinationNumber;
+		const didDefault =
+			destination === undefined ? undefined : artifact.inbound.didDefaults[destination];
+		const consent = resolveRecordingConsent(artifact.settings.recording, {
+			...(didDefault?.recordingConsentPolicy === undefined
+				? {}
+				: { didConsentPolicy: didDefault.recordingConsentPolicy }),
+			...(didDefault?.recordingConsentPromptId === undefined
+				? {}
+				: { didConsentPromptId: didDefault.recordingConsentPromptId }),
+			...(profile.callerIdNumber === undefined ? {} : { callerIdNumber: profile.callerIdNumber }),
+			...(destination === undefined ? {} : { destinationNumber: destination }),
+			// The SIGNALLING direction of the recorded leg, which is what decides whether the far end
+			// is the party the announcement is owed to. `internal` is already folded onto `inbound`
+			// by the aggregate, and that is the right reading here too: on a desk-to-desk call the
+			// jurisdiction rule is the only thing that can widen the announcement.
+			direction:
+				direction ?? (aggregate.snapshot.direction === "outbound" ? "outbound" : "inbound"),
+		});
+		const promptMedia =
+			consent.promptId === undefined
+				? undefined
+				: resolveMediaRefOr(
+						{ promptId: consent.promptId },
+						{
+							promptPrefix: this.env.ENGINE_PROMPT_MEDIA_PREFIX,
+							fallbackMedia: this.env.ENGINE_UNAVAILABLE_ANNOUNCEMENT,
+							objectMediaRoot: this.env.ENGINE_MEDIA_OBJECT_ROOT,
+							prompts: artifact.prompts ?? {},
+						},
+					);
+		const autoPauseOnDtmf =
+			(destination === undefined
+				? undefined
+				: artifact.extensionsByNumber[destination]?.recordAutoPauseOnDtmf) ??
+			artifact.settings.recording?.autoPauseOnDtmf ??
+			false;
+
+		return {
+			consent: promptMedia === undefined ? consent : { ...consent, promptMedia },
+			autoPauseOnDtmf,
+		};
+	}
+
+	/**
+	 * Silences the recording while somebody is pressing digits, and resumes it once they stop. PCI.
+	 *
+	 * ## Why the peer's digits count too
+	 *
+	 * The card number is spoken — or keyed — by the CALLER, and the recorder is attached to whichever
+	 * leg the walk put it on, which on an inbound call to an agent is routinely the other one. A
+	 * pause armed only from the recorded leg's own keypresses would leave the caller's PAN in the
+	 * file on exactly the calls the rule was written for. So the digit is looked up against this leg
+	 * AND its bridge peer, and the pause is applied to whichever of the two holds the recorder.
+	 *
+	 * ## Why a quiet window rather than a pause-per-digit
+	 *
+	 * A pause that resumed after each keypress would open and close sixteen intervals for one card
+	 * number, and the audio between two of them is the gap between two digits — which is exactly
+	 * where the next digit is spoken aloud by a caller who is reading the card out as they type. One
+	 * window, refreshed by every digit, produces one interval covering the whole entry.
+	 *
+	 * ## Why the timer is cleared everywhere and not only by itself
+	 *
+	 * A timer that survives its leg resumes a recording on a call that is over — at best a no-op
+	 * against a media plane that has forgotten the recording, at worst a resume applied to whatever
+	 * reused the id. So it is dropped by the resume itself, by {@link onLegEnded}, by an explicit
+	 * stop through the recording-control verb, and by the drain. The map holds at most one entry per
+	 * currently-paused recording and never grows past that.
+	 */
+	private async autoPauseForDtmf(aggregate: ChannelAggregate): Promise<void> {
+		const peerLegId = aggregate.snapshot.variables[BRIDGE_PEER_VARIABLE];
+		const peer = peerLegId === undefined ? undefined : this.registry.byDomainChannelId(peerLegId);
+		const candidates = peer === undefined ? [aggregate] : [aggregate, peer];
+		const recorded = candidates.find((candidate) => {
+			const recording = this.control.recordingFor(candidate.ariChannelId);
+			return recording !== undefined && recording.autoPauseOnDtmf;
+		});
+		if (recorded === undefined) {
+			return;
+		}
+
+		const mediaChannelId = recorded.ariChannelId;
+		const existing = this.recordingAutoResume.get(mediaChannelId);
+		if (existing !== undefined) {
+			clearTimeout(existing);
+		} else if (this.control.recordingFor(mediaChannelId)?.paused !== true) {
+			// Only the FIRST digit pauses. A resume that a caller's own pause/resume key applied in
+			// the middle of the window is deliberately not fought over: the window still runs, and the
+			// resume at the end of it is idempotent.
+			const paused = await this.control.pauseRecording(this.controlledLeg(recorded), true);
+			if (!paused.ok) {
+				this.logger.info(
+					{ channelId: recorded.channelId, reason: paused.reason },
+					"a PCI auto-pause could not be applied",
+				);
+				return;
+			}
+		}
+
+		const timer = setTimeout(() => {
+			this.recordingAutoResume.delete(mediaChannelId);
+			const live = this.registry.byAriChannelId(mediaChannelId);
+			if (live === undefined || live.isTearingDown) {
+				return;
+			}
+			void this.control.pauseRecording(this.controlledLeg(live), false).catch((error: unknown) => {
+				this.logger.warn(
+					{ channelId: live.channelId, err: String(error) },
+					"a PCI auto-pause could not be resumed",
+				);
+			});
+		}, this.recordingAutoResumeMs);
+		timer.unref?.();
+		this.recordingAutoResume.set(mediaChannelId, timer);
+	}
+
+	/** Drops a leg's quiet-window timer. Called on every leg end, so an unpaused leg costs one lookup. */
+	private disarmRecordingAutoResume(mediaChannelId: string): void {
+		const timer = this.recordingAutoResume.get(mediaChannelId);
+		if (timer === undefined) {
+			return;
+		}
+		clearTimeout(timer);
+		this.recordingAutoResume.delete(mediaChannelId);
+	}
+
 	private async onDtmf(mediaChannelId: string, digit: string, durationMs: number): Promise<void> {
 		const aggregate = this.registry.byAriChannelId(mediaChannelId);
 		const pressed = digit.toUpperCase();
@@ -3377,6 +3758,11 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		if (aggregate === undefined) {
 			return;
 		}
+
+		// Before anything consumes the digit, and regardless of who consumes it: the PCI rule is about
+		// what is being SPOKEN and keyed while the recorder is running, and a digit that a gather or a
+		// feature code claimed is just as much part of a card number as one that reached nobody.
+		await this.autoPauseForDtmf(aggregate);
 
 		const event = dtmfEventFrom({ digit: pressed, durationMs });
 
@@ -3594,6 +3980,8 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		// to come back whether or not the leg was ever filed, or the ceiling ratchets down by one
 		// every time a leg ends outside the registry and the trunk eventually refuses everything.
 		this.trunkCapacity.releaseLeg(mediaChannelId);
+		// A quiet-window timer that outlived its leg would resume a recording on a dead call.
+		this.disarmRecordingAutoResume(mediaChannelId);
 		this.disarmCallDurationCeiling(mediaChannelId);
 		this.disarmSetupDeadline(mediaChannelId);
 
@@ -4047,6 +4435,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				...queueLegOf(aggregate.snapshot.variables),
 				...authorizationOf(aggregate.snapshot.variables),
 				...attestationOf(aggregate.snapshot.variables),
+				...recordingConsentOf(aggregate.snapshot.variables),
 				// The carrier's `Call-ID` for this leg's dialog. Off the variable and not the dialog
 				// registry, so an adopted leg files the same value the original instance would have.
 				...(sipCallId === undefined ? {} : { sipCallId }),
@@ -4269,6 +4658,9 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		// Every walk is waiting on a signal that will never come once the calls are gone. Dropping
 		// the waiters lets the timers fire and the walks settle instead of holding the drain open.
 		this.signals.clear();
+		// The same argument for the playback waiters: a consent gate mid-announcement is waiting for
+		// a completion from a media session that is going away with the drain.
+		this.playbackSignals.clear();
 		this.midCall.clear();
 		// Park timeouts and consultation watchers are the same problem one layer up: a lot's ringback
 		// timer would otherwise fire during the drain and route a call on an instance that is leaving.
@@ -4285,6 +4677,12 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			clearTimeout(timer);
 		}
 		this.durationCeilings.clear();
+		// And the same for the PCI quiet windows: a resume that fired mid-drain would act on a
+		// recording this instance has already handed over.
+		for (const timer of this.recordingAutoResume.values()) {
+			clearTimeout(timer);
+		}
+		this.recordingAutoResume.clear();
 
 		const deadline = Date.now() + timeoutMs;
 		while (this.registry.size > 0 && Date.now() < deadline) {
@@ -5256,6 +5654,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		}
 
 		const snapshot = this.invitedChannelSnapshot(request, organizationId);
+		const srtpPolicy = await this.handsetSrtpPolicy(organizationId, request);
 		await this.onLegArrived(snapshot, (aggregate) => {
 			if (this.media instanceof SplitPlaneMediaPort && request.sdpOffer !== undefined) {
 				this.media.registerInboundLeg(request.legId, {
@@ -5263,6 +5662,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 					callId: aggregate.callId,
 					sipdInstanceId: request.sipdInstanceId,
 					sdpOffer: request.sdpOffer,
+					...(srtpPolicy === undefined ? {} : { srtpPolicy }),
 				});
 			}
 		});

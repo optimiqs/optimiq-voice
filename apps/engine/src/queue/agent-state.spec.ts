@@ -189,6 +189,10 @@ describe("staffing", () => {
 		expect(isStaffing(entry({ status: "unavailable", reason: "max-no-answer" }))).toBe(false);
 		expect(isStaffing(entry({ status: "unavailable", reason: "lunch" }))).toBe(true);
 	});
+
+	it("does not count a RONA bench either, for the same reason", () => {
+		expect(isStaffing(entry({ status: "unavailable", reason: "rona" }))).toBe(false);
+	});
 });
 
 describe("idle time", () => {

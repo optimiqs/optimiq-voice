@@ -68,6 +68,25 @@ interface LegRecord {
 	 * SECOND answer here would allocate a second session for a leg that already has one.
 	 */
 	earlyMediaAnswer: string | undefined;
+	/**
+	 * The SDES-SRTP policy to negotiate THIS leg under, overriding `mediad`'s process-wide floor.
+	 *
+	 * `undefined` — the overwhelming majority — means "let the media plane decide", which is what
+	 * every leg negotiated before the per-leg field existed. It is set from the ORGANIZATION's
+	 * `requireSrtpForTlsPhones` when the far end registered over TLS or WSS, and it is a property of
+	 * the leg rather than of the process because a carrier and a handset need different answers on
+	 * the same `mediad`.
+	 */
+	readonly srtpPolicy: "prefer" | "require" | "disable" | undefined;
+	/**
+	 * Whether this leg's media is ACTUALLY encrypted, as `mediad` reported it off the SRTP context it
+	 * installed — not what the policy asked for.
+	 *
+	 * `undefined` until the leg has negotiated anything at all, which is the state a reader must be
+	 * able to tell apart from `plaintext`: "we do not know yet" is not "there is no encryption", and
+	 * a lock icon rendered off the first would be a lie on every ringing call.
+	 */
+	mediaEncryption: "encrypted" | "plaintext" | undefined;
 }
 
 /**
@@ -202,6 +221,58 @@ export class SplitPlaneMediaPort implements MediaPort {
 		return this.signalling.rpcLatency ?? {};
 	}
 
+	/**
+	 * What `mediad` last reported about a leg's ACTUAL media encryption.
+	 *
+	 * `undefined` for a leg nothing has negotiated yet and for one this port has forgotten — which a
+	 * reader must not collapse into `plaintext`, because a lock icon that says "not encrypted" while
+	 * the call is still ringing is a false statement about the call, not a missing one.
+	 */
+	mediaEncryptionOf(channelId: string): "encrypted" | "plaintext" | undefined {
+		return this.legs.get(channelId)?.mediaEncryption;
+	}
+
+	/**
+	 * Told whenever a leg's encryption state is settled or changes.
+	 *
+	 * A callback rather than a getter the lead polls, because the fact arrives inside a media RPC the
+	 * lead is not the caller of — the `183`, the `200 OK`, a re-INVITE — and a poll would have to
+	 * guess when. Set once by the orchestrator; absent is a port whose state nothing observes, which
+	 * is what every spec harness is and what this port was before the flag existed.
+	 */
+	onMediaEncryption?: (channelId: string, encryption: "encrypted" | "plaintext") => void;
+
+	/**
+	 * Files an encryption state a media reply carried, and tells the lead when it CHANGED.
+	 *
+	 * The change test is what keeps a chatty carrier's five `18x` — each one re-reading the same
+	 * session — from writing the channel snapshot five times, and it is why the leg record holds the
+	 * value at all rather than the callback being fired unconditionally.
+	 */
+	private noteEncryption(
+		channelId: string,
+		encryption: "encrypted" | "plaintext" | undefined,
+	): void {
+		if (encryption === undefined) {
+			// An older `mediad`, or one that did not say. Silence is not `plaintext`.
+			return;
+		}
+		const leg = this.legs.get(channelId);
+		if (leg === undefined || leg.mediaEncryption === encryption) {
+			return;
+		}
+		leg.mediaEncryption = encryption;
+		this.onMediaEncryption?.(channelId, encryption);
+	}
+
+	/** The per-leg SDES policy as an allocate/offer request fragment, or nothing at all. */
+	private srtpPolicyOf(channelId: string): {
+		readonly srtpPolicy?: "prefer" | "require" | "disable";
+	} {
+		const policy = this.legs.get(channelId)?.srtpPolicy;
+		return policy === undefined ? {} : { srtpPolicy: policy };
+	}
+
 	// --- registration: the lead hands the composite each leg's plane state ------------------------
 
 	/**
@@ -217,6 +288,8 @@ export class SplitPlaneMediaPort implements MediaPort {
 			readonly callId: string;
 			readonly sipdInstanceId: string;
 			readonly sdpOffer: string;
+			/** See {@link LegRecord.srtpPolicy}. Absent leaves the media plane's own floor in force. */
+			readonly srtpPolicy?: "prefer" | "require" | "disable";
 		},
 	): void {
 		this.legs.set(channelId, {
@@ -227,6 +300,8 @@ export class SplitPlaneMediaPort implements MediaPort {
 			sdpOffer: context.sdpOffer,
 			originatorChannelId: undefined,
 			earlyMediaAnswer: undefined,
+			srtpPolicy: context.srtpPolicy,
+			mediaEncryption: undefined,
 		});
 	}
 
@@ -238,7 +313,12 @@ export class SplitPlaneMediaPort implements MediaPort {
 	 */
 	registerOutboundLeg(
 		channelId: string,
-		context: { readonly orgId: string; readonly callId: string },
+		context: {
+			readonly orgId: string;
+			readonly callId: string;
+			/** See {@link LegRecord.srtpPolicy}. Absent leaves the media plane's own floor in force. */
+			readonly srtpPolicy?: "prefer" | "require" | "disable";
+		},
 	): void {
 		this.legs.set(channelId, {
 			orgId: context.orgId,
@@ -248,6 +328,8 @@ export class SplitPlaneMediaPort implements MediaPort {
 			sdpOffer: undefined,
 			originatorChannelId: undefined,
 			earlyMediaAnswer: undefined,
+			srtpPolicy: context.srtpPolicy,
+			mediaEncryption: undefined,
 		});
 	}
 
@@ -290,6 +372,12 @@ export class SplitPlaneMediaPort implements MediaPort {
 			sdpOffer: undefined,
 			originatorChannelId: undefined,
 			earlyMediaAnswer: undefined,
+			// Neither is restored, for the reason the offer is not: an adopted leg is already
+			// negotiated, so the policy has nothing left to apply and the encryption state is a fact
+			// the surviving replica did not observe. `undefined` is honest — the snapshot it adopted
+			// already carries whatever flag the dead replica set.
+			srtpPolicy: undefined,
+			mediaEncryption: undefined,
 		});
 		if (context.variables !== undefined) {
 			// The variable store is the SOURCE of truth on this plane (§3.4) — there is no dialplan
@@ -430,6 +518,7 @@ export class SplitPlaneMediaPort implements MediaPort {
 				orgId: leg.orgId,
 				callId: leg.callId,
 				sdpOffer: request.sdpOffer,
+				...this.srtpPolicyOf(request.legId),
 			});
 		} catch (error) {
 			if (error instanceof MediaCommandRefusedError && error.reason === "not_supported")
@@ -438,6 +527,9 @@ export class SplitPlaneMediaPort implements MediaPort {
 		}
 		if (!reply.ok || !reply.sdpAnswer)
 			return { ok: false, legId: request.legId, reason: "not_supported" };
+		// A re-INVITE can change it in either direction — a hold/resume that renegotiates, a phone
+		// that dropped its crypto line — so the flag is re-read here and not only at the answer.
+		this.noteEncryption(request.legId, reply.mediaEncryption);
 		if (this.legs.get(request.legId) !== leg) {
 			await this.media.hangup(request.legId, "NORMAL_CLEARING");
 			return { ok: false, legId: request.legId, reason: "unknown_leg" };
@@ -489,7 +581,9 @@ export class SplitPlaneMediaPort implements MediaPort {
 				legId: channelId,
 				sdpOffer: leg.sdpOffer,
 				direction: "sendrecv",
+				...this.srtpPolicyOf(channelId),
 			});
+			this.noteEncryption(channelId, allocation.mediaEncryption);
 			if (allocation.sdpAnswer === undefined) {
 				throw new SplitPlaneLegStateError(
 					"answer",
@@ -592,7 +686,9 @@ export class SplitPlaneMediaPort implements MediaPort {
 				legId: channelId,
 				sdpOffer: leg.sdpOffer,
 				direction: "sendrecv",
+				...this.srtpPolicyOf(channelId),
 			});
+			this.noteEncryption(channelId, allocation.mediaEncryption);
 			if (allocation.sdpAnswer === undefined) {
 				throw new SplitPlaneLegStateError(
 					"earlyMedia",
@@ -716,7 +812,13 @@ export class SplitPlaneMediaPort implements MediaPort {
 				callId: leg.callId,
 				legId: request.channelId,
 				direction: "sendrecv",
+				...this.srtpPolicyOf(request.channelId),
 			});
+			// `plaintext` between the offer and the answer even under `require`: nothing is installed
+			// until the callee has chosen. `settleOutboundAnswer` is where the B-leg's real state
+			// lands, and this early read is what keeps a ringing leg from claiming a lock it has not
+			// yet earned.
+			this.noteEncryption(request.channelId, offer.mediaEncryption);
 			if (!offer.ok || offer.sdpOffer === undefined) {
 				throw new SplitPlaneSignallingRefusedError(
 					"originate",
@@ -799,7 +901,13 @@ export class SplitPlaneMediaPort implements MediaPort {
 		channelId: string,
 		sdpAnswer: string,
 	): Promise<MediaAcceptAnswerResponse> {
-		return await this.media.acceptAnswer({ sessionId: channelId, sdpAnswer });
+		const reply = await this.media.acceptAnswer({
+			sessionId: channelId,
+			sdpAnswer,
+			...this.srtpPolicyOf(channelId),
+		});
+		this.noteEncryption(channelId, reply.mediaEncryption);
+		return reply;
 	}
 
 	/**

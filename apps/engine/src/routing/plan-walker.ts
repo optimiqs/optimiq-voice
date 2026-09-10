@@ -12,6 +12,7 @@ import {
 	translateMediaRef,
 } from "./media-refs";
 import { planDestinationOf, sameDestination } from "./plan-destination";
+import { TOLL_FRAUD_REFUSAL_CAUSE } from "./toll-fraud-guard";
 import { orderTrunkAttempts } from "./trunk-selection";
 import { verifyPinDigest, verifyVoicemailPin } from "./voicemail-pin";
 import type { DialTarget, MediaPort } from "../media/media-port";
@@ -27,6 +28,7 @@ import type { CallSignalBus, LegSignal } from "./call-signals";
 import type { ConferenceRegistry } from "./conference-registry";
 import type { MediaRefSettings } from "./media-refs";
 import type { PlanDestination } from "./plan-destination";
+import type { TollFraudGuardPort } from "./toll-fraud-guard";
 import type { TrunkCapacityPort } from "./trunk-capacity";
 import type { CallEvent, ExtensionFeature } from "@optimiq-voice/events";
 import type {
@@ -334,7 +336,31 @@ export interface WalkerCallControl {
 	 * recording is indistinguishable downstream from an on-demand one — one `channel.record.started`,
 	 * one object key, one retention rule, one signed-URL endpoint.
 	 */
-	startRecording?(): Promise<{ readonly ok: boolean; readonly reason?: string }>;
+	startRecording?(request?: {
+		/**
+		 * PCI's DTMF auto-pause, when the node asking for the recording has its own answer.
+		 *
+		 * `undefined` is not `false`: it means "this node has no opinion", and the orchestrator falls
+		 * back to the destination extension's flag and then to the organization default, which is what
+		 * every caller of this port did before the argument existed. A queue has its own column and is
+		 * not an extension, so without this its flag was compiled and then read by nothing.
+		 */
+		readonly autoPauseOnDtmf?: boolean;
+		/**
+		 * Which way this recording's call is TRAVELLING, when the node asking knows better than the
+		 * leg does.
+		 *
+		 * A handset dialling out has an A-leg the engine labels `internal` — it arrived from a phone,
+		 * not from a carrier — so the leg alone cannot tell an internal call from an outbound one, and
+		 * the consent policy's outbound rule (announce to the party being CALLED) never fired on the
+		 * calls it was written for. A `trunk-dial` node has no such doubt: reaching it is what makes a
+		 * call outbound.
+		 *
+		 * Absent keeps the orchestrator's own reading of the leg, which is what every caller written
+		 * before this field asks for.
+		 */
+		readonly direction?: "inbound" | "outbound";
+	}): Promise<{ readonly ok: boolean; readonly reason?: string }>;
 }
 
 /**
@@ -957,6 +983,15 @@ export interface PlanWalkerDependencies {
 	 * this one did — so a walker spec that is not about capacity does not have to supply one.
 	 */
 	readonly trunkCapacity?: TrunkCapacityPort;
+	/**
+	 * The spend, velocity and geo gate on outbound trunk dials, or absent when this deployment does
+	 * not enforce one.
+	 *
+	 * Absent means an organization's `tollFraud` policy is read and ignored, which is what every
+	 * release before this one did — so a walker spec that is not about toll fraud does not have to
+	 * supply one.
+	 */
+	readonly tollFraudGuard?: TollFraudGuardPort;
 }
 
 /** One recorded message, on its way to a mailbox. */
@@ -1305,6 +1340,19 @@ export interface OriginatedLegHooks {
 	hangingUp(mediaChannelId: string, cause: HangupCause): void;
 	/** The A-leg and this leg are now in `bridgeId`. Both CDRs gain the other's leg id. */
 	bridged(mediaChannelId: string, bridgeId: string): void;
+	/**
+	 * The A-leg has been taken OUT of the bridge and is being kept alive past this peer's end.
+	 *
+	 * The exact mirror of {@link bridged}, and it exists for one reason: `bridged` stamps each leg
+	 * with the other's id, and the orchestrator's own teardown ends whatever that stamp names. A
+	 * caller detached for a post-call survey therefore had a BYE sent to them a second later, by the
+	 * agent leg's teardown, on the strength of a bridge that no longer existed. Clearing the stamp on
+	 * both sides is what park already does through its own path.
+	 *
+	 * Optional, so a walk built against an older hook set keeps working — such a walk also cannot ask
+	 * to keep a leg, so there is never a detached caller for it to strand.
+	 */
+	unbridged?(mediaChannelId: string): void;
 }
 
 /** One call's facts, alongside the plan the resolver produced for them. */
@@ -1559,7 +1607,13 @@ export class PlanWalker {
 	private readonly notes: string[] = [];
 	private readonly visited: PlanNodeId[] = [];
 	private destination: PlanDestination | undefined;
-	/** Closes the queued caller's DTMF watch. Set for the life of one queue node, and only then. */
+	/**
+	 * Closes the queued caller's DTMF watch.
+	 *
+	 * Set for the life of one queue node, and released by the QUEUE SESSION rather than by the node,
+	 * because a post-call survey polls the same source after the caller has been bridged and the
+	 * node has returned. See {@link import("../queue/queue-session").QueueCallPort.releaseDigits}.
+	 */
 	private queueDigitUnwatch: (() => void) | undefined;
 	/** `number -> extension node`, built lazily per node table. See {@link extensionNodeFor}. */
 	private readonly extensionsByNumber = new WeakMap<
@@ -4455,6 +4509,28 @@ export class PlanWalker {
 			return this.branch(node.failoverNodeId, "NETWORK_OUT_OF_ORDER");
 		}
 
+		// The spend/velocity/geo gate, ahead of the PIN prompt on purpose: a call this organization
+		// has decided it will not place should be refused without first making the caller enter a
+		// code for it. It is also ahead of the first INVITE and ahead of `ringing`, for the reason
+		// spelled out below.
+		if (this.deps.tollFraudGuard !== undefined) {
+			const verdict = await this.deps.tollFraudGuard.authorize({
+				organizationId: this.deps.channel.organizationId,
+				// The CALLER's number, which is the extension a per-extension override belongs to.
+				...(input.callerIdNumber === undefined ? {} : { extensionNumber: input.callerIdNumber }),
+				dialedNumber: number,
+				now: this.deps.now?.() ?? Date.now(),
+			});
+			if (verdict.kind === "refuse") {
+				this.note(verdict.detail);
+				this.log("an outbound call was refused by the toll-fraud policy", {
+					reason: verdict.reason,
+					dialedNumber: number,
+				});
+				return this.branch(node.failoverNodeId, TOLL_FRAUD_REFUSAL_CAUSE);
+			}
+		}
+
 		// The authorisation gate, before the first INVITE and before `ringing`. Both halves of that
 		// ordering matter: a code collected after the carrier has been offered the call is a code
 		// collected too late to stop it, and a caller who hears ringback and is then asked for a PIN
@@ -4538,7 +4614,11 @@ export class PlanWalker {
 				// Handed to the leg: from here the channel is spent until the leg ends, and the
 				// orchestrator returns it in `onLegEnded`.
 				reservation?.bindTo(outcome.mediaChannelId);
-				return await this.bridgeWith(outcome.mediaChannelId);
+				const bridged = await this.bridgeWith(outcome.mediaChannelId);
+				if (bridged.kind === "bridged") {
+					await this.recordOutboundRoute(node);
+				}
+				return bridged;
 			}
 			reservation?.release();
 			if (outcome.kind === "aborted") {
@@ -4555,6 +4635,67 @@ export class PlanWalker {
 		}
 
 		return this.branch(node.failoverNodeId, lastCause);
+	}
+
+	/**
+	 * Starts a recording when the OUTBOUND ROUTE asks for one.
+	 *
+	 * ## Why this existed nowhere until now
+	 *
+	 * `outbound_route.record_enabled` has been a column, a form control and a compiled
+	 * {@link TrunkDialPlanNode} field since the routing package was written, and it was read by
+	 * nothing. A tenant who ticked "record outbound calls" got no recording and no note saying why —
+	 * the same shape of defect as the extension policy closed above it, and worse in one respect:
+	 * outbound is the direction with the most one-party-consent exposure, so the estates that tick it
+	 * are the estates that need it.
+	 *
+	 * ## Through the same gate, deliberately
+	 *
+	 * `WalkerCallControl.startRecording` is the single seam — the record-toggle feature code, the
+	 * extension policy, the queue and the conference all go through it — because that is what applies
+	 * the CONSENT policy: the announcement to the far end, the accept/decline digits, the consent
+	 * record on the leg and in the CDR. A route that started a recorder of its own would produce
+	 * audio with no consent row behind it, which is the one recording a compliance review cannot use.
+	 *
+	 * ## After the BRIDGE, best-effort
+	 *
+	 * Same ordering and the same best-effort rule as {@link recordExtension}: a recording is a tap on
+	 * a bridged conversation, and a media plane that cannot be tapped is not worth dropping a
+	 * connected call over. Every failure leaves a note.
+	 *
+	 * No `autoPauseOnDtmf` argument: a route has no column for it, so the orchestrator's own
+	 * resolution — the destination extension's flag, then the organization default — is the honest
+	 * answer, and passing `false` here would silently override a tenant's PCI setting. `direction`
+	 * IS passed, because a route knows something the leg does not.
+	 */
+	private async recordOutboundRoute(node: TrunkDialPlanNode): Promise<void> {
+		if (!node.recordEnabled) {
+			return;
+		}
+		const control = this.deps.control;
+		if (control?.startRecording === undefined) {
+			this.note(
+				`outbound route ${node.outboundRouteId} is set to record and this walk has no call-control port; the call was connected without a recording`,
+			);
+			return;
+		}
+		try {
+			// `outbound` stated rather than inferred: see `WalkerCallControl.startRecording`. Without it
+			// the consent policy reads this leg as `internal` and never announces to the party being
+			// called, which on an outbound recorded call is the only party owed the announcement.
+			const outcome = await control.startRecording({ direction: "outbound" });
+			if (!outcome.ok) {
+				this.note(
+					`outbound route ${node.outboundRouteId} is set to record and the recording was refused${
+						outcome.reason === undefined ? "" : `: ${outcome.reason}`
+					}; the call was connected without it`,
+				);
+			}
+		} catch (error) {
+			this.note(
+				`outbound route ${node.outboundRouteId} recording could not be started (${String(error)}); the call was connected without it`,
+			);
+		}
 	}
 
 	/**
@@ -6237,12 +6378,12 @@ export class PlanWalker {
 		try {
 			outcome = await session.run();
 			await this.reportQueueOutcome(node, outcome);
-		} finally {
-			// The digit watch outlives nothing: a queued caller who is bridged to an agent is having a
-			// conversation, and a watch still pushing their DTMF into an array nobody reads is a leak
-			// with a caller's keypresses in it.
-			this.queueDigitUnwatch?.();
-			this.queueDigitUnwatch = undefined;
+		} catch (error) {
+			// The session closes the digit watch itself on every path it controls, because a
+			// post-call survey has to keep polling long after `run` has returned `answered`. This is
+			// the net for a session that threw before it could.
+			this.releaseQueueDigits();
+			throw error;
 		}
 
 		switch (outcome.kind) {
@@ -6333,6 +6474,12 @@ export class PlanWalker {
 	 * be captured and the object needs a getter of its own. Everything else is an arrow function,
 	 * which closes over the walker's `this` lexically.
 	 */
+	/** Idempotent: the session releases on several paths and the node's catch is a net over them. */
+	private releaseQueueDigits(): void {
+		this.queueDigitUnwatch?.();
+		this.queueDigitUnwatch = undefined;
+	}
+
 	private queueCallPort(): QueueCallPort {
 		const { channel, media, execute } = this.deps;
 		// The exit key's digit source, opened for the life of the queued call and closed when the
@@ -6410,10 +6557,23 @@ export class PlanWalker {
 				await this.dialQueueAgents(attempts, fanOut, ringTimeoutSeconds),
 			hangupAnsweredAgent: async (mediaChannelId) =>
 				await this.hangupQuietly(mediaChannelId, "NORMAL_TEMPORARY_FAILURE"),
-			bridge: async (mediaChannelId, onEnded) =>
-				(await this.bridgeWith(mediaChannelId, onEnded)).kind === "bridged",
+			bridge: async (mediaChannelId, onEnded, options) =>
+				(await this.bridgeWith(mediaChannelId, onEnded, options?.keepCallerOnPeerEnd === true))
+					.kind === "bridged",
+			endCaller: async () => {
+				// `NORMAL_CLEARING` and not a failure cause: the call really did complete, and the
+				// caller is being released because the survey after it is over.
+				await this.hangupQuietly(this.deps.channel.mediaChannelId, "NORMAL_CLEARING");
+			},
 			pollDigit: () => digits.shift(),
-			startRecording: async () => {
+			releaseDigits: () => {
+				this.releaseQueueDigits();
+				// Emptied as well as unwatched: the array is closed over by a port the survey may
+				// still hold, and stale keypresses answering a later question would be worse than
+				// none.
+				digits.length = 0;
+			},
+			startRecording: async (request) => {
 				// The same seam the record-toggle feature code uses, so a queue recording is
 				// indistinguishable from an on-demand one downstream: one `channel.record.started`, one
 				// object key, one retention rule. A walk with no call-control port announces nothing and
@@ -6425,7 +6585,7 @@ export class PlanWalker {
 					);
 					return false;
 				}
-				const outcome = await control.startRecording();
+				const outcome = await control.startRecording(request);
 				if (!outcome.ok && outcome.reason !== undefined) {
 					this.note(`queue call recording was refused: ${outcome.reason}`);
 				}
@@ -7365,7 +7525,8 @@ export class PlanWalker {
 	 */
 	private async bridgeWith(
 		peerMediaChannelId: string,
-		onPeerEnded?: () => void,
+		onPeerEnded?: (detached: Promise<boolean>) => void,
+		keepLegOnPeerEnd = false,
 	): Promise<StepResult> {
 		if (!(await this.ensureAnswered())) {
 			await this.hangupQuietly(peerMediaChannelId, "ORIGINATOR_CANCEL");
@@ -7415,17 +7576,43 @@ export class PlanWalker {
 				return;
 			}
 			unwatch();
-			// The queue's wrap-up hook, when there is one. Called BEFORE the teardown so an agent's
-			// after-call timer starts at the moment their call ended rather than after two awaited
-			// media-server round trips.
-			onPeerEnded?.();
-			void this.onPeerEnded(bridgeId, peerMediaChannelId);
+			// The teardown is STARTED before the hook is told, and the hook is handed its promise
+			// rather than waiting on it. Both halves matter: the agent's wrap-up timer has to start at
+			// the moment their call ended rather than after two awaited media-server round trips,
+			// while the caller's post-call survey must not speak into a bridge that is still being
+			// pulled apart. One promise serves both — the wrap-up ignores it, the survey awaits it.
+			const detached = this.onPeerEnded(bridgeId, peerMediaChannelId, keepLegOnPeerEnd);
+			onPeerEnded?.(detached);
+			void detached;
 		});
 
 		return { kind: "bridged" };
 	}
 
-	private async onPeerEnded(bridgeId: string, peerMediaChannelId: string): Promise<void> {
+	/**
+	 * The peer of a bridge this leg is in has gone.
+	 *
+	 * Returns whether this leg SURVIVED it and is now out of the bridge — which is only ever true
+	 * under `keepLeg`, and is the fact a post-call survey needs before it plays anything.
+	 *
+	 * ## `keepLeg`, and why it is not "park"
+	 *
+	 * A queue with a survey configured has to keep the caller after the agent hangs up, and the
+	 * shape that already exists for "take this leg out of the bridge and leave it alive" is what
+	 * park and a shared-line recall do. This is the same move without the lot: the bridge is
+	 * unbridged and destroyed, `channel.bridgeId` is cleared — so any OTHER watcher closed over this
+	 * bridge also leaves the leg alone — and the hangup is simply not sent. The caller is then a
+	 * live, answered leg with nothing on the other end, which is exactly what a survey needs and
+	 * exactly what a parked caller is.
+	 *
+	 * The leg does NOT become immortal: whoever asked for `keepLeg` owns ending it, and the queue's
+	 * survey ends it through `QueueCallPort.endCaller` on every exit including its failures.
+	 */
+	private async onPeerEnded(
+		bridgeId: string,
+		peerMediaChannelId: string,
+		keepLeg = false,
+	): Promise<boolean> {
 		// A call-control feature may have taken this leg out of the bridge before the peer ended —
 		// which is exactly what park and a shared-line hold recall do: they move the CALLER out, then
 		// release the leg on the other side. This watcher is a closure over the bridge that walk
@@ -7438,7 +7625,7 @@ export class PlanWalker {
 				bridgeId,
 				peerMediaChannelId,
 			});
-			return;
+			return false;
 		}
 		try {
 			await this.deps.publish("channel.unbridged", {
@@ -7449,12 +7636,25 @@ export class PlanWalker {
 			});
 			this.deps.channel.setBridge(undefined);
 			await this.deps.media.destroyBridge(bridgeId);
-			if (!this.deps.channel.isTearingDown) {
-				await this.hangupQuietly(this.deps.channel.mediaChannelId, "NORMAL_CLEARING");
+			if (this.deps.channel.isTearingDown) {
+				// The caller went too, in the same instant. Nothing survived, whatever was asked for.
+				return false;
 			}
+			if (keepLeg) {
+				// BEFORE the note and before anything else can act on the stamp: the peer's teardown is
+				// already running, and it ends whatever `bridged` named.
+				this.deps.legs?.unbridged?.(peerMediaChannelId);
+				this.note("the agent's leg ended; the caller was kept out of the bridge");
+				return true;
+			}
+			await this.hangupQuietly(this.deps.channel.mediaChannelId, "NORMAL_CLEARING");
 		} catch (error) {
 			this.log("failed to tear the bridge down after the peer hung up", { err: String(error) });
+			// A leg whose detach failed is NOT one a survey may speak to: the bridge may still be
+			// standing and the audio would go to a call that is over.
+			return false;
 		}
+		return false;
 	}
 
 	// -------------------------------------------------------------------------------------------

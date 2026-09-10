@@ -11,10 +11,10 @@ import type { HangupCause } from "@optimiq-voice/telephony";
  * stops at this file. `ari-mapping.ts` translates Asterisk's names; this translates `mediad`'s. The
  * layer above never learns there are two.
  *
- * ## Five events in, four members out
+ * ## Five events in, five members out
  *
- * `mediad` publishes five things and the orchestrator branches on three of them, so the mapping is
- * not symmetric — and that asymmetry is the interesting part.
+ * `mediad` publishes five things and the orchestrator branches on four of them, so the mapping is
+ * still not symmetric — and that asymmetry is the interesting part.
  *
  * - `session.ended` becomes `leg-ended`, the member the CDR is written from. It is the only media
  *   event that means "this leg is over".
@@ -22,14 +22,23 @@ import type { HangupCause } from "@optimiq-voice/telephony";
  *   a `session.ended` whose reason is `rtp-timeout`, and emitting both would tear the leg down
  *   twice: once on the warning and once on the fact. The reason survives on the `leg-ended` it
  *   causes, which is where a consumer asking "why did that call drop" looks.
- * - `playback.finished` maps to NOTHING either, and this one is a deliberate MIRROR of the ARI
- *   path rather than an omission. `MediaPort.play` returns as soon as audio has STARTED — the verb
- *   executor says so in as many words, because barge-in must not hold a fiber for the length of a
- *   prompt — so nothing above this seam waits for a prompt to end. `toMediaEvent` drops Asterisk's
- *   `PlaybackFinished` for exactly that reason, and adding a union member here would mean two media
- *   planes agreeing on a shape no consumer branches on. The event is still PUBLISHED, because
- *   `reason: error` is a caller in silence where a menu should be and nothing else records it; it
- *   is read by whoever is asking that question, not by the orchestrator.
+ * - `playback.finished` becomes `playback-finished`, and it used to map to NOTHING. The argument for
+ *   dropping it was sound for as long as it held: `MediaPort.play` returns as soon as audio has
+ *   STARTED — the verb executor says so in as many words, because barge-in must not hold a fiber for
+ *   the length of a prompt — so nothing above this seam waited for a prompt to end, and a union
+ *   member nobody branches on is a shape two media planes must agree on for no reason.
+ *
+ *   Exactly one consumer now branches on it, and it is the one that cannot be served any other way:
+ *   `CallControl.announceConsent` writes a compliance record naming the parties the
+ *   recording-disclosure prompt reached. That record was stamped when `play` RESOLVED, and `play`
+ *   resolves on acceptance — so a WebRTC party still finishing ICE and DTLS was written down as
+ *   announced to while THIS event was reporting `playedMs 0` and `WebRTC media is not connected` on
+ *   the very same prompt. The fact was on the wire the whole time and the engine threw it away.
+ *
+ *   `playedMs` is the field that makes the record true rather than hopeful: it is how much audio
+ *   actually left the machine, which no layer above the packet path can compute. Nothing else on the
+ *   platform waits for a prompt to end and nothing else should — the member is republished on a
+ *   playback signal key and read by whoever asked for it, exactly as `recording-finished` is.
  * - `recording.finished` becomes `recording-finished`, or `recording-failed` when the reason is
  *   `error`. This is the one media event the layer above genuinely waits for: `plan-walker`'s
  *   voicemail node and `call-control`'s on-demand recording both block until a recording has
@@ -117,6 +126,26 @@ export function toMediaEventFromMediad(envelope: MediaEventEnvelope): MediaEvent
 			durationMs: envelope.data.durationMs,
 		};
 	}
+	if (envelope.type === "playback.finished") {
+		return {
+			type: "playback-finished",
+			// The engine's leg id and mediad's session id are the same string under this driver.
+			channelId: envelope.data.sessionId,
+			// Echoed back verbatim from the `start-playback` the engine sent, which is what lets a
+			// waiter key on the reference it assigned rather than on the channel — two prompts on one
+			// leg (an announcement and the music behind it) must not see each other's completion.
+			playbackRef: envelope.data.playbackRef,
+			// ALWAYS present on this driver, and that is the point of the rung: `mediad` counted the
+			// frames it actually wrote. `0` is a real answer — the prompt was accepted, scheduled and
+			// delivered to nobody — and it is a different fact from a driver that cannot measure at
+			// all, which is why the union's field is optional and this one never omits it.
+			playedMs: envelope.data.playedMs,
+			// Verbatim, because it is the evidence. A projection onto some engine-side vocabulary
+			// would lose the one word an operator greps for when a caller reports silence.
+			reason: envelope.data.reason,
+			...(envelope.data.detail === undefined ? {} : { detail: envelope.data.detail }),
+		};
+	}
 	if (envelope.type === "recording.finished") {
 		// The recording is addressed by NAME the whole way up, because ARI has no recording id and
 		// the seam inherited that: `MediaPort.record(name)` names it, `stopRecording(name)` stops it,
@@ -141,9 +170,8 @@ export function toMediaEventFromMediad(envelope: MediaEventEnvelope): MediaEvent
 			...(envelope.data.pauses === undefined ? {} : { pauses: envelope.data.pauses }),
 		};
 	}
-	// `session.rtp-timeout` and `playback.finished` — see the file header. The first is the
-	// diagnosis of an `ended` that follows and carries the reason; the second has no consumer above
-	// this seam on either driver, because `play` never waited for it.
+	// `session.rtp-timeout` — see the file header: the diagnosis of an `ended` that follows and
+	// carries the reason, so emitting it too would tear the leg down twice.
 	return undefined;
 }
 

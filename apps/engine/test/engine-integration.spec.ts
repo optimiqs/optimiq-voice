@@ -33,6 +33,7 @@ import { ChannelOrchestrator } from "../src/calls/channel-orchestrator.service";
 import { ParkHandoffError } from "../src/calls/park-handoff";
 import { AriConnectionService } from "../src/media/ari-connection.service";
 import { makeFakeMediaPort } from "../src/media/media-port.fake";
+import { PlaybackSignalBus } from "../src/media/playback-signals";
 import { KvClaimBucket } from "../src/nats/claim-store";
 import { ParkHandoffService } from "../src/nats/park-handoff.service";
 import { CallSignalBus } from "../src/routing/call-signals";
@@ -1358,6 +1359,7 @@ async function parkInstance(natsUrl: string, instanceId: string) {
 		activeCallsFor: () => [],
 		publish: async () => undefined,
 		markRecording: () => undefined,
+		markConsent: () => undefined,
 		route: async () => ({ status: "aborted", notes: [] }),
 		parkLotFor: async () => PARK_IT_LOT,
 		parkLotForSlot: async () => PARK_IT_LOT,
@@ -1366,6 +1368,7 @@ async function parkInstance(natsUrl: string, instanceId: string) {
 	const control = new CallControl({
 		media,
 		signals: new CallSignalBus(),
+		playbacks: new PlaybackSignalBus(),
 		parks,
 		host,
 		parkHandoff: handoffs,

@@ -1,6 +1,7 @@
 import {
 	AGENT_STATUSES,
 	ENGINE_DRIVEN_TRANSITIONS,
+	isEngineBenched,
 	VALID_AGENT_TRANSITIONS,
 	type AgentStateEntry,
 	type AgentStatus,
@@ -59,9 +60,11 @@ export type { AgentStatus };
  * - `ringing → on-call` — they answered and are being bridged to the caller.
  * - `ringing → available` — they did not answer, or lost a ring-all race. Back in the pool, with a
  *   penalty deadline the caller-facing loop sets.
- * - `ringing → unavailable` — their consecutive no-answer count reached the queue's `maxNoAnswer`.
- *   `mod_callcenter` does the same thing, for the same reason: a phone that rings out three times in
- *   a row is unplugged, and continuing to send it callers costs each of them a full ring timeout.
+ * - `ringing → unavailable` — their consecutive no-answer count reached the queue's `maxNoAnswer`,
+ *   or the queue has `ronaEnabled` and one offer was enough. `mod_callcenter` does the first, for
+ *   the same reason: a phone that rings out three times in a row is unplugged, and continuing to
+ *   send it callers costs each of them a full ring timeout. RONA is that argument with the count set
+ *   to one, chosen per queue by an operator who would rather bench a seat than spend a caller on it.
  * - `on-call → wrap-up` and `wrap-up → available` — the two halves of after-call work.
  * - `on-call → available` — the same, for a queue whose `wrapUpSeconds` is zero.
  *
@@ -168,16 +171,17 @@ export function isEligibleForDistribution(
  * opposite of what that setting is for. Only `logged-out` — and an agent the bucket has never heard
  * of — means "nobody is working this queue".
  *
- * The one `unavailable` that does NOT count is the engine's own `max-no-answer` bench: that is a
- * handset the distributor has decided is unreachable, not a human on a break, and counting it is how
- * a queue whose whole team's phones are dead holds callers for the full `maxWaitSeconds` instead of
- * ejecting them after `maxWaitNoAgentSeconds`. A manually-set `unavailable` is still a person.
+ * The `unavailable` entries that do NOT count are the ones the DISTRIBUTOR wrote — `max-no-answer`
+ * and `rona`, which {@link isEngineBenched} names. Both mean a handset that is not being answered,
+ * not a human on a break, and counting them is how a queue whose whole team's phones are dead holds
+ * callers for the full `maxWaitSeconds` instead of ejecting them after `maxWaitNoAgentSeconds`. A
+ * manually-set `unavailable` is still a person, and still staffing.
  */
 export function isStaffing(entry: AgentStateEntry | undefined): boolean {
 	if (entry === undefined || entry.status === "logged-out") {
 		return false;
 	}
-	return !(entry.status === "unavailable" && entry.reason === "max-no-answer");
+	return !isEngineBenched(entry);
 }
 
 /** The entry an unseen agent is treated as having, so callers never branch on `undefined`. */

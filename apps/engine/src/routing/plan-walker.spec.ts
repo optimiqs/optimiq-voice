@@ -35,6 +35,7 @@ import type {
 	WalkerChannel,
 	WalkInput,
 } from "./plan-walker";
+import type { TollFraudGuardPort, TollFraudGuardVerdict } from "./toll-fraud-guard";
 import type { TrunkCapacityPort } from "./trunk-capacity";
 import type { CallEvent } from "@optimiq-voice/events";
 import type { CompiledTimeCondition, PlanNode, TrunkDialPlanNode } from "@optimiq-voice/routing";
@@ -102,6 +103,8 @@ interface HarnessOptions {
 	readonly random?: () => number;
 	/** Absent means `maxChannels` is read and ignored, exactly as it is without this port. */
 	readonly trunkCapacity?: TrunkCapacityPort;
+	/** Absent means the toll-fraud policy is read and ignored, exactly as it is without this port. */
+	readonly tollFraudGuard?: TollFraudGuardPort;
 	/** Absent means an `application` node announces, exactly as it does with no control plane. */
 	readonly application?: WalkerApplicationPort;
 	/**
@@ -146,6 +149,11 @@ function harness(options: HarnessOptions = {}) {
 	const hangingUp: { readonly mediaChannelId: string; readonly cause: HangupCause }[] = [];
 	/** How many times a record policy reached the call-control port. */
 	let recordingStarts = 0;
+	/** What each `startRecording` was asked for. `undefined` is a node with no opinion. */
+	const recordingRequests: (
+		| { readonly autoPauseOnDtmf?: boolean; readonly direction?: "inbound" | "outbound" }
+		| undefined
+	)[] = [];
 
 	const state = {
 		answered: options.answered ?? false,
@@ -312,8 +320,9 @@ function harness(options: HarnessOptions = {}) {
 			? {}
 			: {
 					control: {
-						startRecording: async () => {
+						startRecording: async (request) => {
 							recordingStarts += 1;
+							recordingRequests.push(request);
 							return options.canRecord === true
 								? { ok: true }
 								: { ok: false, reason: "this media plane cannot record" };
@@ -329,6 +338,7 @@ function harness(options: HarnessOptions = {}) {
 		...(options.voicemail === undefined ? {} : { voicemail: options.voicemail }),
 		...(options.mailbox === undefined ? {} : { mailbox: options.mailbox }),
 		...(options.trunkCapacity === undefined ? {} : { trunkCapacity: options.trunkCapacity }),
+		...(options.tollFraudGuard === undefined ? {} : { tollFraudGuard: options.tollFraudGuard }),
 		...(options.application === undefined ? {} : { application: options.application }),
 		...(options.sharedLines === undefined ? {} : { sharedLines: options.sharedLines }),
 		random: options.random ?? ((): number => 0),
@@ -359,6 +369,7 @@ function harness(options: HarnessOptions = {}) {
 		destinations,
 		delays,
 		hangingUp,
+		recordingRequests,
 		get recordingStarts(): number {
 			return recordingStarts;
 		},
@@ -3275,5 +3286,192 @@ describe("shared lines", () => {
 
 		expect(outcome.hangupCause).toBe("FACILITY_NOT_IMPLEMENTED");
 		expect(h.media.originated()).toEqual([]);
+	});
+});
+
+/**
+ * `outbound_route.record_enabled` was compiled onto the plan node and read by nothing: a tenant who
+ * ticked "record outbound calls" got no recording, no note, and no consent record — the same shape
+ * of defect as the extension policy, in the direction with the most one-party-consent exposure.
+ */
+describe("recording an outbound route", () => {
+	it("records once the trunk leg is bridged, and not before", async () => {
+		const h = harness({ reactions: { carrier: { kind: "answer" } }, canRecord: true });
+		const outcome = await h.walker.walk(
+			walkInput(
+				[trunkDialNode("t", { recordEnabled: true, attempts: [trunkAttempt("carrier-a", 0)] })],
+				{ dialedNumber: "+15551234567" },
+			),
+		);
+		expect(outcome.status).toBe("bridged");
+		expect(h.recordingStarts).toBe(1);
+	});
+
+	/**
+	 * A handset's own A-leg is labelled `internal`, so the consent policy's OUTBOUND rule — announce
+	 * to the party being called — never fired on an outbound recorded call. A `trunk-dial` node has
+	 * no such doubt about which way the call is travelling, so it says so.
+	 */
+	it("tells the recording gate the call is outbound, which the leg alone cannot", async () => {
+		const h = harness({ reactions: { carrier: { kind: "answer" } }, canRecord: true });
+		await h.walker.walk(
+			walkInput(
+				[trunkDialNode("t", { recordEnabled: true, attempts: [trunkAttempt("carrier-a", 0)] })],
+				{ dialedNumber: "+15551234567" },
+			),
+		);
+		expect(h.recordingRequests).toEqual([{ direction: "outbound" }]);
+	});
+
+	it("records nothing when the route does not ask for it", async () => {
+		const h = harness({ reactions: { carrier: { kind: "answer" } }, canRecord: true });
+		await h.walker.walk(
+			walkInput([trunkDialNode("t", { attempts: [trunkAttempt("carrier-a", 0)] })], {
+				dialedNumber: "+15551234567",
+			}),
+		);
+		expect(h.recordingStarts).toBe(0);
+	});
+
+	// Nothing to tap: a recorder started against a carrier that refused the call would produce an
+	// object with no conversation in it and a consent row for a call that never happened.
+	it("records nothing when the carrier refused the call", async () => {
+		const h = harness({
+			reactions: { carrier: { kind: "reject", cause: "USER_BUSY" } },
+			canRecord: true,
+		});
+		await h.walker.walk(
+			walkInput(
+				[trunkDialNode("t", { recordEnabled: true, attempts: [trunkAttempt("carrier-a", 0)] })],
+				{ dialedNumber: "+15551234567" },
+			),
+		);
+		expect(h.recordingStarts).toBe(0);
+	});
+
+	it("connects the call anyway when the recording is refused, and says so", async () => {
+		const h = harness({ reactions: { carrier: { kind: "answer" } }, canRecord: false });
+		const outcome = await h.walker.walk(
+			walkInput(
+				[trunkDialNode("t", { recordEnabled: true, attempts: [trunkAttempt("carrier-a", 0)] })],
+				{ dialedNumber: "+15551234567" },
+			),
+		);
+		expect(outcome.status).toBe("bridged");
+		expect(outcome.notes.join(" ")).toContain("outbound route route-t");
+	});
+
+	it("says out loud when a recorded route has no call-control port at all", async () => {
+		const h = harness({ reactions: { carrier: { kind: "answer" } } });
+		const outcome = await h.walker.walk(
+			walkInput(
+				[trunkDialNode("t", { recordEnabled: true, attempts: [trunkAttempt("carrier-a", 0)] })],
+				{ dialedNumber: "+15551234567" },
+			),
+		);
+		expect(outcome.status).toBe("bridged");
+		expect(outcome.notes.join(" ")).toContain("no call-control port");
+	});
+});
+
+describe("the toll-fraud gate on a trunk dial", () => {
+	// A guard that answers from a literal and records what it was asked, which is the whole point of
+	// the port: the decision itself is proved in the api's own policy specs.
+	function guard(verdict: TollFraudGuardVerdict): {
+		port: TollFraudGuardPort;
+		asked: { organizationId: string; extensionNumber?: string; dialedNumber: string }[];
+	} {
+		const asked: { organizationId: string; extensionNumber?: string; dialedNumber: string }[] = [];
+		return {
+			asked,
+			port: {
+				authorize: async (request) => {
+					asked.push({
+						organizationId: request.organizationId,
+						...(request.extensionNumber === undefined
+							? {}
+							: { extensionNumber: request.extensionNumber }),
+						dialedNumber: request.dialedNumber,
+					});
+					return await Promise.resolve(verdict);
+				},
+			},
+		};
+	}
+
+	it("refuses before any INVITE and before ringback, and names the reason in the notes", async () => {
+		const gate = guard({
+			kind: "refuse",
+			reason: "DESTINATION_COUNTRY_BLOCKED",
+			detail: "calls to RU are blocked for this organization",
+		});
+		const h = harness({ reactions: { carrier: { kind: "answer" } }, tollFraudGuard: gate.port });
+
+		const outcome = await h.walker.walk(
+			walkInput([trunkDialNode("t", { attempts: [trunkAttempt("carrier-a", 0)] })], {
+				dialedNumber: "+79001234567",
+				callerIdNumber: "1001",
+			}),
+		);
+
+		expect(outcome.status).toBe("hangup");
+		expect(outcome.hangupCause).toBe("OUTGOING_CALL_BARRED");
+		// Nothing was offered to the carrier: the refusal is local, ahead of the first INVITE.
+		expect(h.media.originated()).toEqual([]);
+		expect(outcome.notes.join(" ")).toContain("calls to RU are blocked");
+		expect(gate.asked).toEqual([
+			{ organizationId: ORG_ID, extensionNumber: "1001", dialedNumber: "+79001234567" },
+		]);
+	});
+
+	it("takes the route's own failover branch when the route has one", async () => {
+		const gate = guard({
+			kind: "refuse",
+			reason: "INTERNATIONAL_MINUTES_EXCEEDED",
+			detail: "this organization is over its international minutes for the hour",
+		});
+		const h = harness({ reactions: { carrier: { kind: "answer" } }, tollFraudGuard: gate.port });
+
+		const outcome = await h.walker.walk(
+			walkInput(
+				[
+					trunkDialNode("t", {
+						failoverNodeId: "vm",
+						attempts: [trunkAttempt("carrier-a", 0)],
+					}),
+					voicemailNode("vm", { mode: "check" }),
+				],
+				{ dialedNumber: "+4915112345678" },
+			),
+		);
+
+		expect(outcome.visited).toEqual(["t", "vm"]);
+		expect(h.media.originated()).toEqual([]);
+	});
+
+	it("dials exactly as before when the guard allows, and when there is no guard at all", async () => {
+		const gate = guard({ kind: "allow" });
+		const allowed = harness({
+			reactions: { carrier: { kind: "answer" } },
+			tollFraudGuard: gate.port,
+		});
+		const withGuard = await allowed.walker.walk(
+			walkInput([trunkDialNode("t", { attempts: [trunkAttempt("carrier-a", 0)] })], {
+				dialedNumber: "+1",
+			}),
+		);
+		expect(withGuard.status).toBe("bridged");
+		expect(allowed.media.originated().map((call) => call.endpoint)).toEqual(["PJSIP/+1@carrier-a"]);
+
+		// The absent-port arm is the additive guarantee: a deployment that enforces nothing behaves
+		// exactly as every release before this one did.
+		const none = harness({ reactions: { carrier: { kind: "answer" } } });
+		const without = await none.walker.walk(
+			walkInput([trunkDialNode("t", { attempts: [trunkAttempt("carrier-a", 0)] })], {
+				dialedNumber: "+1",
+			}),
+		);
+		expect(without.status).toBe("bridged");
+		expect(none.media.originated().map((call) => call.endpoint)).toEqual(["PJSIP/+1@carrier-a"]);
 	});
 });

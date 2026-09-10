@@ -1,6 +1,11 @@
 import { idleMsOf, isEligibleForDistribution, isStaffing } from "./agent-state";
-import type { AgentStateEntry, QueueMembership, QueueMembershipAgent } from "@optimiq-voice/events";
-import type { QueueStrategy } from "@optimiq-voice/routing";
+import type {
+	AgentStateEntry,
+	QueueMembership,
+	QueueMembershipAgent,
+	QueueSkillRequirement,
+} from "@optimiq-voice/events";
+import type { QueueSkillRequirementPlan, QueueStrategy } from "@optimiq-voice/routing";
 
 /**
  * Queue distribution: which agent (or agents) a waiting caller reaches next.
@@ -41,6 +46,14 @@ import type { QueueStrategy } from "@optimiq-voice/routing";
  * `tierRulesApply` / `tierRuleWaitSeconds` / `tierRuleNoAgentNoWait` decide which LEVELS are open to
  * a caller who has waited a given time — see {@link openLevels}. They run before the comparator, so
  * every strategy honours them identically and none of them has to know they exist.
+ *
+ * ## Skills are a filter, for exactly the same reason
+ *
+ * A queue that asks for `spanish: 3` has not asked for a seventh strategy — it has said that some
+ * seats cannot take this caller. So the requirement is applied where the tier rules are, BEFORE the
+ * comparator, and `longest-idle` over a skilled pool is still `longest-idle`. See
+ * {@link effectiveSkillBars} for how a bar drops as the caller waits, and
+ * {@link mergeSkillRequirements} for what happens when the queue and the entrance both ask.
  */
 
 /** One agent, joined with the live state the selection needs. */
@@ -59,6 +72,18 @@ export interface QueueSelection {
 	readonly fanOut: "one" | "all";
 	/** Levels that were open to this caller at selection time. For the log and the specs. */
 	readonly openLevels: readonly number[];
+	/** The skill bars applied at selection time, after relaxation. For the log and the specs. */
+	readonly skillBars: readonly QueueSkillBar[];
+	/**
+	 * How many otherwise-reachable agents the skill bars alone removed, on a pass that ended with
+	 * nobody.
+	 *
+	 * Always 0 when somebody was selected, because the question it answers only has consequences
+	 * when the answer is nobody: "nobody qualified" and "nobody is logged in" are the same silence
+	 * to a caller and completely different problems to the supervisor fixing it. Computing it costs
+	 * a second pass over the roster and is therefore only done when the first one came back empty.
+	 */
+	readonly skilledOut: number;
 }
 
 export interface SelectionInput {
@@ -74,6 +99,11 @@ export interface SelectionInput {
 	 * not immediately re-ring the phone that just rang out.
 	 */
 	readonly excludedAgentIds?: ReadonlySet<string>;
+	/**
+	 * What this caller needs from an agent — the queue's own requirements already merged with the
+	 * entrance's. See {@link mergeSkillRequirements}; absent or empty means anybody may take them.
+	 */
+	readonly skillRequirements?: readonly QueueSkillRequirement[];
 	/** Where `round-robin` resumes: the agent id it selected last for this queue. */
 	readonly roundRobinAfterAgentId?: string;
 	/** Injected for `random`, so a spec is deterministic. */
@@ -162,21 +192,110 @@ export function compareByIdle(left: QueueCandidate, right: QueueCandidate): numb
 	return compareByTier(left, right);
 }
 
+/** One skill and the level an agent must have reached to take this caller, right now. */
+export interface QueueSkillBar {
+	readonly skill: string;
+	/** After relaxation. `0` is a bar nobody can fail and is therefore never applied. */
+	readonly minLevel: number;
+}
+
+/**
+ * The queue's requirements and the entrance's, as one set.
+ *
+ * Where both name the same skill the HIGHER `minLevel` wins, and the reasoning is written down on
+ * `QueuePlanNode.requiredSkills`: a queue insisting on level 3 and a door insisting on level 4 have
+ * each been told something the other has not, and taking the lower would let an IVR option quietly
+ * weaken the queue's own bar. The winner brings its own `relaxAfterSeconds` with it — the pair is
+ * one statement ("level 4, and I will come down from it this fast"), and splitting it would produce
+ * a bar neither side asked for.
+ */
+export function mergeSkillRequirements(
+	queue: readonly QueueSkillRequirement[] | undefined,
+	entrance: readonly QueueSkillRequirementPlan[] | undefined,
+): readonly QueueSkillRequirement[] {
+	const merged = new Map<string, QueueSkillRequirement>();
+	for (const requirement of [...(queue ?? []), ...(entrance ?? [])]) {
+		const existing = merged.get(requirement.skill);
+		if (existing === undefined || requirement.minLevel > existing.minLevel) {
+			merged.set(requirement.skill, requirement);
+		}
+	}
+	return [...merged.values()];
+}
+
+const SKILL_LEVEL_ABSENT = 0;
+
+/**
+ * What each requirement actually demands of an agent after `waitedMs` of waiting.
+ *
+ * `relaxAfterSeconds` of 0 never relaxes — the bar stays at `minLevel` for as long as the caller is
+ * prepared to hold, which is the correct and only safe reading for a regulated skill. Otherwise the
+ * bar drops one level per whole `relaxAfterSeconds` elapsed and floors at 0, which excludes nobody:
+ * a queue that has waited long enough has said it would rather be answered than be answered well.
+ */
+export function effectiveSkillBars(
+	requirements: readonly QueueSkillRequirement[] | undefined,
+	waitedMs: number,
+): readonly QueueSkillBar[] {
+	if (requirements === undefined || requirements.length === 0) {
+		return [];
+	}
+	return requirements.map((requirement) => {
+		if (requirement.relaxAfterSeconds === 0) {
+			return { skill: requirement.skill, minLevel: requirement.minLevel };
+		}
+		const steps = Math.floor(waitedMs / (requirement.relaxAfterSeconds * MILLIS_PER_SECOND));
+		return {
+			skill: requirement.skill,
+			minLevel: Math.max(0, requirement.minLevel - steps),
+		};
+	});
+}
+
+/**
+ * Whether one agent clears every bar.
+ *
+ * A skill the agent has no row for is level 0, which is not the same as being unskilled at it — see
+ * `queueMembershipAgentSchema.skills`. It only costs them a queue whose bar has not yet relaxed
+ * to 0.
+ */
+export function clearsSkillBars(
+	agent: QueueMembershipAgent,
+	bars: readonly QueueSkillBar[],
+): boolean {
+	for (const bar of bars) {
+		if (bar.minLevel <= 0) {
+			continue;
+		}
+		const level =
+			agent.skills?.find((skill) => skill.skill === bar.skill)?.level ?? SKILL_LEVEL_ABSENT;
+		if (level < bar.minLevel) {
+			return false;
+		}
+	}
+	return true;
+}
+
 /**
  * Joins the roster with live state and drops everyone who cannot be rung.
  *
- * Four filters, in the order a human would apply them: the seat is enabled, the level is open, the
- * agent has not already been tried by this caller, and their live state says eligible.
+ * Five filters, in the order a human would apply them: the seat is enabled, the level is open, the
+ * agent has not already been tried by this caller, their live state says eligible, and they clear
+ * the caller's skill bars. The last one is here rather than in a comparator for the reason the
+ * levels are — see this file's header.
  */
 export function eligibleCandidates(input: {
 	readonly membership: QueueMembership;
 	readonly states: ReadonlyMap<string, AgentStateEntry>;
 	readonly openLevels: readonly number[];
 	readonly excludedAgentIds?: ReadonlySet<string>;
+	/** Already relaxed for this caller's wait. Empty means the queue asks for nothing. */
+	readonly skillBars?: readonly QueueSkillBar[];
 	readonly now: number;
 	readonly isEligible: (state: AgentStateEntry | undefined, now: number) => boolean;
 }): readonly QueueCandidate[] {
 	const open = new Set(input.openLevels);
+	const bars = input.skillBars ?? [];
 	const candidates: QueueCandidate[] = [];
 
 	for (const agent of input.membership.agents) {
@@ -188,6 +307,9 @@ export function eligibleCandidates(input: {
 		}
 		const state = input.states.get(agent.agentId);
 		if (!input.isEligible(state, input.now) || state === undefined) {
+			continue;
+		}
+		if (!clearsSkillBars(agent, bars)) {
 			continue;
 		}
 		candidates.push({ agent, state, idleMs: idleMsOf(state, input.now) });
@@ -261,14 +383,20 @@ export function selectAgents(input: SelectionInput): QueueSelection {
 		staffingAgentIds: staffing,
 	});
 
-	const candidates = eligibleCandidates({
+	const bars = effectiveSkillBars(input.skillRequirements, input.waitedMs);
+
+	const common = {
 		membership: input.membership,
 		states: input.states,
 		openLevels: levels,
 		...(input.excludedAgentIds === undefined ? {} : { excludedAgentIds: input.excludedAgentIds }),
 		now: input.now,
 		isEligible: isEligibleForDistribution,
-	});
+	};
+
+	const candidates = eligibleCandidates({ ...common, skillBars: bars });
+	const skilledOut =
+		candidates.length === 0 && bars.length > 0 ? eligibleCandidates(common).length : 0;
 
 	const ordered = orderFor(input, candidates);
 
@@ -277,6 +405,8 @@ export function selectAgents(input: SelectionInput): QueueSelection {
 		ordered,
 		fanOut: input.strategy === "ring-all" ? "all" : "one",
 		openLevels: levels,
+		skillBars: bars,
+		skilledOut,
 	};
 }
 

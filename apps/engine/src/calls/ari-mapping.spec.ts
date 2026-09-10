@@ -311,7 +311,13 @@ describe("toMediaEvent", () => {
 		expect(mapped("ChannelCreated", { channel: CHANNEL })).toBeUndefined();
 		expect(mapped("ChannelDialplan", { channel: CHANNEL })).toBeUndefined();
 		expect(mapped("PlaybackStarted", { playback })).toBeUndefined();
+		// `PlaybackFinished` is NOT in this list any more — the consent gate consumes it. What still
+		// drops is a playback that names no leg: one aimed at a bridge reaches everyone in it and
+		// nobody in particular, which is not a fact about whether one PARTY was told anything.
 		expect(mapped("PlaybackFinished", { playback })).toBeUndefined();
+		expect(
+			mapped("PlaybackFinished", { playback: { ...playback, target_uri: "bridge:b1" } }),
+		).toBeUndefined();
 		expect(mapped("BridgeCreated", { bridge })).toBeUndefined();
 		expect(mapped("BridgeDestroyed", { bridge })).toBeUndefined();
 		expect(mapped("ChannelEnteredBridge", { bridge, channel: CHANNEL })).toBeUndefined();
@@ -405,7 +411,12 @@ describe("toMediaEvent", () => {
 	it("can produce every member of MediaEvent from a real frame", () => {
 		const bridge = { id: "b1", technology: "simple_bridge" };
 		const recording = { name: "call-1", format: "wav", target_uri: "", state: "done" };
-		const playback = { id: "p1", media_uri: "sound:hello", target_uri: "", state: "done" };
+		const playback = {
+			id: "p1",
+			media_uri: "sound:hello",
+			target_uri: `channel:${CHANNEL.id}`,
+			state: "done",
+		};
 		const produced = new Set(
 			ARI_EVENT_TYPES.map(
 				(type) =>

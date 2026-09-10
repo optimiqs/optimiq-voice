@@ -5,10 +5,13 @@ import { QueueWaitingStore } from "./queue-waiting.store";
 import type {
 	AgentStatePort,
 	AgentTransitionRequest,
+	QueueAfterCallPort,
 	QueueCallbackSchedulePort,
+	QueueDispositionReport,
 	QueueEventPort,
 	QueueMembershipPort,
 	QueueServices,
+	QueueSurveyReport,
 } from "./queue-session";
 import type {
 	AgentStateEntry,
@@ -102,6 +105,9 @@ export interface RecordedTransition {
 	readonly callId: string;
 	readonly availableAt?: number;
 	readonly noAnswerCount?: number;
+	readonly reason?: string;
+	readonly dispositionCallId?: string;
+	readonly dispositionRequired?: boolean;
 	readonly refused?: boolean;
 }
 
@@ -219,6 +225,12 @@ export function makeFakeAgentStateStore(orgId: string, now: () => number): FakeA
 					? { callId: request.callId }
 					: {}),
 				...(request.legId === undefined ? {} : { legId: request.legId }),
+				...(request.dispositionCallId === undefined
+					? {}
+					: { dispositionCallId: request.dispositionCallId }),
+				...(request.dispositionRequired === undefined
+					? {}
+					: { dispositionRequired: request.dispositionRequired }),
 				...(request.reason === undefined ? {} : { reason: request.reason }),
 			};
 			entries.set(request.agentId, next);
@@ -229,6 +241,13 @@ export function makeFakeAgentStateStore(orgId: string, now: () => number): FakeA
 				callId: request.callId,
 				...(request.availableAt === undefined ? {} : { availableAt: request.availableAt }),
 				...(request.noAnswerCount === undefined ? {} : { noAnswerCount: request.noAnswerCount }),
+				...(request.reason === undefined ? {} : { reason: request.reason }),
+				...(request.dispositionCallId === undefined
+					? {}
+					: { dispositionCallId: request.dispositionCallId }),
+				...(request.dispositionRequired === undefined
+					? {}
+					: { dispositionRequired: request.dispositionRequired }),
 			});
 			return next;
 		},
@@ -269,6 +288,30 @@ export function makeFakeQueueEventPort(): FakeQueueEventPort {
 }
 
 // ---------------------------------------------------------------------------------------------
+// After-call records
+// ---------------------------------------------------------------------------------------------
+
+export interface FakeQueueAfterCallPort extends QueueAfterCallPort {
+	readonly dispositions: QueueDispositionReport[];
+	readonly surveys: QueueSurveyReport[];
+}
+
+export function makeFakeQueueAfterCallPort(): FakeQueueAfterCallPort {
+	const dispositions: QueueDispositionReport[] = [];
+	const surveys: QueueSurveyReport[] = [];
+	return {
+		dispositions,
+		surveys,
+		disposition: async (report) => {
+			dispositions.push(report);
+		},
+		surveyAnswered: async (report) => {
+			surveys.push(report);
+		},
+	};
+}
+
+// ---------------------------------------------------------------------------------------------
 // The bundle
 // ---------------------------------------------------------------------------------------------
 
@@ -280,6 +323,7 @@ export interface FakeQueueServices extends QueueServices {
 	readonly cursor: QueueCursors;
 	/** Writable so a spec can watch which queues the session hands to the callback sweep. */
 	callbacks?: QueueCallbackSchedulePort;
+	readonly afterCall: FakeQueueAfterCallPort;
 }
 
 /**
@@ -317,5 +361,6 @@ export function makeFakeQueueServices(input: {
 		// implementation of the ordering — and the ordering is the thing under test.
 		waiting: new QueueWaitingStore({ queueWaiting: undefined } as never),
 		cursor: new QueueCursors(),
+		afterCall: makeFakeQueueAfterCallPort(),
 	};
 }

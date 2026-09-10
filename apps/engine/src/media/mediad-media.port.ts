@@ -203,6 +203,11 @@ export class MediadMediaPort implements MediaPort {
 		readonly legId?: string;
 		readonly sdpOffer: string;
 		readonly direction?: "sendrecv" | "sendonly" | "recvonly" | "inactive";
+		/**
+		 * SDES-SRTP for THIS leg, overriding `MEDIAD_SRTP_POLICY`. Absent means "the media plane
+		 * decides", which is byte-for-byte the request every caller written before this field sent.
+		 */
+		readonly srtpPolicy?: "prefer" | "require" | "disable";
 	}): Promise<MediaAllocateSessionResponse> {
 		const response = await this.call(
 			RPC_SUBJECTS.mediaAllocateSession,
@@ -213,6 +218,7 @@ export class MediadMediaPort implements MediaPort {
 				...(request.legId === undefined ? {} : { legId: request.legId }),
 				sdpOffer: request.sdpOffer,
 				direction: request.direction ?? "sendrecv",
+				...(request.srtpPolicy === undefined ? {} : { srtpPolicy: request.srtpPolicy }),
 			},
 			mediaAllocateSessionResponseSchema,
 		);
@@ -240,6 +246,11 @@ export class MediadMediaPort implements MediaPort {
 		readonly callId: string;
 		readonly legId?: string;
 		readonly direction?: "sendrecv" | "sendonly" | "recvonly" | "inactive";
+		/**
+		 * SDES-SRTP for THIS leg, overriding `MEDIAD_SRTP_POLICY`. Absent means "the media plane
+		 * decides", which is byte-for-byte the request every caller written before this field sent.
+		 */
+		readonly srtpPolicy?: "prefer" | "require" | "disable";
 	}): Promise<MediaCreateOfferResponse> {
 		const response = await this.callRaw(
 			RPC_SUBJECTS.mediaCreateOffer,
@@ -250,6 +261,7 @@ export class MediadMediaPort implements MediaPort {
 				callId: request.callId,
 				...(request.legId === undefined ? {} : { legId: request.legId }),
 				direction: request.direction ?? "sendrecv",
+				...(request.srtpPolicy === undefined ? {} : { srtpPolicy: request.srtpPolicy }),
 			},
 			mediaCreateOfferResponseSchema,
 		);
@@ -271,10 +283,19 @@ export class MediadMediaPort implements MediaPort {
 	async acceptAnswer(request: {
 		readonly sessionId: string;
 		readonly sdpAnswer: string;
+		/**
+		 * SDES-SRTP for THIS leg, overriding `MEDIAD_SRTP_POLICY`. Absent means "the media plane
+		 * decides", which is byte-for-byte the request every caller written before this field sent.
+		 */
+		readonly srtpPolicy?: "prefer" | "require" | "disable";
 	}): Promise<MediaAcceptAnswerResponse> {
 		return await this.callRaw(
 			RPC_SUBJECTS.mediaAcceptAnswer,
-			{ sessionId: request.sessionId, sdpAnswer: request.sdpAnswer },
+			{
+				sessionId: request.sessionId,
+				sdpAnswer: request.sdpAnswer,
+				...(request.srtpPolicy === undefined ? {} : { srtpPolicy: request.srtpPolicy }),
+			},
 			mediaAcceptAnswerResponseSchema,
 		);
 	}
@@ -485,13 +506,15 @@ export class MediadMediaPort implements MediaPort {
 	 * be able to interrupt without this call holding a fiber for the length of the menu. So this is
 	 * one 1 s command, and the end of the prompt is a `media.evt.v1.…playback.finished` event.
 	 *
-	 * ## Why nothing here waits for that event
+	 * ## Why nothing HERE waits for that event
 	 *
-	 * Because nothing above the seam does. The orchestrator's twelve-member `MediaEvent` union has
-	 * no playback member, and on the ARI path `PlaybackFinished` is one of the events `toMediaEvent`
-	 * deliberately drops. `mediad-event-mapping.ts` mirrors that exactly, which is what makes a
-	 * confirmation IVR or a voicemail greeting behave identically on either driver: both learn a
-	 * prompt started from the command's reply and stop it by reference, and neither waits.
+	 * Because the waiting, where any is done, belongs above this port and not inside a command. The
+	 * union does carry a `playback-finished` member now — `mediad-event-mapping.ts` raises it and
+	 * `toMediaEvent` raises the ARI equivalent — but it is republished on a playback signal key and
+	 * read by the one consumer that needs it: the recording-consent gate, which cannot honestly write
+	 * down who was told without knowing what was delivered. A confirmation IVR or a voicemail greeting
+	 * still behaves identically on either driver: both learn a prompt started from the command's
+	 * reply and stop it by reference, and neither waits.
 	 *
 	 * ## The media ref is passed through, not translated
 	 *

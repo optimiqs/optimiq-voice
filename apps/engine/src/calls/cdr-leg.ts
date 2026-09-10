@@ -161,6 +161,23 @@ export interface CdrLegInput {
 	 * not on the phone.
 	 */
 	readonly relatedCallId?: string;
+	/**
+	 * The consent verdict this leg's recording was made under — or refused under.
+	 *
+	 * Four loose fields here rather than the whole {@link import("@optimiq-voice/routing")
+	 * .RecordingConsentRecord} that rides `channel.record.started`, because the two answer different
+	 * questions. The event's record is evidence attached to one audio object and is stored beside
+	 * it. These are COLUMNS on the ledger, and the ledger's question is "which of this tenant's calls
+	 * were recorded, under what, and where" — asked across millions of rows, filtered and grouped,
+	 * by a reviewer who is not going to unpack a jsonb blob to do it.
+	 *
+	 * All four are absent on the overwhelming majority of legs, which is every leg that was never
+	 * recorded and every leg on a tenant with no consent policy.
+	 */
+	readonly recordingConsent?: NonNullable<CdrLegWriteData["recordingConsent"]>;
+	readonly recordingConsentMethod?: NonNullable<CdrLegWriteData["recordingConsentMethod"]>;
+	readonly recordingConsentAt?: string;
+	readonly recordingConsentRegions?: readonly string[];
 }
 
 /**
@@ -219,7 +236,98 @@ export function buildCdrLegWrite(input: CdrLegInput): CdrLegWriteData {
 		// The cross-CALL link, omitted on the overwhelming majority of legs that settle nothing. See
 		// `CdrLegInput.relatedCallId`.
 		...(input.relatedCallId === undefined ? {} : { relatedCallId: input.relatedCallId }),
+		// Omitted rather than nulled, on the same rule the queue fields follow: the payload is a
+		// `looseObject`, so a null on a leg that was never recorded would be a null in `raw` for every
+		// call in the tenant.
+		...(input.recordingConsent === undefined ? {} : { recordingConsent: input.recordingConsent }),
+		...(input.recordingConsentMethod === undefined
+			? {}
+			: { recordingConsentMethod: input.recordingConsentMethod }),
+		...(input.recordingConsentAt === undefined
+			? {}
+			: { recordingConsentAt: input.recordingConsentAt }),
+		...(input.recordingConsentRegions === undefined
+			? {}
+			: { recordingConsentRegions: [...input.recordingConsentRegions] }),
 	};
+}
+
+/**
+ * The consent verdict off the leg's channel variables.
+ *
+ * Symmetric with {@link attestationOf} and mirrored the same way and for the same reason: the CDR
+ * is written by whichever of teardown and the walk's return gets there first, only the variables
+ * are visible to both, and they travel into the `channels` bucket so a replica adopting the leg
+ * after a failover writes the same record.
+ *
+ * ALL-OR-NOTHING on the outcome, like {@link queueLegOf} and unlike {@link attestationOf}. The
+ * outcome is what makes the rest mean anything: a method with no outcome does not say a call was
+ * announced, it says a variable was half-written, and "announcement" filed against a call with no
+ * verdict is worse than no row at all in the one report these columns exist for. The instant and
+ * the regions are then taken on their own, because either can legitimately be missing — an engine
+ * that lost its clock write still knows the caller declined, and a call with no jurisdiction match
+ * has no regions by construction.
+ *
+ * The regions parse defensively for the reason the queue wait does: a channel variable is a string
+ * a media server echoed, and a JSON blob that came back malformed must put nothing in the column
+ * rather than an exception on the teardown path.
+ */
+export function recordingConsentOf(variables: Readonly<Record<string, string | undefined>>): {
+	recordingConsent?: NonNullable<CdrLegWriteData["recordingConsent"]>;
+	recordingConsentMethod?: NonNullable<CdrLegWriteData["recordingConsentMethod"]>;
+	recordingConsentAt?: string;
+	recordingConsentRegions?: readonly string[];
+} {
+	const outcome = variables.OPTIMIQ_RECORDING_CONSENT;
+	if (outcome === undefined || !isConsentOutcome(outcome)) {
+		return {};
+	}
+	const method = variables.OPTIMIQ_RECORDING_CONSENT_METHOD;
+	const at = variables.OPTIMIQ_RECORDING_CONSENT_AT;
+	const regions = parseConsentRegions(variables.OPTIMIQ_RECORDING_CONSENT_REGIONS);
+	return {
+		recordingConsent: outcome,
+		...(method === undefined || !isConsentMethod(method) ? {} : { recordingConsentMethod: method }),
+		...(at === undefined || at === "" ? {} : { recordingConsentAt: at }),
+		...(regions === undefined ? {} : { recordingConsentRegions: regions }),
+	};
+}
+
+const CONSENT_OUTCOMES: readonly string[] = ["not-required", "announced", "accepted", "declined"];
+const CONSENT_METHODS: readonly string[] = ["none", "announcement", "keypress"];
+
+function isConsentOutcome(
+	value: string,
+): value is NonNullable<CdrLegWriteData["recordingConsent"]> {
+	return CONSENT_OUTCOMES.includes(value);
+}
+
+function isConsentMethod(
+	value: string,
+): value is NonNullable<CdrLegWriteData["recordingConsentMethod"]> {
+	return CONSENT_METHODS.includes(value);
+}
+
+function parseConsentRegions(raw: string | undefined): readonly string[] | undefined {
+	if (raw === undefined || raw === "") {
+		return undefined;
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return undefined;
+	}
+	if (!Array.isArray(parsed)) {
+		return undefined;
+	}
+	const regions = parsed.filter(
+		(entry): entry is string => typeof entry === "string" && entry.length > 0,
+	);
+	// The wire caps both the count and each entry's length; a variable that arrived longer is
+	// truncated here rather than rejected, because a leg's CDR must not be lost to a malformed
+	// sixteenth region.
+	return regions.length === 0 ? undefined : regions.slice(0, 16).map((entry) => entry.slice(0, 16));
 }
 
 /**
@@ -315,6 +423,42 @@ export function attestationOf(variables: Readonly<Record<string, string | undefi
 		...(verstat === undefined || verstat === "" ? {} : { sipVerstat: verstat.slice(0, 64) }),
 		...(origId === undefined || origId === "" ? {} : { sipOrigId: origId.slice(0, 128) }),
 	};
+}
+
+/**
+ * The bare number out of a caller identity as the media server was given it.
+ *
+ * The walker composes what it hands the media server — `"Ada" <+13125557001>` when there is a name,
+ * the number alone when there is not — and that composed string is the only place the **effective**
+ * caller id exists by the time a leg is created. The leg's own profile is inherited from the A-leg,
+ * so a handset dialling out through a trunk that overrides its caller id would file the EXTENSION
+ * number (`7001`) in `call_legs.from_number` while the carrier saw `+13125557001`.
+ *
+ * That is not a cosmetic difference. `AttestationPolicyService`'s backfill stamps
+ * `expected_attestation` only when `from_number` is already an E.164, precisely because looking up
+ * `7001` in the owned-DID table would miss and record **C** on a call attested **A** — a wrong level
+ * in a compliance ledger being worse than an absent one. Filing the number actually presented is
+ * what lets that guard fire on a handset-originated call.
+ *
+ * CLIR does not change the answer: a withheld number is still the identity presented to the carrier
+ * (in `P-Asserted-Identity`), and the presentation decision travels as its own field. What comes
+ * back here is the number, never the display name, and never the angle brackets.
+ *
+ * `undefined` for a name-only identity (`"Ada"`), for an empty one, and for an absent one — in every
+ * such case the leg keeps whatever its profile already said, which is today's behaviour exactly.
+ */
+export function presentedCallerIdNumber(callerId: string | undefined): string | undefined {
+	if (callerId === undefined) {
+		return undefined;
+	}
+	const angled = /<([^>]*)>\s*$/.exec(callerId);
+	const raw = (angled?.[1] ?? callerId).trim();
+	// A name-only composition is `"Ada"` — quoted, and no number at all. Returning `Ada` from it
+	// would put a display name in an E.164 column.
+	if (raw === "" || raw.startsWith('"')) {
+		return undefined;
+	}
+	return raw;
 }
 
 const QUEUE_OUTCOMES: readonly string[] = [

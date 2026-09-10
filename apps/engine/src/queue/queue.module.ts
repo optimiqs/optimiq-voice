@@ -1,5 +1,6 @@
 import { Global, Module } from "@nestjs/common";
 import { AgentStateStore } from "./agent-state.store";
+import { QueueAfterCallClient } from "./queue-after-call.client";
 import { QueueCallbackDialerService } from "./queue-callback.dialer";
 import { QueueCallbackScheduler } from "./queue-callback.scheduler";
 import { QueueEventPublisher } from "./queue-event-publisher.service";
@@ -30,11 +31,18 @@ import { QueueWaitingStore } from "./queue-waiting.store";
  * to be a singleton for the reason the cursors do: two schedulers would be two sweeps over the same
  * tokens, and a token read twice before either pass recorded its attempt is a customer rung twice.
  * Its timer is cleared on `onApplicationShutdown`, so a draining engine leaks nothing.
+ *
+ * {@link QueueAfterCallClient} is a provider on the ordinary terms — it is stateless apart from two
+ * counters and holds the shared `ClientProxy` — and it is what makes `QueueServices.afterCall` real.
+ * Without it the engine ran the wrap-up timer and the whole post-call survey and then dropped both
+ * results on the floor with a note, which is the behaviour `QueueAfterCallPort`'s "a session
+ * with no port notes what it would have reported" sentence describes and nobody wanted deployed.
  */
 @Global()
 @Module({
 	providers: [
 		QueueEventPublisher,
+		QueueAfterCallClient,
 		QueueCallbackDialerService,
 		QueueCallbackScheduler,
 		AgentStateStore,
@@ -44,6 +52,7 @@ import { QueueWaitingStore } from "./queue-waiting.store";
 	],
 	exports: [
 		QueueEventPublisher,
+		QueueAfterCallClient,
 		QueueCallbackScheduler,
 		AgentStateStore,
 		QueueMembershipSource,

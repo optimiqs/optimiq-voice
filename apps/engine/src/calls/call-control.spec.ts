@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { kvKeyFor } from "@optimiq-voice/events";
 import { makeFakeMediaPort } from "../media/media-port.fake";
+import { PlaybackSignalBus, playbackSignalKey } from "../media/playback-signals";
 import { FakeClaimBucket } from "../nats/claim-store.fake";
 import { CallSignalBus, legSignalKey, recordingSignalKey } from "../routing/call-signals";
 import { CLAIM_LEASE_MS, ParkRegistry } from "../routing/park-registry";
@@ -11,6 +12,7 @@ import type { FakeMediaPortOptions } from "../media/media-port.fake";
 import type { ClaimBucket } from "../nats/claim-store";
 import type {
 	CallControlHost,
+	CallControlSettings,
 	ControlledLeg,
 	ParkLot,
 	PickupCandidate,
@@ -22,7 +24,9 @@ import type {
 	SupervisionTarget,
 } from "./call-control";
 import type { ParkHandoffClient } from "./park-handoff";
+import type { ResolvedRecordingConsent } from "./recording-consent";
 import type { CallEvent, ParkClaim, TapMode } from "@optimiq-voice/events";
+import type { RecordingConsentRecord } from "@optimiq-voice/routing";
 import type { CallState, ChannelFlag, ChannelState, HangupCause } from "@optimiq-voice/telephony";
 
 /**
@@ -158,10 +162,33 @@ interface HarnessOptions {
 	readonly sharedLines?: SharedLineControlPort;
 	/** The line the artifact describes, for the recall's appearance numbers. */
 	readonly sharedLine?: SharedLine;
+	/** Deployment knobs a case needs to move — the consent budget, mostly. */
+	readonly settings?: Partial<CallControlSettings>;
+	/**
+	 * Channels whose playbacks the media plane reports as having delivered NO audio (`playedMs 0`).
+	 *
+	 * The live failure, in a fake: `mediad` accepts the prompt, schedules it, writes every frame into
+	 * a transport with no peer, and says so afterwards. Everything about the call looks healthy and
+	 * one number is zero.
+	 */
+	readonly silentChannels?: readonly string[];
+	/** Channels whose playbacks never finish at all — the media plane went quiet mid-prompt. */
+	readonly neverFinishingChannels?: readonly string[];
+	/**
+	 * Channels whose media path comes UP after this many attempts — a browser finishing its DTLS.
+	 *
+	 * The live sequence, as a fake: the first prompts are accepted, written and delivered to nobody,
+	 * and then the handshake completes and the same prompt lands.
+	 */
+	readonly deliversAfterAttempts?: Readonly<Record<string, number>>;
 }
 
 function harness(options: HarnessOptions = {}) {
 	const signals = new CallSignalBus();
+	const playbacks = new PlaybackSignalBus();
+	/** Channels the media plane currently delivers nothing to. Mutable: a handshake completes. */
+	const silent = new Set(options.silentChannels ?? []);
+	const attemptsPerChannel = new Map<string, number>();
 	const now = options.now ?? (() => 1_000);
 	const parks = new ParkRegistry();
 	if (options.claims !== undefined) {
@@ -170,6 +197,8 @@ function harness(options: HarnessOptions = {}) {
 	const published: PublishedEvent[] = [];
 	/** Every `markRecording` the runtime made, in order — the snapshot flags a live surface reads. */
 	const recordingFlags: { legId: string; active: boolean; paused: boolean }[] = [];
+	/** Every consent verdict the runtime filed, in order — what the CDR's four columns are built from. */
+	const consentRecords: { legId: string; record: RecordingConsentRecord }[] = [];
 	const routes: RouteRequest[] = [];
 	const legs = new Map<string, FakeLeg>(
 		(options.legs ?? []).map((leg) => [leg.mediaChannelId, leg]),
@@ -192,6 +221,38 @@ function harness(options: HarnessOptions = {}) {
 		},
 	});
 
+	// The media plane's account of what it DELIVERED, which is what the consent gate now waits for.
+	// Installed as an accessor rather than by wrapping the method once, so that a case which replaces
+	// `play` outright — several do, to make one channel refuse — still gets the completion for the
+	// channels that did play. A fake that only reported delivery on the default `play` would make
+	// those cases prove the opposite of what they say.
+	let play = media.play.bind(media);
+	Object.defineProperty(media, "play", {
+		configurable: true,
+		get: () => async (channelId: string, request: { readonly playbackRef: string }) => {
+			const result = await play(channelId, request as never);
+			attemptsPerChannel.set(channelId, (attemptsPerChannel.get(channelId) ?? 0) + 1);
+			const comesUpAfter = options.deliversAfterAttempts?.[channelId];
+			if (comesUpAfter !== undefined && (attemptsPerChannel.get(channelId) ?? 0) >= comesUpAfter) {
+				silent.delete(channelId);
+			}
+			if (options.neverFinishingChannels?.includes(channelId) !== true) {
+				playbacks.emit(playbackSignalKey(request.playbackRef), {
+					kind: "playback-finished",
+					playbackRef: request.playbackRef,
+					// `frames written`, as mediad counts them. Zero is a real answer and the one this
+					// whole rung exists to catch.
+					playedMs: silent.has(channelId) ? 0 : 1_040,
+					reason: silent.has(channelId) ? "error" : "completed",
+				});
+			}
+			return result;
+		},
+		set: (replacement: typeof play) => {
+			play = replacement;
+		},
+	});
+
 	// A real media server reports `RecordingFinished` when the object is CLOSED, which is the whole
 	// reason `stopRecording` waits for it. Emitting at `record` time instead would let a truncated
 	// recording pass the spec.
@@ -211,6 +272,9 @@ function harness(options: HarnessOptions = {}) {
 		},
 		markRecording: (leg, state) => {
 			recordingFlags.push({ legId: leg.legId, ...state });
+		},
+		markConsent: (leg, record) => {
+			consentRecords.push({ legId: leg.legId, record });
 		},
 		route: async (leg, request) => {
 			routes.push(request);
@@ -237,6 +301,7 @@ function harness(options: HarnessOptions = {}) {
 	const control = new CallControl({
 		media,
 		signals,
+		playbacks,
 		parks,
 		host,
 		...(options.parkHandoff === undefined ? {} : { parkHandoff: options.parkHandoff }),
@@ -254,7 +319,26 @@ function harness(options: HarnessOptions = {}) {
 		// A short snoop budget, because two specs deliberately let a tap never arrive and the production
 		// default would make each of them wait five real seconds for a timer that has already been
 		// proved correct by the ones that do arrive.
-		settings: { application: "optimiq-engine", recordingFormat: "wav", snoopTimeoutMs: 100 },
+		settings: {
+			application: "optimiq-engine",
+			recordingFormat: "wav",
+			snoopTimeoutMs: 100,
+			// A short consent budget for the same reason: the decline-by-timeout case would otherwise
+			// wait ten real seconds for a timer the accept case has already proved fires correctly.
+			consentKeypressTimeoutMs: 50,
+			// And a short readiness budget, for the third time and the same reason: the spec that
+			// proves a peer who never comes up is left out of the record would otherwise sit through
+			// the production two seconds to watch a timer the ready cases already exercise.
+			consentPeerReadyTimeoutMs: 50,
+			// And a short delivery budget, for the fourth time and the same reason: the spec that
+			// proves a prompt which never finishes is left out of the record would otherwise sit
+			// through the production eight seconds.
+			consentPlaybackTimeoutMs: 50,
+			// And a retry gap far shorter than that, so the cases about a party the media plane never
+			// delivers to exercise the retry loop rather than the budget alone.
+			consentPlaybackRetryMs: 5,
+			...options.settings,
+		},
 		newId: () => `id-${String(++counter)}`,
 		now,
 		setTimer: (fn, ms) => {
@@ -267,9 +351,13 @@ function harness(options: HarnessOptions = {}) {
 		control,
 		media,
 		signals,
+		playbacks,
+		silent,
+		attemptsPerChannel,
 		parks,
 		published,
 		recordingFlags,
+		consentRecords,
 		routes,
 		timers,
 		legs,
@@ -1778,6 +1866,520 @@ describe("on-demand recording", () => {
 			ok: false,
 			reason: "this leg is not being recorded",
 		});
+	});
+});
+
+/**
+ * The consent gate.
+ *
+ * Every case here drives the REAL `startRecording`, so what is asserted is the whole sequence — the
+ * prompt at the right party, the digit on the right key, the recording that did or did not start,
+ * and the record filed either way. The resolution that produces a `ResolvedRecordingConsent` is
+ * proved separately in `recording-consent.spec.ts`; here it is a fixture, because what is under
+ * test is what the gate DOES with one.
+ */
+function consent(overrides: Partial<ResolvedRecordingConsent> = {}): ResolvedRecordingConsent {
+	return {
+		policy: "announce",
+		acceptDigit: "1",
+		declineDigit: "2",
+		parties: ["caller"],
+		regions: [],
+		...overrides,
+	};
+}
+
+/** Every channel a consent prompt was played at, in order. */
+function playedAt(h: ReturnType<typeof harness>): string[] {
+	return h.media.calls
+		.filter((call) => call.method === "play")
+		.map((call) => call.args[0] as string);
+}
+
+describe("recording consent", () => {
+	it("records exactly as before when the policy is `none`, and says so", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+
+		const outcome = await h.control.startRecording(leg, {
+			consent: consent({ policy: "none", parties: [] }),
+		});
+
+		expect(outcome.result.ok).toBe(true);
+		expect(playedAt(h)).toEqual([]);
+		expect(outcome.consent).toMatchObject({
+			outcome: "not-required",
+			method: "none",
+			policy: "none",
+			parties: [],
+		});
+		expect(h.consentRecords).toHaveLength(1);
+		expect(h.eventsOf("channel.record.started")[0]?.data).toMatchObject({
+			consent: { outcome: "not-required" },
+		});
+	});
+
+	it("behaves like every release before the gate when no consent is supplied at all", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+
+		const outcome = await h.control.startRecording(leg);
+
+		expect(outcome.result.ok).toBe(true);
+		expect(outcome.consent).toBeUndefined();
+		expect(h.consentRecords).toEqual([]);
+		expect(h.eventsOf("channel.record.started")[0]?.data).not.toHaveProperty("consent");
+	});
+
+	it("announces to the recorded leg alone when only one party is owed it", async () => {
+		const agent = fakeLeg("a");
+		const caller = fakeLeg("c");
+		bridgePair(agent, caller);
+		const h = harness({ legs: [agent, caller] });
+
+		const outcome = await h.control.startRecording(agent, { consent: consent() });
+
+		expect(playedAt(h)).toEqual(["a"]);
+		expect(outcome.consent).toMatchObject({ outcome: "announced", method: "announcement" });
+		expect(outcome.consent?.parties).toEqual(["caller"]);
+	});
+
+	it("announces to BOTH parties on an all-party call, and names the region that forced it", async () => {
+		const agent = fakeLeg("a");
+		const caller = fakeLeg("c");
+		bridgePair(agent, caller);
+		const h = harness({ legs: [agent, caller] });
+
+		const outcome = await h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"], regions: ["US-CA"] }),
+		});
+
+		expect(playedAt(h)).toEqual(["a", "c"]);
+		expect(outcome.consent?.regions).toEqual(["US-CA"]);
+	});
+
+	it("announces to the FAR END of an outbound recorded call, which is the peer leg", async () => {
+		// The agent's own leg is what the walk put the recorder on; the customer is the peer, and the
+		// customer is the party the announcement exists for.
+		const agent = fakeLeg("agent");
+		const customer = fakeLeg("customer");
+		bridgePair(agent, customer);
+		const h = harness({ legs: [agent, customer] });
+
+		await h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+
+		expect(playedAt(h)).toContain("customer");
+	});
+
+	it("plays the tenant's prompt when it has one, and the seeded stem otherwise", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+		await h.control.startRecording(leg, {
+			consent: consent({ promptId: "prompt-row", promptMedia: "sound:tenant/consent" }),
+		});
+		expect(h.media.calls.find((call) => call.method === "play")?.args[1]).toMatchObject({
+			media: ["sound:tenant/consent"],
+		});
+
+		const bare = harness({ legs: [fakeLeg("d")] });
+		await bare.control.startRecording(fakeLeg("d"), { consent: consent() });
+		expect(bare.media.calls.find((call) => call.method === "play")?.args[1]).toMatchObject({
+			media: ["sound:recording-consent"],
+		});
+	});
+
+	it("still records when one of two parties could not be reached", async () => {
+		const agent = fakeLeg("a");
+		const caller = fakeLeg("c");
+		bridgePair(agent, caller);
+		const h = harness({ legs: [agent, caller] });
+		Object.assign(h.media, {
+			play: async (channelId: string) => {
+				if (channelId === "c") {
+					throw new Error("the media plane refused a playback");
+				}
+				return { playbackRef: "p" };
+			},
+		});
+
+		const outcome = await h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+
+		expect(outcome.result.ok).toBe(true);
+		// Only the party that ACTUALLY heard it is reported as having heard it.
+		expect(outcome.consent?.parties).toEqual(["caller"]);
+	});
+
+	it("waits for a peer whose media is not up yet, then announces to it", async () => {
+		// The live failure this exists for: the legs bridge, the gate runs, and the WebRTC far end has
+		// signalled its answer but is still finishing ICE. Playing there writes into a transport with
+		// no peer. So the gate holds until the leg reports `active`, and only then plays.
+		const agent = fakeLeg("a");
+		const customer = fakeLeg("customer", { isAnswered: false });
+		bridgePair(agent, customer);
+		const h = harness({ legs: [agent, customer] });
+
+		const started = h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+		await flush();
+		// Nothing is played while either party is still coming up: the two waits overlap and the
+		// prompt reaches both sides together.
+		expect(playedAt(h)).toEqual([]);
+
+		h.signals.emit(legSignalKey("customer"), { kind: "answered" });
+		const outcome = await started;
+
+		expect(playedAt(h)).toEqual(["a", "customer"]);
+		expect(outcome.result.ok).toBe(true);
+		expect(outcome.consent?.parties).toEqual(["caller", "callee"]);
+	});
+
+	it("leaves a peer that never comes up OUT of the parties, and records anyway", async () => {
+		const agent = fakeLeg("a");
+		const customer = fakeLeg("customer", { isAnswered: false });
+		bridgePair(agent, customer);
+		const h = harness({ legs: [agent, customer] });
+
+		const outcome = await h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+
+		expect(playedAt(h)).toEqual(["a"]);
+		expect(outcome.result.ok).toBe(true);
+		// The claim the record makes is exactly the set of parties a prompt was accepted for.
+		expect(outcome.consent?.parties).toEqual(["caller"]);
+	});
+
+	it("gives up on a peer that hangs up mid-wait rather than sitting out the budget", async () => {
+		const agent = fakeLeg("a");
+		const customer = fakeLeg("customer", { isAnswered: false });
+		bridgePair(agent, customer);
+		const h = harness({ legs: [agent, customer] });
+
+		const started = h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+		await flush();
+		h.signals.emit(legSignalKey("customer"), {
+			kind: "ended",
+			cause: "NORMAL_CLEARING",
+			causeCode: 16,
+		});
+		const outcome = await started;
+
+		expect(playedAt(h)).toEqual(["a"]);
+		expect(outcome.consent?.parties).toEqual(["caller"]);
+	});
+
+	it("clears the readiness watcher on every exit, so a recorded call leaks no listener", async () => {
+		const readyKey = legSignalKey("ready");
+		const lateKey = legSignalKey("late");
+		const goneKey = legSignalKey("gone");
+		const agent = fakeLeg("a");
+		const ready = fakeLeg("ready", { isAnswered: false });
+		const late = fakeLeg("late", { isAnswered: false });
+		const gone = fakeLeg("gone", { isAnswered: false });
+		const h = harness({ legs: [agent, ready, late, gone] });
+
+		// Answered while waiting.
+		bridgePair(agent, ready);
+		const first = h.control.startRecording(agent, {
+			consent: consent({ parties: ["callee"] }),
+		});
+		await flush();
+		h.signals.emit(readyKey, { kind: "answered" });
+		await first;
+		expect(h.signals.isWatched(readyKey)).toBe(false);
+
+		// Budget expired.
+		await h.control.stopRecording(agent);
+		bridgePair(agent, late);
+		await h.control.startRecording(agent, { consent: consent({ parties: ["callee"] }) });
+		expect(h.signals.isWatched(lateKey)).toBe(false);
+
+		// Hung up while waiting.
+		await h.control.stopRecording(agent);
+		bridgePair(agent, gone);
+		const third = h.control.startRecording(agent, {
+			consent: consent({ parties: ["callee"] }),
+		});
+		await flush();
+		h.signals.emit(goneKey, { kind: "ended", cause: "NORMAL_CLEARING", causeCode: 16 });
+		await third;
+		expect(h.signals.isWatched(goneKey)).toBe(false);
+	});
+
+	it("counts a party only when the media plane reports it delivered audio", async () => {
+		// The live failure this whole rung exists for, in one case. The peer is answered, bridged and
+		// perfectly healthy; `play` is accepted; and `mediad` then reports it wrote nothing, because
+		// the browser had not finished ICE and DTLS. The old gate counted the party the moment `play`
+		// resolved and filed a compliance record naming somebody who heard silence.
+		const agent = fakeLeg("a");
+		const customer = fakeLeg("customer");
+		bridgePair(agent, customer);
+		const h = harness({ legs: [agent, customer], silentChannels: ["customer"] });
+
+		const outcome = await h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+
+		// The prompt WAS played at both — the failure is invisible at the command, which is why it
+		// went unnoticed for as long as it did. The peer is then retried until the budget runs out,
+		// because a prompt written into a transport with no peer is not queued anywhere.
+		expect(playedAt(h)).toContain("a");
+		expect(playedAt(h).filter((id) => id === "customer").length).toBeGreaterThan(1);
+		expect(outcome.result.ok).toBe(true);
+		expect(outcome.consent?.parties).toEqual(["caller"]);
+	});
+
+	it("plays again when the media plane says it delivered nothing, and counts the party once it does", async () => {
+		// The live sequence, in a fake. The peer is a browser that answered and has not finished its
+		// DTLS handshake: the first prompts are accepted, decoded, written, and reach nobody. Waiting
+		// would not help — those frames are not queued anywhere — so the gate plays again, and stops
+		// the moment the media plane reports it delivered audio. An RTP endpoint delivers on its first
+		// attempt and pays none of this.
+		const agent = fakeLeg("a");
+		const customer = fakeLeg("customer");
+		bridgePair(agent, customer);
+		const h = harness({
+			legs: [agent, customer],
+			silentChannels: ["customer"],
+			deliversAfterAttempts: { customer: 3 },
+		});
+
+		const outcome = await h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+
+		expect(outcome.result.ok).toBe(true);
+		expect(outcome.consent?.parties).toEqual(["caller", "callee"]);
+		// Three attempts at the peer, and exactly one at the party that heard it first time.
+		expect(h.attemptsPerChannel.get("customer")).toBe(3);
+		expect(h.attemptsPerChannel.get("a")).toBe(1);
+	});
+
+	it("leaves out a party whose playback never finishes, and does not wait forever for it", async () => {
+		const agent = fakeLeg("a");
+		const customer = fakeLeg("customer");
+		bridgePair(agent, customer);
+		const h = harness({ legs: [agent, customer], neverFinishingChannels: ["customer"] });
+
+		const outcome = await h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+
+		expect(outcome.result.ok).toBe(true);
+		expect(outcome.consent?.parties).toEqual(["caller"]);
+	});
+
+	it("refuses the recording when the media plane delivered audio to NOBODY", async () => {
+		// Not a media failure anywhere the engine can see: both plays were accepted. The only evidence
+		// that nobody was told is the number the media plane reported afterwards, and it is enough to
+		// stop the recording — which is the contract the gate held before and still holds.
+		const agent = fakeLeg("a");
+		const customer = fakeLeg("customer");
+		bridgePair(agent, customer);
+		const h = harness({
+			legs: [agent, customer],
+			silentChannels: ["a", "customer"],
+		});
+
+		const outcome = await h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+
+		expect(outcome.result.ok).toBe(false);
+		expect(h.media.methods()).not.toContain("snoop");
+		expect(h.control.recordingFor("a")).toBeUndefined();
+		expect(outcome.consent).toMatchObject({ outcome: "declined", parties: [] });
+	});
+
+	it("clears every playback watcher, on delivery, on silence, on a refused play and on the budget", async () => {
+		const agent = fakeLeg("a");
+		const customer = fakeLeg("customer");
+		bridgePair(agent, customer);
+
+		// Delivered, and reported as delivering nothing.
+		const delivered = harness({ legs: [agent, customer], silentChannels: ["customer"] });
+		await delivered.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+		expect(delivered.playbacks.watchedKeyCount).toBe(0);
+
+		// Never finished: the budget is what ends the wait, and it must take its watcher with it.
+		const stalled = harness({ legs: [agent, customer], neverFinishingChannels: ["customer"] });
+		await stalled.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+		expect(stalled.playbacks.watchedKeyCount).toBe(0);
+
+		// `play` threw: no signal is ever coming, and the watcher was registered before the throw.
+		const refused = harness({ legs: [agent, customer] });
+		Object.assign(refused.media, {
+			play: async () => {
+				throw new Error("the media plane refused a playback");
+			},
+		});
+		await refused.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+		expect(refused.playbacks.watchedKeyCount).toBe(0);
+	});
+
+	it("subscribes before it plays, so a prompt that finishes instantly is not missed", async () => {
+		// The fake emits the completion synchronously from inside `play`, which is the race a waiter
+		// registered after the command would lose every time on a fast local transport.
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+
+		const outcome = await h.control.startRecording(leg, { consent: consent() });
+
+		expect(outcome.result.ok).toBe(true);
+		expect(outcome.consent?.parties).toEqual(["caller"]);
+	});
+
+	it("refuses the recording when the ONLY party owed the prompt never came up", async () => {
+		const agent = fakeLeg("a");
+		const customer = fakeLeg("customer", { isAnswered: false });
+		bridgePair(agent, customer);
+		const h = harness({ legs: [agent, customer] });
+
+		const outcome = await h.control.startRecording(agent, {
+			consent: consent({ parties: ["callee"] }),
+		});
+
+		expect(outcome.result.ok).toBe(false);
+		expect(h.media.methods()).not.toContain("snoop");
+		expect(h.control.recordingFor("a")).toBeUndefined();
+		expect(outcome.consent).toMatchObject({ outcome: "declined", parties: [] });
+	});
+
+	it("refuses the recording outright when NOBODY could be told", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+		Object.assign(h.media, {
+			play: async () => {
+				throw new Error("the media plane refused a playback");
+			},
+		});
+
+		const outcome = await h.control.startRecording(leg, { consent: consent() });
+
+		expect(outcome.result.ok).toBe(false);
+		expect(outcome.result.ok ? "" : outcome.result.reason).toContain("not recorded");
+		expect(h.media.methods()).not.toContain("snoop");
+		expect(h.control.recordingFor("c")).toBeUndefined();
+		expect(outcome.consent).toMatchObject({ outcome: "declined", parties: [] });
+		expect(h.consentRecords).toHaveLength(1);
+	});
+
+	it("starts the recording when the accept digit is pressed", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+
+		const started = h.control.startRecording(leg, {
+			consent: consent({ policy: "announce-and-require-keypress" }),
+		});
+		await flush();
+		h.signals.emit(legSignalKey("c"), { kind: "dtmf", digit: "1" });
+		const outcome = await started;
+
+		expect(outcome.result.ok).toBe(true);
+		expect(outcome.consent).toMatchObject({ outcome: "accepted", method: "keypress" });
+		expect(h.control.recordingFor("c")).toMatchObject({ paused: false });
+	});
+
+	it("ignores a digit that is neither accept nor decline", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+
+		const started = h.control.startRecording(leg, {
+			consent: consent({ policy: "announce-and-require-keypress" }),
+		});
+		await flush();
+		h.signals.emit(legSignalKey("c"), { kind: "dtmf", digit: "#" });
+		h.signals.emit(legSignalKey("c"), { kind: "dtmf", digit: "1" });
+		const outcome = await started;
+
+		expect(outcome.consent?.outcome).toBe("accepted");
+	});
+
+	it("starts NOTHING when the decline digit is pressed, and still files the verdict", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+
+		const started = h.control.startRecording(leg, {
+			consent: consent({ policy: "announce-and-require-keypress" }),
+		});
+		await flush();
+		h.signals.emit(legSignalKey("c"), { kind: "dtmf", digit: "2" });
+		const outcome = await started;
+
+		expect(outcome.result.ok).toBe(false);
+		expect(outcome.recordingId).toBeUndefined();
+		expect(h.control.recordingFor("c")).toBeUndefined();
+		expect(h.media.methods()).not.toContain("snoop");
+		expect(h.eventsOf("channel.record.started")).toEqual([]);
+		// The whole point: no recording, and a provable decline anyway.
+		expect(outcome.consent).toMatchObject({ outcome: "declined", method: "keypress" });
+		expect(h.consentRecords[0]?.record.outcome).toBe("declined");
+	});
+
+	it("treats the timeout as a decline, files it, and leaves no watcher behind", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+
+		const outcome = await h.control.startRecording(leg, {
+			consent: consent({ policy: "announce-and-require-keypress" }),
+		});
+
+		expect(outcome.result.ok).toBe(false);
+		expect(outcome.result.ok ? "" : outcome.result.reason).toContain("no consent digit");
+		expect(outcome.consent).toMatchObject({ outcome: "declined", method: "keypress" });
+		expect(h.control.recordingFor("c")).toBeUndefined();
+		expect(h.signals.isWatched(legSignalKey("c"))).toBe(false);
+	});
+
+	it("drops the watcher on an accept too, so a recorded call leaks nothing", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+		const started = h.control.startRecording(leg, {
+			consent: consent({ policy: "announce-and-require-keypress" }),
+		});
+		await flush();
+		h.signals.emit(legSignalKey("c"), { kind: "dtmf", digit: "1" });
+		await started;
+
+		expect(h.signals.isWatched(legSignalKey("c"))).toBe(false);
+	});
+
+	it("settles as a decline when the party hangs up mid-question", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+		const started = h.control.startRecording(leg, {
+			consent: consent({ policy: "announce-and-require-keypress" }),
+		});
+		await flush();
+		h.signals.emit(legSignalKey("c"), { kind: "ended", cause: "NORMAL_CLEARING", causeCode: 16 });
+		const outcome = await started;
+
+		expect(outcome.result.ok).toBe(false);
+		expect(outcome.consent?.outcome).toBe("declined");
+	});
+
+	it("reports the PCI rule back on the running recording", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+		await h.control.startRecording(leg, { autoPauseOnDtmf: true });
+		expect(h.control.recordingFor("c")).toMatchObject({ autoPauseOnDtmf: true });
+
+		const plain = harness({ legs: [fakeLeg("d")] });
+		await plain.control.startRecording(fakeLeg("d"));
+		expect(plain.control.recordingFor("d")).toMatchObject({ autoPauseOnDtmf: false });
 	});
 });
 

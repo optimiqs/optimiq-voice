@@ -1,6 +1,8 @@
 import { isStaffing } from "./agent-state";
-import { selectAgents } from "./queue-strategy";
+import { mergeSkillRequirements, selectAgents } from "./queue-strategy";
+import { runQueueSurvey } from "./queue-survey";
 import type { QueueCandidate } from "./queue-strategy";
+import type { QueueSurveyAnswer } from "./queue-survey";
 import type { AgentStateEntry, QueueMembership, QueueResumeTombstone } from "@optimiq-voice/events";
 import type { QueueCallbackPlan, QueuePlanNode } from "@optimiq-voice/routing";
 import type { HangupCause } from "@optimiq-voice/telephony";
@@ -165,8 +167,33 @@ export interface QueueCallPort {
 	): Promise<QueueDialOutcome>;
 	/** Ends an answered agent leg that this queue could not claim, through the leg teardown hooks. */
 	hangupAnsweredAgent(mediaChannelId: string): Promise<void>;
-	/** Joins the caller to an answered agent leg. `onEnded` fires when that leg goes away. */
-	bridge(mediaChannelId: string, onEnded: () => void): Promise<boolean>;
+	/**
+	 * Joins the caller to an answered agent leg.
+	 *
+	 * `onEnded` fires when that leg goes away, and is handed the promise of the caller's own
+	 * detach so the two halves of after-call work can be ordered against it: the agent's wrap-up
+	 * timer ignores it and starts at once, the caller's survey awaits it and speaks only to a leg
+	 * that is actually out of the bridge. It resolves `false` when the caller went with the agent —
+	 * the ordinary case, and every case when `keepCallerOnPeerEnd` was not asked for.
+	 *
+	 * `keepCallerOnPeerEnd` is what makes a post-call survey possible at all: without it the agent's
+	 * hangup tears the bridge down AND hangs the caller up, so there is nobody left to ask. It is
+	 * requested only when this queue actually has a survey, because a caller kept alive with nothing
+	 * to say to them is a call that does not end.
+	 */
+	bridge(
+		mediaChannelId: string,
+		onEnded: (detached: Promise<boolean>) => void,
+		options?: { readonly keepCallerOnPeerEnd?: boolean },
+	): Promise<boolean>;
+	/**
+	 * Releases the caller's own leg, for a queue that asked to keep it past the agent's hangup.
+	 *
+	 * Optional, so a walk built against an older port keeps working — and its absence is safe
+	 * precisely because such a port also cannot honour `keepCallerOnPeerEnd`, so there is never a
+	 * kept leg for it to strand.
+	 */
+	endCaller?(): Promise<void>;
 	/**
 	 * The next DTMF digit this caller has pressed, or `undefined` when they have pressed none.
 	 *
@@ -192,13 +219,30 @@ export interface QueueCallPort {
 	 */
 	pollDigit(): string | undefined;
 	/**
+	 * Closes the digit source, after which {@link pollDigit} answers nothing for ever.
+	 *
+	 * The session calls it and the walker must not: a queued call's digit watch has to outlive
+	 * {@link QueueSession.run}, because a post-call survey polls for answers minutes after the
+	 * caller was bridged and `run` returned `answered`. The session releases it on every path it
+	 * owns — including the survey's `finally` — so the one caller that knows whether digits are
+	 * still wanted is the one that closes the source.
+	 */
+	releaseDigits?(): void;
+	/**
 	 * Starts recording the conversation, once the agent is bridged in.
 	 *
 	 * Returns whether recording is now running. `false` is not fatal and never stops the call — see
 	 * {@link QueueSession.startRecording} for why a queue whose media plane cannot record answers the
 	 * caller anyway and says so on the walk.
 	 */
-	startRecording(): Promise<boolean>;
+	startRecording(request?: {
+		/**
+		 * The queue's own PCI auto-pause answer, or `undefined` for "no opinion" — see the walker's
+		 * `WalkerCallControl.startRecording`. A queue is not an extension, so without this the
+		 * per-queue column was compiled and then read by nothing.
+		 */
+		readonly autoPauseOnDtmf?: boolean;
+	}): Promise<boolean>;
 	/** A prompt id as a playable media reference, or `undefined` when it resolves to nothing. */
 	resolvePrompt(promptId: string | undefined): string | undefined;
 	/** A number as playable digit sounds, for the position announcement. */
@@ -227,6 +271,15 @@ export interface AgentTransitionRequest {
 	readonly availableAt?: number;
 	/** Absolute value to store; `undefined` leaves the existing count alone. */
 	readonly noAnswerCount?: number;
+	/**
+	 * The call the agent still owes a wrap-up code for, and whether the queue insists on one.
+	 *
+	 * Written only on the way INTO wrap-up, and only by a queue that has codes to offer. Every other
+	 * transition leaves both off, which clears them: the store rebuilds the entry from the request,
+	 * so an agent who has left wrap-up no longer owes anybody an answer.
+	 */
+	readonly dispositionCallId?: string;
+	readonly dispositionRequired?: boolean;
 	readonly reason?: string;
 }
 
@@ -293,6 +346,40 @@ export interface QueueEventPort {
 			| "callback";
 		readonly exitKey?: string;
 	}): Promise<void>;
+}
+
+/** One wrap-up code, as the session observed it being settled. */
+export interface QueueDispositionReport {
+	readonly orgId: string;
+	readonly queueId: string;
+	readonly callId: string;
+	readonly agentId: string;
+	/** The code the agent chose, or `"unset"` when the deadline settled it for them. */
+	readonly code: string;
+	/** True when nobody chose: the wrap-up ran out and the engine filed the blank. */
+	readonly auto: boolean;
+}
+
+/** One caller's answers to the post-call survey. Absent questions were simply not answered. */
+export interface QueueSurveyReport {
+	readonly orgId: string;
+	readonly queueId: string;
+	readonly callId: string;
+	readonly agentId: string;
+	readonly answers: readonly { readonly questionId: string; readonly digit: string }[];
+}
+
+/**
+ * What the session has to say about a call once the two legs have parted.
+ *
+ * Optional on {@link QueueServices}, and both methods fire-and-forget, for the reason the queue
+ * events are: the call is over, everything here is a record OF it, and a control plane that cannot
+ * take the record must not turn a completed call into an error on the ARI event socket. A session
+ * with no port notes what it would have reported and moves on.
+ */
+export interface QueueAfterCallPort {
+	disposition(report: QueueDispositionReport): Promise<void>;
+	surveyAnswered(report: QueueSurveyReport): Promise<void>;
 }
 
 /**
@@ -388,6 +475,8 @@ export interface QueueServices {
 	 * the next caller who joins it; see `queue-callback.scheduler.ts`.
 	 */
 	readonly callbacks?: QueueCallbackSchedulePort;
+	/** Where wrap-up codes and survey answers go. See {@link QueueAfterCallPort}. */
+	readonly afterCall?: QueueAfterCallPort;
 }
 
 /** How {@link QueueSession} tells the callback sweep that a queue has a promise outstanding. */
@@ -492,6 +581,15 @@ export class QueueSession {
 	private frozenOrder: readonly string[] | undefined;
 	/** Whether the virtual-hold offer has already been announced to this caller. */
 	private callbackOffered = false;
+	/** Whether the "nobody has the skills" note has already been written for this caller. */
+	private notedSkillExclusion = false;
+	/**
+	 * Whether a post-call survey is still owed on this caller's leg.
+	 *
+	 * Set only once a bridge with `keepCallerOnPeerEnd` succeeded, so it names a leg that will
+	 * actually outlive the agent. It is what keeps the digit source open past {@link run}.
+	 */
+	private surveyPending = false;
 	/** When this caller's WAIT started. Always their real arrival, even when their place is older. */
 	private joinedAt = 0;
 	/**
@@ -527,6 +625,19 @@ export class QueueSession {
 	 * `failed` outcome the walker turns into a hangup cause.
 	 */
 	async run(): Promise<QueueOutcome> {
+		try {
+			return await this.runQueued();
+		} finally {
+			// Unless a survey is still owed. `run` returns the moment the caller is bridged, and the
+			// survey polls this same digit source after the agent has gone — closing it here would
+			// make every answer arrive at a source nobody is watching.
+			if (!this.surveyPending) {
+				this.call.releaseDigits?.();
+			}
+		}
+	}
+
+	private async runQueued(): Promise<QueueOutcome> {
 		if (!(await this.call.ensureAnswered())) {
 			return { kind: "aborted" };
 		}
@@ -939,9 +1050,23 @@ export class QueueSession {
 			waitedMs,
 			now,
 			excludedAgentIds: excluded,
+			skillRequirements: mergeSkillRequirements(
+				membership.skillRequirements,
+				this.node.requiredSkills,
+			),
 			random: this.settings.random,
 			...(cursor === undefined ? {} : { roundRobinAfterAgentId: cursor }),
 		});
+
+		// Once per stay, and only when the skills are the whole reason. "Nobody qualified" and
+		// "nobody is logged in" are the same silence to the caller and different problems to whoever
+		// is looking at the queue, and the second is the one the timeout branch already reports.
+		if (selection.skilledOut > 0 && !this.notedSkillExclusion) {
+			this.notedSkillExclusion = true;
+			this.call.note(
+				`queue "${this.node.queueId}": ${String(selection.skilledOut)} otherwise-reachable agent(s) were excluded by the caller's skill requirements (${selection.skillBars.map((bar) => `${bar.skill}>=${String(bar.minLevel)}`).join(", ")})`,
+			);
+		}
 
 		// The count BEFORE the fan-out narrows it to one. That is what the admission gate needs: "how
 		// many phones could be ringing right now", not "how many this caller is about to ring".
@@ -1038,15 +1163,15 @@ export class QueueSession {
 					return await this.answered(membership, pending, outcome.agentId, outcome.mediaChannelId);
 				}
 				case "aborted": {
-					await this.releaseAll(pending, undefined);
+					await this.releaseAll(membership, pending, undefined);
 					return await this.abandon("caller-hangup");
 				}
 				case "failed": {
-					await this.releaseAll(pending, outcome.cause, outcome.agentId);
+					await this.releaseAll(membership, pending, outcome.cause, outcome.agentId);
 					break;
 				}
 				default: {
-					await this.releaseAll(pending, "NO_ANSWER");
+					await this.releaseAll(membership, pending, "NO_ANSWER");
 					break;
 				}
 			}
@@ -1056,7 +1181,7 @@ export class QueueSession {
 		} finally {
 			// Any exception after reservation leaves every still-ringing agent eligible again. Entries
 			// already settled above are removed from `pending`, so normal penalties are not overwritten.
-			await this.releaseAll(pending, undefined);
+			await this.releaseAll(membership, pending, undefined);
 		}
 	}
 
@@ -1104,7 +1229,7 @@ export class QueueSession {
 		reserved.delete(agentId);
 		this.services.cursor.remember(this.call.organizationId, this.node.queueId, agentId);
 
-		await this.releaseAll(reserved, undefined);
+		await this.releaseAll(membership, reserved, undefined);
 
 		await this.services.events.callerAnswered({
 			orgId: this.call.organizationId,
@@ -1118,9 +1243,27 @@ export class QueueSession {
 
 		await this.whisperToAgent(mediaChannelId, membership, agentId);
 
-		const bridged = await this.call.bridge(mediaChannelId, () => {
-			this.detach(this.startWrapUp(membership, agentId), `wrap-up for agent ${agentId}`);
-		});
+		// Asked for ONLY when this queue has a survey. A caller kept out of the bridge with nothing
+		// to ask them is a leg with no owner and no end, which is a worse defect than a missing
+		// survey — so the request and the thing that ends the leg are decided together, here.
+		const survey = membership.survey !== undefined;
+		const bridged = await this.call.bridge(
+			mediaChannelId,
+			(detached) => {
+				this.detach(this.startWrapUp(membership, agentId), `wrap-up for agent ${agentId}`);
+				// Beside the wrap-up and not after it: the agent's after-call work and the caller's
+				// survey happen to the two ends of a call that has just parted, and neither waits on
+				// the other. Detached for the same reason — this runs on the ARI event socket.
+				this.detach(
+					this.runSurvey(membership, agentId, detached),
+					`post-call survey for agent ${agentId}`,
+				);
+			},
+			survey ? { keepCallerOnPeerEnd: true } : {},
+		);
+		// Only on a bridge that took: a survey is owed to a caller who will still be there when the
+		// agent goes, and a failed bridge produces no `onEnded` to run one from.
+		this.surveyPending = survey && bridged;
 
 		// AFTER the bridge, and only after a successful one. Recording is a tap on a bridged
 		// conversation (`CallControl.startRecording`), so there is nothing to tap until the two legs
@@ -1229,7 +1372,14 @@ export class QueueSession {
 			return;
 		}
 		try {
-			this.recording = await this.call.startRecording();
+			// The queue's own flag, or `undefined` so the orchestrator falls back to the organization
+			// default. Never `false`: that would make a queue with no opinion override a tenant that
+			// switched auto-pause on estate-wide.
+			this.recording = await this.call.startRecording(
+				this.node.recordAutoPauseOnDtmf === undefined
+					? {}
+					: { autoPauseOnDtmf: this.node.recordAutoPauseOnDtmf },
+			);
 		} catch (error) {
 			this.recording = false;
 			this.call.note(
@@ -1254,7 +1404,9 @@ export class QueueSession {
 	 *
 	 * `maxNoAnswer` is the escape hatch: an agent who rings out that many times consecutively is
 	 * taken out of distribution entirely, because every further attempt costs the NEXT caller a full
-	 * ring timeout. Bringing them back is a login, which is the control plane's.
+	 * ring timeout. Bringing them back is a login, which is the control plane's. A queue with
+	 * `ronaEnabled` sets that ceiling to one and says so with its own reason — see
+	 * {@link QueueSession.releaseFor}.
 	 *
 	 * A failed write does not forget the reservation. One unref'd retry loop keeps the original
 	 * request (and therefore the original penalty deadline) until the write succeeds or a fresh read
@@ -1269,6 +1421,7 @@ export class QueueSession {
 	 * pressing decline benches a whole tier. Everybody else is released with no penalty.
 	 */
 	private async releaseAll(
+		membership: QueueMembership,
 		reserved: Map<string, QueueCandidate>,
 		cause: HangupCause | undefined,
 		causeAgentId?: string,
@@ -1278,6 +1431,7 @@ export class QueueSession {
 				continue;
 			}
 			const release = this.releaseFor(
+				membership,
 				candidate,
 				causeAgentId === undefined || causeAgentId === agentId ? cause : undefined,
 			);
@@ -1289,7 +1443,11 @@ export class QueueSession {
 		}
 	}
 
-	private releaseFor(candidate: QueueCandidate, cause: HangupCause | undefined): AgentRelease {
+	private releaseFor(
+		membership: QueueMembership,
+		candidate: QueueCandidate,
+		cause: HangupCause | undefined,
+	): AgentRelease {
 		const agent = candidate.agent;
 
 		if (cause === undefined) {
@@ -1311,6 +1469,29 @@ export class QueueSession {
 			cause === "USER_BUSY" ? undefined : (candidate.state.noAnswerCount ?? 0) + 1;
 
 		this.tried.set(agent.agentId, now + delaySeconds * MILLIS_PER_SECOND);
+
+		// RONA, and it is checked BEFORE `maxNoAnswer` because it replaces the count rather than
+		// tightening it: a queue that has turned it on has said one unanswered offer is enough, and
+		// the ceiling is then a number nothing will ever reach. The caller is not affected — they are
+		// still in the line, this agent is in `tried`, and the next pass offers them to somebody else.
+		// Coming back is a `resume` a human performs; the engine has no path out of this.
+		if (noAnswerCount !== undefined && membership.ronaEnabled === true) {
+			this.call.note(
+				`queue agent ${agent.name} did not answer and this queue has RONA on; they were taken out of distribution until somebody resumes them`,
+			);
+			return {
+				candidate,
+				request: {
+					orgId: this.call.organizationId,
+					agentId: agent.agentId,
+					to: "unavailable",
+					queueId: this.node.queueId,
+					callId: this.call.callId,
+					noAnswerCount,
+					reason: "rona",
+				},
+			};
+		}
 
 		if (
 			noAnswerCount !== undefined &&
@@ -1394,10 +1575,28 @@ export class QueueSession {
 	 *
 	 * A queue whose `wrapUpSeconds` is zero skips straight to `available`, which is what the setting
 	 * means and not a special case worth a branch anywhere else.
+	 *
+	 * ## The wrap-up CODE, when the queue asks for one
+	 *
+	 * A queue with `dispositionCodes` carries two extra fields into the `wrap-up` write — which call
+	 * is being coded, and whether an answer is insisted on — so the console needs one read rather
+	 * than a guess at the last CDR row. A queue with no codes writes neither: there is no question,
+	 * so there is nothing to answer and nothing to clear.
+	 *
+	 * When an answer IS insisted on, the deadline stops being the only way out: the agent picking a
+	 * code is the whole event wrap-up was waiting for, so the wait becomes a bounded poll of their
+	 * entry and ends the moment `dispositionCode` appears. When it is not insisted on there is no
+	 * poll at all — the common path must not pay a KV read per second for a question nobody asked.
+	 *
+	 * A deadline reached with nothing chosen is filed as `unset` rather than as silence: "the agent
+	 * did not code this call" is a fact a supervisor acts on, and a missing row is indistinguishable
+	 * from a report that lost one.
 	 */
 	private async startWrapUp(membership: QueueMembership, agentId: string): Promise<void> {
 		const agent = membership.agents.find((candidate) => candidate.agentId === agentId);
 		const seconds = agent?.wrapUpSeconds || membership.wrapUpSeconds;
+		const asksForCode = (membership.dispositionCodes?.length ?? 0) > 0;
+		const required = asksForCode && membership.dispositionRequired === true;
 
 		if (seconds <= 0) {
 			await this.transitionOwnedWithRetry({
@@ -1418,12 +1617,20 @@ export class QueueSession {
 			queueId: this.node.queueId,
 			callId: this.call.callId,
 			availableAt: until,
+			...(asksForCode
+				? { dispositionCallId: this.call.callId, dispositionRequired: required }
+				: {}),
 		});
 		if (!wrapped) {
 			return;
 		}
 
-		await this.call.delay(Math.max(0, until - this.call.now()));
+		let code: string | undefined;
+		if (required) {
+			code = await this.awaitDisposition(agentId, until);
+		} else {
+			await this.call.delay(Math.max(0, until - this.call.now()));
+		}
 
 		await this.transitionOwnedWithRetry({
 			orgId: this.call.organizationId,
@@ -1432,6 +1639,168 @@ export class QueueSession {
 			queueId: this.node.queueId,
 			callId: this.call.callId,
 		});
+
+		if (required) {
+			await this.reportDisposition(agentId, code);
+		}
+	}
+
+	/**
+	 * Waits out the wrap-up deadline, stopping early the moment the agent codes the call.
+	 *
+	 * The poll runs on the session's own interval and against the agent's OWN entry, and it stops
+	 * reading the moment the entry stops belonging to this call — an agent whose wrap-up was adopted
+	 * by another instance, or who logged out, has settled this call as surely as the deadline would.
+	 */
+	private async awaitDisposition(agentId: string, until: number): Promise<string | undefined> {
+		while (this.call.now() < until) {
+			await this.call.delay(
+				Math.min(this.settings.pollIntervalMs, Math.max(0, until - this.call.now())),
+			);
+			const read = await this.services.agents.readState(this.call.organizationId, agentId);
+			if (read.kind !== "found" || !isOwnedByCall(read.entry, this.call.callId)) {
+				return undefined;
+			}
+			if (read.entry.dispositionCode !== undefined && read.entry.dispositionCode !== "") {
+				return read.entry.dispositionCode;
+			}
+		}
+		return undefined;
+	}
+
+	/**
+	 * The caller's half of the after-call work.
+	 *
+	 * Only ever reached from a call that was ANSWERED and BRIDGED — a caller who timed out was never
+	 * served and has nothing to rate, and asking them how the call went would be the queue's worst
+	 * possible moment to speak. The script itself is `queue-survey.ts`; this method's job is to
+	 * decide whether to run it and where the answers go.
+	 *
+	 * An agent hanging up first does NOT necessarily take the caller's leg with them, but it often
+	 * does, and there is no way to tell from here except to look: `isTearingDown` is checked before
+	 * the first prompt and again between questions, and a caller who has gone ends the survey with
+	 * whatever they had already said.
+	 */
+	private async runSurvey(
+		membership: QueueMembership,
+		agentId: string,
+		detached?: Promise<boolean>,
+	): Promise<void> {
+		try {
+			await this.askSurvey(membership, agentId, detached);
+		} finally {
+			// The last reader of the caller's digits, on every path out of the survey including the
+			// ones that never ask a question. {@link run} deliberately left the source open for this.
+			this.surveyPending = false;
+			this.call.releaseDigits?.();
+		}
+	}
+
+	private async askSurvey(
+		membership: QueueMembership,
+		agentId: string,
+		detached?: Promise<boolean>,
+	): Promise<void> {
+		const survey = membership.survey;
+		if (survey === undefined) {
+			return;
+		}
+		// FIRST, and awaited: the caller has to be out of the bridge before a prompt is played, or
+		// the question goes into a conversation that is still being pulled apart — and on a media
+		// plane that answers `destroyBridge` after the playback starts, into the agent's ear.
+		if (detached !== undefined && !(await detached)) {
+			this.call.note(
+				`queue "${this.node.queueId}": the caller's leg went with the agent's, so the post-call survey was not asked`,
+			);
+			return;
+		}
+		if (this.call.isTearingDown) {
+			this.call.note(
+				`queue "${this.node.queueId}": the caller's leg went with the agent's, so the post-call survey was not asked`,
+			);
+			return;
+		}
+
+		try {
+			const answers = await runQueueSurvey({
+				survey,
+				call: this.call,
+				queueId: this.node.queueId,
+				pollIntervalMs: this.settings.pollIntervalMs,
+			});
+			await this.reportSurvey(agentId, answers);
+		} finally {
+			// ALWAYS, and this is the other half of asking for the caller to be kept: a leg detached
+			// for a survey has nobody left to end it, so a survey that returned early, threw, or found
+			// nothing to report would leave the caller listening to silence until an idle reaper
+			// collected them. `endCaller` is idempotent against a leg that is already going.
+			await this.endCallerQuietly();
+		}
+	}
+
+	/** Files the caller's answers. Never fatal — a survey is worth less than the call it is about. */
+	private async reportSurvey(
+		agentId: string,
+		answers: readonly QueueSurveyAnswer[],
+	): Promise<void> {
+		if (answers.length === 0) {
+			return;
+		}
+		const port = this.services.afterCall;
+		if (port === undefined) {
+			this.call.note(
+				`queue "${this.node.queueId}": the caller answered ${String(answers.length)} survey question(s) and there is no port to record them on`,
+			);
+			return;
+		}
+		try {
+			await port.surveyAnswered({
+				orgId: this.call.organizationId,
+				queueId: this.node.queueId,
+				callId: this.call.callId,
+				agentId,
+				answers,
+			});
+		} catch (error) {
+			this.call.note(
+				`queue "${this.node.queueId}": the survey answers could not be reported (${String(error)})`,
+			);
+		}
+	}
+
+	private async endCallerQuietly(): Promise<void> {
+		try {
+			await this.call.endCaller?.();
+		} catch (error) {
+			this.call.note(
+				`queue "${this.node.queueId}": the caller's leg could not be released after the survey (${String(error)})`,
+			);
+		}
+	}
+
+	private async reportDisposition(agentId: string, code: string | undefined): Promise<void> {
+		const report = {
+			orgId: this.call.organizationId,
+			queueId: this.node.queueId,
+			callId: this.call.callId,
+			agentId,
+			code: code ?? "unset",
+			auto: code === undefined,
+		};
+		const port = this.services.afterCall;
+		if (port === undefined) {
+			this.call.note(
+				`queue "${this.node.queueId}": wrap-up ended with disposition "${report.code}" and no port to record it on`,
+			);
+			return;
+		}
+		try {
+			await port.disposition(report);
+		} catch (error) {
+			this.call.note(
+				`queue "${this.node.queueId}": the wrap-up disposition could not be reported (${String(error)})`,
+			);
+		}
 	}
 
 	private async transitionOwnedWithRetry(request: AgentTransitionRequest): Promise<boolean> {

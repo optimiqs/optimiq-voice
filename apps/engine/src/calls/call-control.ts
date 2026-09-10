@@ -8,13 +8,16 @@ import {
 	supportsMediaBug,
 	supportsRecording,
 } from "@optimiq-voice/telephony";
+import { playbackSignalKey } from "../media/playback-signals";
 import { legSignalKey, recordingSignalKey } from "../routing/call-signals";
 import { parkSlotFor } from "../routing/park-registry";
 import { parkHandoffRefusal } from "./park-handoff";
 import type { MediaPort, TapHandle, TapSide } from "../media/media-port";
+import type { PlaybackSignalBus } from "../media/playback-signals";
 import type { CallSignalBus, LegSignal } from "../routing/call-signals";
 import type { ParkedCall, ParkRegistry, ParkResult } from "../routing/park-registry";
 import type { ParkHandoffClient } from "./park-handoff";
+import type { ConsentParty, ResolvedRecordingConsent } from "./recording-consent";
 import type {
 	CallEvent,
 	LegSide,
@@ -26,6 +29,7 @@ import type {
 	TapEndReason,
 	TapMode,
 } from "@optimiq-voice/events";
+import type { RecordingConsentRecord } from "@optimiq-voice/routing";
 import type {
 	CallState,
 	ChannelFlag,
@@ -316,6 +320,21 @@ export interface CallControlHost {
 		leg: ControlledLeg,
 		state: { readonly active: boolean; readonly paused: boolean },
 	): void;
+	/**
+	 * Files the consent verdict on the leg, so the CDR carries it whatever happens next.
+	 *
+	 * Called for EVERY outcome, and the one that matters most is `declined` — a call where the
+	 * tenant asked for a keypress and the caller refused starts no recording at all, publishes no
+	 * `channel.record.started`, and would otherwise leave no trace anywhere that it was ever asked.
+	 * "We asked and they said no" is the single most valuable row a compliance reviewer can find,
+	 * and it is the only one that has no recording to hang off.
+	 *
+	 * Synchronous and fire-and-forget for the reason {@link markRecording} is: the host writes it
+	 * onto the aggregate's channel variables, which are already mirrored on every change and already
+	 * read by the CDR builder — and a mirror that could not be written must not fail a consent gate
+	 * the caller has already answered.
+	 */
+	markConsent(leg: ControlledLeg, record: RecordingConsentRecord): void;
 	/** Resolves `destination` through the organization's artifact and walks the plan on this leg. */
 	route(leg: ControlledLeg, request: RouteRequest): Promise<RouteOutcome>;
 	/**
@@ -359,6 +378,94 @@ export interface CallControlSettings {
 	readonly defaultParkTimeoutSeconds: number;
 	/** Routing namespace a transfer destination is resolved in. */
 	readonly transferContext: string;
+	/**
+	 * How long the consent gate waits for the accept digit before treating the silence as a decline.
+	 *
+	 * Ten seconds, and the direction of the failure is the whole argument: a caller who is thinking,
+	 * or whose phone sends DTMF the media plane needs a moment to detect, must not be recorded
+	 * because a two-second budget expired. A caller who has walked away must not be recorded either.
+	 * Both of those are served by waiting a long-feeling time and then NOT recording.
+	 */
+	readonly consentKeypressTimeoutMs: number;
+	/**
+	 * What the gate plays when the tenant has named no prompt of their own.
+	 *
+	 * The seeded stem, not a spoken sentence chosen here: `system-media.ts` installs
+	 * `recording-consent` on every deployment exactly as it installs `vm-rec-name`, so a tenant who
+	 * turns the policy on without recording anything gets an announcement rather than silence — and
+	 * silence is the one outcome an announcement policy cannot be allowed to produce.
+	 */
+	readonly consentPrompt: string;
+	/**
+	 * How long the gate waits for a party's leg to be carrying media before it plays the prompt at it.
+	 *
+	 * A leg that has SIGNALLED an answer is not yet a leg that can hear anything: a WebRTC party's
+	 * ICE and DTLS finish after the `200 OK`, and a prompt played into that window is written to a
+	 * transport with no peer and dropped — `playedMs 0` — while the recording starts anyway. So the
+	 * gate waits for the evidence the engine actually has (the leg's own `active` call state, off
+	 * {@link CallControlHost.legFor} or the leg signal that announces it) before playing, and a party
+	 * that never produces it is left OUT of the record rather than credited with an announcement.
+	 *
+	 * Two seconds, and short deliberately: this budget is spent with two people already connected to
+	 * each other, so every millisecond of it is conversation happening before the recorder starts.
+	 * Two seconds covers a browser's handshake several times over; a party who needs longer than that
+	 * is a party the engine has no evidence about, and the honest answer there is to leave them out.
+	 *
+	 * NOTE what this can and cannot buy. `active` is a fact about SIGNALLING, not about a media path
+	 * being up, so readiness alone was measured on the running stack and found insufficient — the
+	 * wait returned in 0 ms and the prompt was still dropped. What closes the gap is
+	 * {@link consentPlaybackTimeoutMs}: the gate no longer trusts readiness, it waits for the media
+	 * plane's own account of what it delivered. Readiness is kept because it is still the cheapest
+	 * way to not play at a leg that is not there at all, and because a playback started before the
+	 * leg is answered is a playback the media plane may refuse outright.
+	 */
+	readonly consentPeerReadyTimeoutMs: number;
+	/**
+	 * How long the gate waits for the media plane to report what it DELIVERED of the prompt.
+	 *
+	 * This is the budget that replaced a fixed 1 500 ms sleep, and the difference is the whole point
+	 * of the mechanism. The sleep existed because {@link consentPeerReadyTimeoutMs} waits on a
+	 * SIGNALLING fact — a WebRTC party reports `active` on its `200 OK` and finishes ICE and DTLS
+	 * afterwards — so the prompt was played into a transport with no peer and the record still said
+	 * the party was announced to. `mediad` was publishing the contradiction on the same wire the
+	 * whole time (`playback.finished`, carrying `playedMs` and a reason); it was dropped at the
+	 * mapping. It is not dropped any more, so the gate waits for the DELIVERY instead of guessing at
+	 * how long one takes.
+	 *
+	 * A budget rather than an unbounded wait, because a media plane that dies mid-prompt must not
+	 * hold a recorded call open forever. Eight seconds: the seeded prompt is about one second and a
+	 * tenant's own may be several, so this is generous against the longest plausible announcement and
+	 * still bounded — and unlike the sleep it is not SPENT, it is a ceiling. The normal cost of the
+	 * gate is now however long the prompt actually takes, which is the honest price of announcing.
+	 *
+	 * A party whose playback never finishes inside it is left OUT of the record, on exactly the same
+	 * terms as a party whose leg never carried media: no evidence, no claim.
+	 *
+	 * It is a budget for the whole ATTEMPT at a party, retries included — see
+	 * {@link consentPlaybackRetryMs}.
+	 */
+	readonly consentPlaybackTimeoutMs: number;
+	/**
+	 * How long to wait after the media plane reports it delivered NOTHING before playing again.
+	 *
+	 * This is what replaced the fixed pre-play sleep, and the difference is not cosmetic. The sleep
+	 * ran on every announcing call, whether or not anything was wrong, and its length was a guess
+	 * about somebody else's network. A retry runs only when the media plane has SAID the far end got
+	 * nothing, and it stops the moment the media plane says otherwise — so an RTP endpoint, which
+	 * delivers on the first attempt, pays exactly zero, and a WebRTC party pays as long as its
+	 * handshake actually takes rather than as long as the slowest handshake anyone measured.
+	 *
+	 * A prompt is retried and not merely waited out because a playback aimed at a transport with no
+	 * peer is not queued anywhere: `mediad` decodes the frames, writes them, and they go nowhere.
+	 * There is nothing left to arrive late. The only way the party hears the disclosure is to play it
+	 * again once the path is up, and the media plane's own `playedMs` is what says when that is.
+	 *
+	 * 250 ms: short enough that the announcement lands promptly after the handshake completes, long
+	 * enough that a leg which is failing for a permanent reason is retried a bounded handful of times
+	 * inside {@link consentPlaybackTimeoutMs} rather than hammered. The whole loop is capped by that
+	 * budget, and a party still undelivered when it expires is left out of the record.
+	 */
+	readonly consentPlaybackRetryMs: number;
 }
 
 export const DEFAULT_CALL_CONTROL_SETTINGS: CallControlSettings = {
@@ -372,11 +479,26 @@ export const DEFAULT_CALL_CONTROL_SETTINGS: CallControlSettings = {
 	// `internal` and nothing else. A transfer destination that resolved in `outbound` would let any
 	// caller who reaches a phone with a transfer key dial anywhere on the tenant's account.
 	transferContext: "internal",
+	consentKeypressTimeoutMs: 10_000,
+	consentPrompt: "sound:recording-consent",
+	consentPeerReadyTimeoutMs: 2_000,
+	consentPlaybackTimeoutMs: 8_000,
+	consentPlaybackRetryMs: 250,
 };
 
 export interface CallControlDependencies {
 	readonly media: MediaPort;
 	readonly signals: CallSignalBus;
+	/**
+	 * Where a prompt's ENDING arrives — the consent gate's only reader, and the only one there is.
+	 *
+	 * Required, not optional, unlike the ports below it: a `CallControl` without it could still run
+	 * the consent gate, and would refuse every recording on an announce policy because no party could
+	 * ever be shown to have been announced to. That is a silently broken deployment rather than a
+	 * degraded one, and the orchestrator that constructs this class owns the bus, so there is nobody
+	 * who could legitimately omit it.
+	 */
+	readonly playbacks: PlaybackSignalBus;
 	readonly parks: ParkRegistry;
 	readonly host: CallControlHost;
 	/**
@@ -452,6 +574,9 @@ const ok = (detail?: string): CallControlResult =>
 	detail === undefined ? { ok: true } : { ok: true, detail };
 const refuse = (reason: string): CallControlResult => ({ ok: false, reason });
 
+/** Nobody was announced to. Shared so a `not-required` record allocates nothing per call. */
+const NO_CONSENT_PARTIES: readonly ConsentParty[] = Object.freeze([]);
+
 export interface ParkOutcome {
 	readonly result: CallControlResult;
 	/** The orbit the call landed in, when it landed in one. */
@@ -464,6 +589,14 @@ export interface RecordingOutcome {
 	readonly recordingId?: string;
 	/** Where the audio will be, in the object store's vocabulary. */
 	readonly objectKey?: string;
+	/**
+	 * What the consent gate decided, when one ran.
+	 *
+	 * Present on a REFUSAL too, and that is the point: a decline is reported with no `recordingId`
+	 * and no `objectKey`, because there is no recording — but there is very much a fact, and a
+	 * caller that only read `result.ok` would throw it away.
+	 */
+	readonly consent?: RecordingConsentRecord;
 }
 
 // -------------------------------------------------------------------------------------------
@@ -592,6 +725,25 @@ export interface StartRecordingRequest {
 	readonly silenceStopMs?: number;
 	readonly beep?: boolean;
 	readonly format?: string;
+	/**
+	 * The consent this call owes, resolved from the artifact by whoever fetched it.
+	 *
+	 * Absent means "no gate", and absent behaves EXACTLY as every release before the gate existed:
+	 * no prompt, no wait, no record, and the recording starts. That is not a loophole, it is the
+	 * compatibility contract — a caller that has no artifact (a spec, an old code path, a verb
+	 * executor that has not been taught about consent yet) must not be able to accidentally block
+	 * recording on a tenant who never configured any of this.
+	 */
+	readonly consent?: ResolvedRecordingConsent;
+	/**
+	 * Silence this recording while digits are being pressed — the PCI rule.
+	 *
+	 * Carried on the START rather than being asked for again at each digit, because the answer comes
+	 * from the artifact and the DTMF handler is on the media socket's callback path where fetching
+	 * one per keypress would put a cache miss between a caller's card number and the pause that is
+	 * supposed to hide it. {@link CallControl.recordingFor} reports it back.
+	 */
+	readonly autoPauseOnDtmf?: boolean;
 }
 
 /** The surface the verb executor and the plan walker call. `CallControl` is its only implementation. */
@@ -675,6 +827,8 @@ interface RecordingSession {
 	readonly snoopChannelId?: string;
 	readonly format: string;
 	readonly startedAtMs: number;
+	/** The resolved PCI rule for this recording. See {@link StartRecordingRequest.autoPauseOnDtmf}. */
+	readonly autoPauseOnDtmf: boolean;
 	readonly completion: { result?: RecordingCompletion };
 	readonly stopWatching: () => void;
 }
@@ -883,13 +1037,21 @@ export class CallControl implements CallControlPort {
 	 * PBX recording control — which needs `paused` too, because it answers a caller that is drawing
 	 * a pause/resume button from the reply.
 	 */
-	recordingFor(
-		mediaChannelId: string,
-	): { readonly recordingId: string; readonly paused: boolean } | undefined {
+	recordingFor(mediaChannelId: string):
+		| {
+				readonly recordingId: string;
+				readonly paused: boolean;
+				readonly autoPauseOnDtmf: boolean;
+		  }
+		| undefined {
 		const session = this.recordings.get(mediaChannelId);
 		return session === undefined
 			? undefined
-			: { recordingId: session.recordingId, paused: session.paused };
+			: {
+					recordingId: session.recordingId,
+					paused: session.paused,
+					autoPauseOnDtmf: session.autoPauseOnDtmf,
+				};
 	}
 
 	// -------------------------------------------------------------------------------------------
@@ -2637,6 +2799,32 @@ export class CallControl implements CallControlPort {
 	 * failures need different answers from an operator ("this media plane cannot record" is a
 	 * deployment fact, "the media server refused a tap" is an incident) and only one of them is
 	 * worth paging about.
+	 *
+	 * ## The consent gate runs BEFORE any of this, and its refusal is not an error
+	 *
+	 * {@link StartRecordingRequest.consent} — when it is supplied at all — is answered before a tap
+	 * or a snoop channel exists, because a tap that exists is a recorder that has already heard
+	 * something. `none` is the pass-through: outcome `not-required`, and the rest of the method runs
+	 * exactly as it did before any of this was written. `announce` plays the prompt to each party the
+	 * resolution named and proceeds. `announce-and-require-keypress` plays it and then waits on the
+	 * recorded leg's own signal key for the accept digit.
+	 *
+	 * A decline — an explicit decline digit, or the timeout, which is the same answer given more
+	 * slowly — starts NO recording and returns a refusal that names it. The consent record is
+	 * returned and filed on the leg anyway, through {@link CallControlHost.markConsent}, because a
+	 * call that was asked and said no is a fact somebody will need and the recording that would
+	 * normally have carried it does not exist.
+	 *
+	 * ## A playback that fails must not become a silent recording
+	 *
+	 * The announcement is best-effort PER PARTY: a media plane that will not play to the peer still
+	 * announced to the party in front of it, and refusing the whole recording over the second failure
+	 * would take a legitimate recorded call away over a media error. But if NOBODY heard it, the
+	 * outcome is a refusal. Downgrading a total playback failure to "recorded, announcement
+	 * attempted" is precisely the bug this gate exists to prevent — it would produce recordings that
+	 * a compliance report calls announced and that no human being was ever told about. So the
+	 * outcome is `announced` only when at least one party heard the prompt, and a call where none
+	 * did is refused with the media failure named.
 	 */
 	async startRecording(
 		leg: ControlledLeg,
@@ -2656,6 +2844,16 @@ export class CallControl implements CallControlPort {
 		}
 		if (this.recordings.has(leg.mediaChannelId)) {
 			return { result: refuse("this leg is already being recorded") };
+		}
+
+		let consentRecord: RecordingConsentRecord | undefined;
+		if (request.consent !== undefined) {
+			const gate = await this.runConsentGate(leg, request.consent);
+			consentRecord = gate.record;
+			this.deps.host.markConsent(leg, gate.record);
+			if (gate.refusal !== undefined) {
+				return { result: refuse(gate.refusal), consent: gate.record };
+			}
 		}
 
 		const recordingId = this.newId();
@@ -2731,6 +2929,7 @@ export class CallControl implements CallControlPort {
 			snoopChannelId,
 			format,
 			startedAtMs: this.now(),
+			autoPauseOnDtmf: request.autoPauseOnDtmf ?? false,
 		});
 
 		this.deps.host.markRecording(leg, { active: true, paused: false });
@@ -2740,8 +2939,456 @@ export class CallControl implements CallControlPort {
 			objectKey,
 			kind: "call",
 			stereo: false,
+			...(consentRecord === undefined ? {} : { consent: consentRecord }),
 		});
-		return { result: ok(), recordingId, objectKey };
+		return {
+			result: ok(),
+			recordingId,
+			objectKey,
+			...(consentRecord === undefined ? {} : { consent: consentRecord }),
+		};
+	}
+
+	/**
+	 * Asks the parties, and answers whether the recording may start.
+	 *
+	 * The three policies are three shapes of the same sequence and are written as one method rather
+	 * than three, because the announcement is common to two of them and the RECORD is common to all
+	 * three: whatever happens, exactly one {@link RecordingConsentRecord} comes out, stamped once,
+	 * naming the parties the prompt was actually PLAYED at rather than the parties it was owed to.
+	 * `outcome: "announced"` therefore means "the media plane reported that it played audio to this
+	 * party" — the media plane's own `playedMs`, greater than zero — and never "this person heard
+	 * it", which nothing can establish (see {@link CallControl.announceConsent}). `refusal`
+	 * present means the caller must not record; its absence means it may.
+	 */
+	private async runConsentGate(
+		leg: ControlledLeg,
+		consent: ResolvedRecordingConsent,
+	): Promise<{ readonly record: RecordingConsentRecord; readonly refusal?: string }> {
+		const stamp = (
+			outcome: RecordingConsentRecord["outcome"],
+			method: RecordingConsentRecord["method"],
+			parties: readonly ConsentParty[],
+		): RecordingConsentRecord => ({
+			outcome,
+			method,
+			policy: consent.policy,
+			at: new Date(this.now()).toISOString(),
+			parties,
+			...(consent.regions.length === 0 ? {} : { regions: consent.regions }),
+			...(consent.promptId === undefined ? {} : { promptId: consent.promptId }),
+		});
+
+		if (consent.policy === "none") {
+			return { record: stamp("not-required", "none", NO_CONSENT_PARTIES) };
+		}
+
+		const keypress = consent.policy === "announce-and-require-keypress";
+		const method = keypress ? "keypress" : "announcement";
+		const heard = await this.announceConsent(leg, consent);
+		if (heard.length === 0) {
+			// Nobody was told. See the argument on `startRecording`: this is the one media failure
+			// that has to stop the recording rather than be logged past.
+			return {
+				record: stamp("declined", method, heard),
+				refusal:
+					"the consent announcement could not be played to any party, so this call was not recorded",
+			};
+		}
+		if (!keypress) {
+			return { record: stamp("announced", "announcement", heard) };
+		}
+
+		const pressed = await this.awaitConsentDigit(
+			leg.mediaChannelId,
+			consent,
+			this.settings.consentKeypressTimeoutMs,
+		);
+		if (pressed === consent.acceptDigit) {
+			return { record: stamp("accepted", "keypress", heard) };
+		}
+		return {
+			record: stamp("declined", "keypress", heard),
+			refusal:
+				pressed === undefined
+					? `no consent digit was pressed within ${String(this.settings.consentKeypressTimeoutMs)}ms, so this call was not recorded`
+					: "the party declined to be recorded, so this call was not recorded",
+		};
+	}
+
+	/**
+	 * Plays the consent prompt at every party it is owed to. Returns the ones it was DELIVERED to.
+	 *
+	 * ## What the returned parties mean — read this before reading the consent record
+	 *
+	 * A party in this list is a party whose media plane reported that it PLAYED AUDIO to that party:
+	 * `mediad` publishes `playback.finished` with `playedMs`, the count of milliseconds it actually
+	 * wrote to that leg's transport, and a party is counted only when that number is greater than
+	 * zero. That is a materially stronger claim than the one this method used to make. It used to
+	 * count a party when `MediaPort.play` RESOLVED, and `play` resolves on acceptance — so a WebRTC
+	 * party still finishing ICE and DTLS was written into a compliance record as announced to while
+	 * the media plane was logging `playedMs 0` and `WebRTC media is not connected` on the very same
+	 * prompt. That was measured on the running stack, not imagined.
+	 *
+	 * What it STILL cannot mean, and the documentation says so in the same words: that a human
+	 * listened. Audio left the machine and reached the far end's transport. Nobody can prove a person
+	 * was in the room, was not on mute at their end, or understood the language the prompt is in —
+	 * no telephony platform can, and a record that implied it would be lying about something
+	 * unfalsifiable. `announced` means the media plane delivered audio to that party. See
+	 * `docs/recording-compliance.md`.
+	 *
+	 * ## The two waits, and why neither is a sleep
+	 *
+	 * **Readiness first.** A leg that has not signalled an answer cannot be played at — the media
+	 * plane may refuse the playback outright — so each party's `active` call state is required, read
+	 * off {@link CallControlHost.legFor} and, when it has not arrived, waited for on the leg's signal
+	 * key, bounded by {@link CallControlSettings.consentPeerReadyTimeoutMs}. Both parties are waited
+	 * for AT ONCE, so a bridged pair costs one budget between them rather than two in series.
+	 *
+	 * **Then delivery.** Readiness is a SIGNALLING fact and is not enough on its own; this is where a
+	 * fixed 1 500 ms sleep used to sit, guessing at how long a browser's handshake takes because the
+	 * engine had no way to know when the prompt had actually played. It has one now. The gate
+	 * subscribes to the playback's own reference BEFORE issuing the play — a prompt can finish before
+	 * the command's reply is unwrapped, and a watcher registered afterwards would miss it — and then
+	 * waits for the media plane's account, bounded by
+	 * {@link CallControlSettings.consentPlaybackTimeoutMs}. The gate's cost is therefore the length of
+	 * the prompt, not a constant; a deployment whose parties are all RTP endpoints stops paying the
+	 * old sleep entirely.
+	 *
+	 * Every way a party can fail — no addressable channel, never answered, `play` threw, the playback
+	 * never finished, or it finished having delivered nothing — leaves that party OUT of `parties`
+	 * rather than credited. No party at all refuses the recording, which is the contract
+	 * {@link CallControl.runConsentGate} already held and still holds.
+	 *
+	 * The peer is addressed by its MEDIA channel id and not by walking back through the registry,
+	 * because the far end of an outbound recorded call is exactly the party the announcement exists
+	 * for and it is reachable here with no lookup at all. A `callee` the engine cannot address —
+	 * the recorded leg is not bridged yet, which is what a recording started by the walk before the
+	 * dial looks like — is left out of `parties` rather than reported as told.
+	 */
+	private async announceConsent(
+		leg: ControlledLeg,
+		consent: ResolvedRecordingConsent,
+	): Promise<readonly ConsentParty[]> {
+		const media = consent.promptMedia ?? this.settings.consentPrompt;
+
+		const ready = (
+			await Promise.all(
+				consent.parties.map(async (party) => {
+					const channelId = party === "caller" ? leg.mediaChannelId : leg.peerMediaChannelId;
+					if (channelId === undefined) {
+						return undefined;
+					}
+					if (!(await this.awaitMediaReady(channelId, this.settings.consentPeerReadyTimeoutMs))) {
+						this.log("a consent announcement was not played: the party's leg never carried media", {
+							mediaChannelId: channelId,
+							party,
+							timeoutMs: this.settings.consentPeerReadyTimeoutMs,
+						});
+						return undefined;
+					}
+					return { party, channelId };
+				}),
+			)
+		).filter((entry) => entry !== undefined);
+
+		// Played and awaited CONCURRENTLY, which matters more than it did when this was fire-and-
+		// forget: the parties now wait for the prompt to end, and doing that in series would play at
+		// the second party a whole prompt after the first on a call two people are already on.
+		// ONE budget for the whole announcement, on a real timer rather than on `now()`: the injected
+		// clock is a constant in a spec, and a loop that measured its own elapsed time with it would
+		// never terminate. The budget is raced by every party and cancelled once they have all settled.
+		const budget = this.playbackBudget(this.settings.consentPlaybackTimeoutMs);
+		const delivered = await Promise.all(
+			ready.map(async ({ party, channelId }) => {
+				let attempts = 0;
+				for (;;) {
+					attempts += 1;
+					const playbackRef = this.newId();
+					// Subscribed BEFORE the play, never after: a short prompt on a fast local transport
+					// can finish before the command's reply is unwrapped, and a waiter registered then
+					// would wait out the whole budget for a signal that had already been emitted.
+					const finished = this.awaitPlaybackDelivery(
+						playbackRef,
+						this.settings.consentPlaybackTimeoutMs,
+					);
+					let outcome: Awaited<typeof finished.result> | "budget-expired";
+					try {
+						await this.deps.media.play(channelId, { media: [media], playbackRef });
+						outcome = await Promise.race([finished.result, budget.expiry]);
+					} catch (error) {
+						finished.cancel();
+						// A refused command is not retried: `play` throwing is the media plane declining
+						// this prompt on this leg — an unknown session, an unresolvable media ref — and
+						// none of those become true again by asking a second time. A DELIVERED ZERO is
+						// the opposite: everything worked and the transport was not there yet.
+						this.log("failed to play a consent announcement", {
+							mediaChannelId: channelId,
+							party,
+							err: String(error),
+						});
+						return undefined;
+					}
+					if (outcome === "budget-expired") {
+						finished.cancel();
+					} else if (outcome.deliveredMedia) {
+						if (attempts > 1) {
+							this.log("a consent announcement was delivered after the media path came up", {
+								mediaChannelId: channelId,
+								party,
+								attempts,
+								...(outcome.playedMs === undefined ? {} : { playedMs: outcome.playedMs }),
+							});
+						}
+						return party;
+					}
+					if (outcome === "budget-expired" || budget.expired) {
+						this.log("a consent announcement was played but the media plane delivered no audio", {
+							mediaChannelId: channelId,
+							party,
+							attempts,
+							timeoutMs: this.settings.consentPlaybackTimeoutMs,
+							...(outcome === "budget-expired"
+								? { reason: "the announcement budget expired" }
+								: {
+										...(outcome.playedMs === undefined ? {} : { playedMs: outcome.playedMs }),
+										...(outcome.reason === undefined ? {} : { reason: outcome.reason }),
+									}),
+						});
+						return undefined;
+					}
+					// Retried, not waited out: a playback written into a transport with no peer is not
+					// queued anywhere and nothing is going to arrive late. The only way this party hears
+					// the disclosure is to play it again once the path is up.
+					await Promise.race([this.settle(this.settings.consentPlaybackRetryMs), budget.expiry]);
+					if (budget.expired) {
+						this.log("a consent announcement was played but the media plane delivered no audio", {
+							mediaChannelId: channelId,
+							party,
+							attempts,
+							timeoutMs: this.settings.consentPlaybackTimeoutMs,
+							reason: "the announcement budget expired between attempts",
+						});
+						return undefined;
+					}
+				}
+			}),
+		);
+		budget.cancel();
+		return delivered.filter((party) => party !== undefined);
+	}
+
+	/**
+	 * The whole announcement's ceiling, as a promise that resolves once rather than a clock to read.
+	 *
+	 * `expiry` never rejects and is safe to race any number of times; `expired` is the same fact for
+	 * a caller that has already settled and only wants to know why. `cancel` drops the timer when
+	 * every party is done, so an announcement that succeeds immediately leaves nothing pending.
+	 */
+	private playbackBudget(timeoutMs: number): {
+		readonly expiry: Promise<"budget-expired">;
+		readonly expired: boolean;
+		readonly cancel: () => void;
+	} {
+		let expired = false;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const expiry = new Promise<"budget-expired">((resolve) => {
+			timer = setTimeout(() => {
+				expired = true;
+				resolve("budget-expired");
+			}, timeoutMs);
+			timer.unref?.();
+		});
+		return {
+			expiry,
+			get expired() {
+				return expired;
+			},
+			cancel: () => {
+				if (timer !== undefined) {
+					clearTimeout(timer);
+					timer = undefined;
+				}
+			},
+		};
+	}
+
+	/** The gap between a delivered-nothing report and the next attempt. Unref'd: it never holds exit. */
+	private settle(ms: number): Promise<void> {
+		return new Promise<void>((resolve) => {
+			const timer = setTimeout(resolve, ms);
+			timer.unref?.();
+		});
+	}
+
+	/**
+	 * What the media plane says it delivered of one playback, waiting a bounded time for it.
+	 *
+	 * Returns the promise AND its cancel, rather than just the promise, because the caller has to
+	 * subscribe before it plays and then has a path — the play itself throwing — on which no signal
+	 * will ever arrive. Without the cancel that path would hold a watcher and a timer for the length
+	 * of the budget on a playback that never started.
+	 *
+	 * `deliveredMedia` is the whole judgement, and it is deliberately not `playedMs > 0` on its own.
+	 * A driver that measures delivery (`mediad`) reports a number and `0` means the far end got
+	 * nothing — that is the failure this rung exists to catch. A driver that CANNOT measure it
+	 * (Asterisk's `PlaybackFinished` carries a state and no duration) reports no number, and there
+	 * the strongest available evidence is that the playback ended without failing. Treating a missing
+	 * measurement as a zero would refuse every announcement on an ARI deployment.
+	 *
+	 * The watcher and the timer are torn down by whichever settles first, on EVERY exit — delivered,
+	 * delivered nothing, budget expired, cancelled — for the reason {@link awaitConsentDigit} gives:
+	 * this runs on every recorded call, and a watcher left behind would be a listener on a dead
+	 * playback's key for the life of the process.
+	 */
+	private awaitPlaybackDelivery(
+		playbackRef: string,
+		timeoutMs: number,
+	): {
+		readonly result: Promise<{
+			readonly deliveredMedia: boolean;
+			readonly playedMs?: number;
+			readonly reason?: string;
+		}>;
+		readonly cancel: () => void;
+	} {
+		let cancel = (): void => undefined;
+		const result = new Promise<{
+			readonly deliveredMedia: boolean;
+			readonly playedMs?: number;
+			readonly reason?: string;
+		}>((resolve) => {
+			let unwatch = (): void => undefined;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const done = (value: {
+				readonly deliveredMedia: boolean;
+				readonly playedMs?: number;
+				readonly reason?: string;
+			}): void => {
+				if (timer !== undefined) {
+					clearTimeout(timer);
+					timer = undefined;
+				}
+				unwatch();
+				resolve(value);
+			};
+			cancel = () => {
+				done({ deliveredMedia: false, reason: "the playback was never started" });
+			};
+			unwatch = this.deps.playbacks.watch(playbackSignalKey(playbackRef), (signal) => {
+				done({
+					deliveredMedia:
+						signal.playedMs === undefined
+							? signal.reason !== "error" && signal.reason !== "failed"
+							: signal.playedMs > 0,
+					...(signal.playedMs === undefined ? {} : { playedMs: signal.playedMs }),
+					reason: signal.reason,
+				});
+			});
+			timer = setTimeout(() => {
+				done({ deliveredMedia: false, reason: "the playback never finished" });
+			}, timeoutMs);
+			timer.unref?.();
+		});
+		return {
+			result,
+			cancel: () => {
+				cancel();
+			},
+		};
+	}
+
+	/**
+	 * Whether this leg is answered, waiting a bounded time for it if it is not yet.
+	 *
+	 * The same promise-and-cancel shape as {@link awaitConsentDigit} and for the same reason: the
+	 * watcher and the timer are torn down by whichever settles first, on EVERY exit — already
+	 * answered, answered while waiting, hung up while waiting, budget expired — so a gate that runs
+	 * on every recorded call cannot leave a listener behind on a dead leg's key.
+	 *
+	 * A leg the host does not know is not treated as a failure on the spot: the signal bus is keyed
+	 * by media channel id and works for a leg no registry entry exists for yet, so the wait runs and
+	 * the budget is what ends it.
+	 */
+	private awaitMediaReady(mediaChannelId: string, timeoutMs: number): Promise<boolean> {
+		if (this.deps.host.legFor(mediaChannelId)?.isAnswered === true) {
+			return Promise.resolve(true);
+		}
+		return new Promise<boolean>((resolve) => {
+			let unwatch = (): void => undefined;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const done = (value: boolean): void => {
+				if (timer !== undefined) {
+					clearTimeout(timer);
+					timer = undefined;
+				}
+				unwatch();
+				resolve(value);
+			};
+			unwatch = this.deps.signals.watch(legSignalKey(mediaChannelId), (signal) => {
+				const legSignal = signal as LegSignal;
+				if (legSignal.kind === "answered") {
+					done(true);
+					return;
+				}
+				if (legSignal.kind === "ended") {
+					done(false);
+				}
+			});
+			timer = setTimeout(() => {
+				done(false);
+			}, timeoutMs);
+			timer.unref?.();
+		});
+	}
+
+	/**
+	 * The accept or decline digit off the recorded leg, or `undefined` when the budget ran out.
+	 *
+	 * The same promise-and-cancel shape as {@link awaitLegEntered}, and for the same reason: the
+	 * watcher and the timer are both torn down by whichever settles first, so no exit path — accept,
+	 * decline, hangup, timeout — leaves either behind. A dangling watcher here would be a listener
+	 * on a dead leg's key for the life of the process, and every recorded call would add one.
+	 *
+	 * Digits that are neither the accept nor the decline are IGNORED rather than treated as a
+	 * decline: a caller who is still holding a menu's `#` from two seconds ago has not answered this
+	 * question, and the timeout is what covers a caller who never answers it. An `ended` is a hangup
+	 * mid-question, which settles as no answer — there is nobody left to record either way.
+	 */
+	private awaitConsentDigit(
+		mediaChannelId: string,
+		consent: ResolvedRecordingConsent,
+		timeoutMs: number,
+	): Promise<string | undefined> {
+		return new Promise<string | undefined>((resolve) => {
+			let unwatch = (): void => undefined;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const done = (value: string | undefined): void => {
+				if (timer !== undefined) {
+					clearTimeout(timer);
+					timer = undefined;
+				}
+				unwatch();
+				resolve(value);
+			};
+			unwatch = this.deps.signals.watch(legSignalKey(mediaChannelId), (signal) => {
+				const legSignal = signal as LegSignal;
+				if (legSignal.kind === "ended") {
+					done(undefined);
+					return;
+				}
+				if (legSignal.kind !== "dtmf") {
+					return;
+				}
+				if (legSignal.digit === consent.acceptDigit || legSignal.digit === consent.declineDigit) {
+					done(legSignal.digit);
+				}
+			});
+			timer = setTimeout(() => {
+				done(undefined);
+			}, timeoutMs);
+			timer.unref?.();
+		});
 	}
 
 	/**

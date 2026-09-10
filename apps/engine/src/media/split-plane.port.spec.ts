@@ -182,6 +182,109 @@ describe("answer", () => {
 	});
 });
 
+/**
+ * SDES-SRTP, per leg, and the encryption state a lock icon renders from.
+ *
+ * The policy is what the organization ASKED for; `mediaEncryption` is what `mediad` actually
+ * installed. Conflating the two is the whole reason the flag is not derived from the setting: a leg
+ * under `require` reads `plaintext` between an offer and its answer, because nothing is installed
+ * until the far end has chosen.
+ */
+describe("per-leg SRTP policy and encryption state", () => {
+	it("carries the leg's policy into allocate-session, and omits it when there is none", async () => {
+		const required = newComposite();
+		required.port.registerInboundLeg(CH, {
+			orgId: ORG,
+			callId: CALL,
+			sipdInstanceId: INSTANCE,
+			sdpOffer: OFFER,
+			srtpPolicy: "require",
+		});
+		await required.port.answer(CH);
+		const withPolicy = required.transport.on(RPC_SUBJECTS.mediaAllocateSession)[0]
+			?.payload as Record<string, unknown>;
+		expect(withPolicy["srtpPolicy"]).toBe("require");
+
+		// The additive guarantee: a leg registered without a policy sends the request it always sent.
+		const plain = newComposite();
+		plain.port.registerInboundLeg(CH, {
+			orgId: ORG,
+			callId: CALL,
+			sipdInstanceId: INSTANCE,
+			sdpOffer: OFFER,
+		});
+		await plain.port.answer(CH);
+		const without = plain.transport.on(RPC_SUBJECTS.mediaAllocateSession)[0]?.payload as Record<
+			string,
+			unknown
+		>;
+		expect("srtpPolicy" in without).toBe(false);
+	});
+
+	it("records what mediad installed, and tells the lead once", async () => {
+		const { port, transport } = newComposite();
+		const seen: { legId: string; encryption: string }[] = [];
+		port.onMediaEncryption = (legId, encryption) => {
+			seen.push({ legId, encryption });
+		};
+		transport.reply(RPC_SUBJECTS.mediaAllocateSession, {
+			ok: true,
+			sessionId: CH,
+			sdpAnswer: "v=0\r\no=- 30000 1 IN IP4 203.0.113.10\r\n",
+			instanceId: "mediad-fake",
+			mediaEncryption: "encrypted",
+		});
+		port.registerInboundLeg(CH, {
+			orgId: ORG,
+			callId: CALL,
+			sipdInstanceId: INSTANCE,
+			sdpOffer: OFFER,
+			srtpPolicy: "require",
+		});
+
+		await port.answer(CH);
+
+		expect(port.mediaEncryptionOf(CH)).toBe("encrypted");
+		expect(seen).toEqual([{ legId: CH, encryption: "encrypted" }]);
+	});
+
+	/**
+	 * `undefined` is not `plaintext`. A leg nothing has negotiated must be distinguishable from one
+	 * negotiated in the clear, or a lock icon becomes a claim about every ringing call.
+	 */
+	it("reads undefined for a leg nothing has negotiated, and for an unknown one", () => {
+		const { port } = newComposite();
+		port.registerInboundLeg(CH, {
+			orgId: ORG,
+			callId: CALL,
+			sipdInstanceId: INSTANCE,
+			sdpOffer: OFFER,
+		});
+		expect(port.mediaEncryptionOf(CH)).toBeUndefined();
+		expect(port.mediaEncryptionOf("no-such-leg")).toBeUndefined();
+	});
+
+	it("says nothing when the media plane says nothing, rather than reporting plaintext", async () => {
+		const { port } = newComposite();
+		const seen: string[] = [];
+		port.onMediaEncryption = (_legId, encryption) => {
+			seen.push(encryption);
+		};
+		port.registerInboundLeg(CH, {
+			orgId: ORG,
+			callId: CALL,
+			sipdInstanceId: INSTANCE,
+			sdpOffer: OFFER,
+		});
+
+		// The fake's default allocate reply carries no `mediaEncryption` — an older `mediad`.
+		await port.answer(CH);
+
+		expect(seen).toEqual([]);
+		expect(port.mediaEncryptionOf(CH)).toBeUndefined();
+	});
+});
+
 describe("ring", () => {
 	it("sends a 180 to the owning instance", async () => {
 		const { port, sipd } = newComposite();

@@ -4,6 +4,7 @@ import { parseAriEvent } from "@optimiq-voice/media-ari";
 import { makeFakeMediaPort } from "../media/media-port.fake";
 import { MediadMediaPort } from "../media/mediad-media.port";
 import { FakeMediadTransport } from "../media/mediad-transport.fake";
+import { playbackSignalKey } from "../media/playback-signals";
 import { SplitPlaneMediaPort } from "../media/split-plane.port";
 import {
 	CHANNEL_OWNER_EXPIRES_AT_VARIABLE,
@@ -23,7 +24,7 @@ import { ChannelAggregate } from "./channel-aggregate";
 import { callIdForAriChannel, legIdForAriChannel } from "./channel-identity";
 import { ChannelOrchestrator } from "./channel-orchestrator.service";
 import type { EngineEnv } from "../config/engine-env";
-import type { MediaEvent } from "../media/media-event";
+import type { MediaEvent, MediaEventOf } from "../media/media-event";
 import type { CallEventPublisher } from "../nats/call-event-publisher.service";
 import type { JetStreamService } from "../nats/jetstream.service";
 import type { OriginateCallPath, OriginateService } from "../nats/originate.service";
@@ -2896,5 +2897,269 @@ describe("recording control for a call under nobody's session", () => {
 		});
 
 		expect(refused).toMatchObject({ ok: false, reason: "wrong_instance" });
+	});
+});
+
+/**
+ * The PCI auto-pause, and the consent verdict's trip to the ledger.
+ *
+ * Driven through the REAL DTMF path — a parsed `ChannelDtmfReceived` frame — because what is under
+ * test is the orchestrator's own wiring: which leg's recorder a digit finds, when the window is
+ * refreshed, and when the timer is dropped. The gate that decides whether a recording may start at
+ * all is `call-control.spec.ts`'s, and the resolution behind it is `recording-consent.spec.ts`'s.
+ */
+describe("recording auto-pause on DTMF", () => {
+	interface AutoPauseHandle {
+		control: {
+			startRecording(
+				leg: unknown,
+				request?: { autoPauseOnDtmf?: boolean },
+			): Promise<{ result: { ok: boolean } }>;
+			recordingFor(mediaChannelId: string): { paused: boolean } | undefined;
+		};
+		controlledLegFor(mediaChannelId: string): unknown;
+		recordingAutoResume: ReadonlyMap<string, unknown>;
+	}
+
+	/** A live, answered, recorded leg with a very short quiet window. */
+	async function recorded(options: { readonly autoPause?: boolean } = {}) {
+		const h = harness();
+		// A conversation recorder, the split-plane shape, so the recording starts without waiting for
+		// a snoop channel to enter the application.
+		(h.mediaPort as unknown as { recordConversation: unknown }).recordConversation = (
+			h.mediaPort as unknown as { record: (id: string, request: unknown) => Promise<unknown> }
+		).record.bind(h.mediaPort);
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
+		await h.orchestrator.handleEvent(
+			mediaEvent("ChannelStateChange", { channel: channel({ state: "Up" }) }),
+		);
+		h.published.length = 0;
+
+		// Three seconds of real wall clock per case is the production window; these assert the SHAPE
+		// of the window, and the duration itself is a constant with its own argument beside it.
+		Reflect.set(h.orchestrator, "recordingAutoResumeMs", 25);
+		const inner = h.orchestrator as unknown as AutoPauseHandle;
+		const started = await inner.control.startRecording(inner.controlledLegFor(ARI_CHANNEL), {
+			autoPauseOnDtmf: options.autoPause ?? true,
+		});
+		expect(started.result.ok).toBe(true);
+		return {
+			...h,
+			inner,
+			press: async (digit: string) => {
+				await h.orchestrator.handleEvent(
+					mediaEvent("ChannelDtmfReceived", {
+						channel: channel(),
+						digit,
+						duration_ms: 100,
+					}),
+				);
+			},
+		};
+	}
+
+	it("pauses on the first digit and resumes once the digits stop", async () => {
+		const h = await recorded();
+
+		await h.press("4");
+		expect(h.inner.control.recordingFor(ARI_CHANNEL)?.paused).toBe(true);
+
+		await waitFor(() => h.inner.control.recordingFor(ARI_CHANNEL)?.paused === false);
+		expect(h.inner.recordingAutoResume.size).toBe(0);
+	});
+
+	it("refreshes the window on every digit, so a pause covers the whole card number", async () => {
+		const h = await recorded();
+
+		await h.press("4");
+		await new Promise((resolve) => setTimeout(resolve, 15));
+		// Still inside the first window: the second digit must extend it rather than let it expire.
+		await h.press("1");
+		await new Promise((resolve) => setTimeout(resolve, 15));
+		expect(h.inner.control.recordingFor(ARI_CHANNEL)?.paused).toBe(true);
+
+		await waitFor(() => h.inner.control.recordingFor(ARI_CHANNEL)?.paused === false);
+	});
+
+	it("leaves a recording alone when the tenant did not ask for the pause", async () => {
+		const h = await recorded({ autoPause: false });
+
+		await h.press("4");
+
+		expect(h.inner.control.recordingFor(ARI_CHANNEL)?.paused).toBe(false);
+		expect(h.inner.recordingAutoResume.size).toBe(0);
+	});
+
+	it("clears the timer when the leg tears down, so nothing resumes a dead recording", async () => {
+		const h = await recorded();
+		await h.press("4");
+		expect(h.inner.recordingAutoResume.size).toBe(1);
+
+		// Not awaited: the teardown then waits on the media plane's `RecordingFinished`, which this
+		// fake never sends. The timer is dropped at the TOP of the teardown, before any of that, and
+		// that ordering is exactly the property under test — a leg on its way out must not be able to
+		// leave a resume armed behind it however long its recorder takes to close.
+		void h.orchestrator.handleEvent(
+			mediaEvent("ChannelDestroyed", { channel: channel({ state: "Down" }), cause: 16 }),
+		);
+
+		await waitFor(() => h.inner.recordingAutoResume.size === 0);
+	});
+
+	it("clears the timer when the drain runs", async () => {
+		const h = await recorded();
+		await h.press("4");
+		expect(h.inner.recordingAutoResume.size).toBe(1);
+
+		await h.orchestrator.drain(1);
+
+		expect(h.inner.recordingAutoResume.size).toBe(0);
+	});
+
+	it("survives a digit on a call nothing is recording", async () => {
+		const h = harness();
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
+		await h.orchestrator.handleEvent(
+			mediaEvent("ChannelDtmfReceived", { channel: channel(), digit: "4", duration_ms: 100 }),
+		);
+		expect(typesOf(h.published)).toContain("channel.dtmf");
+	});
+});
+
+describe("the consent verdict on the CDR", () => {
+	it("files every consent field on the leg and carries all four onto the ledger", async () => {
+		const h = harness();
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
+
+		const inner = h.orchestrator as unknown as {
+			callControlHost(): {
+				markConsent(
+					leg: { legId: string },
+					record: {
+						outcome: string;
+						method: string;
+						policy: string;
+						at: string;
+						parties: readonly string[];
+						regions?: readonly string[];
+					},
+				): void;
+			};
+			controlledLegFor(mediaChannelId: string): { legId: string };
+		};
+		inner.callControlHost().markConsent(inner.controlledLegFor(ARI_CHANNEL), {
+			// A DECLINE: no recording was ever started, so this variable is the only trace the call
+			// was ever asked, and the CDR is the only place it can land.
+			outcome: "declined",
+			method: "keypress",
+			policy: "announce-and-require-keypress",
+			at: "2026-01-01T00:00:00.000Z",
+			parties: ["caller"],
+			regions: ["US-CA"],
+		});
+
+		await h.orchestrator.handleEvent(
+			mediaEvent("ChannelDestroyed", { channel: channel({ state: "Down" }), cause: 16 }),
+		);
+		await waitFor(() => h.cdrs.length === 1);
+
+		expect(h.cdrs[0]?.data).toMatchObject({
+			recordingConsent: "declined",
+			recordingConsentMethod: "keypress",
+			recordingConsentAt: "2026-01-01T00:00:00.000Z",
+			recordingConsentRegions: ["US-CA"],
+		});
+	});
+
+	it("leaves all four off a leg nobody asked about, which is nearly every leg", async () => {
+		const h = harness();
+		await h.orchestrator.handleEvent(mediaEvent("StasisStart", { channel: channel(), args: [] }));
+		await h.orchestrator.handleEvent(
+			mediaEvent("ChannelDestroyed", { channel: channel({ state: "Down" }), cause: 16 }),
+		);
+		await waitFor(() => h.cdrs.length === 1);
+
+		expect(h.cdrs[0]?.data).not.toHaveProperty("recordingConsent");
+		expect(h.cdrs[0]?.data).not.toHaveProperty("recordingConsentRegions");
+	});
+});
+
+/**
+ * The dispatch rung for a prompt's ending.
+ *
+ * `mediad` has always published `playback.finished` with the milliseconds it actually wrote, and the
+ * engine dropped it at the mapping. It does not any more, and this is where the fact stops being a
+ * `MediaEvent` and becomes something a waiter can be woken by — the same shape, and the same
+ * argument, as `recording-started` / `recording-finished` on the recording key beside it.
+ */
+describe("republishing a playback's ending", () => {
+	function finished(overrides: Partial<MediaEventOf<"playback-finished">> = {}): MediaEvent {
+		return {
+			type: "playback-finished",
+			channelId: ARI_CHANNEL,
+			playbackRef: "pb-1",
+			playedMs: 1_040,
+			reason: "completed",
+			...overrides,
+		};
+	}
+
+	it("emits on the playback's own key, carrying the delivered milliseconds", async () => {
+		const h = harness();
+		const seen: unknown[] = [];
+		h.orchestrator.playbackSignals.watch(playbackSignalKey("pb-1"), (signal) => {
+			seen.push(signal);
+		});
+
+		await h.orchestrator.handleEvent(finished());
+
+		expect(seen).toEqual([
+			{ kind: "playback-finished", playbackRef: "pb-1", playedMs: 1_040, reason: "completed" },
+		]);
+	});
+
+	it("carries a delivered ZERO through as zero, with the media plane's reason and detail", async () => {
+		// The whole point of the rung: the command succeeded, the session is healthy, and this one
+		// number is the only evidence the far end heard nothing.
+		const h = harness();
+		const seen: unknown[] = [];
+		h.orchestrator.playbackSignals.watch(playbackSignalKey("pb-1"), (signal) => {
+			seen.push(signal);
+		});
+
+		await h.orchestrator.handleEvent(
+			finished({ playedMs: 0, reason: "error", detail: "WebRTC media is not connected" }),
+		);
+
+		expect(seen).toEqual([
+			{
+				kind: "playback-finished",
+				playbackRef: "pb-1",
+				playedMs: 0,
+				reason: "error",
+				detail: "WebRTC media is not connected",
+			},
+		]);
+	});
+
+	it("keys on the REFERENCE, so a second prompt on the same leg wakes nobody", async () => {
+		// An announcement and the music behind it run on one channel. Keying a playback on the leg
+		// would make each of them look like the other's completion, which is exactly the confusion
+		// this whole change exists to remove.
+		const h = harness();
+		const seen: unknown[] = [];
+		h.orchestrator.playbackSignals.watch(playbackSignalKey("pb-1"), (signal) => {
+			seen.push(signal);
+		});
+
+		await h.orchestrator.handleEvent(finished({ playbackRef: "pb-2" }));
+
+		expect(seen).toEqual([]);
+	});
+
+	it("costs nothing when nobody is waiting, which is nearly every prompt on the platform", async () => {
+		const h = harness();
+		await h.orchestrator.handleEvent(finished());
+		expect(h.orchestrator.playbackSignals.watchedKeyCount).toBe(0);
 	});
 });

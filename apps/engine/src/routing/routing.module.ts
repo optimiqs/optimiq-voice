@@ -11,6 +11,7 @@ import { RoutingArtifactSource } from "./routing-artifact.source";
 import { SharedLineRegistry } from "./shared-line-registry";
 import { SupervisorAuthzRpcPort } from "./supervisor-authz.source";
 import { ToggleFeatureRpcPort } from "./toggle-feature.source";
+import { TollFraudGuardRpcPort } from "./toll-fraud-guard.source";
 import { TrunkStatusPublisher } from "./trunk-status.publisher";
 import { VoicemailGreetingRpcPort } from "./voicemail-greeting.source";
 import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
@@ -77,6 +78,7 @@ import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
 		LastCallerRpcSource,
 		VoicemailGreetingRpcPort,
 		SupervisorAuthzRpcPort,
+		TollFraudGuardRpcPort,
 		ConferenceRegistry,
 		ParkRegistry,
 		SharedLineRegistry,
@@ -94,6 +96,7 @@ import { VoicemailMailboxRpcSource } from "./voicemail-mailbox.source";
 		LastCallerRpcSource,
 		VoicemailGreetingRpcPort,
 		SupervisorAuthzRpcPort,
+		TollFraudGuardRpcPort,
 		ConferenceRegistry,
 		ParkRegistry,
 		SharedLineRegistry,

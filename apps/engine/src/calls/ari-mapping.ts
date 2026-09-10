@@ -329,6 +329,28 @@ export function toMediaEvent(event: AriEvent): MediaEvent | undefined {
 			};
 		case "ChannelUnhold":
 			return { type: "leg-unheld", channelId: event.channel.id };
+		case "PlaybackFinished": {
+			// The one playback event with a consumer: `CallControl.announceConsent` counts a party as
+			// announced to only when the media plane says the prompt was delivered. ARI addresses a
+			// playback's target by URI rather than by carrying the channel, so the id is parsed back
+			// out of `channel:<id>`; a playback aimed at a BRIDGE (`bridge:<id>`) belongs to no leg and
+			// drops here rather than being credited to one.
+			const channelId = ariPlaybackChannelId(event.playback.target_uri);
+			if (channelId === undefined) {
+				return undefined;
+			}
+			return {
+				type: "playback-finished",
+				channelId,
+				playbackRef: event.playback.id,
+				// NO `playedMs`. Asterisk reports a playback's STATE and never how much audio it wrote,
+				// and inventing a duration here would be exactly the ARI-shaped fiction this seam
+				// exists to keep out. The union's field is optional so a consumer can tell "nothing was
+				// delivered" from "this media plane does not measure delivery" — see the member's own
+				// documentation, and `announceConsent`, which refuses only on the first.
+				reason: event.playback.state === "" ? UNKNOWN_PLAYBACK_END_REASON : event.playback.state,
+			};
+		}
 		case "RecordingStarted":
 			return { type: "recording-started", recordingName: event.recording.name };
 		case "RecordingFinished":
@@ -371,3 +393,22 @@ export function toMediaEvent(event: AriEvent): MediaEvent | undefined {
 
 /** What a recording failure is reported as when the media server volunteered no reason. */
 export const UNKNOWN_RECORDING_FAILURE_REASON = "unknown";
+
+/** What a playback's end is reported as when the media server volunteered no state. */
+export const UNKNOWN_PLAYBACK_END_REASON = "unknown";
+
+/**
+ * The leg a playback was aimed at, out of ARI's `target_uri`.
+ *
+ * `channel:<id>` and `bridge:<id>` are the two forms Asterisk emits. Only the first names a leg,
+ * and a consumer that wants to know whether ONE PARTY heard something cannot use the second: a
+ * bridge playback reaches everyone in the bridge and nobody in particular.
+ */
+function ariPlaybackChannelId(targetUri: string): string | undefined {
+	const [kind, ...rest] = targetUri.split(":");
+	if (kind !== "channel") {
+		return undefined;
+	}
+	const id = rest.join(":");
+	return id === "" ? undefined : id;
+}
