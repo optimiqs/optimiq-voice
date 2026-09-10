@@ -17,6 +17,7 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/kv"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/profile"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/registrar"
+	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/sipevents"
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/trunk"
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 )
@@ -153,6 +154,11 @@ type Options struct {
 	Responder Responder
 	// Events publishes the dialog family.
 	Events EventSink
+	// Finalizer, when set, owns the release of a terminated leg's `sip-dialogs` claim: it deletes
+	// the claim only once the leg's termination has been acknowledged by the stream. Without it the
+	// claim is deleted as soon as the leg is forgotten, which loses the recovery record for a
+	// termination the broker never accepted.
+	Finalizer *sipevents.Finalizer
 	// Contact is the URI this edge puts in its own responses and requests.
 	Contact sip.Uri
 	// InstanceID stamps claims and is the token engine commands are addressed at.
@@ -195,7 +201,7 @@ type Handler struct {
 	realm     string
 	auth      *registrar.Authenticator
 	creds     credentials.Store
-	lockout   *registrar.Lockout
+	digest    *registrar.DigestGate
 	dialogs   *dialog.Store
 	claims    dialog.ClaimStore
 	profiles  *profile.Set
@@ -207,6 +213,7 @@ type Handler struct {
 	trunkAuth trunk.Authorizer
 	responder Responder
 	events    EventSink
+	finalize  *sipevents.Finalizer
 	contact   sip.Uri
 	instance  string
 	timers    dialog.TimerPolicy
@@ -292,7 +299,7 @@ func New(opts Options) (*Handler, error) {
 		realm:         opts.Realm,
 		auth:          opts.Auth,
 		creds:         opts.Credentials,
-		lockout:       opts.Lockout,
+		digest:        registrar.NewDigestGate(opts.Auth, opts.Credentials, opts.Lockout),
 		dialogs:       opts.Dialogs,
 		claims:        opts.Claims,
 		profiles:      opts.Profiles,
@@ -304,6 +311,7 @@ func New(opts Options) (*Handler, error) {
 		trunkAuth:     opts.TrunkAuth,
 		responder:     opts.Responder,
 		events:        opts.Events,
+		finalize:      opts.Finalizer,
 		contact:       opts.Contact,
 		instance:      opts.InstanceID,
 		timers:        opts.Timers,
@@ -957,7 +965,16 @@ func (h *Handler) forget(legID string) {
 		return
 	}
 	h.dialogs.Remove(legID)
-	if h.claims != nil {
+	switch {
+	case h.finalize != nil:
+		// The claim outlives the leg until its termination is acknowledged; Release deletes it now
+		// only when there is nothing waiting for an acknowledgement.
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := h.finalize.Release(ctx, legID); err != nil {
+			h.log.Warn("cannot release the dialog claim", "legId", legID, "error", err)
+		}
+	case h.claims != nil:
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		if err := h.claims.Delete(ctx, legID); err != nil {
@@ -994,9 +1011,9 @@ func (h *Handler) publish(event Event) {
 	}
 }
 
-// authorize runs the digest exchange for an INVITE. 401 for "no credentials" and "stale nonce"
-// because the device can retry; 403 for everything else, since re-challenging a wrong password
-// makes some handsets loop forever.
+// authorize runs the shared digest pipeline for an INVITE and answers the transaction on every
+// failure path. 401 for "no credentials" and "stale nonce" because the device can retry; 403 for
+// everything else, since re-challenging a wrong password makes some handsets loop forever.
 func (h *Handler) authorize(
 	ctx context.Context,
 	req *sip.Request,
@@ -1010,77 +1027,40 @@ func (h *Handler) authorize(
 		return credentials.Credential{}, false
 	}
 
-	accountAuth := h.auth.ForRequest(req)
-	auth, err := registrar.ParseAuthorization(headerValue(req, "Authorization"))
-	if err != nil {
-		if errors.Is(err, registrar.ErrNoAuthorization) {
-			h.challenge(req, tx, false, log)
-			return credentials.Credential{}, false
-		}
-		log.Info("refusing a malformed Authorization header", "error", err)
-		h.respond(tx, req, statusBadRequest, "Bad Request")
-		return credentials.Credential{}, false
-	}
-	if auth.Realm != accountAuth.Realm() {
-		log.Info("re-challenging a credential for another realm", "offeredRealm", auth.Realm)
-		h.challenge(req, tx, false, log)
-		return credentials.Credential{}, false
-	}
-	if err := accountAuth.CheckNonce(auth.Nonce); err != nil {
-		h.challenge(req, tx, errors.Is(err, registrar.ErrNonceStale), log)
-		return credentials.Credential{}, false
-	}
 	// An account may only call as itself: otherwise any valid account on the realm could place a
 	// call carrying somebody else's From and have the engine attribute it to them.
-	if auth.Username != from.Address.User {
-		log.Warn("refusing an INVITE sent as somebody else", "authenticatedAs", auth.Username)
+	result := h.digest.Authenticate(ctx, req, from.Address.User, "")
+	switch result.Outcome {
+	case registrar.DigestAccepted:
+		return result.Credential, true
+	case registrar.DigestChallenge:
+		h.challenge(req, tx, false, log)
+	case registrar.DigestStale:
+		h.challenge(req, tx, true, log)
+	case registrar.DigestMalformed:
+		log.Info("refusing a malformed Authorization header", "error", result.Err)
+		h.respond(tx, req, statusBadRequest, "Bad Request")
+	case registrar.DigestWrongIdentity:
+		log.Warn("refusing an INVITE sent as somebody else", "authenticatedAs", result.Auth.Username)
 		h.respond(tx, req, statusForbidden, "Forbidden")
-		return credentials.Credential{}, false
-	}
-
-	// Before the lookup, and answered exactly as an unknown account is — see the same check in
-	// registrar.authorize for why the ordering and the indistinguishable status are the point.
-	if refusal, locked := h.lockout.Locked(req.Source(), auth.Username); locked {
+	case registrar.DigestThrottled:
 		log.Info("refusing an INVITE from a locked source",
-			"username", auth.Username, "retryAfterSeconds", int(refusal.RetryAfter.Seconds()))
+			"username", result.Auth.Username, "retryAfterSeconds", int(result.Refusal.RetryAfter.Seconds()))
 		h.respond(tx, req, statusForbidden, "Forbidden")
-		return credentials.Credential{}, false
-	}
-
-	credential, err := h.creds.Lookup(ctx, accountAuth.Realm(), auth.Username)
-	if err != nil {
-		status, reason := statusForbidden, "Forbidden"
-		switch {
-		case errors.Is(err, credentials.ErrNotFound):
-			h.lockout.Fail(req.Source(), auth.Username, "", "")
-			log.Info("refusing an unknown account", "username", auth.Username)
-		case errors.Is(err, credentials.ErrDisabled):
-			log.Info("refusing a disabled account", "username", auth.Username)
-		default:
-			// No answer from the credential RPC is not a claim about this account: a 403 tells the
-			// phone its credentials are wrong and most handsets stop retrying, so a burst that
-			// exceeds the responder's deadline would black out a fleet until somebody re-provisions
-			// it. 503 is the retriable answer (RFC 3261 §21.5.4).
-			log.Error("cannot look up the account", "username", auth.Username, "error", err)
-			status, reason = statusServiceUnavail, "Service Unavailable"
-		}
-		h.respond(tx, req, status, reason)
-		return credentials.Credential{}, false
-	}
-	// INVITE, not REGISTER: HA2 is MD5(method:uri), so the wrong method name accepts nothing.
-	if err := accountAuth.VerifyRequest(req, auth, credential.HA1); err != nil {
-		if errors.Is(err, registrar.ErrNonceStale) {
-			h.challenge(req, tx, true, log)
-			return credentials.Credential{}, false
-		}
-		h.lockout.Fail(req.Source(), auth.Username, credential.OrgID,
-			"sip:"+credential.Username+"@"+strings.ToLower(credential.Realm))
-		log.Warn("refusing a failed digest", "username", auth.Username, "reason", err)
+	case registrar.DigestUnknownAccount:
+		log.Info("refusing an unknown account", "username", result.Auth.Username)
 		h.respond(tx, req, statusForbidden, "Forbidden")
-		return credentials.Credential{}, false
+	case registrar.DigestDisabled:
+		log.Info("refusing a disabled account", "username", result.Auth.Username)
+		h.respond(tx, req, statusForbidden, "Forbidden")
+	case registrar.DigestBadPassword:
+		log.Warn("refusing a failed digest", "username", result.Auth.Username, "reason", result.Err)
+		h.respond(tx, req, statusForbidden, "Forbidden")
+	case registrar.DigestBackendUnavailable:
+		log.Error("cannot look up the account", "username", result.Auth.Username, "error", result.Err)
+		h.respond(tx, req, statusServiceUnavail, "Service Unavailable")
 	}
-	h.lockout.Succeed(req.Source(), auth.Username)
-	return credential, true
+	return credentials.Credential{}, false
 }
 
 func (h *Handler) challenge(req *sip.Request, tx sip.ServerTransaction, stale bool, log *slog.Logger) {

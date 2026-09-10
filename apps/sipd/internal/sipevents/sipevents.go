@@ -15,6 +15,28 @@ import (
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 )
 
+// AckPublisher is a Publisher that can also report the stream's DURABLE acceptance of a
+// `dialog.terminated`. It is optional so a test double need only implement Publisher; a publisher
+// that does not implement it cannot release recovery evidence safely (see PublishTerminatedAck).
+type AckPublisher interface {
+	Publisher
+	TerminatedAck(ctx context.Context, envelope contract.Envelope[contract.SIPDialogTerminatedData]) error
+}
+
+// PublishTerminatedAck publishes a termination and waits for the stream to accept it. A publisher
+// with no acknowledgement path falls back to the unacknowledged publish and says so, because
+// pretending it was durable is what makes a claim deletion lose a CDR.
+func PublishTerminatedAck(
+	ctx context.Context,
+	publisher Publisher,
+	envelope contract.Envelope[contract.SIPDialogTerminatedData],
+) error {
+	if acked, ok := publisher.(AckPublisher); ok {
+		return acked.TerminatedAck(ctx, envelope)
+	}
+	return publisher.Terminated(ctx, envelope)
+}
+
 // Publisher emits the six `sip.evt.v1` dialog events.
 type Publisher interface {
 	Progressed(ctx context.Context, envelope contract.Envelope[contract.SIPDialogProgressedData]) error
@@ -30,7 +52,7 @@ type JetStreamPublisher struct {
 	js jetstream.JetStream
 }
 
-var _ Publisher = (*JetStreamPublisher)(nil)
+var _ AckPublisher = (*JetStreamPublisher)(nil)
 
 // NewJetStreamPublisher wraps an established JetStream context. It does not create the SIP stream;
 // provisioning is the control plane's `ensureStreams`.
@@ -43,7 +65,8 @@ func (p *JetStreamPublisher) Progressed(
 	_ context.Context,
 	envelope contract.Envelope[contract.SIPDialogProgressedData],
 ) error {
-	return publish(p.js, envelope)
+	_, err := publish(p.js, envelope)
+	return err
 }
 
 // Answered publishes a `dialog.answered` event.
@@ -51,7 +74,8 @@ func (p *JetStreamPublisher) Answered(
 	_ context.Context,
 	envelope contract.Envelope[contract.SIPDialogAnsweredData],
 ) error {
-	return publish(p.js, envelope)
+	_, err := publish(p.js, envelope)
+	return err
 }
 
 // Held publishes a `dialog.held` event.
@@ -59,7 +83,8 @@ func (p *JetStreamPublisher) Held(
 	_ context.Context,
 	envelope contract.Envelope[contract.SIPDialogHeldData],
 ) error {
-	return publish(p.js, envelope)
+	_, err := publish(p.js, envelope)
+	return err
 }
 
 // Resumed publishes a `dialog.resumed` event.
@@ -67,15 +92,40 @@ func (p *JetStreamPublisher) Resumed(
 	_ context.Context,
 	envelope contract.Envelope[contract.SIPDialogResumedData],
 ) error {
-	return publish(p.js, envelope)
+	_, err := publish(p.js, envelope)
+	return err
 }
 
-// Terminated publishes a `dialog.terminated` event.
+// Terminated publishes a `dialog.terminated` event without waiting for the stream to accept it. It
+// is called from the dialog's own goroutine, which must not sit on a broker round trip; the recovery
+// claim that outlives the call is released by TerminatedAck instead (see Finalizer).
 func (p *JetStreamPublisher) Terminated(
 	_ context.Context,
 	envelope contract.Envelope[contract.SIPDialogTerminatedData],
 ) error {
-	return publish(p.js, envelope)
+	_, err := publish(p.js, envelope)
+	return err
+}
+
+// TerminatedAck implements AckPublisher: it publishes and waits for the stream's acknowledgement,
+// so a caller can delete recovery evidence knowing the termination is durable.
+func (p *JetStreamPublisher) TerminatedAck(
+	ctx context.Context,
+	envelope contract.Envelope[contract.SIPDialogTerminatedData],
+) error {
+	future, err := publish(p.js, envelope)
+	if err != nil {
+		return err
+	}
+	select {
+	case <-future.Ok():
+		return nil
+	case err := <-future.Err():
+		return fmt.Errorf("sipevents: %s on %s was not acknowledged: %w",
+			envelope.Type, envelope.Subject, err)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // DTMF publishes a `dialog.dtmf` event.
@@ -83,33 +133,37 @@ func (p *JetStreamPublisher) DTMF(
 	_ context.Context,
 	envelope contract.Envelope[contract.SIPDialogDTMFData],
 ) error {
-	return publish(p.js, envelope)
+	_, err := publish(p.js, envelope)
+	return err
 }
 
 // publish enqueues one envelope asynchronously.
 //
 // Asynchronous because the caller is the dialog's own goroutine, which serialises every task for
 // that call: a synchronous PubAck put a broker round trip between the 180 and the 200 a caller is
-// waiting on. Delivery is unchanged — same connection, same Nats-Msg-Id, so the stream still
-// de-duplicates — and the failed-ack report moves to the JetStream context's
-// WithPublishAsyncErrHandler. sipd never retried a failed publish, so nothing that was durable
-// before is less durable now; shutdown waits for the outstanding acks (cmd/sipd) so a drain does
-// not drop the `dialog.terminated` a CDR is built from.
+// waiting on. A failed ack is reported by the JetStream context's WithPublishAsyncErrHandler, and
+// shutdown waits for the outstanding acks (cmd/sipd). The one event whose durability something else
+// depends on — `dialog.terminated`, which releases the leg's recovery claim — is published through
+// Finalizer, which waits for the acknowledgement and retries.
 //
 // CheckSubject stays on this path: the subject carries the legId, and an event applied to the wrong
 // leg tears down somebody else's call.
-func publish[T any](js jetstream.JetStream, envelope contract.Envelope[T]) error {
+//
+// The returned future is how TerminatedAck turns this into an acknowledged publish; every other
+// caller drops it.
+func publish[T any](js jetstream.JetStream, envelope contract.Envelope[T]) (jetstream.PubAckFuture, error) {
 	if err := contract.CheckSubject(envelope.Subject, envelope); err != nil {
-		return fmt.Errorf("sipevents: refusing to publish an inconsistent envelope: %w", err)
+		return nil, fmt.Errorf("sipevents: refusing to publish an inconsistent envelope: %w", err)
 	}
 	payload, err := contract.Marshal(envelope)
 	if err != nil {
-		return fmt.Errorf("sipevents: encoding %s: %w", envelope.Type, err)
+		return nil, fmt.Errorf("sipevents: encoding %s: %w", envelope.Type, err)
 	}
-	if _, err := js.PublishAsync(envelope.Subject, payload, jetstream.WithMsgID(envelope.ID)); err != nil {
-		return fmt.Errorf("sipevents: publishing %s on %s: %w", envelope.Type, envelope.Subject, err)
+	future, err := js.PublishAsync(envelope.Subject, payload, jetstream.WithMsgID(envelope.ID))
+	if err != nil {
+		return nil, fmt.Errorf("sipevents: publishing %s on %s: %w", envelope.Type, envelope.Subject, err)
 	}
-	return nil
+	return future, nil
 }
 
 // RecordingPublisher captures envelopes in memory instead of publishing them.
@@ -123,7 +177,7 @@ type RecordingPublisher struct {
 	dtmf       []contract.Envelope[contract.SIPDialogDTMFData]
 }
 
-var _ Publisher = (*RecordingPublisher)(nil)
+var _ AckPublisher = (*RecordingPublisher)(nil)
 
 // NewRecordingPublisher returns an empty recorder.
 func NewRecordingPublisher() *RecordingPublisher { return &RecordingPublisher{} }
@@ -170,6 +224,14 @@ func (p *RecordingPublisher) Resumed(
 	defer p.mu.Unlock()
 	p.resumed = append(p.resumed, envelope)
 	return nil
+}
+
+// TerminatedAck implements AckPublisher: a recorded event is durable by construction.
+func (p *RecordingPublisher) TerminatedAck(
+	ctx context.Context,
+	envelope contract.Envelope[contract.SIPDialogTerminatedData],
+) error {
+	return p.Terminated(ctx, envelope)
 }
 
 // Terminated implements Publisher.

@@ -55,6 +55,9 @@ type Options struct {
 	// RegistrationACL is the `scope=registration` blocklist, consulted before anything else on the
 	// REGISTER path. Nil disables the check, which is what a deployment with no such entries wants.
 	RegistrationACL *profile.ACL
+	// NATPolicy clamps a granted registration to what the arriving profile's NAT position can
+	// survive. Nil leaves the expiry policy's own answer alone.
+	NATPolicy NATPolicy
 	// Lockout throttles credential guessing. Shared with every other handler that authenticates, so
 	// a spray cannot get one budget per method. Nil disables it.
 	Lockout *Lockout
@@ -95,8 +98,9 @@ type Registrar struct {
 	realm       string
 	auth        *Authenticator
 	expiry      ExpiryPolicy
+	natPolicy   NATPolicy
+	digest      *DigestGate
 	sourceACL   *profile.ACL
-	lockout     *Lockout
 	creds       credentials.Store
 	bindings    kv.Store
 	connections ConnectionProbe
@@ -148,8 +152,8 @@ func New(opts Options) (*Registrar, error) {
 		realm:         opts.Realm,
 		auth:          opts.Auth,
 		expiry:        opts.Expiry,
+		natPolicy:     opts.NATPolicy,
 		sourceACL:     opts.RegistrationACL,
-		lockout:       opts.Lockout,
 		creds:         opts.Credentials,
 		bindings:      opts.Bindings,
 		connections:   opts.Connections,
@@ -162,6 +166,7 @@ func New(opts Options) (*Registrar, error) {
 		baseCtx:       opts.BaseContext,
 		opTimeout:     opts.OperationTimeout,
 		now:           opts.Now,
+		digest:        NewDigestGate(opts.Auth, opts.Credentials, opts.Lockout),
 		authFailures:  newAuthFailureLimiter(AuthFailureInterval),
 		tracked:       make(map[string]kv.Binding),
 	}
@@ -193,6 +198,36 @@ func New(opts Options) (*Registrar, error) {
 		registrar.now = time.Now
 	}
 	return registrar, nil
+}
+
+// NATPolicy answers the maximum registration interval the profile a REGISTER arrived on can
+// survive, in the same terms as nat.Policy.MaxRegistrationInterval: zero means no clamp.
+//
+// It is a seam so this package needs no profile set to test the clamp; profile.Set implements it.
+type NATPolicy interface {
+	MaxRegistrationInterval(req *sip.Request) time.Duration
+}
+
+// TrackNATPolicy attaches the clamp after boot, for the wiring order where the profile set is built
+// once the registrar exists. Called before any traffic is served.
+func (r *Registrar) TrackNATPolicy(policy NATPolicy) { r.natPolicy = policy }
+
+// clampGranted applies the arriving profile's NAT clamp to an interval the expiry policy already
+// granted. A device behind a router that forgets a UDP binding after sixty seconds is unreachable
+// for the rest of an hour it talked itself into, and clamping needs no cooperation from it.
+//
+// Zero is left alone: it is a de-registration, not a short registration. The result never drops
+// below the expiry policy's minimum, so a clamp can never grant less than the value a 423 would
+// have told the device to ask for.
+func (r *Registrar) clampGranted(req *sip.Request, granted time.Duration) time.Duration {
+	if r.natPolicy == nil || granted <= 0 {
+		return granted
+	}
+	clamp := r.natPolicy.MaxRegistrationInterval(req)
+	if clamp <= 0 {
+		return granted
+	}
+	return max(min(granted, clamp), r.expiry.Min)
 }
 
 // HandleRegister authenticates and atomically updates every Contact in one REGISTER.
@@ -281,17 +316,18 @@ func (r *Registrar) HandleUnsupported(req *sip.Request, tx sip.ServerTransaction
 	r.send(tx, res)
 }
 
-// authorize runs the digest exchange. It answers the transaction itself on every failure path and
-// reports whether the caller should continue.
+// authorize runs the shared digest pipeline and answers the transaction on every failure path,
+// reporting whether the caller should continue.
 //
 // Missing credentials and a stale or forged nonce get 401 plus a challenge, since the device can
 // retry. Everything else gets a final 403: re-challenging a wrong password loops some phones for
-// ever, and wrong password, unknown account and disabled account are answered identically so the
-// response cannot be used to enumerate extensions.
+// ever, and wrong password, unknown account, locked account and disabled account are answered
+// identically so the response cannot be used to enumerate extensions. A credential store that could
+// not answer gets 503, which is not a claim about the account.
 //
-// The failures reported as `auth-failed` are exactly those reached AFTER the credential lookup, so
-// the organization on the event's subject is one the directory answered with rather than one this
-// edge guessed from a header an attacker wrote.
+// The failures reported as `auth-failed` are exactly those the pipeline resolved to an organization,
+// so the event's subject carries one the directory answered with rather than one this edge guessed
+// from a header an attacker wrote.
 func (r *Registrar) authorize(
 	ctx context.Context,
 	req *sip.Request,
@@ -299,112 +335,58 @@ func (r *Registrar) authorize(
 	aor, aorUser string,
 	log *requestLog,
 ) (credentials.Credential, bool) {
-	accountAuth := r.auth.ForRequest(req)
-	if RequestRealm(req) == "" {
+	result := r.digest.Authenticate(ctx, req, aorUser, aor)
+	if result.DefaultRealm {
 		// No tenant matched: the request named no domain, so the challenge carries the deployment
 		// default. Logged because a fleet serving several tenants should see none of these.
 		log.Info("challenging with the deployment default realm: the request named no domain",
-			"realm", accountAuth.Realm())
-	}
-	auth, err := ParseAuthorization(headerValue(req, "Authorization"))
-	if err != nil {
-		if errors.Is(err, ErrNoAuthorization) {
-			r.challenge(req, tx, false, log)
-			return credentials.Credential{}, false
-		}
-		log.Info("rejecting a malformed Authorization header", "error", err)
-		r.respond(tx, req, statusBadRequest, "Bad Request")
-		return credentials.Credential{}, false
+			"realm", result.Realm)
 	}
 
-	if auth.Realm != accountAuth.Realm() {
-		log.Info("re-challenging a credential for another realm", "offeredRealm", auth.Realm)
+	switch result.Outcome {
+	case DigestAccepted:
+		return result.Credential, true
+	case DigestChallenge:
 		r.challenge(req, tx, false, log)
-		return credentials.Credential{}, false
-	}
-	if err := accountAuth.CheckNonce(auth.Nonce); err != nil {
-		r.challenge(req, tx, errors.Is(err, ErrNonceStale), log)
-		return credentials.Credential{}, false
-	}
-
-	// An authenticated account may only bind its own address of record; otherwise any valid account
-	// on the realm could register a contact for any extension and steal its calls.
-	if auth.Username != aorUser {
-		log.Warn("rejecting a registration for somebody else's AOR", "authenticatedAs", auth.Username)
-		r.respond(tx, req, statusForbidden, "Forbidden")
-		return credentials.Credential{}, false
-	}
-
-	// Before the lookup, and answered exactly as an unknown account is: a spray that could tell a
-	// locked account from an absent one would have an enumeration oracle, and one that reached the
-	// directory at all would cost an RPC per packet.
-	if refusal, locked := r.lockout.Locked(req.Source(), auth.Username); locked {
-		log.Info("refusing a REGISTER from a locked source",
-			"username", auth.Username, "retryAfterSeconds", int(refusal.RetryAfter.Seconds()),
-			"scope", lockoutScope(refusal))
-		r.publishAuthFailure(ctx, req, refusal.OrgID, cmp.Or(refusal.AOR, aor), auth.Username,
-			contract.RegistrationAuthFailedReasonBadCredentials, true)
-		r.respond(tx, req, statusForbidden, "Forbidden")
-		return credentials.Credential{}, false
-	}
-
-	credential, err := r.creds.Lookup(ctx, accountAuth.Realm(), auth.Username)
-	if err != nil {
-		status, reason := statusForbidden, "Forbidden"
-		switch {
-		case errors.Is(err, credentials.ErrNotFound):
-			// A guess at an account that exists nowhere still counts: a spray that walked extension
-			// numbers rather than passwords would otherwise never trip the source cap.
-			r.lockout.Fail(req.Source(), auth.Username, "", "")
-			log.Info("rejecting an unknown account", "username", auth.Username)
-		case errors.Is(err, credentials.ErrDisabled):
-			log.Info("rejecting a disabled account", "username", auth.Username)
-		default:
-			// No answer from the credential RPC is not a claim about this account: a 403 tells the
-			// phone its credentials are wrong and most handsets stop retrying, so a burst that
-			// exceeds the responder's deadline would black out a fleet until somebody re-provisions
-			// it. 503 is the retriable answer (RFC 3261 §21.5.4).
-			log.Error("cannot look up the account", "username", auth.Username, "error", err)
-			status, reason = statusUnavailable, "Service Unavailable"
-		}
-		r.respond(tx, req, status, reason)
-		return credentials.Credential{}, false
-	}
-
-	if err := accountAuth.VerifyRequest(req, auth, credential.HA1); err != nil {
-		if errors.Is(err, ErrNonceStale) {
+	case DigestStale:
+		if result.Replayed {
 			// A replayed nonce count is a captured credential being re-sent, not the honest expiry
 			// the rest of this branch handles, so it is the only stale case worth recording.
-			if errors.Is(err, ErrNonceReplayed) {
-				r.publishAuthFailure(ctx, req, credential.OrgID, aor, auth.Username,
-					contract.RegistrationAuthFailedReasonStaleNonce, false)
-			}
-			r.challenge(req, tx, true, log)
-			return credentials.Credential{}, false
+			r.publishAuthFailure(ctx, req, result.OrgID, result.AOR, result.Auth.Username,
+				contract.RegistrationAuthFailedReasonStaleNonce, false)
 		}
-		// A digest that does not verify is the ONLY signal this edge gets that the HA1 it holds may
-		// be the previous one: the credential RPC is pull-only and apps/api publishes nothing when a
-		// SIP secret is rotated, so there is no invalidation to subscribe to. Re-ask once — the
-		// store rate-bounds it — and re-verify, or a rotation refuses a correctly re-REGISTERing
-		// phone for a whole positive TTL.
-		if fresh, refreshed := r.refresh(ctx, accountAuth.Realm(), auth.Username, credential); refreshed {
-			if retry := accountAuth.VerifyRequest(req, auth, fresh.HA1); retry == nil {
-				log.Info("accepting a REGISTER against a re-fetched credential; the cached one was stale",
-					"username", auth.Username)
-				r.lockout.Succeed(req.Source(), auth.Username)
-				return fresh, true
-			}
-		}
-		r.lockout.Fail(req.Source(), auth.Username, credential.OrgID, aor)
-		log.Warn("rejecting a failed digest", "username", auth.Username, "reason", err)
-		r.publishAuthFailure(ctx, req, credential.OrgID, aor, auth.Username,
+		r.challenge(req, tx, true, log)
+	case DigestMalformed:
+		log.Info("rejecting a malformed Authorization header", "error", result.Err)
+		r.respond(tx, req, statusBadRequest, "Bad Request")
+	case DigestWrongIdentity:
+		// An authenticated account may only bind its own address of record; otherwise any valid
+		// account on the realm could register a contact for any extension and steal its calls.
+		log.Warn("rejecting a registration for somebody else's AOR", "authenticatedAs", result.Auth.Username)
+		r.respond(tx, req, statusForbidden, "Forbidden")
+	case DigestThrottled:
+		log.Info("refusing a REGISTER from a locked source",
+			"username", result.Auth.Username, "retryAfterSeconds", int(result.Refusal.RetryAfter.Seconds()),
+			"scope", lockoutScope(result.Refusal))
+		r.publishAuthFailure(ctx, req, result.OrgID, cmp.Or(result.AOR, aor), result.Auth.Username,
+			contract.RegistrationAuthFailedReasonBadCredentials, true)
+		r.respond(tx, req, statusForbidden, "Forbidden")
+	case DigestUnknownAccount:
+		log.Info("rejecting an unknown account", "username", result.Auth.Username)
+		r.respond(tx, req, statusForbidden, "Forbidden")
+	case DigestDisabled:
+		log.Info("rejecting a disabled account", "username", result.Auth.Username)
+		r.respond(tx, req, statusForbidden, "Forbidden")
+	case DigestBadPassword:
+		log.Warn("rejecting a failed digest", "username", result.Auth.Username, "reason", result.Err)
+		r.publishAuthFailure(ctx, req, result.OrgID, result.AOR, result.Auth.Username,
 			contract.RegistrationAuthFailedReasonBadCredentials, false)
 		r.respond(tx, req, statusForbidden, "Forbidden")
-		return credentials.Credential{}, false
+	case DigestBackendUnavailable:
+		log.Error("cannot look up the account", "username", result.Auth.Username, "error", result.Err)
+		r.respond(tx, req, statusUnavailable, "Service Unavailable")
 	}
-
-	r.lockout.Succeed(req.Source(), auth.Username)
-	return credential, true
+	return credentials.Credential{}, false
 }
 
 // lockoutScope names which counter refused, for the log line an operator reads when a whole office

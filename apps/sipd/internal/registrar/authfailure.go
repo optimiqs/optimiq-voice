@@ -7,8 +7,6 @@ import (
 
 	"github.com/emiago/sipgo/sip"
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
-
-	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/credentials"
 )
 
 // AuthFailureInterval is the window in which one source and account pair produces at most one
@@ -91,7 +89,9 @@ func (r *Registrar) publishAuthFailure(
 		return
 	}
 	source := req.Source()
-	if !r.authFailures.admit(source, username, r.now()) {
+	// Rate-limited on the source HOST: a device behind NAT changes ephemeral port on every rebind,
+	// and a per-port key would let a spray defeat the limiter by churning it.
+	if !r.authFailures.admit(SourceIdentity(req), username, r.now()) {
 		return
 	}
 	data := contract.RegistrationAuthFailedData{
@@ -118,25 +118,4 @@ func (r *Registrar) publishAuthFailure(
 	if err != nil {
 		r.log.Error("cannot publish an authentication failure", "error", err)
 	}
-}
-
-// refresh re-asks the credential store for an account whose digest just failed, reporting whether
-// it came back with a DIFFERENT ha1 — the only case worth re-verifying.
-//
-// A store that does not cache implements no Refresher and this is a no-op; the NATS store bounds
-// the re-ask per account, so a credential spray cannot turn one wrong password into one RPC.
-func (r *Registrar) refresh(
-	ctx context.Context,
-	realm, username string,
-	stale credentials.Credential,
-) (credentials.Credential, bool) {
-	refresher, ok := r.creds.(credentials.Refresher)
-	if !ok {
-		return credentials.Credential{}, false
-	}
-	fresh, err := refresher.Refresh(ctx, realm, username)
-	if err != nil || fresh.HA1 == stale.HA1 {
-		return credentials.Credential{}, false
-	}
-	return fresh, true
 }

@@ -283,26 +283,6 @@ func TestRegistrationIntervalClamp(t *testing.T) {
 	}
 }
 
-func TestKeepaliveDue(t *testing.T) {
-	now := time.Date(2026, 8, 12, 9, 0, 0, 0, time.UTC)
-	policy := DefaultInternalPolicy()
-
-	if policy.KeepaliveDue(now.Add(-10*time.Second), now) {
-		t.Error("a binding touched ten seconds ago is not due on a thirty-second interval")
-	}
-	if !policy.KeepaliveDue(now.Add(-30*time.Second), now) {
-		t.Error("exactly the interval is due")
-	}
-	crlf := Policy{KeepaliveMethod: KeepaliveCRLF, KeepaliveInterval: time.Second}
-	if crlf.KeepaliveDue(now.Add(-time.Hour), now) {
-		t.Error("CRLF keepalive is the device's job; this edge originates nothing")
-	}
-	none := Policy{KeepaliveMethod: KeepaliveNone}
-	if none.KeepaliveDue(now.Add(-time.Hour), now) {
-		t.Error("a profile with no keepalive method must never be due")
-	}
-}
-
 func TestPolicyVocabularies(t *testing.T) {
 	for _, mode := range []Mode{ModeAuto, ModeAlways, ModeNever} {
 		if !mode.Valid() {
@@ -311,14 +291,6 @@ func TestPolicyVocabularies(t *testing.T) {
 	}
 	if Mode("sometimes").Valid() {
 		t.Error("an invented rewrite mode must not be valid")
-	}
-	for _, method := range []KeepaliveMethod{KeepaliveNone, KeepaliveCRLF, KeepaliveOptions} {
-		if !method.Valid() {
-			t.Errorf("%q must be valid", method)
-		}
-	}
-	if KeepaliveMethod("ping").Valid() {
-		t.Error("an invented keepalive method must not be valid")
 	}
 	if DefaultExternalPolicy().ContactRewrite != ModeAlways {
 		t.Error("a carrier's Contact is frequently an internal SBC address; the external default rewrites")

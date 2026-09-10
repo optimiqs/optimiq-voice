@@ -1005,3 +1005,62 @@ func TestAReplayedAuthorizationCannotBindAnAttackersContact(t *testing.T) {
 		}
 	}
 }
+
+// natClamp is a NATPolicy that answers one interval for every request.
+type natClamp time.Duration
+
+func (c natClamp) MaxRegistrationInterval(*sip.Request) time.Duration { return time.Duration(c) }
+
+// R16: the NAT clamp is the one pinhole mechanism this element has, so it has to reach the granted
+// interval a device is told about — not only the policy struct.
+func TestNATClampBoundsTheGrantedRegistration(t *testing.T) {
+	t.Run("a long registration is clamped to what the pinhole survives", func(t *testing.T) {
+		h := newHarness(t, nil, func(o *registrar.Options) { o.NATPolicy = natClamp(300 * time.Second) })
+		res := h.register(contactHeader("sip:1001@203.0.113.9:5060", "expires=3600"))
+		if res.StatusCode != 200 {
+			t.Fatalf("status = %d, want 200", res.StatusCode)
+		}
+		binding, _ := h.binding()
+		if binding.ExpiresInSeconds != 300 {
+			t.Errorf("granted %d seconds, want the profile's 300-second clamp", binding.ExpiresInSeconds)
+		}
+		if got := res.GetHeader("Expires"); got == nil || got.Value() != "300" {
+			t.Errorf("Expires header = %v, want the clamped 300 so the device refreshes in time", got)
+		}
+	})
+
+	t.Run("a shorter request is left alone", func(t *testing.T) {
+		h := newHarness(t, nil, func(o *registrar.Options) { o.NATPolicy = natClamp(300 * time.Second) })
+		if res := h.register(contactHeader("sip:1001@203.0.113.9:5060", "expires=120")); res.StatusCode != 200 {
+			t.Fatalf("status = %d, want 200", res.StatusCode)
+		}
+		binding, _ := h.binding()
+		if binding.ExpiresInSeconds != 120 {
+			t.Errorf("granted %d seconds, want the requested 120", binding.ExpiresInSeconds)
+		}
+	})
+
+	t.Run("a clamp never grants less than the policy minimum", func(t *testing.T) {
+		h := newHarness(t, nil, func(o *registrar.Options) { o.NATPolicy = natClamp(5 * time.Second) })
+		if res := h.register(contactHeader("sip:1001@203.0.113.9:5060", "expires=3600")); res.StatusCode != 200 {
+			t.Fatalf("status = %d, want 200", res.StatusCode)
+		}
+		binding, _ := h.binding()
+		if binding.ExpiresInSeconds != 60 {
+			t.Errorf("granted %d seconds, want the 60-second minimum floor", binding.ExpiresInSeconds)
+		}
+	})
+
+	t.Run("a de-registration is not a short registration", func(t *testing.T) {
+		h := newHarness(t, nil, func(o *registrar.Options) { o.NATPolicy = natClamp(300 * time.Second) })
+		if res := h.register(contactHeader("sip:1001@203.0.113.9:5060", "expires=600")); res.StatusCode != 200 {
+			t.Fatalf("status = %d", res.StatusCode)
+		}
+		if res := h.register(contactHeader("sip:1001@203.0.113.9:5060", "expires=0")); res.StatusCode != 200 {
+			t.Fatalf("de-registration status = %d, want 200", res.StatusCode)
+		}
+		if _, found := h.binding(); found {
+			t.Error("the clamp turned Expires: 0 into a live binding")
+		}
+	})
+}

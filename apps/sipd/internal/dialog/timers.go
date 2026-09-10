@@ -1,6 +1,7 @@
 package dialog
 
 import (
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -105,19 +106,36 @@ type TimerPolicy struct {
 	// effectively disabled the timer.
 	MaxSE time.Duration
 	// PreferLocalRefresh makes this edge volunteer as the refresher when the peer expresses no
-	// preference — the safer default for a B2BUA, which holds both dialogs and so knows the truth.
+	// preference. It is REFUSED by Validate while nothing here can send a refresh: the re-INVITE's
+	// offer comes from mediad by way of the engine, so a refresher role this process cannot honour
+	// is a peer tearing down a live call at the interval it was promised (RFC 4028 §7.2).
 	PreferLocalRefresh bool
 }
 
+// ErrNoLocalRefresher means the policy volunteers this edge as the session refresher, which it
+// cannot be: there is no command surface that builds a refresh re-INVITE or UPDATE.
+var ErrNoLocalRefresher = errors.New(
+	"dialog: session timers cannot select this edge as the refresher: sipd has no way to build a " +
+		"refresh re-INVITE, so the far end would tear the call down at the interval it was promised")
+
+// Validate refuses a configuration this edge cannot honour, at boot rather than at the first call.
+func (p TimerPolicy) Validate() error {
+	if p.Enabled && p.PreferLocalRefresh {
+		return ErrNoLocalRefresher
+	}
+	return nil
+}
+
 // DefaultTimerPolicy is the shape a deployment gets when it turns timers on and configures nothing
-// else. The numbers are RFC 4028's own recommendation (1800 s) and its hard floor (90 s).
+// else. The numbers are RFC 4028's own recommendation (1800 s) and its hard floor (90 s). The far
+// end refreshes, because this edge cannot (see PreferLocalRefresh).
 func DefaultTimerPolicy() TimerPolicy {
 	return TimerPolicy{
 		Enabled:            true,
 		MinSE:              90 * time.Second,
 		DefaultSE:          1800 * time.Second,
 		MaxSE:              7200 * time.Second,
-		PreferLocalRefresh: true,
+		PreferLocalRefresh: false,
 	}
 }
 
@@ -234,23 +252,32 @@ func RetryAfter422(policy TimerPolicy, minSE time.Duration) (time.Duration, bool
 
 // refresherFor applies RFC 4028 §7.2's rule: the party named in the `refresher` parameter
 // refreshes, and when nobody is named the answering side chooses.
+//
+// A peer that names US is answered with the opposite choice rather than a role this edge cannot
+// perform — §7.2 leaves the refresher to the answering side, and a promised refresh that never
+// comes ends a call that is up.
 func refresherFor(policy TimerPolicy, request TimerRequest, role Role) Refresher {
+	chosen := RefresherRemote
 	switch strings.ToLower(strings.TrimSpace(request.RefresherParam)) {
 	case "uac":
 		if role == RoleUAC {
-			return RefresherLocal
+			chosen = RefresherLocal
 		}
-		return RefresherRemote
 	case "uas":
 		if role == RoleUAS {
-			return RefresherLocal
+			chosen = RefresherLocal
 		}
+	default:
+		if policy.PreferLocalRefresh {
+			chosen = RefresherLocal
+		}
+	}
+	if chosen == RefresherLocal {
+		// Nothing here can build a refresh, so the role is declined rather than accepted and
+		// dropped. Remove this once a refresh command surface exists (see ErrNoLocalRefresher).
 		return RefresherRemote
 	}
-	if policy.PreferLocalRefresh {
-		return RefresherLocal
-	}
-	return RefresherRemote
+	return chosen
 }
 
 // SetTimer records a negotiated timer on the dialog, keeping the invariant that a timer is either

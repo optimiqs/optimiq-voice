@@ -21,6 +21,7 @@ import (
 // `_unknown` token — so one that reaches here is a dialog that published before admission answered.
 type PublishingSink struct {
 	publisher sipevents.Publisher
+	finalizer *sipevents.Finalizer
 	instance  string
 	log       *slog.Logger
 }
@@ -30,6 +31,18 @@ var _ EventSink = (*PublishingSink)(nil)
 // NewPublishingSink builds the sink. Both arguments are required: an empty instance id would
 // produce payloads no engine could address a command back at, so the call could never be answered.
 func NewPublishingSink(publisher sipevents.Publisher, instanceID string, log *slog.Logger) (*PublishingSink, error) {
+	return NewFinalizingSink(publisher, instanceID, nil, log)
+}
+
+// NewFinalizingSink is NewPublishingSink plus the finalizer that holds a leg's `sip-dialogs` claim
+// until the stream has acknowledged its `dialog.terminated`. Without one the terminal event is
+// fire-and-forget and the claim is released on trust.
+func NewFinalizingSink(
+	publisher sipevents.Publisher,
+	instanceID string,
+	finalizer *sipevents.Finalizer,
+	log *slog.Logger,
+) (*PublishingSink, error) {
 	if publisher == nil {
 		return nil, errors.New("invite: a sip.evt.v1 publisher is required")
 	}
@@ -40,7 +53,12 @@ func NewPublishingSink(publisher sipevents.Publisher, instanceID string, log *sl
 	if log == nil {
 		log = slog.Default()
 	}
-	return &PublishingSink{publisher: publisher, instance: instanceID, log: log}, nil
+	return &PublishingSink{
+		publisher: publisher,
+		finalizer: finalizer,
+		instance:  instanceID,
+		log:       log,
+	}, nil
 }
 
 // Publish implements EventSink.
@@ -176,6 +194,11 @@ func (s *PublishingSink) Publish(ctx context.Context, event Event) error {
 			})
 		if err != nil {
 			return wrapEnvelope(event, err)
+		}
+		if s.finalizer != nil {
+			// Off this goroutine and acknowledged: the claim that lets another instance reap this leg
+			// is released only once the stream has the termination (see sipevents.Finalizer).
+			return s.finalizer.Terminated(envelope)
 		}
 		return s.publisher.Terminated(ctx, envelope)
 

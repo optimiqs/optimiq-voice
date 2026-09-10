@@ -15,6 +15,7 @@ import (
 	"net"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/emiago/sipgo/sip"
 
@@ -159,9 +160,6 @@ func (p Profile) Validate() error {
 	if !p.NAT.ContactRewrite.Valid() {
 		problems = append(problems, fmt.Sprintf("%q is not a valid contact-rewrite mode", p.NAT.ContactRewrite))
 	}
-	if !p.NAT.KeepaliveMethod.Valid() {
-		problems = append(problems, fmt.Sprintf("%q is not a valid keepalive method", p.NAT.KeepaliveMethod))
-	}
 	switch p.Kind {
 	case KindExternal:
 		if p.Auth != AuthTrunkACL {
@@ -297,6 +295,16 @@ func NewSet(profiles ...Profile) (*Set, error) {
 // any traffic is served.
 func (s *Set) TrackArrivals(arrivals *Arrivals) { s.arrivals = arrivals }
 
+// MaxRegistrationInterval is the NAT clamp of the profile a request arrived on, or zero when no
+// profile owns it — a request nothing claims is refused before it can be registered anyway.
+func (s *Set) MaxRegistrationInterval(req *sip.Request) time.Duration {
+	owner, err := s.For(req)
+	if err != nil {
+		return 0
+	}
+	return owner.NAT.MaxRegistrationInterval
+}
+
 // Profiles returns the set's profiles in declaration order.
 func (s *Set) Profiles() []Profile { return s.profiles }
 
@@ -323,7 +331,7 @@ func (s *Set) ByName(name string) (Profile, bool) {
 // For decides which profile owns a request, in this order:
 //
 //  1. The LOCAL address the message arrived on — the only selector the sender cannot influence. It
-//     comes from the Arrivals table, because nothing in sipgo stamps it on an inbound message.
+//     comes from the read filter, because nothing in sipgo stamps it on an inbound message.
 //  2. The transport, when exactly one profile serves it.
 //  3. The SOURCE address against an external profile's ACL — a profile with no listeners of its own
 //     always, one that owns listeners only while the arrival socket is unknown. Last, and narrowed,
@@ -418,9 +426,14 @@ func (s *Set) For(req *sip.Request) (Profile, error) {
 // It reads the destination off the embedded MessageData and NOT off `req.Destination()`: the
 // Request override falls back to the Route header or the Request-URI when nothing set one, which is
 // the SENDER's own text and must never choose the trust boundary applied to it. Nothing in sipgo
-// sets the field on an inbound message, so in practice this is the arrivals table.
+// sets the field on an inbound message, so in practice this is the stamp the read filter put on the
+// datagram, and for the stream transports the arrivals table. See the Arrivals doc for why the
+// order is that way round.
 func (s *Set) localAddrFor(req *sip.Request) string {
 	if local := req.MessageData.Destination(); local != "" {
+		return local
+	}
+	if local, stamped := arrivalStamp(req); stamped {
 		return local
 	}
 	if s.arrivals == nil {

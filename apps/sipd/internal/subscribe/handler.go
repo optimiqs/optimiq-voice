@@ -150,6 +150,9 @@ type Options struct {
 	Auth *registrar.Authenticator
 	// Credentials resolves the account behind the subscriber's AOR.
 	Credentials credentials.Store
+	// Lockout throttles credential guessing. It must be the same instance the registrar holds, or a
+	// spray that used SUBSCRIBE would get a budget of its own. Nil disables it.
+	Lockout *registrar.Lockout
 	// Bindings is the location service. Read to confirm the subscriber is registered HERE, never
 	// written — a SUBSCRIBE changes no binding.
 	Bindings kv.Store
@@ -201,6 +204,7 @@ type Handler struct {
 	realm    string
 	auth     *registrar.Authenticator
 	creds    credentials.Store
+	digest   *registrar.DigestGate
 	bindings kv.Store
 	presence presence.Store
 	mwi      mwi.Source
@@ -258,6 +262,7 @@ func New(opts Options) (*Handler, error) {
 
 	handler := &Handler{
 		realm:         opts.Realm,
+		digest:        registrar.NewDigestGate(opts.Auth, opts.Credentials, opts.Lockout),
 		auth:          opts.Auth,
 		creds:         opts.Credentials,
 		bindings:      opts.Bindings,
@@ -953,8 +958,8 @@ func (h *Handler) Wait(timeout time.Duration) bool {
 	}
 }
 
-// authorize runs the digest exchange for a SUBSCRIBE. It answers the transaction itself on every
-// failure path and reports whether the caller should continue.
+// authorize runs the shared digest pipeline for a SUBSCRIBE and answers the transaction on every
+// failure path, reporting whether the caller should continue.
 //
 // 401 for "no credentials" and "stale nonce" because the device can retry; 403 for everything else,
 // because re-challenging a wrong password produces a loop some handsets run forever.
@@ -965,69 +970,40 @@ func (h *Handler) authorize(
 	fromUser string,
 	log *slog.Logger,
 ) (credentials.Credential, bool) {
-	accountAuth := h.auth.ForRequest(req)
-	auth, err := registrar.ParseAuthorization(headerValue(req, "Authorization"))
-	if err != nil {
-		if errors.Is(err, registrar.ErrNoAuthorization) {
-			h.challenge(req, tx, false, log)
-			return credentials.Credential{}, false
-		}
-		log.Info("rejecting a malformed Authorization header", "error", err)
-		h.respond(tx, req, statusBadRequest, "Bad Request")
-		return credentials.Credential{}, false
-	}
-
-	if auth.Realm != accountAuth.Realm() {
-		log.Info("re-challenging a credential for another realm", "offeredRealm", auth.Realm)
-		h.challenge(req, tx, false, log)
-		return credentials.Credential{}, false
-	}
-	if err := accountAuth.CheckNonce(auth.Nonce); err != nil {
-		h.challenge(req, tx, errors.Is(err, registrar.ErrNonceStale), log)
-		return credentials.Credential{}, false
-	}
-
 	// An account may only subscribe AS ITSELF: otherwise any valid account on the realm could send a
 	// SUBSCRIBE carrying somebody else's From, which for `message-summary` is another's mailbox.
-	if auth.Username != fromUser {
-		log.Warn("rejecting a SUBSCRIBE sent as somebody else", "authenticatedAs", auth.Username)
+	result := h.digest.Authenticate(ctx, req, fromUser, "")
+	switch result.Outcome {
+	case registrar.DigestAccepted:
+		return result.Credential, true
+	case registrar.DigestChallenge:
+		h.challenge(req, tx, false, log)
+	case registrar.DigestStale:
+		h.challenge(req, tx, true, log)
+	case registrar.DigestMalformed:
+		log.Info("rejecting a malformed Authorization header", "error", result.Err)
+		h.respond(tx, req, statusBadRequest, "Bad Request")
+	case registrar.DigestWrongIdentity:
+		log.Warn("rejecting a SUBSCRIBE sent as somebody else", "authenticatedAs", result.Auth.Username)
 		h.respond(tx, req, statusForbidden, "Forbidden")
-		return credentials.Credential{}, false
-	}
-
-	credential, err := h.creds.Lookup(ctx, accountAuth.Realm(), auth.Username)
-	if err != nil {
-		status, reason := statusForbidden, "Forbidden"
-		switch {
-		case errors.Is(err, credentials.ErrNotFound):
-			log.Info("rejecting an unknown account", "username", auth.Username)
-		case errors.Is(err, credentials.ErrDisabled):
-			log.Info("rejecting a disabled account", "username", auth.Username)
-		default:
-			// No answer from the credential RPC is not a claim about this account: a 403 tells the
-			// phone its credentials are wrong and most handsets stop retrying, so a burst that
-			// exceeds the responder's deadline would black out a fleet until somebody re-provisions
-			// it. 503 is the retriable answer (RFC 3261 §21.5.4).
-			log.Error("cannot look up the account", "username", auth.Username, "error", err)
-			status, reason = statusUnavailable, "Service Unavailable"
-		}
-		h.respond(tx, req, status, reason)
-		return credentials.Credential{}, false
-	}
-
-	// SUBSCRIBE, not REGISTER: HA2 is MD5(method:uri), so verifying with the wrong method name
-	// accepts nothing.
-	if err := accountAuth.VerifyRequest(req, auth, credential.HA1); err != nil {
-		if errors.Is(err, registrar.ErrNonceStale) {
-			h.challenge(req, tx, true, log)
-			return credentials.Credential{}, false
-		}
-		log.Warn("rejecting a failed digest", "username", auth.Username, "reason", err)
+	case registrar.DigestThrottled:
+		log.Info("rejecting a SUBSCRIBE from a locked source",
+			"username", result.Auth.Username, "retryAfterSeconds", int(result.Refusal.RetryAfter.Seconds()))
 		h.respond(tx, req, statusForbidden, "Forbidden")
-		return credentials.Credential{}, false
+	case registrar.DigestUnknownAccount:
+		log.Info("rejecting an unknown account", "username", result.Auth.Username)
+		h.respond(tx, req, statusForbidden, "Forbidden")
+	case registrar.DigestDisabled:
+		log.Info("rejecting a disabled account", "username", result.Auth.Username)
+		h.respond(tx, req, statusForbidden, "Forbidden")
+	case registrar.DigestBadPassword:
+		log.Warn("rejecting a failed digest", "username", result.Auth.Username, "reason", result.Err)
+		h.respond(tx, req, statusForbidden, "Forbidden")
+	case registrar.DigestBackendUnavailable:
+		log.Error("cannot look up the account", "username", result.Auth.Username, "error", result.Err)
+		h.respond(tx, req, statusUnavailable, "Service Unavailable")
 	}
-
-	return credential, true
+	return credentials.Credential{}, false
 }
 
 // isRegistered reports whether the subscriber has a live binding in this deployment.

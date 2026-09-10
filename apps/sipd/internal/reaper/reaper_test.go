@@ -307,6 +307,15 @@ func (p *failingPublisher) Terminated(
 	return p.err
 }
 
+// The reaper waits for the stream's acknowledgement before it deletes a claim, so the failure this
+// double models is an unacknowledged publish and not merely a rejected submission.
+func (p *failingPublisher) TerminatedAck(
+	_ context.Context,
+	_ contract.Envelope[contract.SIPDialogTerminatedData],
+) error {
+	return p.err
+}
+
 // The reap half lists the WHOLE bucket, on every instance — cost O(instances × fleet dialogs) — so
 // it runs on its own longer interval while the heartbeat keeps ticking at the sweep rate.
 func TestTheReapListingDoesNotRunOnEverySweep(t *testing.T) {

@@ -45,31 +45,6 @@ func (m Mode) Valid() bool {
 	}
 }
 
-// KeepaliveMethod is how a registered device is kept reachable through its NAT pinhole.
-type KeepaliveMethod string
-
-const (
-	// KeepaliveNone leaves it to the device's own registration refresh: wrong behind any router
-	// whose UDP timeout (typically 30-60s) is shorter than the registration interval.
-	KeepaliveNone KeepaliveMethod = "none"
-	// KeepaliveCRLF is RFC 5626 §3.5.1's double-CRLF ping. It only works when the DEVICE sends it,
-	// so choosing it means advertising a registration interval short enough for the device's timer.
-	KeepaliveCRLF KeepaliveMethod = "crlf"
-	// KeepaliveOptions sends an OPTIONS to each binding on an interval. Unlike CRLF it also tells us
-	// when the device has gone.
-	KeepaliveOptions KeepaliveMethod = "options"
-)
-
-// Valid reports whether the method is one this package implements.
-func (m KeepaliveMethod) Valid() bool {
-	switch m {
-	case KeepaliveNone, KeepaliveCRLF, KeepaliveOptions:
-		return true
-	default:
-		return false
-	}
-}
-
 // Policy is one profile's NAT position. It is data: the internal and external profiles hold
 // different instances of it.
 type Policy struct {
@@ -79,11 +54,12 @@ type Policy struct {
 	// fail differently: without rport the far end never sees the 200; without the Contact rewrite it
 	// sees the 200 and then cannot be reached again.
 	TrustRPort bool
-	// KeepaliveMethod and KeepaliveInterval keep a pinhole open.
-	KeepaliveMethod   KeepaliveMethod
-	KeepaliveInterval time.Duration
 	// MaxRegistrationInterval clamps what the registrar may grant, so a device behind NAT cannot
 	// talk itself into a 3600-second registration its router forgets after sixty. Zero means no clamp.
+	//
+	// This is the only pinhole mechanism this element has: it needs no cooperation from the device.
+	// There is deliberately no server-sent keepalive — nothing here sends OPTIONS to a binding — so
+	// a profile whose devices must stay reachable clamps the interval instead.
 	MaxRegistrationInterval time.Duration
 }
 
@@ -94,8 +70,6 @@ func DefaultInternalPolicy() Policy {
 	return Policy{
 		ContactRewrite:          ModeAuto,
 		TrustRPort:              true,
-		KeepaliveMethod:         KeepaliveOptions,
-		KeepaliveInterval:       30 * time.Second,
 		MaxRegistrationInterval: 300 * time.Second,
 	}
 }
@@ -105,12 +79,8 @@ func DefaultInternalPolicy() Policy {
 // clamp, because a trunk authenticates by source IP or registers to us on a different path.
 func DefaultExternalPolicy() Policy {
 	return Policy{
-		ContactRewrite:  ModeAlways,
-		TrustRPort:      true,
-		KeepaliveMethod: KeepaliveOptions,
-		// A minute rather than thirty seconds: a carrier is not behind a consumer NAT, so this is a
-		// reachability probe feeding trunk.status* rather than a pinhole ping.
-		KeepaliveInterval: 60 * time.Second,
+		ContactRewrite: ModeAlways,
+		TrustRPort:     true,
 	}
 }
 
@@ -332,16 +302,6 @@ func (p Policy) RegistrationInterval(granted time.Duration) time.Duration {
 		return granted
 	}
 	return min(granted, p.MaxRegistrationInterval)
-}
-
-// KeepaliveDue reports whether a binding last touched at `last` is due for a keepalive at `now`.
-// A profile with no keepalive method answers false always, which is what makes the pinger a no-op
-// rather than a special case at its call site.
-func (p Policy) KeepaliveDue(last, now time.Time) bool {
-	if p.KeepaliveMethod != KeepaliveOptions || p.KeepaliveInterval <= 0 {
-		return false
-	}
-	return !now.Before(last.Add(p.KeepaliveInterval))
 }
 
 func itoa(value int) string { return strconv.Itoa(value) }

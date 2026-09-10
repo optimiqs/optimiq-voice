@@ -56,6 +56,7 @@ func (r *Registrar) updateRegistration(ctx context.Context, req *sip.Request, tx
 		}
 		requested, stated := contactExpires(contact, headerExpiry, headerStated)
 		granted, err := r.expiry.Grant(requested, stated)
+		granted = r.clampGranted(req, granted)
 		if errors.Is(err, ErrIntervalTooBrief) {
 			res := sip.NewResponseFromRequest(req, statusIntervalTooBrief, "Interval Too Brief", nil)
 			res.AppendHeader(sip.NewHeader("Min-Expires", strconv.Itoa(r.expiry.MinSeconds())))

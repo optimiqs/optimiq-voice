@@ -368,3 +368,33 @@ func ulawDecode(encoded byte) int16 {
 	}
 	return int16(value)
 }
+
+// SendTonePaced writes a sine wave as packets of the given DURATION each — the knob SendTone does
+// not have. A 30 ms packet carries 240 G.711 samples, which is what a phone with ptime=30 puts on
+// the wire and what a mixer that assumes 20 ms mishandles.
+func (s *RTPSender) SendTonePaced(frequency float64, total, packet time.Duration) (int, error) {
+	samples := int(packet.Seconds() * 8000)
+	if samples <= 0 {
+		return 0, fmt.Errorf("sipua: packet duration %s carries no samples", packet)
+	}
+	frames := int(total / packet)
+	ticker := time.NewTicker(packet)
+	defer ticker.Stop()
+	phase := 0.0
+	step := 2 * math.Pi * frequency / 8000
+	sent := 0
+	for range frames {
+		payload := make([]byte, samples)
+		for index := range payload {
+			payload[index] = ulawEncode(int16(8000 * math.Sin(phase)))
+			phase += step
+		}
+		if err := s.write(PayloadPCMU, payload, false); err != nil {
+			return sent, err
+		}
+		s.stamp += uint32(samples)
+		sent++
+		<-ticker.C
+	}
+	return sent, nil
+}

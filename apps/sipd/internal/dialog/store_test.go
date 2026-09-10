@@ -140,6 +140,7 @@ func TestFindReplaced(t *testing.T) {
 	// early-only against an answered dialog is refused rather than ignored: it exists so a transfer
 	// target can decline to cut into a call somebody else has already picked up.
 	apply(t, created, Input{Trigger: TriggerLocalAnswer})
+	store.Touch(created)
 	if _, err := store.FindReplaced("consult-1", "ours", "theirs", true); !errors.Is(err, ErrInvalidState) {
 		t.Errorf("early-only against a confirmed dialog = %v, want ErrInvalidState", err)
 	}
@@ -150,6 +151,7 @@ func TestFindReplaced(t *testing.T) {
 	// And a dialog that has ended is gone rather than merely unknown, which is the distinction the
 	// caller turns into 481 versus a retry.
 	apply(t, created, Input{Trigger: TriggerRemoteBye})
+	store.Touch(created)
 	if _, err := store.FindReplaced("consult-1", "ours", "theirs", false); !errors.Is(err, ErrDialogGone) {
 		t.Errorf("a terminated dialog = %v, want ErrDialogGone", err)
 	}
@@ -393,8 +395,11 @@ func TestClaimsDoNotRaceWithTheOwningGoroutine(t *testing.T) {
 }
 
 // answerUAC drives a fresh UAC dialog to StateEstablished the way the wire does.
-func answerUAC(t *testing.T, d *Dialog) {
+// answerUAC drives a UAC dialog to answered and publishes the store's view of it, which is what the
+// dialog's own session goroutine does through SessionOptions.OnUpdate.
+func answerUAC(t *testing.T, store *Store, d *Dialog) {
 	t.Helper()
+	defer store.Touch(d)
 	for _, in := range []Input{
 		{Trigger: TriggerRemoteProvisional},
 		{Trigger: TriggerRemoteEarly, RemoteTag: d.Identity.RemoteTag},
@@ -424,7 +429,7 @@ func TestMatchEstablishedAuthorisesOnTheFullTriple(t *testing.T) {
 	identity := Identity{SIPCallID: "call-1", LocalTag: "ours", RemoteTag: "theirs"}
 	store, created := storeWithDialog(t, RoleUAC, identity)
 	created.AccountAOR = "sip:1002@acme.example.com"
-	answerUAC(t, created)
+	answerUAC(t, store, created)
 
 	member, ok := store.MatchEstablished(referTo(t, "call-1", "theirs", "ours"))
 	if !ok {
@@ -456,10 +461,11 @@ func TestMatchEstablishedRefusesADialogThatIsNotAnswered(t *testing.T) {
 		t.Error("a dialog that has not been answered must not authorise an in-dialog request")
 	}
 
-	answerUAC(t, created)
+	answerUAC(t, store, created)
 	if _, err := created.Apply(Input{Trigger: TriggerRemoteBye}); err != nil {
 		t.Fatalf("Apply(bye): %v", err)
 	}
+	store.Touch(created)
 	if _, ok := store.MatchEstablished(referTo(t, "call-2", "theirs", "ours")); ok {
 		t.Error("a dialog that has ended must not authorise an in-dialog request")
 	}

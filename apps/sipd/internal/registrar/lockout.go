@@ -57,8 +57,9 @@ type LockoutStats struct {
 
 // Lockout counts digest failures per (source, account) and per source, and refuses while cooling.
 //
-// Safe for concurrent use and shared by every handler that authenticates — a spray that alternated
-// REGISTER and INVITE against two separate counters would get twice the budget.
+// Safe for concurrent use and shared by every handler that authenticates, through DigestGate — a
+// spray that alternated REGISTER, INVITE, SUBSCRIBE and REFER against separate counters would get
+// four times the budget. Keys are the source HOST and a realm-scoped account; see SourceIdentity.
 type Lockout struct {
 	policy LockoutPolicy
 	now    func() time.Time

@@ -19,6 +19,7 @@
 package command
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
+	"github.com/optimiqs/optimiq-voice/packages/runtime-go/keyed"
 )
 
 // Refusal codes. The values come from the contract; these names exist so a handler reads as prose.
@@ -154,11 +156,34 @@ func (s *Server) Subscribe(conn *nats.Conn) ([]*nats.Subscription, error) {
 				return
 			}
 			data := msg.Data
-			s.commands.Submit(orderingKey(data), func() {
-				if err := msg.Respond(handle(data)); err != nil {
+			respondWith := func(reply []byte) {
+				if err := msg.Respond(reply); err != nil {
 					s.log.Error("cannot reply to a command", "subject", subject, "error", err)
 				}
+			}
+			key := orderingKey(data)
+			err := s.commands.SubmitContext(key, func(ctx context.Context) {
+				if ctx.Err() != nil {
+					// The command waited longer for a slot than its requester waited for an answer.
+					// Answering is still worth it — it turns the caller's timeout into a retry
+					// decision — but doing the work is not.
+					s.log.Warn("refusing a command that waited past its enqueue deadline",
+						"subject", subject, "legId", key)
+					respondWith(s.refuseOverloaded(ReasonCapacity,
+						"this instance is saturated: the command waited past its deadline"))
+					return
+				}
+				respondWith(handle(data))
 			})
+			if err != nil {
+				reason, message := ReasonCapacity, "this instance is at its pending-command limit"
+				if errors.Is(err, keyed.ErrClosed) {
+					reason, message = ReasonShuttingDown, "this instance is draining"
+				}
+				s.log.Warn("refusing a command at admission",
+					"subject", subject, "legId", key, "reason", reason)
+				respondWith(s.refuseOverloaded(reason, message))
+			}
 		}
 
 		var (
@@ -182,6 +207,28 @@ func (s *Server) Subscribe(conn *nats.Conn) ([]*nats.Subscription, error) {
 	}
 	return subscriptions, nil
 }
+
+// refuseOverloaded answers a command that never reached its handler, because the runner refused it
+// at admission or its enqueue deadline passed first.
+//
+// One shape for every subject: each command response in the contract carries these four fields, and
+// a caller reading `ok:false` with a `reason` does not need the rest.
+func (s *Server) refuseOverloaded(reason, message string) []byte {
+	return encode(s.log, struct {
+		Ok         bool   `json:"ok"`
+		InstanceID string `json:"instanceId"`
+		Reason     string `json:"reason"`
+		Error      string `json:"error"`
+	}{
+		InstanceID: s.instance,
+		Reason:     reason,
+		Error:      message,
+	})
+}
+
+// DrainCommands stops accepting commands and waits for the accepted ones, reporting whether they
+// all finished. Called after the subscriptions are dropped, so a handler mid-flight still answers.
+func (s *Server) DrainCommands(ctx context.Context) bool { return s.commands.Drain(ctx) }
 
 // encode marshals a reply. A reply that cannot be marshalled is a programming error, but the caller
 // is mid-call, so it degrades to a hand-written refusal rather than to a timeout.

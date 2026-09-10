@@ -3,6 +3,7 @@ package invite
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -71,12 +72,12 @@ func (e *executor) Handle(ctx context.Context, d *dialog.Dialog, effect dialog.E
 		e.stopSessionTimer()
 		return nil
 	case dialog.EffectSendSessionRefresh:
-		// The refresh is a re-INVITE whose offer comes from mediad by way of the engine, so it
-		// cannot be built here. Logged rather than silently skipped: session timers were turned on
-		// before a command surface existed to build one.
-		e.handler.log.Warn("a session refresh is due and there is no command surface to build it",
-			"legId", d.LegID)
-		return nil
+		// Unreachable: the refresh is a re-INVITE whose offer comes from mediad by way of the
+		// engine, so dialog.TimerPolicy never selects this edge as the refresher and Validate
+		// refuses a configuration that asks it to. Reported as a failure rather than a success,
+		// because a refresh this edge silently skips ends a live call at the interval.
+		return fmt.Errorf("invite: leg %s owes a session refresh this edge cannot send: %w",
+			d.LegID, dialog.ErrNoLocalRefresher)
 	case dialog.EffectReleaseClaim:
 		e.stopRetransmit()
 		e.stopSessionTimer()

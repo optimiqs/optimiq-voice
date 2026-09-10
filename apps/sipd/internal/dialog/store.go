@@ -37,8 +37,14 @@ type Store struct {
 	// byIdentity maps a full dialog triple to a legId: the lookup for every mid-dialog request.
 	byIdentity map[string]string
 	// byEarly maps a Call-ID plus our own tag to a legId, for the window before the far end's tag
-	// is known. A UAC's CANCEL, its Timer B and its 100 all land in that window.
+	// is known. A UAC's CANCEL, its Timer B and its 100 all land in that window. Only a dialog whose
+	// remote tag is genuinely unresolved is indexed here, and Rebind drops the entry the moment the
+	// far end's tag arrives: an established dialog must be reachable only on the full RFC 3261 §12
+	// triple, or a wrong From tag would still match it.
 	byEarly map[string]string
+	// views is the owner-rendered snapshot of every dialog's mutable state, so a lookup on another
+	// goroutine never reads a *Dialog the session owns (see Touch).
+	views map[string]view
 	// claims is the rendered Claim per legId, kept as a VALUE under this lock. The heartbeat sweep
 	// runs on the reaper's goroutine, so rendering a claim off the dialog there would race the
 	// owner: the claim is rendered by the OWNER (Insert, Rebind, Touch) and the sweep copies values.
@@ -67,6 +73,7 @@ func NewStore(opts StoreOptions) *Store {
 		byLeg:      make(map[string]*Dialog),
 		byIdentity: make(map[string]string),
 		byEarly:    make(map[string]string),
+		views:      make(map[string]view),
 		claims:     make(map[string]Claim),
 		instanceID: opts.InstanceID,
 		lease:      opts.Lease,
@@ -98,8 +105,23 @@ func (s *Store) Insert(dialog *Dialog) error {
 	}
 	s.byLeg[dialog.LegID] = dialog
 	s.index(dialog)
+	s.views[dialog.LegID] = viewOf(dialog)
 	s.claims[dialog.LegID] = s.claimFor(dialog)
 	return nil
+}
+
+// view is the part of a dialog a lookup needs and only its owner may read: the state machine's
+// current state plus the identity an in-dialog request acts as. It is a VALUE, rendered on the
+// owning goroutine and published under the store's lock, because reading those fields off the
+// *Dialog from another goroutine is a data race whatever lock the reader holds (Go memory model).
+type view struct {
+	state      State
+	orgID      string
+	accountAOR string
+}
+
+func viewOf(dialog *Dialog) view {
+	return view{state: dialog.state, orgID: dialog.OrgID, accountAOR: dialog.AccountAOR}
 }
 
 // index writes both index entries for a dialog. Called with the lock held.
@@ -107,7 +129,7 @@ func (s *Store) index(dialog *Dialog) {
 	if dialog.Identity.Established() {
 		s.byIdentity[dialog.Identity.Key()] = dialog.LegID
 	}
-	if dialog.Identity.SIPCallID != "" && dialog.Identity.LocalTag != "" {
+	if !dialog.Identity.Established() && dialog.Identity.SIPCallID != "" && dialog.Identity.LocalTag != "" {
 		s.byEarly[dialog.Identity.EarlyKey()] = dialog.LegID
 	}
 }
@@ -123,25 +145,29 @@ func (s *Store) Rebind(legID string, identity Identity) error {
 		return ErrUnknownDialog
 	}
 	delete(s.byIdentity, dialog.Identity.Key())
+	delete(s.byEarly, dialog.Identity.EarlyKey())
 	dialog.Identity = identity
 	s.index(dialog)
 	s.claims[legID] = s.claimFor(dialog)
 	return nil
 }
 
-// Touch re-renders a dialog's cached claim. It MUST be called from the goroutine that owns the
-// dialog: the read of the dialog's fields happens there and only the resulting value crosses the
-// lock.
+// Touch re-renders a dialog's cached claim and lookup view. It MUST be called from the goroutine
+// that owns the dialog: the read of the dialog's fields happens there and only the resulting values
+// cross the lock. dialog.SessionOptions.OnUpdate calls it after every task, which is what keeps the
+// view current.
 func (s *Store) Touch(dialog *Dialog) {
 	if dialog == nil {
 		return
 	}
 	claim := s.claimFor(dialog)
+	current := viewOf(dialog)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, held := s.byLeg[dialog.LegID]; !held {
 		return
 	}
+	s.views[dialog.LegID] = current
 	s.claims[dialog.LegID] = claim
 }
 
@@ -154,8 +180,9 @@ func (s *Store) Get(legID string) (*Dialog, bool) {
 }
 
 // MatchRequest finds the dialog a mid-dialog request belongs to: the full triple first, then the
-// early index. The order matters — matching early first would let someone who guessed a Call-ID and
-// our tag reach a confirmed call.
+// early index, which by construction holds only dialogs whose remote tag is still unknown. An
+// established dialog is therefore reachable on its full triple alone (RFC 3261 §12) and a request
+// carrying the wrong remote tag matches nothing.
 func (s *Store) MatchRequest(req *sip.Request) (*Dialog, bool) {
 	identity, err := identityOfIncoming(req)
 	if err != nil {
@@ -185,7 +212,8 @@ type Membership struct {
 }
 
 // MatchEstablished resolves an in-dialog request against a CONFIRMED dialog and reports the identity
-// to act as. Unlike MatchRequest it does not fall back to the early index: both tags must match, and
+// to act as, reading the owner-rendered view rather than the dialog itself. Unlike MatchRequest it
+// does not fall back to the early index: both tags must match, and
 // they are unguessable secrets shared only with the dialog's peers, so membership of an established
 // dialog is itself the authorisation an in-dialog request needs (RFC 3261 §12.2 — such a request's
 // From is the dialog's local URI and asserts nothing).
@@ -200,11 +228,11 @@ func (s *Store) MatchEstablished(req *sip.Request) (Membership, bool) {
 	if !found {
 		return Membership{}, false
 	}
-	dialog, ok := s.byLeg[legID]
-	if !ok || !dialog.state.Answered() {
+	current, ok := s.views[legID]
+	if !ok || !current.state.Answered() {
 		return Membership{}, false
 	}
-	return Membership{LegID: dialog.LegID, OrgID: dialog.OrgID, AccountAOR: dialog.AccountAOR}, true
+	return Membership{LegID: legID, OrgID: current.orgID, AccountAOR: current.accountAOR}, true
 }
 
 // MatchResponse finds the dialog a response to one of OUR requests belongs to. The first response
@@ -228,7 +256,8 @@ func (s *Store) MatchResponse(res *sip.Response) (*Dialog, bool) {
 	return nil, false
 }
 
-// FindReplaced resolves an RFC 3891 Replaces triple against this instance's dialogs.
+// FindReplaced resolves an RFC 3891 Replaces triple against this instance's dialogs, judging state
+// from the owner-rendered view.
 //
 // Per RFC 3891 §3 the tags are written from the sender's point of view, so `to-tag` compares against
 // OUR local tag and `from-tag` against the remote one — the same orientation as an incoming request,
@@ -246,13 +275,14 @@ func (s *Store) FindReplaced(callID, toTag, fromTag string, earlyOnly bool) (*Di
 		return nil, ErrUnknownDialog
 	}
 	dialog, ok := s.byLeg[legID]
-	if !ok {
+	current, known := s.views[legID]
+	if !ok || !known {
 		return nil, ErrUnknownDialog
 	}
-	if !dialog.state.Alive() {
+	if !current.state.Alive() {
 		return nil, ErrDialogGone
 	}
-	if earlyOnly && dialog.state.Answered() {
+	if earlyOnly && current.state.Answered() {
 		return nil, ErrInvalidState
 	}
 	return dialog, nil
@@ -267,6 +297,7 @@ func (s *Store) Remove(legID string) {
 		return
 	}
 	delete(s.byLeg, legID)
+	delete(s.views, legID)
 	delete(s.claims, legID)
 	delete(s.byIdentity, dialog.Identity.Key())
 	delete(s.byEarly, dialog.Identity.EarlyKey())
@@ -429,10 +460,12 @@ func Orphans(claims []Claim, instanceID string, now time.Time) []Claim {
 // Reapable returns the claims this instance may terminate on a dead owner's behalf, judged on two
 // pieces of evidence rather than one.
 //
-// The first is the claim's own lease, which is what Orphans has always used. The second is the
-// `sip-instances` bucket: an owner with no live lease is a process that stopped renewing seconds
-// ago, and waiting out the claim's much longer lease before reaping its dialogs leaves the engine
-// holding live channels for a minute and a half after its edge died.
+// The first is the claim's own lease, which is what Orphans uses when there is no other evidence.
+// The second is the `sip-instances` bucket, and it is the STRONGER of the two: an owner with no live
+// lease is a process that stopped renewing seconds ago, and waiting out the claim's much longer
+// lease before reaping its dialogs leaves the engine holding live channels for a minute and a half
+// after its edge died — while an owner that IS listed live holds calls that are up, whatever its
+// per-call claim's expiry says.
 //
 // liveInstances is trusted ONLY when it is non-empty. An empty or nil set means "no lease evidence
 // this sweep" — an old sipd that writes no lease, a bucket that could not be listed — and the
@@ -449,12 +482,15 @@ func Reapable(
 		if claim.InstanceID == instanceID {
 			continue
 		}
-		ownerGone := false
 		if len(liveInstances) > 0 {
-			_, alive := liveInstances[claim.InstanceID]
-			ownerGone = !alive
-		}
-		if !ownerGone && !claim.Expired(now) {
+			if _, alive := liveInstances[claim.InstanceID]; alive {
+				// The owner renewed its INSTANCE lease seconds ago, so an expired per-call claim is a
+				// heartbeat that fell behind — a slow bucket, a long sweep — and not a dead call.
+				// Reaping it would publish a termination for a call the owner is still serving, which
+				// is the same mistake as reaping our own expired claim.
+				continue
+			}
+		} else if !claim.Expired(now) {
 			continue
 		}
 		orphans = append(orphans, claim)

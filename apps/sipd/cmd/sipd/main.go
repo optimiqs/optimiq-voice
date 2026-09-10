@@ -14,6 +14,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -221,8 +222,8 @@ func run() error {
 	// and it stays empty — admitting everything — when it does not.
 	registrationACL := profile.NewWatchedBlocklist(nil)
 
-	// One lockout for the whole process: REGISTER and INVITE share the budget, or a spray that
-	// alternated methods would get two.
+	// One lockout for the whole process, shared by REGISTER, INVITE, SUBSCRIBE and REFER through
+	// registrar.DigestGate: a spray that alternated methods would otherwise get a budget each.
 	lockout := registrar.NewLockout(cfg.AuthLockout, time.Now)
 	if lockout == nil {
 		log.Warn("SIPD_AUTH_LOCKOUT_THRESHOLD is 0; credential guessing is unthrottled and every " +
@@ -285,13 +286,13 @@ func run() error {
 	dialogs := dialog.NewStore(dialog.StoreOptions{InstanceID: cfg.InstanceID})
 
 	transfers, err := newTransferHandler(
-		cfg, conn, sipClient, authenticator, credentialStore, bindings, dialogs, ctx, log)
+		cfg, conn, sipClient, authenticator, credentialStore, lockout, bindings, dialogs, ctx, log)
 	if err != nil {
 		return err
 	}
 
 	subscriptions, err := newSubscribeHandler(
-		cfg, conn, sipClient, authenticator, credentialStore, bindings, presenceStore, ctx, log)
+		cfg, conn, sipClient, authenticator, credentialStore, lockout, bindings, presenceStore, ctx, log)
 	if err != nil {
 		return err
 	}
@@ -424,7 +425,7 @@ func run() error {
 	// into a call-processing element, which needs dialog affinity at the load balancer, a trunk
 	// directory and an ACL bucket already in place.
 	if cfg.EnableInvite {
-		invites, err := newInviteHandler(inviteDeps{
+		invites, finalizer, err := newInviteHandler(inviteDeps{
 			cfg:             cfg,
 			server:          server,
 			client:          sipClient,
@@ -437,6 +438,7 @@ func run() error {
 			auth:            authenticator,
 			credentials:     credentialStore,
 			lockout:         lockout,
+			registrar:       reg,
 			registrationACL: registrationACL,
 			arrivals:        arrivals,
 			ctx:             ctx,
@@ -445,6 +447,16 @@ func run() error {
 		if err != nil {
 			return err
 		}
+		// Drained before the JetStream flush below it, so a termination still waiting for its
+		// acknowledgement is published — and its claim released — rather than abandoned.
+		defer func() {
+			drainCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+			defer cancel()
+			if !finalizer.Shutdown(drainCtx) {
+				log.Warn("some dialog terminations were still unacknowledged at shutdown",
+					"pending", finalizer.Pending())
+			}
+		}()
 		server.OnInvite(metrics.Wrap("INVITE", invites.ServeInvite))
 		server.OnAck(metrics.Wrap("ACK", invites.HandleAck))
 		server.OnBye(metrics.Wrap("BYE", invites.HandleBye))
@@ -472,6 +484,12 @@ func run() error {
 				if err := subscription.Unsubscribe(); err != nil {
 					log.Debug("unsubscribing a command subject", "error", err)
 				}
+			}
+			// Admission closes with the subscriptions; the commands already accepted still answer.
+			drainCtx, cancelDrain := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+			defer cancelDrain()
+			if !commands.DrainCommands(drainCtx) {
+				log.Warn("commands were still running at the shutdown deadline")
 			}
 		}()
 		log.Info("dialog command surface ready",
@@ -550,52 +568,66 @@ func run() error {
 
 	var readyListeners atomic.Int32
 	var expectedListeners int32
-	listen := func(network, addr string) {
+	// Every transport binds its own socket here, on this goroutine, and only then hands the bound
+	// socket to sipgo's Serve* variant. sipgo's ListenAndServe/ListenAndServeTLS bind inside the
+	// call while a cancellation goroutine it started at sipgo@v1.4.3/server.go:102-108 already reads
+	// the connection the same function writes at server.go:123-128 — a data race on every shutdown.
+	// A bound socket is also the readiness signal, so a bind failure is fatal here with the address
+	// named rather than surfacing from a goroutine after health has reported ready.
+	listen := func(network, addr string) error {
+		ready := sipgo.ListenReadyFuncCtxValue(func(network, addr string) {
+			readyListeners.Add(1)
+			log.Info("listening", "network", network, "addr", addr, "realm", cfg.Realm)
+		})
+		bound, err := bindListener(network, addr, tlsConfig, cfg.SocketBufferBytes, log)
+		if err != nil {
+			return err
+		}
 		expectedListeners++
+		context.AfterFunc(ctx, func() { _ = bound.closer.Close() })
+		ready(network, bound.addr)
 		group.Go(func() {
-			listenCtx := context.WithValue(ctx, sipgo.ListenReadyCtxKey, sipgo.ListenReadyFuncCtxValue(func(network, addr string) {
-				readyListeners.Add(1)
-				log.Info("listening", "network", network, "addr", addr, "realm", cfg.Realm)
-			}))
-			var err error
-			switch {
-			// Named rather than a "ends in s" test, which also matches the plaintext `ws` network and
-			// served it over TLS whenever a certificate was loaded for `tls`/`wss`.
-			case (network == "tls" || network == "wss") && tlsConfig != nil:
-				// ListenAndServeTLS closes its listener when ctx is done; a post-shutdown error is
-				// the close itself, not a failure.
-				err = server.ListenAndServeTLS(listenCtx, network, addr, tlsConfig)
-			case network == "udp":
-				err = serveUDP(listenCtx, server, addr, cfg.SocketBufferBytes, log)
-			default:
-				err = server.ListenAndServe(listenCtx, network, addr)
-			}
-			if err != nil && ctx.Err() == nil {
+			if err := bound.serve(server); err != nil && ctx.Err() == nil {
 				errs <- fmt.Errorf("%s listener: %w", network, err)
 			}
 		})
+		return nil
 	}
 	if cfg.EnableUDP {
-		listen("udp", cfg.ListenAddr)
+		if err := listen("udp", cfg.ListenAddr); err != nil {
+			return err
+		}
 	}
 	if cfg.EnableTCP {
-		listen("tcp", cfg.ListenAddr)
+		if err := listen("tcp", cfg.ListenAddr); err != nil {
+			return err
+		}
 	}
 	if cfg.EnableTLS {
-		listen("tls", cfg.TLSListenAddr)
+		if err := listen("tls", cfg.TLSListenAddr); err != nil {
+			return err
+		}
 	}
 	if cfg.EnableWS {
 		// SIP over WebSocket (RFC 7118), the only transport a browser has. Signalling only: a WebRTC
 		// endpoint needs DTLS-SRTP, so a softphone can register and be rung and hear nothing.
 		// Plaintext `ws` is for a development origin; a browser-loaded page needs `wss`.
-		listen("ws", cfg.WSListenAddr)
+		if err := listen("ws", cfg.WSListenAddr); err != nil {
+			return err
+		}
 	}
 	if cfg.EnableWSS {
-		listen("wss", cfg.WSSListenAddr)
+		if err := listen("wss", cfg.WSSListenAddr); err != nil {
+			return err
+		}
 	}
 	if cfg.ExternalListenAddr != "" && cfg.ExternalListenAddr != cfg.ListenAddr {
-		listen("udp", cfg.ExternalListenAddr)
-		listen("tcp", cfg.ExternalListenAddr)
+		if err := listen("udp", cfg.ExternalListenAddr); err != nil {
+			return err
+		}
+		if err := listen("tcp", cfg.ExternalListenAddr); err != nil {
+			return err
+		}
 	}
 	if err := conn.FlushTimeout(3 * time.Second); err != nil {
 		return fmt.Errorf("flushing SIP subscriptions: %w", err)
@@ -658,6 +690,7 @@ func newTransferHandler(
 	client *sipgo.Client,
 	authenticator *registrar.Authenticator,
 	credentialStore credentials.Store,
+	lockout *registrar.Lockout,
 	bindings kv.Store,
 	dialogs *dialog.Store,
 	ctx context.Context,
@@ -677,6 +710,7 @@ func newTransferHandler(
 		Realm:        cfg.Realm,
 		Auth:         authenticator,
 		Credentials:  credentialStore,
+		Lockout:      lockout,
 		Dialogs:      dialogs,
 		Bindings:     bindings,
 		Transfers:    requester,
@@ -709,6 +743,7 @@ func newSubscribeHandler(
 	client *sipgo.Client,
 	authenticator *registrar.Authenticator,
 	credentialStore credentials.Store,
+	lockout *registrar.Lockout,
 	bindings kv.Store,
 	presenceStore presence.Store,
 	ctx context.Context,
@@ -727,6 +762,7 @@ func newSubscribeHandler(
 		Realm:       cfg.Realm,
 		Auth:        authenticator,
 		Credentials: credentialStore,
+		Lockout:     lockout,
 		Bindings:    bindings,
 		Presence:    presenceStore,
 		MWI:         mwiSource,
@@ -772,6 +808,11 @@ type inviteDeps struct {
 	credentials credentials.Store
 	// lockout is the process-wide credential-guessing throttle, shared with the registrar.
 	lockout *registrar.Lockout
+	// registrar receives the profile set as its NAT clamp, so a granted registration cannot outlive
+	// the pinhole the arriving profile's position allows. It is attached here because the profile
+	// set is built here; a deployment with no INVITE surface builds no profiles and has no clamp to
+	// apply.
+	registrar *registrar.Registrar
 	// registrationACL is filled by the same `sip-acl` watch the trunk ACL uses. Owned by the
 	// registrar, which is built first; passed through so one watch feeds both scopes.
 	registrationACL *profile.ACL
@@ -791,14 +832,17 @@ type inviteDeps struct {
 // which stops an inbound PSTN call dialling back out through a trunk.
 //
 // RefusingPort is used when there is no broker; it answers every INVITE 503 with a Retry-After.
-func newInviteHandler(deps inviteDeps) (*invite.Handler, error) {
+func newInviteHandler(deps inviteDeps) (*invite.Handler, *sipevents.Finalizer, error) {
 	cfg, log := deps.cfg, deps.log
 
 	profiles, aclWatcher, aclReady, err := buildProfiles(deps.ctx, cfg, deps.registrationACL, deps.conn, log)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	profiles.TrackArrivals(deps.arrivals)
+	if deps.registrar != nil {
+		deps.registrar.TrackNATPolicy(profiles)
+	}
 	// buildProfiles starts the ACL watch rather than finishing it, so this is where the security
 	// boundary becomes loaded rather than merely opened. The wait is bounded: an empty ACL fails
 	// closed, and waiting for ever would stop REGISTER over a bucket that may not exist yet.
@@ -809,27 +853,44 @@ func newInviteHandler(deps inviteDeps) (*invite.Handler, error) {
 	}
 	requester, err := invite.NewClientRequester(deps.client)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	caller, err := invite.NewClientCaller(deps.client)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	port, err := invite.NewNATSPort(deps.conn, invite.NATSOptions{})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	sink, err := invite.NewPublishingSink(deps.events, cfg.InstanceID, log)
+	// The recovery claim is released by the finalizer and not by the leg, so a `dialog.terminated`
+	// the stream never accepted leaves the evidence a reaper needs.
+	finalizer, err := sipevents.NewFinalizer(sipevents.FinalizerOptions{
+		Publisher: deps.events,
+		Claims:    deps.claims,
+		Timeout:   cfg.PublishAsyncTimeout,
+		Logger:    log,
+	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	sink, err := invite.NewFinalizingSink(deps.events, cfg.InstanceID, finalizer, log)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	timers := dialog.TimerPolicy{
-		Enabled:            cfg.EnableSessionTimers,
-		MinSE:              cfg.MinSE,
-		DefaultSE:          cfg.SessionExpires,
-		MaxSE:              cfg.SessionExpires * 4,
-		PreferLocalRefresh: true,
+		Enabled:   cfg.EnableSessionTimers,
+		MinSE:     cfg.MinSE,
+		DefaultSE: cfg.SessionExpires,
+		MaxSE:     cfg.SessionExpires * 4,
+		// Not local: this edge has no way to BUILD a refresh — the re-INVITE's offer comes from
+		// mediad by way of the engine — so volunteering as the refresher would promise a peer a
+		// refresh that never arrives and let it tear down a live call (RFC 4028 §7.2).
+		PreferLocalRefresh: false,
+	}
+	if err := timers.Validate(); err != nil {
+		return nil, nil, err
 	}
 
 	handler, err := invite.New(invite.Options{
@@ -848,6 +909,7 @@ func newInviteHandler(deps inviteDeps) (*invite.Handler, error) {
 		TrunkAuth:    trunk.NewNATSAuthorizer(deps.conn),
 		Responder:    deps.server,
 		Events:       sink,
+		Finalizer:    finalizer,
 		Contact:      contactURI(cfg),
 		InstanceID:   cfg.InstanceID,
 		Timers:       timers,
@@ -857,7 +919,7 @@ func newInviteHandler(deps inviteDeps) (*invite.Handler, error) {
 		NewLegID:     contract.NewEventID,
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	log.Info("INVITE handling ready",
@@ -870,7 +932,7 @@ func newInviteHandler(deps inviteDeps) (*invite.Handler, error) {
 		"aclLoaded", aclLoaded,
 		"trunks", deps.trunks.Len(),
 		"sessionTimers", cfg.EnableSessionTimers)
-	return handler, nil
+	return handler, finalizer, nil
 }
 
 // buildProfiles turns the configuration and the `sip-acl` bucket into the trust boundaries the
@@ -1063,33 +1125,82 @@ func contactURI(cfg config.Config) sip.Uri {
 	return sip.Uri{Scheme: "sip", User: cfg.UserAgent, Host: host, Port: port}
 }
 
-// serveUDP binds the UDP socket with an explicit receive and send buffer, then hands it to sipgo.
+// boundListener is one SIP transport whose socket is already bound. serve blocks until closer is
+// closed; closer is owned by the caller.
+type boundListener struct {
+	addr   string
+	closer io.Closer
+	serve  func(*sipgo.Server) error
+}
+
+// bindListener binds the socket for one SIP transport and returns it with the sipgo Serve variant
+// that accepts an already-bound listener.
 //
-// sipgo's own ListenAndServe takes the kernel default (~200 KiB on Linux). One goroutine drains the
-// socket, and a fleet re-registering after a network blip arrives faster than it can be parsed; the
-// overflow is silently dropped datagrams. A kernel that refuses the size is logged, not fatal.
-func serveUDP(ctx context.Context, server *sipgo.Server, addr string, bufferBytes int, log *slog.Logger) error {
-	laddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return fmt.Errorf("resolving %s: %w", addr, err)
+// Binding here rather than through sipgo's ListenAndServe/ListenAndServeTLS keeps the process out
+// of the upstream race at sipgo@v1.4.3/server.go:102-108 (the cancellation goroutine reads the
+// listener) versus server.go:123-128 (the same function writes it).
+//
+// UDP is additionally given an explicit receive and send buffer: sipgo takes the kernel default
+// (~200 KiB on Linux), one goroutine drains the socket, and a fleet re-registering after a network
+// blip arrives faster than it can be parsed. A kernel that refuses the size is logged, not fatal.
+func bindListener(network, addr string, tlsConfig *tls.Config, bufferBytes int, log *slog.Logger) (*boundListener, error) {
+	switch network {
+	case "udp":
+		laddr, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			return nil, fmt.Errorf("resolving %s: %w", addr, err)
+		}
+		conn, err := net.ListenUDP("udp", laddr)
+		if err != nil {
+			return nil, fmt.Errorf("listening on %s: %w", addr, err)
+		}
+		sizes, err := netbuf.Tune(conn, bufferBytes, bufferBytes)
+		if err != nil {
+			log.Warn("cannot size the UDP socket buffers; the kernel default applies",
+				"addr", addr, "bytes", bufferBytes, "error", err)
+		} else if bufferBytes > 0 {
+			log.Info("sized the UDP socket buffers",
+				"addr", addr, "receiveBytes", sizes.Receive, "sendBytes", sizes.Send)
+		}
+		return &boundListener{
+			addr:   conn.LocalAddr().String(),
+			closer: conn,
+			serve:  func(server *sipgo.Server) error { return server.ServeUDP(conn) },
+		}, nil
+	case "tcp", "ws":
+		listener, err := net.Listen("tcp", addr)
+		if err != nil {
+			return nil, fmt.Errorf("listening on %s: %w", addr, err)
+		}
+		serve := (*sipgo.Server).ServeTCP
+		if network == "ws" {
+			serve = (*sipgo.Server).ServeWS
+		}
+		return &boundListener{
+			addr:   listener.Addr().String(),
+			closer: listener,
+			serve:  func(server *sipgo.Server) error { return serve(server, listener) },
+		}, nil
+	case "tls", "wss":
+		if tlsConfig == nil {
+			return nil, fmt.Errorf("listening on %s: %s needs a TLS certificate", addr, network)
+		}
+		inner, err := net.Listen("tcp", addr)
+		if err != nil {
+			return nil, fmt.Errorf("listening on %s: %w", addr, err)
+		}
+		listener := tls.NewListener(inner, tlsConfig)
+		serve := (*sipgo.Server).ServeTLS
+		if network == "wss" {
+			serve = (*sipgo.Server).ServeWSS
+		}
+		return &boundListener{
+			addr:   listener.Addr().String(),
+			closer: listener,
+			serve:  func(server *sipgo.Server) error { return serve(server, listener) },
+		}, nil
 	}
-	conn, err := net.ListenUDP("udp", laddr)
-	if err != nil {
-		return fmt.Errorf("listening on %s: %w", addr, err)
-	}
-	sizes, err := netbuf.Tune(conn, bufferBytes, bufferBytes)
-	if err != nil {
-		log.Warn("cannot size the UDP socket buffers; the kernel default applies",
-			"addr", addr, "bytes", bufferBytes, "error", err)
-	} else if bufferBytes > 0 {
-		log.Info("sized the UDP socket buffers",
-			"addr", addr, "receiveBytes", sizes.Receive, "sendBytes", sizes.Send)
-	}
-	context.AfterFunc(ctx, func() { _ = conn.Close() })
-	if ready, ok := ctx.Value(sipgo.ListenReadyCtxKey).(sipgo.ListenReadyFuncCtxValue); ok {
-		ready("udp", conn.LocalAddr().String())
-	}
-	return server.ServeUDP(conn)
+	return nil, fmt.Errorf("listening on %s: unsupported transport %q", addr, network)
 }
 
 // flushPublishes waits for the outstanding asynchronous JetStream acks, bounded by timeout.

@@ -21,11 +21,16 @@
 package reaper
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"log/slog"
 	"math/rand/v2"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
@@ -82,8 +87,17 @@ type Options struct {
 	// ReapInterval is how often the REAP half runs, which is deliberately not every sweep. Zero
 	// means twice the heartbeat interval. See Reaper.Sweep.
 	ReapInterval time.Duration
-	// Timeout bounds one sweep's I/O.
+	// Timeout bounds one sweep's I/O. It is the default for both halves below.
 	Timeout time.Duration
+	// HeartbeatTimeout and ReapTimeout are the two halves' own budgets. They are separate because a
+	// slow bucket listing must not eat the time the heartbeat needs: a heartbeat that runs out of
+	// budget is a neighbour declaring this instance's live calls orphaned. Zero takes Timeout.
+	HeartbeatTimeout time.Duration
+	ReapTimeout      time.Duration
+	// Workers is how many claim renewals may be in flight at once. The heartbeat is N round trips
+	// to the bucket and a serial pass costs N×latency, which is what starves the tail of a large
+	// instance. Zero takes 16.
+	Workers int
 	Logger  *slog.Logger
 	// Now is injectable so lease expiry is testable without sleeping.
 	Now func() time.Time
@@ -98,11 +112,17 @@ type Reaper struct {
 	instance string
 	interval time.Duration
 	// reapInterval and nextReap gate the bucket listing. See Sweep.
-	reapInterval time.Duration
-	nextReap     time.Time
-	timeout      time.Duration
-	log          *slog.Logger
-	now          func() time.Time
+	reapInterval     time.Duration
+	nextReap         time.Time
+	timeout          time.Duration
+	heartbeatTimeout time.Duration
+	reapTimeout      time.Duration
+	workers          int
+	// nextHeartbeat is where the next heartbeat pass starts, so a sweep that runs out of budget
+	// leaves the claims it did not reach at the FRONT of the next one. Only Sweep touches it.
+	nextHeartbeat string
+	log           *slog.Logger
+	now           func() time.Time
 }
 
 // New validates the options and builds a Reaper.
@@ -120,16 +140,19 @@ func New(opts Options) (*Reaper, error) {
 			"bucket looks like somebody else's and this process would reap its own calls")
 	}
 	reaper := &Reaper{
-		store:        opts.Store,
-		dialogs:      opts.Dialogs,
-		events:       opts.Events,
-		leases:       opts.Leases,
-		instance:     opts.InstanceID,
-		interval:     opts.Interval,
-		reapInterval: opts.ReapInterval,
-		timeout:      opts.Timeout,
-		log:          opts.Logger,
-		now:          opts.Now,
+		store:            opts.Store,
+		dialogs:          opts.Dialogs,
+		events:           opts.Events,
+		leases:           opts.Leases,
+		instance:         opts.InstanceID,
+		interval:         opts.Interval,
+		reapInterval:     opts.ReapInterval,
+		timeout:          opts.Timeout,
+		heartbeatTimeout: opts.HeartbeatTimeout,
+		reapTimeout:      opts.ReapTimeout,
+		workers:          opts.Workers,
+		log:              opts.Logger,
+		now:              opts.Now,
 	}
 	if reaper.interval <= 0 {
 		// Thirty seconds against the store's ninety-second default lease: three chances to land a
@@ -147,6 +170,15 @@ func New(opts Options) (*Reaper, error) {
 	}
 	if reaper.reapInterval <= 0 {
 		reaper.reapInterval = 2 * reaper.interval
+	}
+	if reaper.heartbeatTimeout <= 0 {
+		reaper.heartbeatTimeout = reaper.timeout
+	}
+	if reaper.reapTimeout <= 0 {
+		reaper.reapTimeout = reaper.timeout
+	}
+	if reaper.workers <= 0 {
+		reaper.workers = 16
 	}
 	return reaper, nil
 }
@@ -178,10 +210,10 @@ func (r *Reaper) Run(ctx context.Context) error {
 // CDR of last resort, which is safe because the claim's own lease decides whether it is an orphan,
 // not when we look.
 func (r *Reaper) Sweep(ctx context.Context) {
-	sweepCtx, cancel := context.WithTimeout(ctx, r.timeout)
-	defer cancel()
+	heartbeatCtx, cancelHeartbeat := context.WithTimeout(ctx, r.heartbeatTimeout)
+	r.nextHeartbeat = r.heartbeat(heartbeatCtx)
+	cancelHeartbeat()
 
-	r.heartbeat(sweepCtx)
 	now := r.now()
 	if now.Before(r.nextReap) {
 		return
@@ -190,40 +222,99 @@ func (r *Reaper) Sweep(ctx context.Context) {
 	// for ever after.
 	jitter := time.Duration(rand.Int64N(int64(r.reapInterval) / 4))
 	r.nextReap = now.Add(r.reapInterval - r.reapInterval/8 + jitter)
-	r.reap(sweepCtx)
+
+	reapCtx, cancelReap := context.WithTimeout(ctx, r.reapTimeout)
+	defer cancelReap()
+	r.reap(reapCtx)
 }
 
 // heartbeat re-writes every live dialog's claim, unconditionally rather than only those close to
 // expiry: tracking per-claim deadlines here would be a second copy of the lease that could disagree
 // with the bucket's.
 //
-// A failure is logged and the sweep continues; abandoning the pass would leave every subsequent
-// dialog's claim stale as well.
-func (r *Reaper) heartbeat(ctx context.Context) {
-	claims := r.dialogs.Claims()
-	written, failed := 0, 0
-	for _, claim := range claims {
-		if err := r.store.Put(ctx, claim); err != nil {
-			failed++
-			r.log.Warn("cannot refresh a dialog claim", "legId", claim.LegID, "error", err)
-			continue
-		}
-		written++
+// The renewals run on a bounded worker pool, so N claims cost about N/W broker round trips rather
+// than N: a serial pass on a busy instance can spend its whole budget before reaching the tail, and
+// a claim that misses enough refreshes is reaped as an orphan while its call is up. The pass starts
+// where the last one stopped and returns where this one did, so the same calls cannot be the ones
+// left out every time. A failure is logged and the pass continues; abandoning it would leave every
+// claim behind it stale as well.
+func (r *Reaper) heartbeat(ctx context.Context) string {
+	claims := rotate(r.dialogs.Claims(), r.nextHeartbeat)
+	if len(claims) == 0 {
+		return ""
 	}
-	if failed > 0 {
-		r.log.Warn("some dialog claims could not be refreshed",
-			"refreshed", written, "failed", failed, "instanceId", r.instance)
-		return
+
+	var (
+		mu        sync.Mutex
+		written   int
+		failed    int
+		unrenewed = len(claims)
+		next      atomic.Int64
+	)
+	workers := min(r.workers, len(claims))
+	var pool sync.WaitGroup
+	for range workers {
+		pool.Go(func() {
+			for {
+				index := int(next.Add(1)) - 1
+				if index >= len(claims) || ctx.Err() != nil {
+					return
+				}
+				claim := claims[index]
+				err := r.store.Put(ctx, claim)
+				mu.Lock()
+				if err != nil {
+					failed++
+					unrenewed = min(unrenewed, index)
+				} else {
+					written++
+				}
+				mu.Unlock()
+				if err != nil {
+					r.log.Warn("cannot refresh a dialog claim", "legId", claim.LegID, "error", err)
+				}
+			}
+		})
+	}
+	pool.Wait()
+
+	// Whatever the pool did not start is unrenewed too, and it is the tail this cursor exists for.
+	started := min(int(next.Load()), len(claims))
+	if started < len(claims) {
+		unrenewed = min(unrenewed, started)
+	}
+	if unrenewed < len(claims) {
+		r.log.Warn("some dialog claims could not be refreshed this sweep",
+			"refreshed", written, "failed", failed, "unreached", len(claims)-started,
+			"instanceId", r.instance)
+		return claims[unrenewed].LegID
 	}
 	if written > 0 {
 		r.log.Debug("refreshed dialog claims", "count", written, "instanceId", r.instance)
 	}
+	return ""
 }
 
-// reap publishes a termination for every orphaned claim and then deletes it. The order is not
-// interchangeable: deleting first would open a window in which a crash leaves the leg unreapable by
-// anybody, for ever. Publishing first risks only a republish on the next sweep, which the stream's
-// duplicate window collapses via the envelope's stable `Nats-Msg-Id`.
+// rotate starts the slice at the first claim at or after `from`, wrapping. dialog.Store.Claims is
+// sorted by leg id, so this is the fair continuation of the previous pass.
+func rotate(claims []dialog.Claim, from string) []dialog.Claim {
+	if from == "" || len(claims) == 0 {
+		return claims
+	}
+	at, _ := slices.BinarySearchFunc(claims, from, func(claim dialog.Claim, target string) int {
+		return cmp.Compare(claim.LegID, target)
+	})
+	if at == 0 || at >= len(claims) {
+		return claims
+	}
+	return append(slices.Clone(claims[at:]), claims[:at]...)
+}
+
+// reap publishes a termination for every orphaned claim, waits for the stream to acknowledge it,
+// and only then deletes the claim. The order is not interchangeable: deleting first would open a
+// window in which a crash leaves the leg unreapable by anybody, for ever. Publishing first risks
+// only a republish on the next sweep, which the stream's duplicate window collapses via the
+// envelope's stable `Nats-Msg-Id` (terminationID).
 func (r *Reaper) reap(ctx context.Context) {
 	claims, err := r.store.All(ctx)
 	if err != nil {
@@ -331,7 +422,24 @@ func (r *Reaper) liveInstances(ctx context.Context) map[string]struct{} {
 	return live
 }
 
-// publishTermination builds and publishes one orphan's `dialog.terminated`.
+// terminationID is the identity a retried orphan termination carries: the same publication, not a
+// new one, however many sweeps or instances reach the same orphan. It is derived from the leg's
+// INCARNATION — leg id, the instance that owned it and the moment that dialog was created — plus the
+// termination kind, so the broker's duplicate window collapses two publications into one CDR row
+// (R23: NewEnvelope's fresh UUID could not).
+func terminationID(orphan dialog.Claim) string {
+	return contract.DerivedEventID(
+		contract.EventTypeSIPDialogTerminated,
+		orphan.LegID,
+		orphan.InstanceID,
+		strconv.FormatInt(orphan.CreatedAt, 10),
+		string(contract.SIPDialogTerminatedReasonInstanceLost),
+	)
+}
+
+// publishTermination builds one orphan's `dialog.terminated` and waits for the stream to accept it.
+// The wait is the point: the caller deletes the claim next, and a claim deleted for a publish the
+// stream never took loses the only evidence the call ever ended.
 //
 // It reports the DEAD OWNER's instance id, not this one, or the engine would address a follow-up
 // command at a process that never held the call. `answeredForSeconds` is deliberately absent even
@@ -346,6 +454,7 @@ func (r *Reaper) publishTermination(ctx context.Context, orphan dialog.Claim) er
 	}
 	envelope, err := contract.NewSIPDialogTerminatedEnvelope(
 		contract.EnvelopeInput[contract.SIPDialogTerminatedData]{
+			ID:     terminationID(orphan),
 			OrgID:  orphan.OrgID,
 			Source: "sipd",
 			At:     r.now(),
@@ -372,7 +481,7 @@ func (r *Reaper) publishTermination(ctx context.Context, orphan dialog.Claim) er
 	if err != nil {
 		return err
 	}
-	return r.events.Terminated(ctx, envelope)
+	return sipevents.PublishTerminatedAck(ctx, r.events, envelope)
 }
 
 func optional(value string) *string {

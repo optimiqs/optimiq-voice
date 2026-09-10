@@ -34,14 +34,14 @@ func TestNegotiateUAS(t *testing.T) {
 			policy:        enabled,
 			request:       TimerRequest{Supported: true},
 			wantInterval:  seconds(1800),
-			wantRefresher: RefresherLocal,
+			wantRefresher: RefresherRemote,
 		},
 		{
 			name:          "a peer's interval is honoured",
 			policy:        enabled,
 			request:       TimerRequest{Supported: true, SessionExpires: seconds(600)},
 			wantInterval:  seconds(600),
-			wantRefresher: RefresherLocal,
+			wantRefresher: RefresherRemote,
 		},
 		{
 			name:       "an interval below our floor is 422 with the floor named",
@@ -55,14 +55,14 @@ func TestNegotiateUAS(t *testing.T) {
 			policy:        enabled,
 			request:       TimerRequest{Supported: true, SessionExpires: seconds(86400)},
 			wantInterval:  seconds(7200),
-			wantRefresher: RefresherLocal,
+			wantRefresher: RefresherRemote,
 		},
 		{
 			name:          "the peer's own Min-SE is a floor and wins over our clamp",
 			policy:        TimerPolicy{Enabled: true, MinSE: seconds(90), DefaultSE: seconds(600), MaxSE: seconds(600), PreferLocalRefresh: true},
 			request:       TimerRequest{Supported: true, SessionExpires: seconds(1800), MinSE: seconds(1200)},
 			wantInterval:  seconds(1200),
-			wantRefresher: RefresherLocal,
+			wantRefresher: RefresherRemote,
 		},
 		{
 			name:          "refresher=uac makes the far end the refresher",
@@ -72,11 +72,13 @@ func TestNegotiateUAS(t *testing.T) {
 			wantRefresher: RefresherRemote,
 		},
 		{
-			name:          "refresher=uas makes us the refresher",
+			// A peer naming US is declined: nothing here can build a refresh, so the answer puts the
+			// obligation back on the peer rather than accepting one this edge would drop.
+			name:          "refresher=uas is answered with the far end as the refresher",
 			policy:        enabled,
 			request:       TimerRequest{Supported: true, SessionExpires: seconds(600), RefresherParam: "uas"},
 			wantInterval:  seconds(600),
-			wantRefresher: RefresherLocal,
+			wantRefresher: RefresherRemote,
 		},
 		{
 			name:          "with no preference and PreferLocalRefresh off the far end refreshes",
@@ -129,8 +131,8 @@ func TestAcceptUACResponse(t *testing.T) {
 		t.Error("a response with no Session-Expires must leave no timer")
 	}
 	timer := AcceptUACResponse(policy, TimerRequest{SessionExpires: seconds(900), RefresherParam: "uac"})
-	if timer.Interval != seconds(900) || timer.Refresher != RefresherLocal {
-		t.Errorf("timer = %s/%s, want 900s refreshed locally", timer.Interval, timer.Refresher)
+	if timer.Interval != seconds(900) || timer.Refresher != RefresherRemote {
+		t.Errorf("timer = %s/%s, want 900s refreshed by the far end", timer.Interval, timer.Refresher)
 	}
 	if timer := AcceptUACResponse(TimerPolicy{}, TimerRequest{SessionExpires: seconds(900)}); timer.Negotiated() {
 		t.Error("a disabled policy accepts no timer")
