@@ -2421,6 +2421,42 @@ describe("admitting a call from the sip edge", () => {
 	});
 
 	/**
+	 * Regression: a queue callback stamped `OPTIMIQ_CDR_RELATED_CALL_ID` on the leg it originated,
+	 * and the ledger still showed `related_call_id` null on every row — the name was not in
+	 * `ARRIVAL_VARIABLES`, so the read that builds the aggregate dropped it. Same shape as the
+	 * attestation regression above; same guard now covers it.
+	 */
+	it("carries a stamped related call id from the arriving leg to the CDR", async () => {
+		const RELATED = "0195c0f0-1c2f-7000-8000-00000000c0de";
+		const h = harness(fakeEnv());
+
+		await h.orchestrator.handleEvent({
+			type: "leg-arrived",
+			channel: {
+				id: ARI_CHANNEL,
+				name: "PJSIP/trunk-00000001",
+				callerName: "Queue 4010",
+				callerNumber: "4010",
+				dialedNumber: "+15551234567",
+				context: "local-ctx",
+				variables: {
+					OPTIMIQ_ORG_ID: ORG,
+					OPTIMIQ_CALL_DIRECTION: "outbound",
+					OPTIMIQ_CDR_RELATED_CALL_ID: RELATED,
+				},
+			},
+		});
+		await h.orchestrator.handleEvent({
+			type: "leg-ended",
+			channelId: ARI_CHANNEL,
+			cause: "NORMAL_CLEARING",
+			causeCode: 16,
+		});
+
+		expect(h.cdrs[0]?.data).toMatchObject({ relatedCallId: RELATED });
+	});
+
+	/**
 	 * Regression: on the wire this failed with NO log line at all.
 	 *
 	 * `relayEarlyMedia` read the originator only from the composite's own leg record and returned

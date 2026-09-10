@@ -182,6 +182,7 @@ const SIP_ORIGID_VARIABLE = "OPTIMIQ_SIP_ORIGID";
  * whole point of not keeping it in process memory.
  */
 const DEVICE_ID_VARIABLE = "OPTIMIQ_DEVICE_ID";
+const CDR_RELATED_CALL_ID_VARIABLE = "OPTIMIQ_CDR_RELATED_CALL_ID";
 /**
  * Every variable an arriving leg carries, in ONE list, because the two halves drifted apart once.
  *
@@ -207,6 +208,7 @@ const ARRIVAL_VARIABLES = [
 	SIP_ATTESTATION_VARIABLE,
 	SIP_VERSTAT_VARIABLE,
 	SIP_ORIGID_VARIABLE,
+	CDR_RELATED_CALL_ID_VARIABLE,
 ] as const;
 type ArrivalVariable = (typeof ARRIVAL_VARIABLES)[number];
 /**
@@ -260,7 +262,6 @@ const CDR_HANGUP_CAUSE_CODE_VARIABLE = "OPTIMIQ_CDR_HANGUP_CAUSE_CODE";
  * minutes later, and this is the only thing that says which wait it settled. A channel variable
  * rather than a field on the aggregate, so it survives the snapshot an instance reads after failover.
  */
-const CDR_RELATED_CALL_ID_VARIABLE = "OPTIMIQ_CDR_RELATED_CALL_ID";
 const TERMINAL_HANGUP_EVENT_ID_VARIABLE = "OPTIMIQ_TERMINAL_HANGUP_EVENT_ID";
 const TERMINAL_DESTROYED_EVENT_ID_VARIABLE = "OPTIMIQ_TERMINAL_DESTROYED_EVENT_ID";
 const TERMINAL_EVENTS_PUBLISHED_VARIABLE = "OPTIMIQ_TERMINAL_EVENTS_PUBLISHED";
@@ -5374,6 +5375,8 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			[SIP_ATTESTATION_VARIABLE]: request.attestation?.level,
 			[SIP_VERSTAT_VARIABLE]: request.attestation?.verstat,
 			[SIP_ORIGID_VARIABLE]: request.attestation?.origId,
+			// Only an originated leg (queue callback, click-to-call) carries one; it arrives stamped.
+			[CDR_RELATED_CALL_ID_VARIABLE]: undefined,
 		};
 		return {
 			id: request.legId,
