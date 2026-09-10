@@ -2378,7 +2378,13 @@ describe("shared lines, mid-call", () => {
 
 	it("re-bridges the held party to the appearance that retrieved the line", async () => {
 		const caller = fakeLeg("c", { callId: "call-c" });
-		const retriever = fakeLeg("b", { callId: "call-b", destinationNumber: "1002" });
+		// Dialled the LINE, which is what a retrieve is: the appearance is the party on the leg, so
+		// it is `callerIdNumber` that names it and `destinationNumber` that names the line.
+		const retriever = fakeLeg("b", {
+			callId: "call-b",
+			callerIdNumber: "1002",
+			destinationNumber: "4500",
+		});
 		const lines = fakeSharedLines({ state: "held", legId: caller.legId });
 		const h = harness({
 			legs: [caller, retriever],
@@ -2414,7 +2420,8 @@ describe("shared lines, mid-call", () => {
 		const caller = fakeLeg("c", { callId: "call-c" });
 		const retriever = fakeLeg("b", {
 			callId: "call-b",
-			destinationNumber: "1002",
+			callerIdNumber: "1002",
+			destinationNumber: "4500",
 			isAnswered: false,
 		});
 		const lines = fakeSharedLines({ state: "held", legId: caller.legId });
@@ -2431,6 +2438,59 @@ describe("shared lines, mid-call", () => {
 		// refused `unknown_session` on a split media plane and the appearance hears ringback.
 		expect(h.media.methods()).toContain("answer");
 		expect(retriever.bridgePeers).toContain(caller.legId);
+	});
+
+	/**
+	 * Regression: after a retrieve the line was never recallable again.
+	 *
+	 * Two halves, both about the appearance that retrieved. The lamp kept naming the appearance that
+	 * had PUT the call on hold, because the retrieving leg was matched on `destinationNumber` — which
+	 * is the LINE's number, never an appearance's. And the seizure is filed under the caller's call,
+	 * while a retrieving appearance dialled in as a call of its own, so its hold was not recognised
+	 * as a shared-line hold at all and no recall was ever armed.
+	 */
+	it("re-arms the recall at the retrieving appearance when it holds the line in turn", async () => {
+		const caller = fakeLeg("c", { callId: "call-c" });
+		const first = fakeLeg("a", { callId: "call-c" });
+		bridgePair(first, caller);
+		const retriever = fakeLeg("b", {
+			callId: "call-b",
+			callerIdNumber: "1002",
+			destinationNumber: "4500",
+		});
+		const lines = fakeSharedLines({ legId: caller.legId });
+		const h = harness({
+			legs: [caller, first, retriever],
+			sharedLines: lines.port,
+			sharedLine: SHARED_LINE,
+		});
+
+		await h.control.onSharedLineHold(first, true);
+		expect(lines.recalls).toHaveLength(1);
+
+		expect((await h.control.retrieveSharedLine(retriever, { sharedLineId: "sl-1" })).ok).toBe(true);
+		// The lamp now names the appearance that is actually on the line.
+		expect(lines.state).toMatchObject({
+			state: "seized",
+			heldByExtensionId: "ext-b",
+			heldByAppearanceIndex: 2,
+		});
+		expect(lines.recalls).toEqual([]);
+		// What the aggregate does on a real bridge, which the fake leg cannot derive from a leg id.
+		retriever.peerMediaChannelId = caller.mediaChannelId;
+		caller.peerMediaChannelId = retriever.mediaChannelId;
+
+		await h.control.onSharedLineHold(retriever, true);
+
+		expect(lines.state?.state).toBe("held");
+		expect(lines.recalls).toEqual([{ timeoutMs: 45_000, fire: expect.any(Function) }]);
+
+		lines.recalls[0]?.fire();
+		await Promise.resolve();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		// Back to the SECOND appearance, not the first.
+		expect(h.routes.map((route) => route.destination)).toEqual(["1002"]);
 	});
 
 	it("refuses to retrieve a line that is in use rather than on hold", async () => {

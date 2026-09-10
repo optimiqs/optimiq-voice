@@ -553,9 +553,12 @@ export class SplitPlaneMediaPort implements MediaPort {
 	 * carrier sends find the work already done rather than renegotiating a caller mid-announcement.
 	 * That latch is also what the later {@link answer} repeats.
 	 */
-	async earlyMedia(channelId: string): Promise<void> {
+	async earlyMedia(channelId: string, relayFrom?: string): Promise<void> {
 		const leg = this.require("earlyMedia", channelId);
 		if (leg.earlyMediaAnswer !== undefined) {
+			// A chatty carrier's second `18x`. The exchange is committed; what may still be missing is
+			// the relay, because the first attempt could have got the `183` out and failed the bridge.
+			await this.relayEarlyAudio(channelId, relayFrom);
 			return;
 		}
 		if (leg.sdpOffer === undefined) {
@@ -614,6 +617,11 @@ export class SplitPlaneMediaPort implements MediaPort {
 			// Latched only once the 183 is on the wire: a refused response is not a committed exchange,
 			// and latching before it would leave the later 200 repeating an answer nobody ever received.
 			leg.earlyMediaAnswer = allocation.sdpAnswer;
+			// And the audio, which the `183` alone does not carry. Both sessions exist and both have
+			// settled a codec by now; until they are put in one relay `mediad` has nowhere to send the
+			// carrier's packets and the caller hears eight seconds of nothing. The `200` re-bridges
+			// them under the walk's own bridge id.
+			await this.relayEarlyAudio(channelId, relayFrom);
 		} catch (error) {
 			try {
 				await this.media.releaseSession(channelId);
@@ -624,6 +632,27 @@ export class SplitPlaneMediaPort implements MediaPort {
 				);
 			}
 			throw error;
+		}
+	}
+
+	/**
+	 * Puts the caller's session and the leg whose early media this is into one relay.
+	 *
+	 * Best-effort by construction: the `183` is already on the wire and the caller's exchange is
+	 * committed, so a failed relay costs them the announcement and nothing else — and the `200`
+	 * bridges the pair properly a few seconds later. Throwing here would undo a committed exchange.
+	 */
+	private async relayEarlyAudio(channelId: string, relayFrom: string | undefined): Promise<void> {
+		if (relayFrom === undefined || relayFrom === channelId) {
+			return;
+		}
+		try {
+			await this.media.bridgeEarly(channelId, relayFrom);
+		} catch (error) {
+			this.logger.warn(
+				{ channelId, legId: relayFrom, err: String(error) },
+				"could not relay early media to the caller; they hear ringback until answer",
+			);
 		}
 	}
 

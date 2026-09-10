@@ -913,6 +913,14 @@ func (m *Manager) ReapIdle() int {
 	for id, session := range m.sessions {
 		idle := session.Idle(now)
 		heardSomething := session.lastPacket.Load() != 0
+		// A leg that has never received a packet but is putting its peer's audio on the wire is a
+		// caller listening to early media: the far end plays and the caller sends nothing until the
+		// 200. Counting it as idle would reap the announcement out from under them at the backstop.
+		if !heardSomething {
+			if sent := session.lastWrite.Load(); sent != 0 {
+				idle = min(idle, now.Sub(time.UnixMilli(sent)))
+			}
+		}
 		// Held, muted and just-resumed sessions are EXPECTED to be silent, so they are exempt from
 		// the RTP timeout — but only from that one. A leg that has never received a packet is a leak
 		// whatever its direction, so the idle backstop below still applies to it.

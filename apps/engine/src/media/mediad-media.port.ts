@@ -400,6 +400,34 @@ export class MediadMediaPort implements MediaPort {
 	}
 
 	/**
+	 * Relays the callee's early media to the caller, before either leg has answered.
+	 *
+	 * The same `bridge-sessions` command an answered call issues — a relay is a relay, and the
+	 * media plane has no notion of "answered" to gate it on. Two things make it different from
+	 * {@link addToBridge}: the pair is NOT recorded in {@link bridges}, because the walk builds its
+	 * own bridge at the `200` and `mediad` re-points both sessions there (`Manager.Bridge` detaches
+	 * whatever each session was in first), and the id is derived from the caller's leg so a chatty
+	 * carrier's second `183` re-issues the same command rather than opening a second relay.
+	 *
+	 * Nothing here outlives the call: `mediad` unbridges a pair when either session is released.
+	 *
+	 * The relay is symmetric, where RFC 3960 §3.1 only asks for the announcement direction. Gating
+	 * the caller's own packets would need a dialog state the media plane deliberately does not hold,
+	 * and it buys nothing: a caller listening to an announcement sends nothing until they answer, and
+	 * one that does send early is talking to a party that is already playing at them.
+	 */
+	async bridgeEarly(callerSessionId: string, calleeSessionId: string): Promise<void> {
+		await this.call(
+			RPC_SUBJECTS.mediaBridgeSessions,
+			{
+				bridgeId: `early-${callerSessionId}`.slice(0, 128),
+				sessionIds: [callerSessionId, calleeSessionId],
+			},
+			mediaBridgeSessionsResponseSchema,
+		);
+	}
+
+	/**
 	 * Separates legs from a bridge WITHOUT hanging them up.
 	 *
 	 * A relay is all-or-nothing between two parties, so removing either one ends it. The survivor

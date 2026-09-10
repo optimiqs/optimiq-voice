@@ -3331,7 +3331,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 			return;
 		}
 		try {
-			await port.earlyMedia(originator);
+			await port.earlyMedia(originator, mediaChannelId);
 		} catch (error) {
 			this.logger.warn(
 				{ channelId: originator, legId: mediaChannelId, err: String(error) },
@@ -5020,7 +5020,50 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 		// Where the answered customer is walked to. The queue's number when it has one; its id
 		// otherwise, which the walk resolves the same way a dialled number would.
 		const dialed = request.queueNumber ?? request.queueId;
+		const variables = {
+			OPTIMIQ_ORG_ID: request.orgId,
+			// The direction the leg actually took: `outbound` over a trunk, `internal` when the
+			// party who waited was one of this tenant's own extensions. Calling an on-net
+			// callback `outbound` would bill an internal call as a carrier minute.
+			OPTIMIQ_CALL_DIRECTION: onNet ? "internal" : "outbound",
+			OPTIMIQ_ROUTING_CONTEXT: "internal",
+			OPTIMIQ_DIALED_NUMBER: dialed,
+			...(request.relatedCallId === undefined
+				? {}
+				: { [CDR_RELATED_CALL_ID_VARIABLE]: request.relatedCallId }),
+		};
+		const native = this.media instanceof SplitPlaneMediaPort;
 		try {
+			if (native) {
+				// The split plane refuses to originate on a leg it does not hold — `require("originate",
+				// …)` throws "the leg is not registered" — so the leg is filed here exactly as
+				// click-to-call files its own. Without it every callback was refused `extension_offline`
+				// for a customer who was perfectly reachable.
+				await this.onLegArrived(
+					{
+						id: request.callbackId,
+						name: endpoint,
+						...(plan.callerIdNumber === undefined ? {} : { callerNumber: plan.callerIdNumber }),
+						dialedNumber: dialed,
+						context: "internal",
+						variables: { ...variables, OPTIMIQ_LEG: "a" },
+					},
+					(aggregate) => {
+						(this.media as SplitPlaneMediaPort).registerOutboundLeg(request.callbackId, {
+							orgId: request.orgId,
+							callId: aggregate.callId,
+						});
+					},
+					true,
+				);
+				if (this.registry.byAriChannelId(request.callbackId) === undefined) {
+					return {
+						kind: "refused",
+						reason: "internal",
+						error: "could not claim the callback leg",
+					};
+				}
+			}
 			await this.media.originate({
 				endpoint,
 				// The structured target for the SIP edge, exactly as the walker builds it: an AOR at the
@@ -5042,18 +5085,7 @@ export class ChannelOrchestrator implements OnApplicationShutdown {
 				...(request.ringTimeoutSeconds === undefined
 					? {}
 					: { timeoutSeconds: request.ringTimeoutSeconds }),
-				variables: {
-					OPTIMIQ_ORG_ID: request.orgId,
-					// The direction the leg actually took: `outbound` over a trunk, `internal` when the
-					// party who waited was one of this tenant's own extensions. Calling an on-net
-					// callback `outbound` would bill an internal call as a carrier minute.
-					OPTIMIQ_CALL_DIRECTION: onNet ? "internal" : "outbound",
-					OPTIMIQ_ROUTING_CONTEXT: "internal",
-					OPTIMIQ_DIALED_NUMBER: dialed,
-					...(request.relatedCallId === undefined
-						? {}
-						: { [CDR_RELATED_CALL_ID_VARIABLE]: request.relatedCallId }),
-				},
+				variables,
 			});
 		} catch (error) {
 			this.logger.info(

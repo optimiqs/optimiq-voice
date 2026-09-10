@@ -361,8 +361,14 @@ export interface MediaPort {
 	 *
 	 * Idempotent by contract: a carrier that sends `183` several times must not re-negotiate the
 	 * caller's media or re-send the response on each one.
+	 *
+	 * `relayFrom` is the leg whose early media this is — the callee's. A driver whose media plane
+	 * only carries audio between legs it has been told about needs it: on a split plane the two
+	 * sessions have no path between them until they are bridged, so the `183` alone reaches the
+	 * caller as signalling and never as sound. Optional, and ignored by a driver that is already in
+	 * both media paths.
 	 */
-	earlyMedia(channelId: string): Promise<void>;
+	earlyMedia(channelId: string, relayFrom?: string): Promise<void>;
 
 	/** Start audio. Returns the handle the engine will stop it with. */
 	play(channelId: string, request: PlayRequest): Promise<PlaybackHandle>;

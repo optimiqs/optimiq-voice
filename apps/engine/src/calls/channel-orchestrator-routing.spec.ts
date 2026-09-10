@@ -1236,6 +1236,52 @@ describe("sip dialog correlation", () => {
 		);
 	});
 
+	/**
+	 * Regression, end to end through the walker: the answering party's blind transfer.
+	 *
+	 * The REFER resolves, `routeTransferee` starts a walk on the caller's leg — and the walk that
+	 * built the original bridge is still watching the DESK PHONE's leg. Its `onPeerEnded` compares
+	 * the caller's bridge pointer against the bridge it built, so unless the transfer clears that
+	 * pointer before hanging the transferor up, the caller is ended `NORMAL_CLEARING` two
+	 * milliseconds into the new walk and the transfer is refused for a call it killed itself.
+	 */
+	it("does not take the caller down when the party who ANSWERED transfers them", async () => {
+		const { h, bLegChannelId } = await answeredBy("callee@1.2.3.4");
+		// The desk phone's own `200 OK`, which is what makes its leg usable for a transfer.
+		await h.orchestrator.handleEvent(
+			mediaEvent("ChannelStateChange", { channel: bLegChannel(bLegChannelId) }),
+		);
+		const transferor = h.sipCallPath().legFor(bLegChannelId) as ControlledLeg;
+		// A hangup on a real media server is followed by `ChannelDestroyed`, which is what the
+		// orchestrator turns into the `ended` signal the walker's watcher is waiting on. The fake has
+		// no such event, so the hangup itself raises it — at the same moment production does.
+		const hangup = h.media.hangup.bind(h.media);
+		(h.media as { hangup: typeof hangup }).hangup = async (channelId, cause) => {
+			await hangup(channelId, cause);
+			if (channelId === bLegChannelId) {
+				h.signals.emit(legSignalKey(bLegChannelId), {
+					kind: "ended",
+					cause: "NORMAL_CLEARING",
+					causeCode: 16,
+				});
+			}
+		};
+
+		const result = await h.sipCallPath().transfer(transferor, {
+			kind: "blind",
+			destination: "1002",
+		});
+		await h.orchestrator.awaitWalks();
+
+		expect(result.ok).toBe(true);
+		// The caller was re-dialled at the target and never hung up: only the transferor's leg went.
+		expect(h.media.originated().map((request) => request.endpoint)).toEqual([
+			"PJSIP/1001",
+			"PJSIP/1002",
+		]);
+		expect(h.media.hungUp().map((call) => call.channelId)).not.toContain(ARI_CHANNEL);
+	});
+
 	it("lets a transfer through when the artifact cannot be read, rather than failing the feature", async () => {
 		const h = harness();
 		await arrive(h);
@@ -1865,6 +1911,49 @@ describe("the queue-callback call path", () => {
 		// `internal`, not `outbound`: billing an on-net callback as a carrier minute is a refund.
 		expect(originated?.variables?.OPTIMIQ_CALL_DIRECTION).toBe("internal");
 		expect(originated?.variables?.OPTIMIQ_DIALED_NUMBER).toBe("4010");
+	});
+
+	/**
+	 * Regression: every callback on a split media plane was refused `extension_offline`.
+	 *
+	 * `SplitPlaneMediaPort.originate` opens with `require("originate", …)`, which throws "the leg is
+	 * not registered" for a channel nothing filed. Click-to-call files its leg before it originates;
+	 * this path never did, so the throw was mapped to `extension_offline` and the runner spent every
+	 * attempt on a customer who was perfectly reachable.
+	 */
+	it("registers the callback leg with the split plane before originating it", async () => {
+		const transport = new FakeMediadTransport();
+		transport.reply("rpc.media.v1.create-offer", {
+			ok: true,
+			sessionId: CALLBACK_ID,
+			sdpOffer: "v=0\r\n",
+		});
+		const originated: { legId: string; target: unknown }[] = [];
+		const signalling = {
+			resolveTarget: async () => ({ ok: true, instanceId: "sipd-test", transport: "udp" }),
+			originate: async (request: { legId: string; target: unknown }) => {
+				originated.push(request);
+				return { ok: true, legId: request.legId, instanceId: "sipd-test" };
+			},
+		} as unknown as SipdCommandPort;
+		const h = harness({
+			artifact: callbackArtifact(),
+			nativeMedia: new SplitPlaneMediaPort(new MediadMediaPort(transport, 500), signalling),
+			env: { ENGINE_MEDIA_DRIVER: "mediad" },
+		});
+
+		const placement = await h.originatePath().placeQueueCallback?.(callbackRequest());
+
+		expect(placement).toMatchObject({ kind: "placed", legId: CALLBACK_ID });
+		expect(originated).toHaveLength(1);
+		expect(originated[0]?.target).toEqual({
+			kind: "trunk",
+			trunkId: "0195c0f0-1c2f-7000-8000-0000000000e1",
+			number: "+15551234567",
+		});
+		// Filed as an ordinary A-leg, which is what the answered customer's walk then runs on.
+		expect(h.orchestrator.activeChannelCount).toBe(1);
+		expect([...h.kv.values()][0]?.callId).toBe(callIdForAriChannel(CALLBACK_ID));
 	});
 
 	it("is idempotent: a retry of a lost reply does not ring the customer twice", async () => {

@@ -2001,8 +2001,12 @@ export class CallControl implements CallControlPort {
 			return refuse(`the transferee could not be held for the transfer: ${held.reason}`);
 		}
 		// Cleared BEFORE the transferor is hung up: `endBridgePeer` would otherwise follow the
-		// transferor's teardown straight into the call it just handed over.
+		// transferor's teardown straight into the call it just handed over, and the walk that built
+		// the bridge watches the transferor's leg — `onPeerEnded` hangs the transferee up unless the
+		// bridge pointer it compares against is gone by then. `hold` keeps the bridge id in its own
+		// record, so the unhold path is unaffected.
 		transferee.setBridgePeer(undefined);
+		transferee.setBridge(undefined);
 		transferor.setBridgePeer(undefined);
 		transferee.addFlag("transfer");
 		transferee.moveTo("routing");
@@ -2071,6 +2075,9 @@ export class CallControl implements CallControlPort {
 		}
 
 		transferee.setBridgePeer(undefined);
+		// Same seam as `completeBlindTransfer`: the walk that bridged this leg watches the leg that
+		// is going away, and its `onPeerEnded` compares against this pointer before ending us.
+		transferee.setBridge(undefined);
 		transferee.addFlag("transfer");
 		transferee.moveTo("routing");
 
@@ -3285,7 +3292,11 @@ export class CallControl implements CallControlPort {
 		if (lines === undefined) {
 			return;
 		}
-		const seizure = lines.seizureForCall(leg.callId);
+		// The seizure is filed under the CALLER's call, which is the one that survives a retrieve.
+		// An appearance that retrieved the line dialled in as a call of its own, so its own call id
+		// matches nothing and the party on the other side of the bridge is the one to ask about.
+		const seizure =
+			lines.seizureForCall(leg.callId) ?? lines.seizureForCall(this.peerOf(leg)?.callId ?? "");
 		if (seizure === undefined) {
 			return;
 		}
@@ -3366,8 +3377,13 @@ export class CallControl implements CallControlPort {
 		if (line === undefined) {
 			return refuse(`shared line ${request.sharedLineId} is not in this organization's artifact`);
 		}
+		// The retrieving leg DIALLED the line, so what it was dialled to reach is the line's number
+		// and not the appearance's — the person on it is `numberOf`. Matching on
+		// `destinationNumber` never found an appearance, and the fallback below then left the lamp
+		// naming the appearance that had put the call on hold.
+		const retrievingNumber = numberOf(leg);
 		const appearance = line.appearances.find(
-			(candidate) => candidate.extensionNumber === leg.destinationNumber,
+			(candidate) => candidate.extensionNumber === retrievingNumber,
 		);
 		const heldState = lines.held(leg.organizationId, request.sharedLineId);
 		if (heldState === undefined) {

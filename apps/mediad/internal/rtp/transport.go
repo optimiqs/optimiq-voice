@@ -3,6 +3,7 @@ package rtp
 import (
 	"net"
 	"sync"
+	"time"
 
 	pionrtp "github.com/pion/rtp"
 )
@@ -47,6 +48,9 @@ func (s *Session) readRTP(buf []byte) (int, *net.UDPAddr, error) {
 }
 
 func (s *Session) writeRTP(buf []byte, to *net.UDPAddr) (int, error) {
+	// The one choke point for every outbound packet, which is why the liveness stamp lives here
+	// rather than in each of forward, playback, dtmf and the mixer.
+	s.lastWrite.Store(time.Now().UnixMilli())
 	if s.transport != nil {
 		return s.transport.WriteRTP(buf)
 	}

@@ -276,6 +276,59 @@ describe("early media", () => {
 		expect(transport.on(RPC_SUBJECTS.mediaAllocateSession)).toHaveLength(2);
 	});
 
+	/**
+	 * Regression: the caller got the `183` with the carrier's answer and then eight seconds of
+	 * silence. Both sessions existed and neither was in a relay — `mediad` bridges at the `200`, and
+	 * an unbridged pair carries nothing, so pre-answer audio had no path at all.
+	 */
+	it("puts the caller and the callee in one relay so the announcement actually reaches them", async () => {
+		const { port, transport } = newComposite();
+		inbound(port);
+
+		await port.earlyMedia(CH, "b-leg-1");
+
+		const bridge = transport.on(RPC_SUBJECTS.mediaBridgeSessions)[0]?.payload as Record<
+			string,
+			unknown
+		>;
+		expect(bridge["sessionIds"]).toEqual([CH, "b-leg-1"]);
+		// Derived from the caller's leg, so a chatty carrier's second 183 re-issues the same command
+		// rather than opening a second relay.
+		expect(bridge["bridgeId"]).toBe(`early-${CH}`);
+		expect(transport.on(RPC_SUBJECTS.mediaBridgeSessions)).toHaveLength(1);
+
+		await port.earlyMedia(CH, "b-leg-1");
+		expect(transport.on(RPC_SUBJECTS.mediaBridgeSessions)).toHaveLength(2);
+		expect(transport.on(RPC_SUBJECTS.mediaAllocateSession)).toHaveLength(1);
+	});
+
+	it("still sends the 183 when the relay cannot be opened, and does not unlatch it", async () => {
+		const { port, transport, sipd } = newComposite();
+		inbound(port);
+		transport.reply(RPC_SUBJECTS.mediaBridgeSessions, {
+			ok: false,
+			bridgeId: `early-${CH}`,
+			reason: "unknown_session",
+			error: "the callee's session has gone",
+		});
+
+		await port.earlyMedia(CH, "b-leg-1");
+
+		expect(sipd.ringCalls).toHaveLength(1);
+		// The exchange IS committed — the answer is on the wire — so the 200 repeats it.
+		await port.answer(CH);
+		expect(transport.on(RPC_SUBJECTS.mediaAllocateSession)).toHaveLength(1);
+	});
+
+	it("relays nothing when the caller's own leg is the one that progressed", async () => {
+		const { port, transport } = newComposite();
+		inbound(port);
+
+		await port.earlyMedia(CH, CH);
+
+		expect(transport.on(RPC_SUBJECTS.mediaBridgeSessions)).toHaveLength(0);
+	});
+
 	it("throws when the leg was never registered", async () => {
 		const { port } = newComposite();
 		await expect(port.earlyMedia(CH)).rejects.toThrow(SplitPlaneLegStateError);

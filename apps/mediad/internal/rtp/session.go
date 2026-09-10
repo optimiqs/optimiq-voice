@@ -237,6 +237,11 @@ type Session struct {
 	// reads it for every live session while holding the Manager's global lock.
 	lastPacket atomic.Int64
 
+	// lastWrite is when this session last put a packet on the wire, in Unix millis. Read only by
+	// the reaper: a leg that has never RECEIVED anything but is relaying its peer's audio — a caller
+	// listening to a carrier's announcement before the 200 — is live, not a leak. See Manager.ReapIdle.
+	lastWrite atomic.Int64
+
 	statsMu sync.Mutex
 	stats   Stats
 
