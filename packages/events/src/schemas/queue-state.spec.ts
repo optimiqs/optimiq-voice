@@ -243,6 +243,47 @@ describe("the queue-waiting bucket", () => {
 		).toThrow();
 	});
 
+	/**
+	 * The cross-call link, and the only place it can live: `call_legs` relates legs INSIDE one
+	 * `call_id`, and a callback is a new call. Optional, so a token written before it existed still
+	 * parses and simply loses the link.
+	 */
+	it("carries the queued call a callback settles, and parses a token written without it", () => {
+		const base = {
+			callerNumber: "+15551234567",
+			joinedAt: 1,
+			priority: 0,
+			abandonedAt: 1,
+			expiresAt: 2,
+		};
+		const callId = "0195c0f0-1c2f-7000-8000-0000000000d1";
+		expect(
+			queueResumeTombstoneSchema.parse({
+				...base,
+				callback: { attempts: 0, maxAttempts: 3, nextAttemptAt: 0, callId },
+			}).callback?.callId,
+		).toBe(callId);
+		expect(
+			queueResumeTombstoneSchema.parse({
+				...base,
+				callback: { attempts: 0, maxAttempts: 3, nextAttemptAt: 0 },
+			}).callback?.callId,
+		).toBeUndefined();
+	});
+
+	it("refuses a link that is not a call id, so a report cannot join on a made-up value", () => {
+		expect(() =>
+			queueResumeTombstoneSchema.parse({
+				callerNumber: "+15551234567",
+				joinedAt: 1,
+				priority: 0,
+				abandonedAt: 1,
+				expiresAt: 2,
+				callback: { attempts: 0, maxAttempts: 3, nextAttemptAt: 0, callId: "call-1" },
+			}),
+		).toThrow();
+	});
+
 	it("caps both arrays below what the bucket's value size would accept", () => {
 		const one = entry();
 		expect(() =>

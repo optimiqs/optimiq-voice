@@ -26,12 +26,17 @@
  * to the cache is needed at all.
  */
 
-import { isHangupCause, RETRYABLE_HANGUP_CAUSES } from "@optimiq-voice/telephony";
+import {
+	describeE164Rejection,
+	isHangupCause,
+	RETRYABLE_HANGUP_CAUSES,
+} from "@optimiq-voice/telephony";
 import { ROUTING_ARTIFACT_VERSION } from "./artifact";
 import { snapshotHash } from "./cache";
 import { destinationShapeIssues, isDestinationType } from "./destinations";
 import { DiagnosticBag } from "./diagnostics";
 import { directoryDigits } from "./dial-by-name";
+import { ingestDialTarget, ingestE164, readCallingCode } from "./e164-ingest";
 import {
 	EMERGENCY_CONTINUE_ON_CAUSES,
 	EMERGENCY_NODE_ID,
@@ -43,7 +48,7 @@ import {
 } from "./emergency";
 import { RoutingCompileError, RoutingSnapshotError } from "./errors";
 import {
-	FEATURE_CODE_ARGUMENT_MODE,
+	featureCodeArgumentMode,
 	featureCodeIssues,
 	featureCodeWouldConsume,
 	isWellFormedFeatureCode,
@@ -103,7 +108,9 @@ import type {
 	ExtensionPlanNode,
 	FollowMeDestination,
 	FollowMePlan,
+	IvrOption,
 	PlanNode,
+	QueueCallbackPlan,
 	PlanNodeId,
 	RingGroupMember,
 	SharedLineAppearance,
@@ -116,6 +123,8 @@ import type {
 	DialByNameDirectoryInput,
 	EmergencyAddressInput,
 	ExtensionInput,
+	FeatureCodeAction,
+	FeatureCodeParams,
 	FollowMeTargetInput,
 	IvrMenuOptionInput,
 	MohClassInput,
@@ -351,9 +360,16 @@ class Compiler {
 	 */
 	private readonly aliasStack: string[] = [];
 
+	/**
+	 * The organization's calling code, for `e164-ingest.ts`. `undefined` means a bare national
+	 * number is reported rather than guessed at.
+	 */
+	private readonly defaultCallingCode: string | undefined;
+
 	constructor(snapshot: OrgRoutingSnapshot, compiledAt: string) {
 		this.snapshot = snapshot;
 		this.compiledAt = compiledAt;
+		this.defaultCallingCode = readCallingCode(snapshot.settings?.defaultCallingCode);
 	}
 
 	run(): CompileResult {
@@ -364,6 +380,7 @@ class Compiler {
 		// condition can all name a ruleset and none of them may compile against a half-built one.
 		this.compileTranslationRulesets();
 		const phrases = this.compilePhrases();
+		const prompts = this.compilePrompts();
 		this.compileTimeConditions();
 		this.materialiseEntities();
 
@@ -403,6 +420,7 @@ class Compiler {
 			outbound,
 			callBlock,
 			...(Object.keys(phrases).length === 0 ? {} : { phrases }),
+			...(Object.keys(prompts).length === 0 ? {} : { prompts }),
 			extensionsByNumber: extensionIndex,
 			diagnostics,
 		};
@@ -446,11 +464,31 @@ class Compiler {
 		for (const group of sortById(this.snapshot.pagingGroups ?? [])) {
 			this.pagingGroupsById.set(group.id, group);
 		}
+		// The DID's E.164 is canonicalised HERE, at ingestion, and not at each of the four places
+		// that read it. `didDefaults` is keyed by this string, an inbound rule bound to one number
+		// compares it with `===`, and the emergency ELIN is whichever spelling came out of the row —
+		// so a number normalised in one of those places and not the others would be worse than one
+		// normalised nowhere. One rewrite, before anything indexes it.
 		for (const did of sortById(this.snapshot.phoneNumbers)) {
-			this.phoneNumbersById.set(did.id, did);
+			const subject: DiagnosticSubject = { kind: "phone-number", id: did.id, name: did.e164 };
+			const e164 = this.e164Field(did.e164, "Number", subject, "e164") ?? did.e164;
+			this.phoneNumbersById.set(did.id, e164 === did.e164 ? did : { ...did, e164 });
 		}
+		// The override is canonicalised here rather than in `compileTrunkPlan`, which runs once per
+		// route that names the trunk and would report the same bad number once per route.
 		for (const trunk of sortById(this.snapshot.trunks)) {
-			this.trunksById.set(trunk.id, trunk);
+			const callerId = this.e164Field(
+				trunk.callerIdNumberOverride,
+				`Trunk "${trunk.name}" caller id override`,
+				{ kind: "trunk", id: trunk.id, name: trunk.name },
+				"callerIdNumberOverride",
+			);
+			this.trunksById.set(
+				trunk.id,
+				callerId === (trunk.callerIdNumberOverride ?? undefined)
+					? trunk
+					: { ...trunk, callerIdNumberOverride: callerId ?? null },
+			);
 		}
 		for (const condition of sortById(this.snapshot.timeConditions)) {
 			this.timeConditionInputsById.set(condition.id, condition);
@@ -518,7 +556,12 @@ class Compiler {
 		return compact({
 			defaultTimezone: timezone,
 			outboundEnabled: input.outboundEnabled ?? true,
-			outboundCallerIdNumber: input.outboundCallerIdNumber ?? undefined,
+			outboundCallerIdNumber: this.e164Field(
+				input.outboundCallerIdNumber,
+				"Organization outbound caller id",
+				undefined,
+				"settings.outboundCallerIdNumber",
+			),
 			outboundCallerIdName: input.outboundCallerIdName ?? undefined,
 			// A per-org fact the engine cannot read any other way — it has no database handle, so the
 			// artifact is where the realm has to be. Empty/whitespace collapses to absent, and absent is
@@ -557,6 +600,58 @@ class Compiler {
 			return undefined;
 		}
 		return value;
+	}
+
+	/**
+	 * A field that IS a phone number, canonicalised to E.164 before it reaches a table.
+	 *
+	 * `undefined` in, `undefined` out — an absent caller id is not a malformed one. A value that
+	 * cannot be read is compiled VERBATIM with a warning rather than dropped: see `non-e164-number`
+	 * for why the artifact is still the better half of that trade.
+	 */
+	private e164Field(
+		value: string | null | undefined,
+		what: string,
+		subject: DiagnosticSubject | undefined,
+		path: string,
+	): string | undefined {
+		if (value == null || value.trim().length === 0) {
+			return undefined;
+		}
+		const outcome = ingestE164(value, this.defaultCallingCode);
+		if (outcome.rejection !== null) {
+			this.bag.warning(
+				"non-e164-number",
+				`${what} "${value}" ${describeE164Rejection(outcome.rejection)}; it was compiled as written and will only match a caller who presents it the same way.`,
+				subject,
+				path,
+			);
+		}
+		return outcome.value;
+	}
+
+	/**
+	 * A DIAL STRING, canonicalised only when it already declares itself international.
+	 *
+	 * See `e164-ingest.ts`: an external target is matched against outbound patterns written the way
+	 * a handset dials, so a bare national number here is correct as it stands and is left alone.
+	 */
+	private dialTargetField(
+		value: string,
+		what: string,
+		subject: DiagnosticSubject | undefined,
+		path: string,
+	): string {
+		const outcome = ingestDialTarget(value, this.defaultCallingCode);
+		if (outcome.rejection !== null) {
+			this.bag.warning(
+				"non-e164-number",
+				`${what} "${value}" is written as an international number but ${describeE164Rejection(outcome.rejection)}; it was compiled as written.`,
+				subject,
+				path,
+			);
+		}
+		return outcome.value;
 	}
 
 	private trunkContinueOnCauses(): readonly HangupCause[] {
@@ -868,7 +963,15 @@ class Compiler {
 				return this.aliasNode(ref, subject, path);
 			}
 			case "external": {
-				return this.externalNode(destination.destinationData?.value ?? "", true);
+				return this.externalNode(
+					this.dialTargetField(
+						destination.destinationData?.value ?? "",
+						"External destination",
+						subject,
+						path,
+					),
+					true,
+				);
 			}
 			case "application": {
 				return this.applicationNode(
@@ -953,7 +1056,12 @@ class Compiler {
 			extensionId: extension.id,
 			number: extension.number,
 			callerIdName: extension.callerIdName ?? undefined,
-			callerIdNumber: extension.callerIdNumber ?? undefined,
+			callerIdNumber: this.e164Field(
+				extension.callerIdNumber,
+				`Extension ${extension.number} caller id`,
+				subject,
+				"callerIdNumber",
+			),
 			tollClass: extension.tollClass,
 			recordPolicy: extension.recordPolicy,
 			timeoutSeconds: extension.callTimeoutSeconds,
@@ -1047,7 +1155,13 @@ class Compiler {
 		if (internal !== undefined) {
 			return this.extensionNode(internal);
 		}
-		return this.externalNode(target, true);
+		// AFTER the internal lookup, so a bare extension number is never mistaken for a number to
+		// canonicalise — and `dialTargetField` leaves anything without an international prefix alone
+		// in any case, because the outbound patterns are written the way a handset dials.
+		return this.externalNode(
+			this.dialTargetField(target, "Forward destination", subject, path),
+			true,
+		);
 	}
 
 	// -------------------------------------------------------------------------------------------
@@ -1151,7 +1265,12 @@ class Compiler {
 		subject: DiagnosticSubject,
 	): FollowMeDestination | undefined {
 		const path = `followMe.targets[${String(index)}]`;
-		const dialString = (target.destination ?? "").trim();
+		const dialString = this.dialTargetField(
+			(target.destination ?? "").trim(),
+			`Follow-me hop ${String(index + 1)} of extension ${extension.number}`,
+			subject,
+			path,
+		);
 		if (dialString.length === 0) {
 			this.bag.warning(
 				"unresolvable-follow-me",
@@ -1381,16 +1500,23 @@ class Compiler {
 			kind: "ivr-menu",
 			label: menu.name,
 			ivrMenuId: menu.id,
-			greetingPromptId: menu.greetingPromptId ?? undefined,
-			shortGreetingPromptId: menu.shortGreetingPromptId ?? undefined,
-			invalidPromptId: menu.invalidPromptId ?? undefined,
-			timeoutPromptId: menu.timeoutPromptId ?? undefined,
+			greetingPromptId: this.promptRef(menu.greetingPromptId, subject, "greetingPromptId"),
+			shortGreetingPromptId: this.promptRef(
+				menu.shortGreetingPromptId,
+				subject,
+				"shortGreetingPromptId",
+			),
+			invalidPromptId: this.promptRef(menu.invalidPromptId, subject, "invalidPromptId"),
+			timeoutPromptId: this.promptRef(menu.timeoutPromptId, subject, "timeoutPromptId"),
 			digitTimeoutMs: menu.digitTimeoutMs,
 			interDigitTimeoutMs: menu.interDigitTimeoutMs,
 			maxDigits: menu.maxDigits,
 			maxFailures: menu.maxFailures,
 			maxTimeouts: menu.maxTimeouts,
 			directDialEnabled: menu.directDialEnabled,
+			directDialMaxDigits: menu.directDialEnabled
+				? this.directDialDigits(menu, options, subject)
+				: undefined,
 			options,
 			timeoutNodeId: timeoutNodeId === id ? undefined : (timeoutNodeId ?? undefined),
 			invalidNodeId: invalidNodeId === id ? undefined : (invalidNodeId ?? undefined),
@@ -1398,6 +1524,60 @@ class Compiler {
 
 		this.nodes.set(id, node);
 		return id;
+	}
+
+	/**
+	 * How many digits a direct dial on this menu may need, and what the admin should know about it.
+	 *
+	 * The number is the longest EXTENSION number in the organization, because the extension
+	 * directory is the only thing direct dial resolves against — not ring groups, not queues, not
+	 * the internal number table. Widening it to every internal number would let a caller reach a
+	 * paging group from an auto-attendant, which is a decision an option is for.
+	 *
+	 * The diagnostics are about the collision between a menu's options and that directory. A digit
+	 * option and an extension number that starts with it are told apart at runtime ONLY by whether
+	 * the caller paused, so the admin is told which of their options that applies to — an exact
+	 * collision, where the extension can never be reached, separately from a prefix one, where it
+	 * can but the option costs the other caller an inter-digit timeout.
+	 */
+	private directDialDigits(
+		menu: OrgRoutingSnapshot["ivrMenus"][number],
+		options: readonly IvrOption[],
+		subject: DiagnosticSubject,
+	): number | undefined {
+		const numbers = [...this.extensionsByNumber.keys()];
+		if (numbers.length === 0) {
+			this.bag.warning(
+				"ivr-direct-dial-empty",
+				`IVR menu "${menu.name}" allows a caller to dial an extension, but this organization has no enabled extension; every direct dial takes the invalid branch.`,
+				subject,
+				"directDialEnabled",
+			);
+			return undefined;
+		}
+
+		for (const option of options) {
+			// Only a literal digit option can collide: a regex option is matched, not typed, and what
+			// it would shadow is not decidable from the pattern.
+			if (option.pattern.kind !== "exact") {
+				continue;
+			}
+			const shadowed = numbers.filter((number) => number.startsWith(option.matchValue));
+			if (shadowed.length === 0) {
+				continue;
+			}
+			const exact = shadowed.includes(option.matchValue);
+			this.bag.warning(
+				"ivr-direct-dial-ambiguous",
+				exact
+					? `IVR menu "${menu.name}" has an option "${option.matchValue}" that is also an extension number; the option wins, so that extension cannot be reached by direct dial from this menu.`
+					: `IVR menu "${menu.name}" has an option "${option.matchValue}" that ${shadowed.length === 1 ? `extension ${shadowed[0]} starts with` : `${String(shadowed.length)} extension numbers start with`}; a caller who wants the option waits ${String(menu.interDigitTimeoutMs)}ms before it is taken.`,
+				subject,
+				"options",
+			);
+		}
+
+		return Math.max(...numbers.map((number) => number.length));
 	}
 
 	private ringGroupNodeById(
@@ -1468,11 +1648,11 @@ class Compiler {
 			ringTimeoutSeconds: group.ringTimeoutSeconds,
 			ignoreBusy: group.ignoreBusy,
 			confirmEnabled: group.confirmEnabled,
-			confirmPromptId: group.confirmPromptId ?? undefined,
+			confirmPromptId: this.promptRef(group.confirmPromptId, subject, "confirmPromptId"),
 			callerIdNamePrefix: group.callerIdNamePrefix ?? undefined,
 			mohClassId: group.mohClassId ?? undefined,
 			mohClass: this.mohClassName(group.mohClassId, subject, "mohClassId"),
-			ringbackPromptId: group.ringbackPromptId ?? undefined,
+			ringbackPromptId: this.promptRef(group.ringbackPromptId, subject, "ringbackPromptId"),
 			members,
 			timeoutNodeId: this.namedDestinationNode(group, "timeout", subject) ?? undefined,
 		}) as PlanNode;
@@ -1599,12 +1779,16 @@ class Compiler {
 			strategy: entry.strategy,
 			mohClassId: entry.mohClassId ?? undefined,
 			mohClass: this.mohClassName(entry.mohClassId, subject, "mohClassId"),
-			greetingPromptId: entry.greetingPromptId ?? undefined,
-			announcePromptId: entry.announcePromptId ?? undefined,
+			greetingPromptId: this.promptRef(entry.greetingPromptId, subject, "greetingPromptId"),
+			announcePromptId: this.promptRef(entry.announcePromptId, subject, "announcePromptId"),
 			// Carried as an id, exactly like the two prompts above it: a prompt is addressed by row id
 			// the whole way down, and only `mohClass` needs resolving because only a media server
 			// insists on the NAME.
-			agentWhisperPromptId: entry.agentWhisperPromptId ?? undefined,
+			agentWhisperPromptId: this.promptRef(
+				entry.agentWhisperPromptId,
+				subject,
+				"agentWhisperPromptId",
+			),
 			maxWaitSeconds: entry.maxWaitSeconds,
 			maxWaitNoAgentSeconds: entry.maxWaitNoAgentSeconds,
 			announcePositionEnabled: entry.announcePositionEnabled,
@@ -1612,6 +1796,7 @@ class Compiler {
 			recordPolicy: entry.recordPolicy ?? "none",
 			exitKey,
 			exitNodeId,
+			callback: this.queueCallback(entry, exitKey, subject),
 			priority,
 			abandonedResumeAllowed: entry.abandonedResumeAllowed ?? false,
 			discardAbandonedAfterSeconds: entry.discardAbandonedAfterSeconds ?? 0,
@@ -1619,6 +1804,72 @@ class Compiler {
 		}) as PlanNode;
 		this.nodes.set(id, node);
 		return id;
+	}
+
+	/**
+	 * The queue's virtual-hold block, or `undefined` when it offers no callback.
+	 *
+	 * The bounds are applied HERE rather than being trusted from the row, for the reason
+	 * `concurrentCallCeiling` gives: a nonsensical number reaches the database from a migration or a
+	 * direct edit as easily as from the form, and the artifact is read by a process that cannot ask.
+	 * Every one of them is clamped to something the queue can actually execute, and only the
+	 * configurations that cannot work at all earn a diagnostic.
+	 */
+	private queueCallback(
+		entry: OrgRoutingSnapshot["queues"][number],
+		exitKey: string | undefined,
+		subject: DiagnosticSubject,
+	): QueueCallbackPlan | undefined {
+		if (entry.callbackEnabled !== true) {
+			return undefined;
+		}
+
+		const rawKey = entry.callbackKey?.trim() ?? "";
+		let key = normalizeExitKey(entry.callbackKey);
+		if (key === undefined && rawKey.length > 0) {
+			this.bag.warning(
+				"queue-callback-unusable",
+				`Queue "${entry.name}" offers a callback on ${JSON.stringify(rawKey)}, which is not a DTMF digit (${QUEUE_EXIT_KEYS.join(", ")}); the offer compiled with no key at all.`,
+				subject,
+				"callbackKey",
+			);
+		}
+		if (key !== undefined && key === exitKey) {
+			// One digit cannot mean two things. The EXIT key keeps it, because leaving the queue is
+			// the more destructive of the two and a caller who pressed it meant to go somewhere.
+			this.bag.warning(
+				"queue-callback-unusable",
+				`Queue "${entry.name}" uses "${key}" for both its exit key and its callback offer; the exit key keeps it and the callback compiled with no key.`,
+				subject,
+				"callbackKey",
+			);
+			key = undefined;
+		}
+
+		const offerAfterSeconds = wholeSeconds(entry.callbackOfferAfterSeconds ?? 0);
+		if (key === undefined && offerAfterSeconds === 0) {
+			this.bag.warning(
+				"queue-callback-unusable",
+				`Queue "${entry.name}" offers a callback with neither a key to accept it nor a wait after which to announce it, so no caller can ever be offered one.`,
+				subject,
+				"callbackEnabled",
+			);
+			return undefined;
+		}
+
+		return compact({
+			key,
+			offerAfterSeconds,
+			offerPromptId: this.promptRef(entry.callbackOfferPromptId, subject, "callbackOfferPromptId"),
+			confirmPromptId: this.promptRef(
+				entry.callbackConfirmPromptId,
+				subject,
+				"callbackConfirmPromptId",
+			),
+			maxAttempts: wholeCount(entry.callbackMaxAttempts, 3, 1, 10),
+			retryDelaySeconds: wholeCount(entry.callbackRetryDelaySeconds, 300, 30, 86_400),
+			expiresAfterSeconds: wholeCount(entry.callbackExpiresAfterSeconds, 3600, 60, 604_800),
+		}) as QueueCallbackPlan;
 	}
 
 	private voicemailNodeById(
@@ -1889,6 +2140,34 @@ class Compiler {
 		return sortRecordKeys(phrases);
 	}
 
+	/**
+	 * Compiles the prompt id → object-ref table.
+	 *
+	 * The resolution half of `dangling-prompt`. A plan node names a prompt by ROW id, the audio
+	 * lives in the object store under a DIFFERENT id minted at upload, and the engine has no
+	 * database handle — so without this table a tenant's prompt is unplayable no matter what the
+	 * media server is. The value is the same `object://` ref a voicemail greeting already carries
+	 * and takes the same path through the reader.
+	 *
+	 * Phrases are skipped: their audio is their steps', each of which is a row in here in its own
+	 * right. A row with no key is skipped rather than written empty, so a reader's MISS always means
+	 * "fall back", never "play nothing".
+	 */
+	private compilePrompts(): Readonly<Record<string, string>> {
+		const prompts: Record<string, string> = {};
+		for (const entry of sortById(this.snapshot.prompts ?? [])) {
+			if (entry.kind === "phrase" || !entry.enabled) {
+				continue;
+			}
+			const objectKey = (entry.objectKey ?? "").trim();
+			if (objectKey === "") {
+				continue;
+			}
+			prompts[entry.id] = objectMediaRef(objectKey);
+		}
+		return sortRecordKeys(prompts);
+	}
+
 	private callFlowNodeById(
 		ref: string,
 		subject: DiagnosticSubject,
@@ -2129,8 +2408,8 @@ class Compiler {
 				directoryId: directory.id,
 				minDigits: directory.minDigits,
 				maxFailures: directory.maxFailures,
-				greetingPromptId: directory.greetingPromptId ?? undefined,
-				invalidPromptId: directory.invalidPromptId ?? undefined,
+				greetingPromptId: this.promptRef(directory.greetingPromptId, subject, "greetingPromptId"),
+				invalidPromptId: this.promptRef(directory.invalidPromptId, subject, "invalidPromptId"),
 				entries,
 				timeoutNodeId: this.namedDestinationNode(directory, "timeout", subject) ?? undefined,
 			}) as PlanNode,
@@ -2273,8 +2552,8 @@ class Compiler {
 			name: set.name,
 			maxAttempts: set.maxAttempts,
 			digitTimeoutMs: set.digitTimeoutMs,
-			promptId: set.promptId ?? undefined,
-			failurePromptId: set.failurePromptId ?? undefined,
+			promptId: this.promptRef(set.promptId, subject, "promptId"),
+			failurePromptId: this.promptRef(set.failurePromptId, subject, "failurePromptId"),
 			entries,
 		}) as CompiledPinSet;
 	}
@@ -2422,6 +2701,58 @@ class Compiler {
 			return undefined;
 		}
 		return mohClass.name;
+	}
+
+	/**
+	 * A prompt id, carried through only when the prompt library actually has it.
+	 *
+	 * ## Why this check earns its place
+	 *
+	 * The compiler passes prompt ids to the engine unresolved — a prompt is addressed by row id the
+	 * whole way down — which means a plan naming a prompt that was deleted compiles, publishes and
+	 * routes perfectly. The caller is the one who finds out: the media plane refuses the playback,
+	 * the walker plays nothing, and an IVR falls to its timeout branch after forty-eight seconds of
+	 * silence. That is indistinguishable, in every log and every CDR, from a caller who put the
+	 * phone down.
+	 *
+	 * So the reference is checked where checking is cheap and the answer is actionable — at the
+	 * write, against the snapshot the write compiled. The id is still emitted: dropping it would
+	 * silently change the plan's SHAPE (an IVR with no greeting gathers digits immediately), and the
+	 * point here is to report the gap, not to route around it.
+	 *
+	 * Nothing to check against is not a miss: a loader that does not yet load `prompts` is a rollout
+	 * state, the same rule and the same reason as {@link mohClassName}.
+	 */
+	private promptRef(
+		promptId: string | null | undefined,
+		subject: DiagnosticSubject,
+		path: string,
+	): string | undefined {
+		const id = promptId ?? undefined;
+		if (id === undefined || id.trim() === "") {
+			return undefined;
+		}
+		if (this.snapshot.prompts !== undefined) {
+			const target = this.promptsById.get(id);
+			if (target === undefined) {
+				this.bag.warning(
+					"dangling-prompt",
+					`Prompt "${id}" is not in this snapshot, so nothing will play where it is named.`,
+					subject,
+					path,
+				);
+			} else if (target.kind !== "phrase" && target.objectKey === null) {
+				// `null` is the row saying it has no file; `undefined` is a loader that does not
+				// project the column, which is the rollout state and not a miss.
+				this.bag.warning(
+					"dangling-prompt",
+					`Prompt "${target.name}" has no audio in the object store, so nothing will play where it is named.`,
+					subject,
+					path,
+				);
+			}
+		}
+		return id;
 	}
 
 	private conferenceNodeById(
@@ -2973,11 +3304,25 @@ class Compiler {
 					id: entry.id,
 					code: entry.code,
 					action: entry.action,
-					argumentMode: FEATURE_CODE_ARGUMENT_MODE[entry.action],
+					// From the action AND the row's own params: a `*81` with a group pinned takes no
+					// argument, and reading the action table alone made it unreachable when dialled bare.
+					argumentMode: featureCodeArgumentMode(entry.action, entry.params ?? undefined),
 					params: entry.params ?? undefined,
 					label: entry.label ?? undefined,
 					nodeId: id,
 				}) as CompiledFeatureCode,
+			);
+		}
+
+		this.compileToggleCodes(compiled);
+
+		const login = compiled.find((entry) => entry.action === "hotdesk-login");
+		if (login !== undefined && !compiled.some((entry) => entry.action === "hotdesk-logout")) {
+			this.bag.warning(
+				"hotdesk-logout-missing",
+				`Feature code "${login.code}" logs an agent into a shared handset and this organization has no hot-desk logout code, so a session can only end when it expires.`,
+				{ kind: "feature-code", id: login.id, name: login.code },
+				"action",
 			);
 		}
 
@@ -2987,6 +3332,80 @@ class Compiler {
 				right.code.length - left.code.length ||
 				(left.code < right.code ? -1 : left.code > right.code ? 1 : 0),
 		);
+	}
+
+	/**
+	 * The two star codes that live on an ENTITY rather than in the code catalogue.
+	 *
+	 * `call_flow.feature_code` flips a flow to night mode; `time_condition.override_feature_code`
+	 * cycles a condition's override. Both were validated on write, offered in the admin UI and
+	 * reachable by nothing: they never entered `internal.featureCodes` and they cannot enter
+	 * `internal.numbers`, whose keys are read as extension numbers and where a `*` is refused. A
+	 * tenant's `*65` therefore fell through the internal context and was answered by "no outbound
+	 * route matched" (`E2E-routing2.md`).
+	 *
+	 * So the compiler synthesises a catalogue entry for each. They are ordinary
+	 * {@link CompiledFeatureCode}s from the matcher's point of view — same longest-first walk, same
+	 * `featureCodeWouldConsume` checks for speed dials and voicemail prefixes — carrying the entity
+	 * id in `params`, which is what lets the engine act on ONE flow without a second lookup.
+	 *
+	 * Collisions are still reported by {@link reportToggleCodeCollisions}, which runs after this and
+	 * against the finished table, so a toggle code that a real feature code would swallow is an error
+	 * naming both. A toggle code that is not dialable is dropped here rather than compiled into a
+	 * table the matcher would never hit.
+	 */
+	private compileToggleCodes(compiled: CompiledFeatureCode[]): void {
+		for (const flow of sortById(this.snapshot.callFlows ?? [])) {
+			const code = flow.featureCode?.trim() ?? "";
+			if (!flow.enabled || code.length === 0 || !isWellFormedFeatureCode(code)) {
+				continue;
+			}
+			compiled.push(
+				this.toggleCode(`call-flow:${flow.id}`, code, "call-flow-toggle", flow.name, {
+					callFlowId: flow.id,
+				}),
+			);
+		}
+		for (const condition of sortById(this.snapshot.timeConditions)) {
+			const code = condition.overrideFeatureCode?.trim() ?? "";
+			if (!condition.enabled || code.length === 0 || !isWellFormedFeatureCode(code)) {
+				continue;
+			}
+			compiled.push(
+				this.toggleCode(
+					`time-condition:${condition.id}`,
+					code,
+					"time-condition-override",
+					condition.name,
+					{ timeConditionId: condition.id },
+				),
+			);
+		}
+	}
+
+	private toggleCode(
+		key: string,
+		code: string,
+		action: FeatureCodeAction,
+		label: string,
+		params: FeatureCodeParams,
+	): CompiledFeatureCode {
+		const id = `feature-code:${key}`;
+		if (!this.claimed.has(id)) {
+			this.claimed.add(id);
+			this.nodes.set(id, {
+				id,
+				kind: "feature-code",
+				label,
+				featureCodeId: id,
+				code,
+				action,
+				params,
+			} as PlanNode);
+		}
+		// No `targetNodeId`: a toggle is a WRITE, not a place to go. The walker's feature-code
+		// dispatch runs it, exactly as it runs `*78`.
+		return { id, code, action, argumentMode: "none", params, label, nodeId: id };
 	}
 
 	/**
@@ -3164,13 +3583,20 @@ class Compiler {
 	 * under which the tenant gets what they asked for.
 	 */
 	private reportToggleCodeCollisions(featureCodes: readonly CompiledFeatureCode[]): void {
+		// The CATALOGUE's own codes. The synthesised toggle entries are excluded because they ARE the
+		// codes being checked — asking whether `*65` is consumed by the entry `*65` compiled into
+		// would report every toggle code as colliding with itself. Toggle-against-toggle is still
+		// caught, by `seen` below, which is where it was caught before the entries existed.
+		const catalogue = featureCodes.filter(
+			(entry) => entry.action !== "call-flow-toggle" && entry.action !== "time-condition-override",
+		);
 		const seen = new Map<string, string>();
 		const check = (code: string | null | undefined, subject: DiagnosticSubject, path: string) => {
 			const value = code?.trim() ?? "";
 			if (value.length === 0) {
 				return;
 			}
-			const clash = featureCodeWouldConsume(featureCodes, value);
+			const clash = featureCodeWouldConsume(catalogue, value);
 			if (clash !== undefined) {
 				this.bag.error(
 					"conflicting-feature-code",
@@ -3413,7 +3839,7 @@ class Compiler {
 		this.reportInboundShadowing(ordered);
 
 		const didDefaults: Record<string, InboundDidDefault> = {};
-		for (const did of sortById(this.snapshot.phoneNumbers)) {
+		for (const did of sortById([...this.phoneNumbersById.values()])) {
 			if (!did.enabled || !did.voiceEnabled) {
 				continue;
 			}
@@ -3629,6 +4055,14 @@ class Compiler {
 
 			const failoverNodeId = this.namedDestinationNode(route, "failover", subject);
 			const trunkPlan = this.compileTrunkPlan(route, continueOnCauses, subject);
+			// Once, not once per copy: the same override rides both the node and the rule, and two
+			// calls would report the same bad number twice.
+			const routeCallerId = this.e164Field(
+				route.callerIdNumberOverride,
+				`Outbound route "${route.name}" caller id override`,
+				subject,
+				"callerIdNumberOverride",
+			);
 			const nodeId = `trunk-dial:${route.id}`;
 			if (!this.claimed.has(nodeId)) {
 				this.claimed.add(nodeId);
@@ -3643,7 +4077,7 @@ class Compiler {
 						attempts: trunkPlan.attempts,
 						continueOnCauses: trunkPlan.continueOnCauses,
 						recordEnabled: route.recordEnabled,
-						callerIdNumberOverride: route.callerIdNumberOverride ?? undefined,
+						callerIdNumberOverride: routeCallerId,
 						failoverNodeId: failoverNodeId ?? undefined,
 						// The gate travels on the NODE, because the node is what the engine walks — a
 						// resolver hands over an `ExecutionPlan`, not the rule it matched.
@@ -3663,7 +4097,7 @@ class Compiler {
 					prependDigits: route.prependDigits ?? undefined,
 					timeGate: this.routeTimeGate(route.timeConditionId, failoverNodeId, subject),
 					recordEnabled: route.recordEnabled,
-					callerIdNumberOverride: route.callerIdNumberOverride ?? undefined,
+					callerIdNumberOverride: routeCallerId,
 					// AFTER the inline strip/prepend, which the resolver applies first. The order and
 					// its argument are in `translations-schema.ts`: the inline pair turns what fingers
 					// did into the number meant, and the ruleset normalises that for the wire.
@@ -3853,7 +4287,7 @@ class Compiler {
 		let chosen: { readonly elin: string; readonly emergencyAddressId: string } | undefined;
 		const unassigned: DiagnosticSubject[] = [];
 
-		for (const did of [...this.snapshot.phoneNumbers].sort((left, right) =>
+		for (const did of [...this.phoneNumbersById.values()].sort((left, right) =>
 			left.e164 < right.e164 ? -1 : left.e164 > right.e164 ? 1 : 0,
 		)) {
 			if (!did.enabled || !did.voiceEnabled) {
@@ -4068,6 +4502,9 @@ class Compiler {
 				enabled: extension.enabled,
 				outboundCallerIdNumber: extension.outboundCallerIdNumber ?? undefined,
 				outboundCallerIdName: extension.outboundCallerIdName ?? undefined,
+				// Only the withhold is written. See `ExtensionIndexEntry.outboundCallerIdPresentation`.
+				outboundCallerIdPresentation:
+					extension.outboundCallerIdPresentation === "restricted" ? "restricted" : undefined,
 				emergencyCallerIdNumber: extension.emergencyCallerIdNumber ?? undefined,
 				pickupGroup: pickupGroupOf(extension),
 				sharedLineAppearances:
@@ -4238,6 +4675,22 @@ function allowFirst(action: CallBlockAction): number {
  * fractional timeout is a shape the database will happily hold. Clamping here means the engine
  * never has to defend against one on the call path.
  */
+/**
+ * A whole number inside a bound, or the default. Used for the callback block, where a value that
+ * reached the row from a migration or a direct edit is read by a process that cannot ask about it.
+ */
+function wholeCount(
+	value: number | null | undefined,
+	fallback: number,
+	min: number,
+	max: number,
+): number {
+	if (value == null || !Number.isFinite(value)) {
+		return fallback;
+	}
+	return Math.min(max, Math.max(min, Math.trunc(value)));
+}
+
 function wholeSeconds(value: number | undefined): number {
 	return Number.isFinite(value) ? Math.max(0, Math.trunc(value as number)) : 0;
 }

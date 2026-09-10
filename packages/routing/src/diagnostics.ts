@@ -61,6 +61,16 @@ export const DIAGNOSTIC_CODES = [
 	"missing-voicemail-box",
 	/** An entity names a music-on-hold class that is not in the snapshot, or is disabled. */
 	"dangling-moh-class",
+	/**
+	 * An entity names a prompt that is not in the snapshot, so the audio it asks for does not
+	 * exist.
+	 *
+	 * Warning rather than error, and the severity is the whole point of the code: an IVR whose
+	 * greeting prompt was deleted still routes — the caller hears nothing, presses nothing, and is
+	 * sent to the timeout branch. That is exactly the failure a compile-on-write diagnostic has to
+	 * name at the moment of the write, because the call it breaks looks like a caller who hung up.
+	 */
+	"dangling-prompt",
 	/** A voicemail greeting row belongs to a mailbox that is not in the snapshot. */
 	"dangling-voicemail-greeting",
 	/** A mailbox's `pinHash` is not in the format `voicemail-pin.ts` defines, so it is not enforced. */
@@ -101,6 +111,44 @@ export const DIAGNOSTIC_CODES = [
 	"invalid-queue-priority",
 	/** A queue has an exit key and no exit destination, so pressing it hangs the caller up. */
 	"queue-exit-key-without-destination",
+	/**
+	 * A queue's virtual-hold offer cannot be taken as configured — the accept key is not a DTMF
+	 * digit, it is already the exit key, or there is neither a key nor a wait to announce it after.
+	 *
+	 * A warning: the queue still distributes calls exactly as it did, and the only thing lost is the
+	 * offer. Refusing the compile would take the tenant's whole dial plan down over one form field.
+	 */
+	"queue-callback-unusable",
+
+	// --- IVR direct dial ---------------------------------------------------------------------------
+	/**
+	 * A direct-dial menu's option shares a prefix with an extension number, so the two entries are
+	 * told apart only by whether the caller paused.
+	 *
+	 * A warning, and one an admin genuinely wants: the configuration WORKS — a caller who types
+	 * `1104` without stopping reaches the extension, and one who presses `1` and waits reaches the
+	 * option — but the second caller waits `interDigitTimeoutMs` before anything happens, and an
+	 * option whose value IS an extension number makes that extension unreachable by direct dial
+	 * altogether. Neither is visible from the form, and both look like a broken menu on the phone.
+	 */
+	"ivr-direct-dial-ambiguous",
+
+	// --- hot desking ------------------------------------------------------------------------------
+	/**
+	 * The tenant can log a handset IN and cannot log it back OUT — a `hotdesk-login` code with no
+	 * `hotdesk-logout` beside it.
+	 *
+	 * A warning rather than an error, because the sessions still EXPIRE: the sweeper restores every
+	 * home binding at `hot_desk_expires_at` whatever the catalogue says, so the consequence is an
+	 * agent who cannot hand the desk back before then, not a phone stuck forever. It is worth saying
+	 * out loud because nothing on the feature-code form suggests the two are a pair.
+	 */
+	"hotdesk-logout-missing",
+	/**
+	 * A direct-dial menu is enabled for an organization with no extension to dial, so the feature
+	 * can only ever send callers to the invalid branch.
+	 */
+	"ivr-direct-dial-empty",
 
 	// --- organization quotas ----------------------------------------------------------------------
 	/**
@@ -127,6 +175,15 @@ export const DIAGNOSTIC_CODES = [
 	// --- matching tables ------------------------------------------------------------------------
 	/** Two entities claim the same internal number (extension 200 and ring group 200). */
 	"duplicate-internal-number",
+	/**
+	 * A field that is a phone number could not be read as E.164, so it was compiled verbatim.
+	 *
+	 * A warning and not an error, for the reason `invalid-queue-priority` is: every table in this
+	 * package compares numbers as strings, so a non-canonical one still routes — it just only
+	 * matches a caller who presents it the same way. Refusing the compile would take a tenant's
+	 * whole dial plan down over one row a migration wrote before normalisation existed.
+	 */
+	"non-e164-number",
 	/** Two feature codes claim the same code, or one code is a prefix of another. */
 	"conflicting-feature-code",
 	/** Two inbound routes match exactly the same DID input; the lower-priority one never runs. */

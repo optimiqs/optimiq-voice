@@ -13,6 +13,7 @@ const productionBaseline: EnvInvariantConfig = {
 	NATS_USER: "optimiq",
 	NATS_PASS: "a-real-nats-password",
 	AUTH_SECRET: "a".repeat(48),
+	PLATFORM_SECRET_ENCRYPTION_KEY: "b".repeat(64),
 	AUTH_URL: "https://auth.optimiq.example",
 	API_APP_URL: "https://app.optimiq.example",
 	API_OWNER_PASSWORD: "a-real-owner-password",
@@ -82,6 +83,12 @@ describe("env invariants in production", () => {
 		expect(() => assertEnvInvariants(withProduction({ AUTH_SECRET: "too-short" }))).toThrow(
 			"AUTH_SECRET must be at least 32 characters.",
 		);
+	});
+
+	it("requires the platform secret-encryption key so IdP secrets are never stored in plaintext", () => {
+		expect(() =>
+			assertEnvInvariants(withProduction({ PLATFORM_SECRET_ENCRYPTION_KEY: undefined })),
+		).toThrow(/PLATFORM_SECRET_ENCRYPTION_KEY/);
 	});
 
 	it("requires HTTPS for public URLs", () => {
@@ -247,6 +254,7 @@ describe("production NATS credentials", () => {
 		NATS_URL: "nats://nats:4222",
 		DATABASE_URL: "postgres://app@db:5432/app",
 		AUTH_SECRET: "a-production-auth-secret-long-enough",
+		PLATFORM_SECRET_ENCRYPTION_KEY: "b".repeat(64),
 		AUTH_URL: "https://app.example.com",
 	};
 

@@ -500,6 +500,7 @@ export function aPrompt(overrides: Partial<PromptInput> = {}): PromptInput {
 		enabled: true,
 		name: "Greeting",
 		kind: "prompt",
+		objectKey: "prompts/org-1/01a0-greeting.wav",
 		...overrides,
 	};
 }

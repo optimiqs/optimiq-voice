@@ -1,4 +1,14 @@
-import { boolean, index, integer, jsonb, pgTable, text, uniqueIndex } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import {
+	boolean,
+	check,
+	index,
+	integer,
+	jsonb,
+	pgTable,
+	text,
+	uniqueIndex,
+} from "drizzle-orm/pg-core";
 import {
 	auditTimestampColumns,
 	tenantOrganizationIdColumn,
@@ -7,6 +17,7 @@ import {
 } from "@optimiq-voice/db";
 import { tenantCompositeForeignKey, tenantIsolationPolicy } from "../tenant";
 import { mohClass } from "./media-schema";
+import { pinSet } from "./pins-schema";
 
 /**
  * Extensions — the tenant's internal endpoints. FusionPBX carries ~55 columns here; this is the
@@ -26,6 +37,18 @@ export type RecordPolicy = (typeof RECORD_POLICIES)[number];
  */
 export const TOLL_CLASSES = ["internal", "local", "national", "international", "premium"] as const;
 export type TollClass = (typeof TOLL_CLASSES)[number];
+
+/**
+ * Whether this extension's outbound caller id is shown to the far end — CLIP/CLIR.
+ *
+ * `restricted` is the standing withhold: sipd sends the anonymous `From` of RFC 3323 §4.1.1.3 plus
+ * `Privacy: id`, and the real number still travels in `P-Asserted-Identity` so the carrier's own
+ * authorisation and any lawful-intercept path keep the identity. It is a presentation decision, not
+ * a suppression of the number, which is why it sits beside `outbound_caller_id_number` rather than
+ * replacing it. The emergency path ignores it outright: a 911 call presents the ELIN.
+ */
+export const CALLER_ID_PRESENTATIONS = ["allowed", "restricted"] as const;
+export type CallerIdPresentation = (typeof CALLER_ID_PRESENTATIONS)[number];
 
 /** How an extension_user link participates in the extension. */
 export const EXTENSION_USER_ROLES = ["primary", "shared", "delegate"] as const;
@@ -67,6 +90,11 @@ export const extension = pgTable.withRLS(
 		/** Caller id presented to the PSTN; overridden per outbound route when set there. */
 		outboundCallerIdName: text("outbound_caller_id_name"),
 		outboundCallerIdNumber: text("outbound_caller_id_number"),
+		/** Whether that number is presented to the far end. See {@link CALLER_ID_PRESENTATIONS}. */
+		outboundCallerIdPresentation: text("outbound_caller_id_presentation")
+			.$type<CallerIdPresentation>()
+			.notNull()
+			.default("allowed"),
 		/** Caller id presented on emergency calls; must map to a validated emergency address. */
 		emergencyCallerIdName: text("emergency_caller_id_name"),
 		emergencyCallerIdNumber: text("emergency_caller_id_number"),
@@ -130,6 +158,32 @@ export const extension = pgTable.withRLS(
 		 * discover the delay by taking a call.
 		 */
 		callScreening: boolean("call_screening").notNull().default(false),
+		/**
+		 * The set of codes that may claim this extension on a shared handset — the hot-desk gate.
+		 *
+		 * A reference to `pin_set` and not a `hot_desk_pin` column of its own, because the digest
+		 * format, the attempt budget, the digit timeout, the prompt pair and the "which code was
+		 * used" identity are all already modelled there and getting a second PIN store subtly wrong
+		 * is exactly the failure `pins-schema.ts` was written to avoid. An extension whose owner
+		 * should be able to hot desk gets a set with their code in it; several extensions may share
+		 * one set, which is how a team of six that rotates desks is configured with one form.
+		 *
+		 * NULL is the ordinary state and it FAILS CLOSED: an extension with no hot-desk set cannot be
+		 * claimed, and `hot-desk.service.ts` refuses the login. That is the right default for a
+		 * feature whose whole effect is "send this person's calls to a phone they are standing at" —
+		 * the alternative, an ungated login, would let anyone in the building take anyone's calls.
+		 *
+		 * A single-column reference with `ON DELETE SET NULL`, matching `outbound_route.pin_set_id`
+		 * exactly rather than taking a tenant-composite key. The composite form is always `cascade`
+		 * (`tenant.ts` says why), and cascading here would DELETE THE EXTENSION when somebody retired
+		 * a code list. `set null` is also the fail-closed direction: losing the set stops the
+		 * extension being hot-deskable rather than making it claimable with no PIN at all. The
+		 * cross-tenant reference the composite key would have prevented is instead prevented where
+		 * `pin_set_id` already is — `assertDestinations`/the resource guard on the write path.
+		 */
+		hotDeskPinSetId: uuidEntityId("hot_desk_pin_set_id").references(() => pinSet.id, {
+			onDelete: "set null",
+		}),
 		tollClass: text("toll_class").$type<TollClass>().notNull().default("national"),
 		callTimeoutSeconds: integer("call_timeout_seconds").notNull().default(30),
 		maxRegistrations: integer("max_registrations").notNull().default(3),
@@ -153,6 +207,14 @@ export const extension = pgTable.withRLS(
 		 * child references `(organization_id, id)` instead, which needs this unique index.
 		 */
 		uniqueIndex("extension_organization_id_key").on(table.organizationId, table.id),
+		index("extension_organization_hot_desk_pin_set_idx").on(
+			table.organizationId,
+			table.hotDeskPinSetId,
+		),
+		check(
+			"extension_outbound_caller_id_presentation_check",
+			sql`outbound_caller_id_presentation in ('allowed', 'restricted')`,
+		),
 		tenantIsolationPolicy("extension"),
 	],
 );

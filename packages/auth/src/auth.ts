@@ -158,6 +158,33 @@ export interface CreateAuthOptions {
 	 * end-to-end, which is the honest scope.
 	 */
 	readonly ssoProviders?: readonly SsoProviderConfig[];
+	/**
+	 * Called once, after an organization row and its owner membership exist.
+	 *
+	 * The seam is here because a tenant is BORN empty: better-auth writes `organization` and
+	 * `member` and nothing else, so anything the platform considers part of "an organization"
+	 * — the default star codes, today — has to be written by somebody who is told a new one
+	 * appeared. This package has no database of its own beyond the auth tables and no opinion
+	 * about what a tenant should contain, so it forwards the fact and the host does the work,
+	 * exactly as {@link AuthEmailDelivery} forwards a message and the host sends it.
+	 *
+	 * **A throw here never fails organization creation.** The callback is invoked inside a
+	 * `try`/`catch` that swallows: a new organization missing its defaults is recoverable by one
+	 * idempotent re-seed, whereas a sign-up that 500s after the row was already written is not.
+	 * The host's callback is therefore responsible for LOGGING its own failure — this package
+	 * carries no logger, and a silent swallow is only honest if the other side is noisy.
+	 */
+	readonly onOrganizationCreated?: (event: OrganizationCreatedEvent) => Promise<void>;
+}
+
+/** What {@link CreateAuthOptions.onOrganizationCreated} is told about a newly created tenant. */
+export interface OrganizationCreatedEvent {
+	readonly organizationId: string;
+	readonly organizationName: string;
+	readonly organizationSlug: string | undefined;
+	/** The creator, who is the organization's owner member. */
+	readonly userId: string;
+	readonly userEmail: string;
 }
 
 /**
@@ -391,6 +418,7 @@ export function createAuth(options: CreateAuthOptions) {
 	// Captured once so the plugin's option object can be built conditionally without re-reading a
 	// possibly-undefined member inside the callback.
 	const sendTwoFactorOtp = options.email.sendTwoFactorOtp;
+	const onOrganizationCreated = options.onOrganizationCreated;
 
 	const rolesOption = options.organizationRoles ?? true;
 	const accessControl = rolesOption === false ? undefined : buildOrganizationAccessControl();
@@ -494,6 +522,34 @@ export function createAuth(options: CreateAuthOptions) {
 					options.invitationExpiresInSeconds ?? DEFAULT_INVITATION_EXPIRES_IN_SECONDS,
 				requireEmailVerificationOnInvitation: true,
 				cancelPendingInvitationsOnReInvite: true,
+				/**
+				 * `organizationHooks.afterCreateOrganization` — the plugin's own option name in
+				 * 1.6.23 — runs after the organization and the owner `member` are committed and
+				 * before the response is written, which is the only point where "this tenant is new"
+				 * is known exactly once. Registered only when the host supplied a callback, so a
+				 * host with nothing to seed composes the plugin exactly as it did before.
+				 */
+				...(onOrganizationCreated === undefined
+					? {}
+					: {
+							organizationHooks: {
+								afterCreateOrganization: async (data) => {
+									try {
+										await onOrganizationCreated({
+											organizationId: data.organization.id,
+											organizationName: data.organization.name,
+											organizationSlug: data.organization.slug ?? undefined,
+											userId: data.user.id,
+											userEmail: data.user.email,
+										});
+									} catch {
+										// Deliberately swallowed; see `onOrganizationCreated` for why, and note
+										// that the host logs. Re-throwing would turn a missing default into a
+										// failed sign-up with the organization already on disk.
+									}
+								},
+							},
+						}),
 				sendInvitationEmail: async (data) => {
 					await options.email.sendInvite({
 						email: data.email,

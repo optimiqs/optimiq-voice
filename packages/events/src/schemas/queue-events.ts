@@ -63,6 +63,12 @@ export const queueCallerAnsweredDataSchema = z.object({
  * pressed 2 to leave a voicemail chose to stop waiting; a caller sent to an overflow destination had
  * the choice made for them. They belong in the same "not served by an agent" bucket for the SLA and
  * in different rows on the report a supervisor reads to decide whether the exit key is working.
+ *
+ * `callback` is the one ending that is not a loss. The caller accepted virtual hold: they left the
+ * line, their place is held as a resume tombstone, and the system owes them a call. It is published
+ * as an abandonment because that is what the LINE saw — everybody behind them moved up — and it is
+ * its own reason because an SLA that counted it as a caller who gave up would penalise a queue for
+ * the feature working.
  */
 export const queueCallerAbandonedDataSchema = z.object({
 	callId: z.uuid(),
@@ -70,7 +76,9 @@ export const queueCallerAbandonedDataSchema = z.object({
 	waitMs: z.int().min(0),
 	/** Position at the moment of abandonment — how close they got. */
 	position: z.int().min(1).optional(),
-	reason: z.enum(["caller-hangup", "timeout", "overflow", "no-agents", "exit-key"]).optional(),
+	reason: z
+		.enum(["caller-hangup", "timeout", "overflow", "no-agents", "exit-key", "callback"])
+		.optional(),
 	/** The digit they pressed, when `reason` is `exit-key`. Which key was used is the report. */
 	exitKey: z.string().min(1).max(1).optional(),
 });
@@ -87,11 +95,57 @@ export const queueAgentStateDataSchema = z.object({
 	reason: z.string().max(128).optional(),
 });
 
+/**
+ * `callback.placed` — virtual hold made good: the queue dialled the caller back.
+ *
+ * Published when the CALL EXISTS, not when the caller answers, for the reason
+ * `rpc.engine.v1.queue-callback` answers on creation: the ring is minutes of wall clock and a report
+ * that waited for it would attribute the attempt to whenever somebody picked up. Whether they
+ * answered is `caller.joined` on the same queue a moment later, carrying the same `callId`.
+ *
+ * `originalCallId` is the CDR link. A callback is a new call with a new `call_id`, so the only thing
+ * that relates it to the wait it settles is this field and the `related_call_id` column it feeds —
+ * see `packages/cdr-db`.
+ */
+export const queueCallbackPlacedDataSchema = z.object({
+	/** The call the engine created for the callback. */
+	callId: z.uuid(),
+	/** The queued call the caller accepted the offer on. The link across the two `call_id`s. */
+	originalCallId: z.uuid().optional(),
+	/** The number dialled — the one the caller presented when they were waiting. */
+	callerNumber: z.string().min(1).max(128),
+	/** Attempts already spent on this token, `0` on the first. */
+	attempts: z.int().min(0).max(10),
+	/** How long the held place had been waiting to be called. The virtual-hold SLA. */
+	heldMs: z.int().min(0),
+});
+
+/**
+ * `callback.failed` — an attempt did not produce a call.
+ *
+ * One event for both endings, with `dropped` as the discriminator, by
+ * {@link queueCallerAbandonedDataSchema}'s argument: "how many callback attempts failed" is one
+ * question, and splitting the last one onto its own subject would make the count a sum over two
+ * streams. `dropped: true` is the promise ending — the attempts are spent and nothing further will
+ * be tried — and it is the only one worth alerting on.
+ */
+export const queueCallbackFailedDataSchema = z.object({
+	callerNumber: z.string().min(1).max(128),
+	/** Attempts spent INCLUDING this one. */
+	attempts: z.int().min(1).max(10),
+	/** True when the token was given up on rather than deferred to another attempt. */
+	dropped: z.boolean(),
+	/** The engine's refusal code, verbatim, so an operator can tell busy from unroutable. */
+	reason: z.string().max(64).optional(),
+});
+
 export const QUEUE_EVENT_DEFINITIONS = {
 	"caller.joined": defineEvent("queue", "caller.joined", queueCallerJoinedDataSchema),
 	"caller.answered": defineEvent("queue", "caller.answered", queueCallerAnsweredDataSchema),
 	"caller.abandoned": defineEvent("queue", "caller.abandoned", queueCallerAbandonedDataSchema),
 	"agent.state": defineEvent("queue", "agent.state", queueAgentStateDataSchema),
+	"callback.placed": defineEvent("queue", "callback.placed", queueCallbackPlacedDataSchema),
+	"callback.failed": defineEvent("queue", "callback.failed", queueCallbackFailedDataSchema),
 } as const;
 
 export type QueueEventDefinitions = typeof QUEUE_EVENT_DEFINITIONS;
@@ -110,6 +164,8 @@ export const queueEventSchema = z.discriminatedUnion("type", [
 	QUEUE_EVENT_DEFINITIONS["caller.answered"].envelope,
 	QUEUE_EVENT_DEFINITIONS["caller.abandoned"].envelope,
 	QUEUE_EVENT_DEFINITIONS["agent.state"].envelope,
+	QUEUE_EVENT_DEFINITIONS["callback.placed"].envelope,
+	QUEUE_EVENT_DEFINITIONS["callback.failed"].envelope,
 ]);
 
 export type QueueEventEnvelope = z.infer<typeof queueEventSchema>;

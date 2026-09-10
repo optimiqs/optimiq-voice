@@ -157,12 +157,19 @@ type ChannelRecordStartedData struct {
 // Subject: calls.evt.v1.<orgId>.<callId>.channel.record.stopped
 // Envelope: Envelope[ChannelRecordStoppedData]
 type ChannelRecordStoppedData struct {
-	LegID       string              `json:"legId"`
-	RecordingID string              `json:"recordingId"`
-	ObjectKey   string              `json:"objectKey"`
-	DurationMs  int                 `json:"durationMs"`
-	Reason      RecordingStopReason `json:"reason"`
-	Bytes       *int                `json:"bytes,omitempty"`
+	LegID       string                       `json:"legId"`
+	RecordingID string                       `json:"recordingId"`
+	ObjectKey   string                       `json:"objectKey"`
+	DurationMs  int                          `json:"durationMs"`
+	Reason      RecordingStopReason          `json:"reason"`
+	Bytes       *int                         `json:"bytes,omitempty"`
+	Pauses      []ChannelRecordStoppedPauses `json:"pauses,omitempty"`
+}
+
+// ChannelRecordStoppedPauses is a payload fragment of the contract.
+type ChannelRecordStoppedPauses struct {
+	StartMs int `json:"startMs"`
+	EndMs   int `json:"endMs"`
 }
 
 // ChannelHangupData is the payload of the "channel.hangup" event.
@@ -392,6 +399,7 @@ type CallEmergencyDialedData struct {
 	Dialed             string  `json:"dialed"`
 	Number             string  `json:"number"`
 	CallerNumber       *string `json:"callerNumber,omitempty"`
+	DeviceID           *string `json:"deviceId,omitempty"`
 	CallerName         *string `json:"callerName,omitempty"`
 	Elin               *string `json:"elin,omitempty"`
 	EmergencyAddressID *string `json:"emergencyAddressId,omitempty"`

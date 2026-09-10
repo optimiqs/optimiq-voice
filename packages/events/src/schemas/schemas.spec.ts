@@ -14,11 +14,15 @@ import { makeRegistrationEvent, registrationEventSchema } from "./registration-e
 import {
 	AUTHZ_CHECK_RPC,
 	SESSION_ANNOUNCE_RPC,
+	CALL_CONTROL_REFUSAL_REASONS,
+	CALL_CONTROL_RPC,
+	CALL_CONTROL_VERBS,
 	SESSION_VERB_RPC,
 	SESSION_VERBS,
 	FILE_GREETING_RPC,
 	ORIGINATE_REFUSAL_REASONS,
 	ORIGINATE_RPC,
+	QUEUE_CALLBACK_RPC,
 	ROUTING_RESOLVE_RPC,
 	SIP_ANSWER_RPC,
 	SIP_DIALOG_REFUSAL_REASONS,
@@ -372,6 +376,52 @@ describe("queue events", () => {
 		expect(event.subject).toBe(`queue.evt.v1.${ORG}._all.agent.state`);
 	});
 
+	/**
+	 * Virtual hold's lifecycle. `callback.placed` is published when the CALL EXISTS rather than when
+	 * the customer answers, and it carries the queued call it settles — the only thing that relates
+	 * a callback's `call_id` to the wait behind it.
+	 */
+	it("builds the callback lifecycle, carrying the call the callback settles", () => {
+		const event = makeQueueEvent("callback.placed", {
+			orgId: ORG,
+			queueId: QUEUE,
+			source: "engine",
+			data: {
+				callId: CALL,
+				originalCallId: createEntityId(),
+				callerNumber: "+15551234567",
+				attempts: 0,
+				heldMs: 60_000,
+			},
+		});
+		expect(event.subject).toBe(`queue.evt.v1.${ORG}.${QUEUE}.callback.placed`);
+		expect(queueEventSchema.parse(event)).toEqual(event);
+	});
+
+	/** One event for both endings, with `dropped` as the discriminator. */
+	it("builds a failed attempt, and refuses one that claims no attempt was spent", () => {
+		const event = makeQueueEvent("callback.failed", {
+			orgId: ORG,
+			queueId: QUEUE,
+			source: "engine",
+			data: {
+				callerNumber: "+15551234567",
+				attempts: 3,
+				dropped: true,
+				reason: "extension_offline",
+			},
+		});
+		expect(queueEventSchema.parse(event)).toEqual(event);
+		expect(() =>
+			makeQueueEvent("callback.failed", {
+				orgId: ORG,
+				queueId: QUEUE,
+				source: "engine",
+				data: { callerNumber: "+15551234567", attempts: 0, dropped: false },
+			}),
+		).toThrow(EventValidationError);
+	});
+
 	it("rejects an unknown agent status and a zero position", () => {
 		expect(() =>
 			makeQueueEvent("agent.state", {
@@ -662,6 +712,49 @@ describe("rpc contracts", () => {
 				arguments: { terminators: ["##"] },
 			}).success,
 		).toBe(false);
+	});
+
+	it("validates a PBX call-control verb both ways, with the leg optional", () => {
+		expect(CALL_CONTROL_RPC.subject).toBe("rpc.engine.v1.call-control");
+		const callId = createEntityId();
+		// The common case: the control plane knows the CALL and not which of its legs is recorded.
+		const request = CALL_CONTROL_RPC.request.parse({ orgId: ORG, callId, verb: "pauseRecord" });
+		expect(request.legId).toBeUndefined();
+		expect(
+			CALL_CONTROL_RPC.request.safeParse({
+				orgId: ORG,
+				callId,
+				legId: createEntityId(),
+				verb: "stopRecord",
+			}).success,
+		).toBe(true);
+		expect(
+			CALL_CONTROL_RPC.response.parse({
+				ok: true,
+				verb: "pauseRecord",
+				instanceId: "engine-1",
+				legId: "leg-1",
+				recording: true,
+				paused: true,
+			}).paused,
+		).toBe(true);
+	});
+
+	it("carries only the three recording verbs, so it cannot become a remote control", () => {
+		expect([...CALL_CONTROL_VERBS]).toEqual(["pauseRecord", "resumeRecord", "stopRecord"]);
+		for (const absent of ["hangup", "hold", "transfer", "dial"]) {
+			expect(
+				CALL_CONTROL_RPC.request.safeParse({
+					orgId: ORG,
+					callId: createEntityId(),
+					verb: absent,
+				}).success,
+			).toBe(false);
+		}
+	});
+
+	it("spells the stale-address refusal exactly as mediad and sipd do", () => {
+		expect(CALL_CONTROL_REFUSAL_REASONS).toContain("wrong_instance");
 	});
 
 	it("pins the voicemail list contract to its subject", () => {
@@ -956,6 +1049,63 @@ describe("the originate contract", () => {
 	it("refuses a reason outside that vocabulary", () => {
 		expect(
 			ORIGINATE_RPC.response.safeParse({ ok: false, originateId: "a", reason: "no_dialtone" })
+				.success,
+		).toBe(false);
+	});
+});
+
+describe("the queue callback contract", () => {
+	const request = () => ({
+		orgId: ORG,
+		callbackId: createEntityId(),
+		queueId: createEntityId(),
+		to: "+15551230000",
+	});
+
+	it("pins the subject and the deadline", () => {
+		expect(QUEUE_CALLBACK_RPC.subject).toBe("rpc.engine.v1.queue-callback");
+		// The originate's five seconds: the reply means the channel exists, not that anybody answered.
+		expect(QUEUE_CALLBACK_RPC.timeoutMs).toBe(5_000);
+	});
+
+	/**
+	 * The whole reason it is a sibling subject and not a variant of the originate: there is no
+	 * extension anywhere in it, so `fromExtension` cannot quietly become optional on the surface a
+	 * click-to-call is authorised against.
+	 */
+	it("has no extension in it at all", () => {
+		const parsed = QUEUE_CALLBACK_RPC.request.parse(request());
+		expect("fromExtension" in parsed).toBe(false);
+		expect(ORIGINATE_RPC.request.safeParse(request()).success).toBe(false);
+	});
+
+	it("carries the queued call it settles, which is the only cross-call link there is", () => {
+		const relatedCallId = createEntityId();
+		expect(QUEUE_CALLBACK_RPC.request.parse({ ...request(), relatedCallId }).relatedCallId).toBe(
+			relatedCallId,
+		);
+	});
+
+	it("refuses a callback handle that is not a uuid — it becomes a channel id", () => {
+		expect(QUEUE_CALLBACK_RPC.request.safeParse({ ...request(), callbackId: "cb-1" }).success).toBe(
+			false,
+		);
+	});
+
+	it("refuses a request with no number to ring", () => {
+		expect(QUEUE_CALLBACK_RPC.request.safeParse({ ...request(), to: "" }).success).toBe(false);
+	});
+
+	it("shares the originate's refusal vocabulary, because the codes are the engine's", () => {
+		expect(
+			QUEUE_CALLBACK_RPC.response.safeParse({
+				ok: false,
+				callbackId: "cb",
+				reason: "extension_offline",
+			}).success,
+		).toBe(true);
+		expect(
+			QUEUE_CALLBACK_RPC.response.safeParse({ ok: false, callbackId: "cb", reason: "no_agent" })
 				.success,
 		).toBe(false);
 	});

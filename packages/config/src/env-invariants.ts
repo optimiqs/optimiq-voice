@@ -28,6 +28,7 @@ export interface EnvInvariantConfig {
 	NATS_MEDIAD_PASS?: string;
 	NATS_SIPD_USER?: string;
 	NATS_SIPD_PASS?: string;
+	PLATFORM_SECRET_ENCRYPTION_KEY?: string;
 	AUTH_SECRET?: string;
 	AUTH_URL?: string;
 	AUTH_COOKIE_DOMAIN?: string;
@@ -277,6 +278,8 @@ export function assertEnvInvariants(config: EnvInvariantConfig): void {
 			throw new Error(`AUTH_SECRET must be at least ${MINIMUM_SECRET_LENGTH} characters.`);
 		}
 		requireHttpsUrl("AUTH_URL", config.AUTH_URL);
+		// Without it, SSO client secrets would be stored in plaintext.
+		requirePresent("PLATFORM_SECRET_ENCRYPTION_KEY", config.PLATFORM_SECRET_ENCRYPTION_KEY);
 		if (config.API_APP_URL?.trim()) requireHttpsUrl("API_APP_URL", config.API_APP_URL);
 	} else {
 		// The engine owns no database or browser authentication. It authenticates only to NATS.

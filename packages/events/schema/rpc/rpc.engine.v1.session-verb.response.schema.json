@@ -14,6 +14,8 @@
 				"stopPlay",
 				"gather",
 				"record",
+				"pauseRecord",
+				"resumeRecord",
 				"dial",
 				"bridge",
 				"unbridge",

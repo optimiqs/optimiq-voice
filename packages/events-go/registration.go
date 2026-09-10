@@ -63,3 +63,17 @@ func NewRegistrationExpiredEnvelope(
 	envelope.Data.AORHash = hash
 	return envelope, nil
 }
+
+// NewRegistrationAuthFailedEnvelope builds an `auth-failed` event — a REGISTER whose digest did not
+// verify. Only raised once the account has been resolved, because the subject needs an
+// organization and an unresolved account has none.
+func NewRegistrationAuthFailedEnvelope(
+	in EnvelopeInput[RegistrationAuthFailedData],
+) (Envelope[RegistrationAuthFailedData], error) {
+	envelope, hash, err := registrationEnvelope(EventTypeRegistrationAuthFailed, in.Data.AOR, in)
+	if err != nil {
+		return Envelope[RegistrationAuthFailedData]{}, err
+	}
+	envelope.Data.AORHash = hash
+	return envelope, nil
+}

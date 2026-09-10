@@ -15,7 +15,10 @@ import (
 // Option configures the health listener.
 type Option func(*options)
 
-type options struct{ pprof bool }
+type options struct {
+	pprof   bool
+	metrics http.Handler
+}
 
 // WithPprof serves net/http/pprof under /debug/pprof/ on this listener.
 //
@@ -23,6 +26,19 @@ type options struct{ pprof bool }
 // reachable from outside is a denial of service and a memory disclosure.
 func WithPprof(enabled bool) Option {
 	return func(o *options) { o.pprof = enabled }
+}
+
+// WithMetrics serves a Prometheus exposition handler at /metrics on this listener.
+//
+// On the PRIVATE listener for the same reason as pprof, and it is a weaker reason but still a
+// real one: a metrics payload names every tenant-visible thing the service counts — call volume,
+// registration counts, authentication failures — and that is reconnaissance, not telemetry, in
+// the hands of anyone who is not the scraper.
+//
+// A nil handler leaves the route unregistered, so a service can pass its option through
+// unconditionally and decide with configuration.
+func WithMetrics(handler http.Handler) Option {
+	return func(o *options) { o.metrics = handler }
 }
 
 // Server is a started health listener; Errors reports a serve failure.
@@ -62,6 +78,9 @@ func Start(ctx context.Context, addr string, ready func() bool, opts ...Option) 
 		}
 		_, _ = w.Write([]byte(`{"status":"ready"}`))
 	})
+	if settings.metrics != nil {
+		mux.Handle("GET /metrics", settings.metrics)
+	}
 	if settings.pprof {
 		// Registered by hand rather than via the package init's http.DefaultServeMux, which would
 		// put these handlers on every other listener in the process that uses that mux.

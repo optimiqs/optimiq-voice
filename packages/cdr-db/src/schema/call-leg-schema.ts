@@ -86,6 +86,21 @@ export const callLegs = pgTable.withRLS(
 		originatingLegId: uuidEntityId("originating_leg_id"),
 		/** The leg this one was bridged to, when a bridge was established. */
 		bridgeLegId: uuidEntityId("bridge_leg_id"),
+		/**
+		 * Another CALL this one continues. Null on every leg that continues nothing.
+		 *
+		 * The two columns above relate legs INSIDE one `call_id`, which is every relationship this
+		 * ledger had until virtual hold. A queue callback is a different kind of fact: the platform
+		 * rings a customer back minutes after their first call ended, and that is unambiguously a new
+		 * call — it has its own answer, its own billing and its own trunk — so reusing the original
+		 * `call_id` would put two disjoint conversations under one row's worth of totals and make
+		 * every duration in the ledger a sum over time the customer was not on the phone.
+		 *
+		 * So the link is a column and not a reuse. Deliberately NOT a foreign key and deliberately
+		 * not indexed as unique: the call it names may have been retained out from under this one,
+		 * and several callbacks can settle one wait.
+		 */
+		relatedCallId: uuidEntityId("related_call_id"),
 
 		direction: text("direction").$type<CallDirection>().notNull(),
 		sipCallId: text("sip_call_id"),
@@ -146,6 +161,32 @@ export const callLegs = pgTable.withRLS(
 		 */
 		authPinOrdinal: integer("auth_pin_ordinal"),
 		authPinLabel: text("auth_pin_label"),
+		/**
+		 * What the carrier said about the calling number's attestation, on an inbound trunk leg.
+		 *
+		 * Visibility only. Nothing here was signed by this platform and nothing here was verified by
+		 * it: the carrier verifies and states the outcome in `P-Asserted-Identity`, `verstat` and
+		 * `Identity` headers, and the SIP edge carries the claim forward. These columns are therefore
+		 * never an authorisation — no routing decision reads them, and a `tn-validation-failed` call
+		 * is on the ledger because it was placed, not because it was allowed.
+		 *
+		 * They are on the ledger and not in a log because of WHEN the question is asked: "was the
+		 * number on this call attested" comes up months later, about a call somebody has already
+		 * found, in a dispute or a traceback — `orig_id` is the originating provider's opaque call
+		 * identifier and is exactly what a traceback is keyed on. A log with a retention window
+		 * cannot answer that.
+		 *
+		 * `sip_verstat` is free text on purpose: the parameter is carrier-writable, and an
+		 * unrecognised value must reach a record rather than fail an INVITE. The `Identity` JWS
+		 * itself is deliberately not stored — multi-kilobyte, unverified here, and a field nobody
+		 * checks that looks like proof is worse than no field.
+		 *
+		 * Null on every internal leg and on every trunk call that arrived without the headers, which
+		 * is most of them.
+		 */
+		sipAttestation: text("sip_attestation"),
+		sipVerstat: text("sip_verstat"),
+		sipOrigId: text("sip_orig_id"),
 		ivrRef: uuidEntityId("ivr_ref"),
 		ringGroupRef: uuidEntityId("ring_group_ref"),
 		/** Billing tag carried from the extension or trunk. */
@@ -208,6 +249,11 @@ export const callLegs = pgTable.withRLS(
 		),
 		// Leg correlation: assemble a whole call from any leg.
 		index("call_legs_call_idx").on(table.callId),
+		// Sparse: the column is null on all but the callback legs, so the index is the size of the
+		// feature rather than of the table.
+		index("call_legs_related_call_idx")
+			.on(table.relatedCallId)
+			.where(sql`${table.relatedCallId} is not null`),
 		index("call_legs_organization_from_idx").on(table.organizationId, table.fromNumber),
 		index("call_legs_organization_to_idx").on(table.organizationId, table.toNumber),
 		// Recording browser + retention sweep only ever look at legs that produced media.
@@ -241,6 +287,25 @@ export const callLegs = pgTable.withRLS(
 		index("call_legs_queue_idx")
 			.on(table.organizationId, table.queueRef, table.startedAt.desc().nullsLast())
 			.where(sql`queue_outcome is not null`),
+		/**
+		 * The index the per-AGENT statistics query runs on.
+		 *
+		 * A second partial index over the queue traffic and not a reuse of `call_legs_queue_idx`,
+		 * which is the kind of duplication worth justifying rather than assuming. The agent report's
+		 * predicate is `queue_agent_ref is not null` — a strict subset of the queue index's rows,
+		 * since only an ANSWERED queue leg names a seat — and its second key is the agent. On the
+		 * queue index the agent is not a key at all, so "how did this one agent do today" would be a
+		 * scan of every queued call in the window; here it is a seek. It also carries the window
+		 * function's ordering column in the right place, which is what keeps the `lead()` over an
+		 * agent's calls from needing a sort per partition.
+		 *
+		 * The insert cost is paid only by legs an agent answered, which on any real tenant is a small
+		 * fraction of the ledger — the same argument `call_legs_recording_idx` and the queue index
+		 * both make, and the reason neither of them is a full index.
+		 */
+		index("call_legs_queue_agent_idx")
+			.on(table.organizationId, table.queueAgentRef, table.startedAt.desc().nullsLast())
+			.where(sql`queue_agent_ref is not null`),
 
 		// Append-only ledger: SELECT + INSERT, two policies, no UPDATE/DELETE for the tenant role.
 		pgPolicy("call_legs_tenant_select", {

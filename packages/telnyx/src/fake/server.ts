@@ -4,6 +4,7 @@ import {
 	type FakeFax,
 	type FakeNumberInventoryEntry,
 	type FakeOrder,
+	type FakePortingOrder,
 	type FakeProfile,
 	FakeTelnyxState,
 } from "./state";
@@ -33,9 +34,15 @@ import type { AddressInfo } from "node:net";
  * `features` as objects, costs as strings, `POST /number_orders` returning 200 while
  * `POST /credential_connections` returns 201, `DELETE /phone_numbers/{id}` returning a body.
  *
- * Not faithful: rate limits (driven by an explicit queue instead), regulatory requirements,
- * porting, messaging, and the several hundred endpoints this platform does not call. A fake that
- * tried to be complete would be a second implementation to maintain and would still be wrong.
+ * Also faithful about the two porting shapes that are easy to assume wrong: `POST /porting_orders`
+ * answering with a **list** because Telnyx splits a request across losing carriers, and CNAM's two
+ * halves living on two different endpoints — the `caller_id_name_enabled` written on `…/voice` is
+ * read back from the parent number and NOT from the voice GET.
+ *
+ * Not faithful: rate limits (driven by an explicit queue instead), regulatory requirements, the
+ * porting DOCUMENT workflow (LOAs, end-user detail, drafts), messaging, and the several hundred
+ * endpoints this platform does not call. A fake that tried to be complete would be a second
+ * implementation to maintain and would still be wrong.
  *
  * It is deliberately NOT authenticated beyond "there must be a bearer token" — asserting the exact
  * key would test that we can pass a string to ourselves.
@@ -137,8 +144,8 @@ function phoneNumberBody(entry: FakeNumberInventoryEntry, status = "active") {
 		emergency_enabled: false,
 		emergency_address_id: null,
 		call_forwarding_enabled: false,
-		cnam_listing_enabled: false,
-		caller_id_name_enabled: false,
+		cnam_listing_enabled: entry.cnamListingEnabled ?? false,
+		caller_id_name_enabled: entry.callerIdNameEnabled ?? false,
 		call_recording_enabled: false,
 		t38_fax_gateway_enabled: false,
 		phone_number_type: entry.phoneNumberType,
@@ -166,7 +173,10 @@ function voiceSettingsBody(entry: FakeNumberInventoryEntry) {
 			forwards_to: "",
 			forwarding_type: "always",
 		},
-		cnam_listing: { cnam_listing_enabled: false, cnam_listing_details: "" },
+		cnam_listing: {
+			cnam_listing_enabled: entry.cnamListingEnabled ?? false,
+			cnam_listing_details: entry.cnamListingDetails ?? "",
+		},
 		emergency: {
 			emergency_enabled: false,
 			emergency_address_id: "",
@@ -276,6 +286,39 @@ function faxBody(fax: FakeFax) {
 		created_at: fax.createdAt,
 		updated_at: fax.createdAt,
 	};
+}
+
+function portingOrderBody(order: FakePortingOrder) {
+	return {
+		id: order.id,
+		record_type: "porting_order",
+		status: order.status,
+		customer_reference: order.customerReference,
+		support_key: order.supportKey,
+		phone_numbers_count: order.phoneNumbers.length,
+		activation_settings: {
+			foc_datetime_requested: null,
+			foc_datetime_actual: null,
+			fast_port_eligible: false,
+		},
+		misc: { type: "full", remaining_numbers_action: "keep" },
+		created_at: order.createdAt,
+		updated_at: order.createdAt,
+		phone_numbers: order.phoneNumbers.map((phoneNumber) => ({
+			id: randomIshId(phoneNumber),
+			record_type: "porting_phone_number",
+			phone_number: phoneNumber,
+			porting_order_status: order.status,
+			activation_status: "New",
+			phone_number_type: "landline",
+			portability_status: "confirmed",
+		})),
+	};
+}
+
+/** A stable per-number id, so two reads of one order do not disagree about it. */
+function randomIshId(phoneNumber: string): string {
+	return `pn-${phoneNumber.replace(/[^0-9]/gu, "")}`;
 }
 
 interface Reply {
@@ -399,6 +442,80 @@ function route(request: ParsedRequest, state: FakeTelnyxState): Reply {
 		return { status: 200, body: { data: orderBody(order, state) } };
 	}
 
+	// ---- porting orders --------------------------------------------------------------------
+	if (method === "POST" && path === "/porting_orders") {
+		const requested = Array.isArray(body.phone_numbers)
+			? (body.phone_numbers as unknown[]).filter(
+					(value): value is string => typeof value === "string",
+				)
+			: [];
+		if (requested.length === 0) {
+			return { status: 422, body: errorBody("10027", "Unprocessable Entity", "phone_numbers") };
+		}
+		const customerReference =
+			typeof body.customer_reference === "string" ? body.customer_reference : "";
+
+		/**
+		 * The split. Telnyx files one order per losing carrier, and the fake stands in for that by
+		 * splitting on country code — enough to make the list-shaped response REAL rather than a
+		 * one-element array a client could get away with mis-modelling as a single object.
+		 */
+		const groups = new Map<string, string[]>();
+		for (const phoneNumber of requested) {
+			const key = phoneNumber.slice(0, 2);
+			groups.set(key, [...(groups.get(key) ?? []), phoneNumber]);
+		}
+		const created: FakePortingOrder[] = [];
+		for (const numbers of groups.values()) {
+			const order: FakePortingOrder = {
+				id: state.newId(),
+				customerReference,
+				supportKey: `sk-${state.newId().slice(0, 8)}`,
+				// Telnyx files a port as a draft: it is not with the losing carrier until the documents
+				// are in. A fake that answered "in-process" would hide the one state a UI must surface.
+				status: "draft",
+				phoneNumbers: numbers,
+				createdAt: state.now(),
+			};
+			state.portingOrders.set(order.id, order);
+			created.push(order);
+		}
+		// 200, and a LIST envelope — see resources/porting-orders.ts.
+		return {
+			status: 200,
+			body: {
+				data: created.map(portingOrderBody),
+				meta: { total_results: created.length, page_number: 1, page_size: 20, total_pages: 1 },
+			},
+		};
+	}
+
+	if (method === "GET" && path === "/porting_orders") {
+		const status = query.get("filter[status]");
+		const reference = query.get("filter[customer_reference]");
+		const matches = [...state.portingOrders.values()].filter(
+			(order) =>
+				(status === null || order.status === status) &&
+				(reference === null || order.customerReference === reference),
+		);
+		return {
+			status: 200,
+			body: {
+				data: matches.map(portingOrderBody),
+				meta: { total_results: matches.length, page_number: 1, page_size: 20, total_pages: 1 },
+			},
+		};
+	}
+
+	const portingMatch = /^\/porting_orders\/([^/]+)$/u.exec(path);
+	if (method === "GET" && portingMatch) {
+		const order = state.portingOrders.get(decodeURIComponent(portingMatch[1] ?? ""));
+		if (order === undefined) {
+			return { status: 404, body: errorBody("10005", "Resource not found") };
+		}
+		return { status: 200, body: { data: portingOrderBody(order) } };
+	}
+
 	// ---- phone numbers ---------------------------------------------------------------------
 	if (method === "GET" && path === "/phone_numbers") {
 		const filter = query.get("filter[phone_number]");
@@ -420,6 +537,30 @@ function route(request: ParsedRequest, state: FakeTelnyxState): Reply {
 		const entry = state.findOwned(decodeURIComponent(voiceMatch[1] ?? ""));
 		if (entry === undefined) {
 			return { status: 404, body: errorBody("10005", "Resource not found") };
+		}
+		if (method === "PATCH") {
+			// Write-only here: accepted on the PATCH, stored on the number, and deliberately NOT
+			// echoed by voiceSettingsBody. A client that reads it back from this response is reading a
+			// field the real API does not send.
+			if (typeof body.caller_id_name_enabled === "boolean") {
+				entry.callerIdNameEnabled = body.caller_id_name_enabled;
+			}
+			const cnam = body.cnam_listing;
+			if (typeof cnam === "object" && cnam !== null) {
+				const group = cnam as Record<string, unknown>;
+				if (typeof group.cnam_listing_enabled === "boolean") {
+					entry.cnamListingEnabled = group.cnam_listing_enabled;
+				}
+				if (typeof group.cnam_listing_details === "string") {
+					if (group.cnam_listing_details.length > 15) {
+						return {
+							status: 422,
+							body: errorBody("10027", "Unprocessable Entity", "cnam_listing_details"),
+						};
+					}
+					entry.cnamListingDetails = group.cnam_listing_details;
+				}
+			}
 		}
 		return { status: 200, body: { data: voiceSettingsBody(entry) } };
 	}

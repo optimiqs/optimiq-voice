@@ -339,6 +339,30 @@ export const mediaRecordingFinishedDataSchema = z.object({
 	objectKey: z.string().min(1).max(1_024),
 	/** Which side of the session was captured. */
 	direction: z.enum(["receive", "both"]),
+	/**
+	 * Every interval `rpc.media.v1.pause-recording` silenced, against THIS file's timeline.
+	 *
+	 * The PCI half of the recording contract. A pause writes silence rather than ending the file,
+	 * so the gap is invisible in the audio — a reviewer asked "was the card number captured?"
+	 * hears quiet and cannot tell whether the agent paused or the caller did. These are the only
+	 * record that says so, and only the process that wrote the audio can produce them.
+	 *
+	 * Offsets are milliseconds from the start of the file, `[startMs, endMs)`, in the order they
+	 * happened and never overlapping. A pause still running when the recording ended is closed at
+	 * the file's own duration, because an open interval on a finished artifact says nothing.
+	 *
+	 * Absent and empty mean the same thing — nothing was paused — and the field is optional so
+	 * that a `recording.finished` from an older media plane still parses.
+	 */
+	pauses: z
+		.array(
+			z.object({
+				startMs: z.int().min(0),
+				endMs: z.int().min(0),
+			}),
+		)
+		.max(256)
+		.optional(),
 	/** Free text for the `error` reason, and for anything an operator would want in a log line. */
 	detail: z.string().max(512).optional(),
 });

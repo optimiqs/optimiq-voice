@@ -56,6 +56,8 @@ describe("subject roots", () => {
 			authzCheck: "rpc.authz.v1.check",
 			voicemailList: "rpc.voicemail.v1.list",
 			pbxExtensionFeature: "rpc.pbx.v1.extension-feature",
+			pbxToggleFeature: "rpc.pbx.v1.toggle-feature",
+			pbxHotDesk: "rpc.pbx.v1.hot-desk",
 			pbxLastCaller: "rpc.pbx.v1.last-caller",
 			pbxFileGreeting: "rpc.pbx.v1.file-greeting",
 			sipCredential: "rpc.sip.v1.credential",
@@ -80,14 +82,17 @@ describe("subject roots", () => {
 			mediaSendDtmf: "rpc.media.v1.send-dtmf",
 			mediaStartRecording: "rpc.media.v1.start-recording",
 			mediaStopRecording: "rpc.media.v1.stop-recording",
+			mediaPauseRecording: "rpc.media.v1.pause-recording",
 			mediaTapSession: "rpc.media.v1.tap-session",
 			mediaUntapSession: "rpc.media.v1.untap-session",
 			mediaMuteSession: "rpc.media.v1.mute-session",
 			mediaHoldSession: "rpc.media.v1.hold-session",
 			engineOriginate: "rpc.engine.v1.originate",
+			engineQueueCallback: "rpc.engine.v1.queue-callback",
 			engineParkHandoff: "rpc.engine.v1.park-handoff",
 			engineSessionVerb: "rpc.engine.v1.session-verb",
 			engineConferenceControl: "rpc.engine.v1.conference-control",
+			engineCallControl: "rpc.engine.v1.call-control",
 			sessionAnnounce: "rpc.session.v1.announce",
 		});
 	});
@@ -277,6 +282,22 @@ describe("subjectFor.engineSessionVerbRpc", () => {
 		);
 		expect(
 			matchesSubject(`${RPC_SUBJECTS.engineSessionVerb}.*`, subjectFor.engineSessionVerbRpc(id)),
+		).toBe(true);
+	});
+});
+
+describe("subjectFor.engineCallControlRpc", () => {
+	it("addresses the instance the channels bucket says owns the leg", () => {
+		expect(subjectFor.engineCallControlRpc("engine-2")).toBe("rpc.engine.v1.call-control.engine-2");
+	});
+
+	it("uses the SAME token every other instance-addressed subject does", () => {
+		const id = "engine.eu-west.internal";
+		expect(subjectFor.engineCallControlRpc(id)).toBe(
+			`${RPC_SUBJECTS.engineCallControl}.${instanceSubjectToken(id)}`,
+		);
+		expect(
+			matchesSubject(`${RPC_SUBJECTS.engineCallControl}.*`, subjectFor.engineCallControlRpc(id)),
 		).toBe(true);
 	});
 });

@@ -1,0 +1,1 @@
+ALTER TABLE "call_legs" DROP CONSTRAINT "call_legs_queue_outcome_check", ADD CONSTRAINT "call_legs_queue_outcome_check" CHECK ("queue_outcome" in ('answered', 'caller-hangup', 'timeout', 'overflow', 'no-agents', 'exit-key', 'callback'));

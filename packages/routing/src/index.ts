@@ -107,6 +107,13 @@ export {
 	type DestinationType,
 } from "./destinations";
 export {
+	declaresInternational,
+	ingestDialTarget,
+	ingestE164,
+	readCallingCode,
+	type NumberIngest,
+} from "./e164-ingest";
+export {
 	DEFAULT_EMERGENCY_NUMBERS,
 	EMERGENCY_CONTINUE_ON_CAUSES,
 	EMERGENCY_NODE_ID,
@@ -140,6 +147,7 @@ export {
 	DEFAULT_FEATURE_CODES,
 	FEATURE_CODE_ARGUMENT_MODE,
 	FEATURE_CODE_ARGUMENT_MODES,
+	featureCodeArgumentMode,
 	featureCodeIssues,
 	isWellFormedFeatureCode,
 	matchFeatureCode,
@@ -192,6 +200,7 @@ export {
 	type PlanNodeOf,
 	type PlanNodeTable,
 	type PlaybackPlanNode,
+	type QueueCallbackPlan,
 	type QueuePlanNode,
 	type CallFlowPlanNode,
 	type CompiledPinEntry,
@@ -228,6 +237,7 @@ export {
 	CALL_BLOCK_ACTIONS,
 	CALL_BLOCK_DIRECTIONS,
 	CALL_BLOCK_MATCH_KINDS,
+	CALLER_ID_PRESENTATIONS,
 	emptySnapshot,
 	FEATURE_CODE_ACTIONS,
 	isOptionalSnapshotCollection,
@@ -251,6 +261,7 @@ export {
 	type CallBlockDirection,
 	type CallBlockMatchKind,
 	type CallBlockRuleInput,
+	type CallerIdPresentation,
 	type ConferenceInput,
 	type EmergencyAddressInput,
 	type ExtensionInput,

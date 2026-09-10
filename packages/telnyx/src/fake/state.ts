@@ -30,6 +30,41 @@ export interface FakeNumberInventoryEntry {
 	/** Set once ordered, so the release path has something to look up. */
 	ownedId?: string;
 	connectionId?: string;
+	/**
+	 * CNAM, kept on the entry rather than regenerated per response.
+	 *
+	 * The fake persists it because the property under test is precisely that the two halves round
+	 * trip through the two DIFFERENT endpoints Telnyx splits them across — `caller_id_name_enabled`
+	 * written on `…/voice` and read from the parent, `cnam_listing` written and read on `…/voice`.
+	 * A fake that echoed the request would agree with a client that read the wrong endpoint.
+	 */
+	callerIdNameEnabled?: boolean;
+	cnamListingEnabled?: boolean;
+	cnamListingDetails?: string;
+}
+
+/**
+ * A port-in.
+ *
+ * Separate from {@link FakeOrder} for the reason the resources are separate: a port is not a
+ * purchase that completes in a second, it is a weeks-long workflow whose interesting states
+ * (`draft`, `exception`) have no analogue in a number order.
+ */
+export interface FakePortingOrder {
+	readonly id: string;
+	readonly customerReference: string;
+	readonly supportKey: string;
+	status:
+		| "draft"
+		| "in-process"
+		| "submitted"
+		| "exception"
+		| "foc-date-confirmed"
+		| "cancel-pending"
+		| "ported"
+		| "cancelled";
+	readonly phoneNumbers: readonly string[];
+	readonly createdAt: string;
 }
 
 export interface FakeOrder {
@@ -114,6 +149,7 @@ export class FakeTelnyxState {
 	/** Numbers returned by a search on this instance. The `85000` gate reads this. */
 	readonly searched = new Set<string>();
 	readonly orders = new Map<string, FakeOrder>();
+	readonly portingOrders = new Map<string, FakePortingOrder>();
 	readonly connections = new Map<string, FakeConnection>();
 	readonly profiles = new Map<string, FakeProfile>();
 	readonly faxes = new Map<string, FakeFax>();
@@ -168,6 +204,7 @@ export class FakeTelnyxState {
 	reset(): void {
 		this.searched.clear();
 		this.orders.clear();
+		this.portingOrders.clear();
 		this.connections.clear();
 		this.profiles.clear();
 		this.faxes.clear();
@@ -177,6 +214,9 @@ export class FakeTelnyxState {
 			entry.available = true;
 			delete entry.ownedId;
 			delete entry.connectionId;
+			delete entry.callerIdNameEnabled;
+			delete entry.cnamListingEnabled;
+			delete entry.cnamListingDetails;
 		}
 	}
 }

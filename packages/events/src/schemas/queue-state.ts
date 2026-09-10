@@ -289,6 +289,41 @@ export const queueResumeTombstoneSchema = z.object({
 	abandonedAt: z.number(),
 	/** Epoch millis, `now + discard_abandoned_after_seconds`. Past it the promise is gone. */
 	expiresAt: z.number(),
+	/**
+	 * Present when the platform owes this caller a CALL, rather than merely holding their place if
+	 * they happen to ring back.
+	 *
+	 * Virtual hold and abandoned-resume are the same fact with different owners of the next move, so
+	 * they are the same record with one extra block rather than two stores that can disagree about
+	 * who holds which place. Everything that already reads a tombstone keeps working: a callback
+	 * token IS a resume promise, so a caller who rings back before the system reaches them claims it
+	 * through the ordinary `join`, in the same compare-and-set that deletes it — which is exactly the
+	 * "one resume per tombstone" guarantee above, now doing double duty as "we never call somebody
+	 * who is already back on the line".
+	 *
+	 * Optional, so a record written before this existed parses unchanged and a reader that does not
+	 * know about callbacks treats every tombstone as the resume promise it always was.
+	 */
+	callback: z
+		.object({
+			/** Attempts made so far. Starts at 0; the token is dropped when it reaches `maxAttempts`. */
+			attempts: z.int().min(0).max(10),
+			/** Attempts allowed, from the queue's compiled callback plan. */
+			maxAttempts: z.int().min(1).max(10),
+			/** Epoch millis before which no attempt may be made. Set forward after each failure. */
+			nextAttemptAt: z.number(),
+			/**
+			 * The queued call the caller accepted the offer on.
+			 *
+			 * The CROSS-CALL CDR link, and the only place it can live: a callback is a new `call_id`,
+			 * and `call_legs` relates legs INSIDE one call. The engine carries it onto the callback's
+			 * `related_call_id`, so a report can put the wait and the call that settled it side by
+			 * side. Optional, so a token written before this existed still parses — it simply loses
+			 * the link, which is the same amount of linking those reports have today.
+			 */
+			callId: z.uuid().optional(),
+		})
+		.optional(),
 });
 
 export type QueueResumeTombstone = z.infer<typeof queueResumeTombstoneSchema>;

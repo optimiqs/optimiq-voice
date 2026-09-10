@@ -877,6 +877,23 @@ function eventSamples(): readonly {
 			},
 		}),
 	});
+	samples.push({
+		name: "registration.auth-failed",
+		goType: "RegistrationAuthFailedData",
+		envelope: makeRegistrationEvent("auth-failed", {
+			...next(),
+			orgId: ORG_A,
+			data: {
+				aor: "sip:1001@acme.example.com",
+				aorHash: "0".repeat(32),
+				transport: "udp",
+				sourceAddress: "203.0.113.9:5060",
+				userAgent: "friendly-scanner",
+				username: "1001",
+				reason: "bad-credentials",
+			},
+		}),
+	});
 
 	samples.push({
 		name: "queue.caller.joined",
@@ -1551,8 +1568,16 @@ function parityGolden(
 			// The one key in this file that TRANSFORMS its argument. Both writers and the reader go
 			// through one function; these vectors are what makes "both" true across the language
 			// border, and a Go folder that dropped the slash would produce a key nobody else writes.
-			{ builder: "sipAcl", args: ["203.0.113.0/24"], key: kvKeyFor.sipAcl("203.0.113.0/24") },
-			{ builder: "sipAcl", args: ["2001:db8::/32"], key: kvKeyFor.sipAcl("2001:db8::/32") },
+			{
+				builder: "sipAcl",
+				args: [ORG_A, "trunk", "203.0.113.0/24"],
+				key: kvKeyFor.sipAcl(ORG_A, "trunk", "203.0.113.0/24"),
+			},
+			{
+				builder: "sipAcl",
+				args: [ORG_A, "registration", "2001:db8::/32"],
+				key: kvKeyFor.sipAcl(ORG_A, "registration", "2001:db8::/32"),
+			},
 		],
 		streams: EVENT_STREAMS.map((definition: StreamDefinition) => ({ ...definition })),
 		kvBuckets: KV_BUCKETS.map((definition: KvBucketDefinition) => ({ ...definition })),

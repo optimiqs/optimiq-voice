@@ -22,6 +22,8 @@ const (
 	SubjectAuthzCheckRPC            = "rpc.authz.v1.check"
 	SubjectVoicemailListRPC         = "rpc.voicemail.v1.list"
 	SubjectExtensionFeatureRPC      = "rpc.pbx.v1.extension-feature"
+	SubjectToggleFeatureRPC         = "rpc.pbx.v1.toggle-feature"
+	SubjectHotDeskRPC               = "rpc.pbx.v1.hot-desk"
 	SubjectLastCallerRPC            = "rpc.pbx.v1.last-caller"
 	SubjectFileGreetingRPC          = "rpc.pbx.v1.file-greeting"
 	SubjectSipCredentialRPC         = "rpc.sip.v1.credential"
@@ -46,14 +48,17 @@ const (
 	SubjectMediaSendDtmfRPC         = "rpc.media.v1.send-dtmf"
 	SubjectMediaStartRecordingRPC   = "rpc.media.v1.start-recording"
 	SubjectMediaStopRecordingRPC    = "rpc.media.v1.stop-recording"
+	SubjectMediaPauseRecordingRPC   = "rpc.media.v1.pause-recording"
 	SubjectMediaTapSessionRPC       = "rpc.media.v1.tap-session"
 	SubjectMediaUntapSessionRPC     = "rpc.media.v1.untap-session"
 	SubjectMediaMuteSessionRPC      = "rpc.media.v1.mute-session"
 	SubjectMediaHoldSessionRPC      = "rpc.media.v1.hold-session"
 	SubjectOriginateRPC             = "rpc.engine.v1.originate"
+	SubjectQueueCallbackRPC         = "rpc.engine.v1.queue-callback"
 	SubjectParkHandoffRPC           = "rpc.engine.v1.park-handoff"
 	SubjectSessionVerbRPC           = "rpc.engine.v1.session-verb"
 	SubjectConferenceControlRPC     = "rpc.engine.v1.conference-control"
+	SubjectCallControlRPC           = "rpc.engine.v1.call-control"
 	SubjectSessionAnnounceRPC       = "rpc.session.v1.announce"
 )
 
@@ -62,6 +67,8 @@ const (
 	TimeoutAuthzCheckRPC            = 1000 * time.Millisecond
 	TimeoutVoicemailListRPC         = 3000 * time.Millisecond
 	TimeoutExtensionFeatureRPC      = 5000 * time.Millisecond
+	TimeoutToggleFeatureRPC         = 5000 * time.Millisecond
+	TimeoutHotDeskRPC               = 8000 * time.Millisecond
 	TimeoutLastCallerRPC            = 3000 * time.Millisecond
 	TimeoutFileGreetingRPC          = 5000 * time.Millisecond
 	TimeoutSipCredentialRPC         = 500 * time.Millisecond
@@ -86,14 +93,17 @@ const (
 	TimeoutMediaSendDtmfRPC         = 500 * time.Millisecond
 	TimeoutMediaStartRecordingRPC   = 1000 * time.Millisecond
 	TimeoutMediaStopRecordingRPC    = 500 * time.Millisecond
+	TimeoutMediaPauseRecordingRPC   = 500 * time.Millisecond
 	TimeoutMediaTapSessionRPC       = 500 * time.Millisecond
 	TimeoutMediaUntapSessionRPC     = 500 * time.Millisecond
 	TimeoutMediaMuteSessionRPC      = 500 * time.Millisecond
 	TimeoutMediaHoldSessionRPC      = 1000 * time.Millisecond
 	TimeoutOriginateRPC             = 5000 * time.Millisecond
+	TimeoutQueueCallbackRPC         = 5000 * time.Millisecond
 	TimeoutParkHandoffRPC           = 3000 * time.Millisecond
 	TimeoutSessionVerbRPC           = 30000 * time.Millisecond
 	TimeoutConferenceControlRPC     = 2000 * time.Millisecond
+	TimeoutCallControlRPC           = 2000 * time.Millisecond
 	TimeoutSessionAnnounceRPC       = 2000 * time.Millisecond
 )
 
@@ -323,6 +333,123 @@ func (v ExtensionFeatureResponseFeature) Valid() bool {
 }
 
 func (v ExtensionFeatureResponseFeature) String() string { return string(v) }
+
+// ToggleFeatureRequest is the request body of rpc.pbx.v1.toggle-feature.
+type ToggleFeatureRequest struct {
+	OrgID           string                     `json:"orgId"`
+	Target          ToggleFeatureRequestTarget `json:"target"`
+	CallFlowID      *string                    `json:"callFlowId,omitempty"`
+	TimeConditionID *string                    `json:"timeConditionId,omitempty"`
+	ExtensionNumber *string                    `json:"extensionNumber,omitempty"`
+	CallID          *string                    `json:"callId,omitempty"`
+}
+
+// ToggleFeatureRequestTarget is the closed vocabulary of ToggleFeatureRequest.target.
+type ToggleFeatureRequestTarget string
+
+const (
+	ToggleFeatureRequestTargetCallFlow      ToggleFeatureRequestTarget = "call-flow"
+	ToggleFeatureRequestTargetTimeCondition ToggleFeatureRequestTarget = "time-condition"
+)
+
+// ToggleFeatureRequestTargetValues lists every member of the vocabulary, in contract order.
+var ToggleFeatureRequestTargetValues = []ToggleFeatureRequestTarget{
+	ToggleFeatureRequestTargetCallFlow,
+	ToggleFeatureRequestTargetTimeCondition,
+}
+
+// Valid reports whether v is a member of the ToggleFeatureRequestTarget vocabulary.
+func (v ToggleFeatureRequestTarget) Valid() bool {
+	return slices.Contains(ToggleFeatureRequestTargetValues, v)
+}
+
+func (v ToggleFeatureRequestTarget) String() string { return string(v) }
+
+// ToggleFeatureResponse is the reply body of rpc.pbx.v1.toggle-feature.
+type ToggleFeatureResponse struct {
+	Applied bool                        `json:"applied"`
+	Target  ToggleFeatureResponseTarget `json:"target"`
+	State   *string                     `json:"state,omitempty"`
+	Reason  *string                     `json:"reason,omitempty"`
+}
+
+// ToggleFeatureResponseTarget is the closed vocabulary of ToggleFeatureResponse.target.
+type ToggleFeatureResponseTarget string
+
+const (
+	ToggleFeatureResponseTargetCallFlow      ToggleFeatureResponseTarget = "call-flow"
+	ToggleFeatureResponseTargetTimeCondition ToggleFeatureResponseTarget = "time-condition"
+)
+
+// ToggleFeatureResponseTargetValues lists every member of the vocabulary, in contract order.
+var ToggleFeatureResponseTargetValues = []ToggleFeatureResponseTarget{
+	ToggleFeatureResponseTargetCallFlow,
+	ToggleFeatureResponseTargetTimeCondition,
+}
+
+// Valid reports whether v is a member of the ToggleFeatureResponseTarget vocabulary.
+func (v ToggleFeatureResponseTarget) Valid() bool {
+	return slices.Contains(ToggleFeatureResponseTargetValues, v)
+}
+
+func (v ToggleFeatureResponseTarget) String() string { return string(v) }
+
+// HotDeskRequest is the request body of rpc.pbx.v1.hot-desk.
+type HotDeskRequest struct {
+	OrgID           string               `json:"orgId"`
+	Action          HotDeskRequestAction `json:"action"`
+	DeviceID        string               `json:"deviceId"`
+	ExtensionNumber *string              `json:"extensionNumber,omitempty"`
+	Pin             *string              `json:"pin,omitempty"`
+	CallID          *string              `json:"callId,omitempty"`
+}
+
+// HotDeskRequestAction is the closed vocabulary of HotDeskRequest.action.
+type HotDeskRequestAction string
+
+const (
+	HotDeskRequestActionLogin  HotDeskRequestAction = "login"
+	HotDeskRequestActionLogout HotDeskRequestAction = "logout"
+)
+
+// HotDeskRequestActionValues lists every member of the vocabulary, in contract order.
+var HotDeskRequestActionValues = []HotDeskRequestAction{
+	HotDeskRequestActionLogin,
+	HotDeskRequestActionLogout,
+}
+
+// Valid reports whether v is a member of the HotDeskRequestAction vocabulary.
+func (v HotDeskRequestAction) Valid() bool { return slices.Contains(HotDeskRequestActionValues, v) }
+
+func (v HotDeskRequestAction) String() string { return string(v) }
+
+// HotDeskResponse is the reply body of rpc.pbx.v1.hot-desk.
+type HotDeskResponse struct {
+	Applied         bool                  `json:"applied"`
+	Action          HotDeskResponseAction `json:"action"`
+	ExtensionNumber *string               `json:"extensionNumber,omitempty"`
+	ExpiresAt       *string               `json:"expiresAt,omitempty"`
+	Reason          *string               `json:"reason,omitempty"`
+}
+
+// HotDeskResponseAction is the closed vocabulary of HotDeskResponse.action.
+type HotDeskResponseAction string
+
+const (
+	HotDeskResponseActionLogin  HotDeskResponseAction = "login"
+	HotDeskResponseActionLogout HotDeskResponseAction = "logout"
+)
+
+// HotDeskResponseActionValues lists every member of the vocabulary, in contract order.
+var HotDeskResponseActionValues = []HotDeskResponseAction{
+	HotDeskResponseActionLogin,
+	HotDeskResponseActionLogout,
+}
+
+// Valid reports whether v is a member of the HotDeskResponseAction vocabulary.
+func (v HotDeskResponseAction) Valid() bool { return slices.Contains(HotDeskResponseActionValues, v) }
+
+func (v HotDeskResponseAction) String() string { return string(v) }
 
 // LastCallerRequest is the request body of rpc.pbx.v1.last-caller.
 type LastCallerRequest struct {
@@ -619,6 +746,7 @@ type SipInviteRequest struct {
 	LegID          string                         `json:"legId"`
 	SipdInstanceID string                         `json:"sipdInstanceId"`
 	OrgID          *string                        `json:"orgId,omitempty"`
+	DeviceID       *string                        `json:"deviceId,omitempty"`
 	Authentication SipInviteRequestAuthentication `json:"authentication"`
 	Profile        *string                        `json:"profile,omitempty"`
 	RoutingContext string                         `json:"routingContext"`
@@ -632,6 +760,7 @@ type SipInviteRequest struct {
 	HasOffer       bool                           `json:"hasOffer"`
 	SDPOffer       *string                        `json:"sdpOffer,omitempty"`
 	MediaHint      *SipInviteRequestMediaHint     `json:"mediaHint,omitempty"`
+	Attestation    *SipInviteRequestAttestation   `json:"attestation,omitempty"`
 	UserAgent      *string                        `json:"userAgent,omitempty"`
 	Replaces       *SipInviteRequestReplaces      `json:"replaces,omitempty"`
 	ReplacesLegID  *string                        `json:"replacesLegId,omitempty"`
@@ -681,6 +810,38 @@ type SipInviteRequestMediaHint struct {
 	Mismatch         bool    `json:"mismatch"`
 	Private          bool    `json:"private"`
 }
+
+// SipInviteRequestAttestation is a payload fragment of the contract.
+type SipInviteRequestAttestation struct {
+	Level            *SipInviteRequestAttestationLevel `json:"level,omitempty"`
+	Verstat          *string                           `json:"verstat,omitempty"`
+	AssertedIdentity *string                           `json:"assertedIdentity,omitempty"`
+	OrigID           *string                           `json:"origId,omitempty"`
+	Signed           bool                              `json:"signed"`
+}
+
+// SipInviteRequestAttestationLevel is the closed vocabulary of SipInviteRequestAttestation.level.
+type SipInviteRequestAttestationLevel string
+
+const (
+	SipInviteRequestAttestationLevelA SipInviteRequestAttestationLevel = "A"
+	SipInviteRequestAttestationLevelB SipInviteRequestAttestationLevel = "B"
+	SipInviteRequestAttestationLevelC SipInviteRequestAttestationLevel = "C"
+)
+
+// SipInviteRequestAttestationLevelValues lists every member of the vocabulary, in contract order.
+var SipInviteRequestAttestationLevelValues = []SipInviteRequestAttestationLevel{
+	SipInviteRequestAttestationLevelA,
+	SipInviteRequestAttestationLevelB,
+	SipInviteRequestAttestationLevelC,
+}
+
+// Valid reports whether v is a member of the SipInviteRequestAttestationLevel vocabulary.
+func (v SipInviteRequestAttestationLevel) Valid() bool {
+	return slices.Contains(SipInviteRequestAttestationLevelValues, v)
+}
+
+func (v SipInviteRequestAttestationLevel) String() string { return string(v) }
 
 // SipInviteRequestReplaces is a payload fragment of the contract.
 type SipInviteRequestReplaces struct {
@@ -1016,16 +1177,17 @@ func (v SipReinviteResponseReason) String() string { return string(v) }
 
 // SipOriginateRequest is the request body of rpc.sip.v1.originate.
 type SipOriginateRequest struct {
-	LegID            string                    `json:"legId"`
-	EngineInstanceID *string                   `json:"engineInstanceId,omitempty"`
-	OrgID            string                    `json:"orgId"`
-	CallID           string                    `json:"callId"`
-	Target           SipOriginateRequestTarget `json:"target"`
-	CallerIDNumber   *string                   `json:"callerIdNumber,omitempty"`
-	CallerIDName     *string                   `json:"callerIdName,omitempty"`
-	SDPOffer         string                    `json:"sdpOffer"`
-	RingTimeoutMs    *int                      `json:"ringTimeoutMs,omitempty"`
-	Headers          map[string]string         `json:"headers,omitempty"`
+	LegID                string                                   `json:"legId"`
+	EngineInstanceID     *string                                  `json:"engineInstanceId,omitempty"`
+	OrgID                string                                   `json:"orgId"`
+	CallID               string                                   `json:"callId"`
+	Target               SipOriginateRequestTarget                `json:"target"`
+	CallerIDNumber       *string                                  `json:"callerIdNumber,omitempty"`
+	CallerIDName         *string                                  `json:"callerIdName,omitempty"`
+	CallerIDPresentation *SipOriginateRequestCallerIDPresentation `json:"callerIdPresentation,omitempty"`
+	SDPOffer             string                                   `json:"sdpOffer"`
+	RingTimeoutMs        *int                                     `json:"ringTimeoutMs,omitempty"`
+	Headers              map[string]string                        `json:"headers,omitempty"`
 }
 
 // SipOriginateRequestTarget is a payload fragment of the contract.
@@ -1060,6 +1222,27 @@ func (v SipOriginateRequestTargetKind) Valid() bool {
 }
 
 func (v SipOriginateRequestTargetKind) String() string { return string(v) }
+
+// SipOriginateRequestCallerIDPresentation is the closed vocabulary of SipOriginateRequest.callerIdPresentation.
+type SipOriginateRequestCallerIDPresentation string
+
+const (
+	SipOriginateRequestCallerIDPresentationAllowed    SipOriginateRequestCallerIDPresentation = "allowed"
+	SipOriginateRequestCallerIDPresentationRestricted SipOriginateRequestCallerIDPresentation = "restricted"
+)
+
+// SipOriginateRequestCallerIDPresentationValues lists every member of the vocabulary, in contract order.
+var SipOriginateRequestCallerIDPresentationValues = []SipOriginateRequestCallerIDPresentation{
+	SipOriginateRequestCallerIDPresentationAllowed,
+	SipOriginateRequestCallerIDPresentationRestricted,
+}
+
+// Valid reports whether v is a member of the SipOriginateRequestCallerIDPresentation vocabulary.
+func (v SipOriginateRequestCallerIDPresentation) Valid() bool {
+	return slices.Contains(SipOriginateRequestCallerIDPresentationValues, v)
+}
+
+func (v SipOriginateRequestCallerIDPresentation) String() string { return string(v) }
 
 // SipOriginateResponse is the reply body of rpc.sip.v1.originate.
 type SipOriginateResponse struct {
@@ -1961,6 +2144,55 @@ func (v MediaStopRecordingResponseReason) Valid() bool {
 
 func (v MediaStopRecordingResponseReason) String() string { return string(v) }
 
+// MediaPauseRecordingRequest is the request body of rpc.media.v1.pause-recording.
+type MediaPauseRecordingRequest struct {
+	RecordingRef string `json:"recordingRef"`
+	Resume       bool   `json:"resume"`
+}
+
+// MediaPauseRecordingResponse is the reply body of rpc.media.v1.pause-recording.
+type MediaPauseRecordingResponse struct {
+	Ok           bool                               `json:"ok"`
+	RecordingRef string                             `json:"recordingRef"`
+	Paused       bool                               `json:"paused"`
+	Applied      bool                               `json:"applied"`
+	SessionID    *string                            `json:"sessionId,omitempty"`
+	InstanceID   *string                            `json:"instanceId,omitempty"`
+	Reason       *MediaPauseRecordingResponseReason `json:"reason,omitempty"`
+	Error        *string                            `json:"error,omitempty"`
+}
+
+// MediaPauseRecordingResponseReason is the closed vocabulary of MediaPauseRecordingResponse.reason.
+type MediaPauseRecordingResponseReason string
+
+const (
+	MediaPauseRecordingResponseReasonBadRequest     MediaPauseRecordingResponseReason = "bad_request"
+	MediaPauseRecordingResponseReasonCapacity       MediaPauseRecordingResponseReason = "capacity"
+	MediaPauseRecordingResponseReasonShuttingDown   MediaPauseRecordingResponseReason = "shutting_down"
+	MediaPauseRecordingResponseReasonUnknownSession MediaPauseRecordingResponseReason = "unknown_session"
+	MediaPauseRecordingResponseReasonWrongInstance  MediaPauseRecordingResponseReason = "wrong_instance"
+	MediaPauseRecordingResponseReasonNotSupported   MediaPauseRecordingResponseReason = "not_supported"
+	MediaPauseRecordingResponseReasonInternal       MediaPauseRecordingResponseReason = "internal"
+)
+
+// MediaPauseRecordingResponseReasonValues lists every member of the vocabulary, in contract order.
+var MediaPauseRecordingResponseReasonValues = []MediaPauseRecordingResponseReason{
+	MediaPauseRecordingResponseReasonBadRequest,
+	MediaPauseRecordingResponseReasonCapacity,
+	MediaPauseRecordingResponseReasonShuttingDown,
+	MediaPauseRecordingResponseReasonUnknownSession,
+	MediaPauseRecordingResponseReasonWrongInstance,
+	MediaPauseRecordingResponseReasonNotSupported,
+	MediaPauseRecordingResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the MediaPauseRecordingResponseReason vocabulary.
+func (v MediaPauseRecordingResponseReason) Valid() bool {
+	return slices.Contains(MediaPauseRecordingResponseReasonValues, v)
+}
+
+func (v MediaPauseRecordingResponseReason) String() string { return string(v) }
+
 // MediaTapSessionRequest is the request body of rpc.media.v1.tap-session.
 type MediaTapSessionRequest struct {
 	TapID           string                        `json:"tapId"`
@@ -2290,6 +2522,64 @@ func (v OriginateResponseReason) Valid() bool {
 
 func (v OriginateResponseReason) String() string { return string(v) }
 
+// QueueCallbackRequest is the request body of rpc.engine.v1.queue-callback.
+type QueueCallbackRequest struct {
+	OrgID              string  `json:"orgId"`
+	CallbackID         string  `json:"callbackId"`
+	QueueID            string  `json:"queueId"`
+	To                 string  `json:"to"`
+	QueueNumber        *string `json:"queueNumber,omitempty"`
+	CallerIDNumber     *string `json:"callerIdNumber,omitempty"`
+	CallerIDName       *string `json:"callerIdName,omitempty"`
+	RingTimeoutSeconds *int    `json:"ringTimeoutSeconds,omitempty"`
+	RelatedCallID      *string `json:"relatedCallId,omitempty"`
+}
+
+// QueueCallbackResponse is the reply body of rpc.engine.v1.queue-callback.
+type QueueCallbackResponse struct {
+	Ok         bool                         `json:"ok"`
+	CallbackID string                       `json:"callbackId"`
+	InstanceID *string                      `json:"instanceId,omitempty"`
+	CallID     *string                      `json:"callId,omitempty"`
+	LegID      *string                      `json:"legId,omitempty"`
+	Endpoint   *string                      `json:"endpoint,omitempty"`
+	Reason     *QueueCallbackResponseReason `json:"reason,omitempty"`
+	Error      *string                      `json:"error,omitempty"`
+}
+
+// QueueCallbackResponseReason is the closed vocabulary of QueueCallbackResponse.reason.
+type QueueCallbackResponseReason string
+
+const (
+	QueueCallbackResponseReasonBadRequest       QueueCallbackResponseReason = "bad_request"
+	QueueCallbackResponseReasonUnknownExtension QueueCallbackResponseReason = "unknown_extension"
+	QueueCallbackResponseReasonExtensionOffline QueueCallbackResponseReason = "extension_offline"
+	QueueCallbackResponseReasonInvalidTarget    QueueCallbackResponseReason = "invalid_target"
+	QueueCallbackResponseReasonCapacity         QueueCallbackResponseReason = "capacity"
+	QueueCallbackResponseReasonNotSupported     QueueCallbackResponseReason = "not_supported"
+	QueueCallbackResponseReasonShuttingDown     QueueCallbackResponseReason = "shutting_down"
+	QueueCallbackResponseReasonInternal         QueueCallbackResponseReason = "internal"
+)
+
+// QueueCallbackResponseReasonValues lists every member of the vocabulary, in contract order.
+var QueueCallbackResponseReasonValues = []QueueCallbackResponseReason{
+	QueueCallbackResponseReasonBadRequest,
+	QueueCallbackResponseReasonUnknownExtension,
+	QueueCallbackResponseReasonExtensionOffline,
+	QueueCallbackResponseReasonInvalidTarget,
+	QueueCallbackResponseReasonCapacity,
+	QueueCallbackResponseReasonNotSupported,
+	QueueCallbackResponseReasonShuttingDown,
+	QueueCallbackResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the QueueCallbackResponseReason vocabulary.
+func (v QueueCallbackResponseReason) Valid() bool {
+	return slices.Contains(QueueCallbackResponseReasonValues, v)
+}
+
+func (v QueueCallbackResponseReason) String() string { return string(v) }
+
 // ParkHandoffRequest is the request body of rpc.engine.v1.park-handoff.
 type ParkHandoffRequest struct {
 	OrgID                   string `json:"orgId"`
@@ -2363,26 +2653,28 @@ type SessionVerbRequest struct {
 type SessionVerbRequestVerb string
 
 const (
-	SessionVerbRequestVerbAnswer      SessionVerbRequestVerb = "answer"
-	SessionVerbRequestVerbRinging     SessionVerbRequestVerb = "ringing"
-	SessionVerbRequestVerbPlay        SessionVerbRequestVerb = "play"
-	SessionVerbRequestVerbStopPlay    SessionVerbRequestVerb = "stopPlay"
-	SessionVerbRequestVerbGather      SessionVerbRequestVerb = "gather"
-	SessionVerbRequestVerbRecord      SessionVerbRequestVerb = "record"
-	SessionVerbRequestVerbDial        SessionVerbRequestVerb = "dial"
-	SessionVerbRequestVerbBridge      SessionVerbRequestVerb = "bridge"
-	SessionVerbRequestVerbUnbridge    SessionVerbRequestVerb = "unbridge"
-	SessionVerbRequestVerbTransfer    SessionVerbRequestVerb = "transfer"
-	SessionVerbRequestVerbHold        SessionVerbRequestVerb = "hold"
-	SessionVerbRequestVerbUnhold      SessionVerbRequestVerb = "unhold"
-	SessionVerbRequestVerbPark        SessionVerbRequestVerb = "park"
-	SessionVerbRequestVerbUnpark      SessionVerbRequestVerb = "unpark"
-	SessionVerbRequestVerbPlayDTMF    SessionVerbRequestVerb = "playDtmf"
-	SessionVerbRequestVerbMute        SessionVerbRequestVerb = "mute"
-	SessionVerbRequestVerbUnmute      SessionVerbRequestVerb = "unmute"
-	SessionVerbRequestVerbSetVariable SessionVerbRequestVerb = "setVariable"
-	SessionVerbRequestVerbSleep       SessionVerbRequestVerb = "sleep"
-	SessionVerbRequestVerbHangup      SessionVerbRequestVerb = "hangup"
+	SessionVerbRequestVerbAnswer       SessionVerbRequestVerb = "answer"
+	SessionVerbRequestVerbRinging      SessionVerbRequestVerb = "ringing"
+	SessionVerbRequestVerbPlay         SessionVerbRequestVerb = "play"
+	SessionVerbRequestVerbStopPlay     SessionVerbRequestVerb = "stopPlay"
+	SessionVerbRequestVerbGather       SessionVerbRequestVerb = "gather"
+	SessionVerbRequestVerbRecord       SessionVerbRequestVerb = "record"
+	SessionVerbRequestVerbPauseRecord  SessionVerbRequestVerb = "pauseRecord"
+	SessionVerbRequestVerbResumeRecord SessionVerbRequestVerb = "resumeRecord"
+	SessionVerbRequestVerbDial         SessionVerbRequestVerb = "dial"
+	SessionVerbRequestVerbBridge       SessionVerbRequestVerb = "bridge"
+	SessionVerbRequestVerbUnbridge     SessionVerbRequestVerb = "unbridge"
+	SessionVerbRequestVerbTransfer     SessionVerbRequestVerb = "transfer"
+	SessionVerbRequestVerbHold         SessionVerbRequestVerb = "hold"
+	SessionVerbRequestVerbUnhold       SessionVerbRequestVerb = "unhold"
+	SessionVerbRequestVerbPark         SessionVerbRequestVerb = "park"
+	SessionVerbRequestVerbUnpark       SessionVerbRequestVerb = "unpark"
+	SessionVerbRequestVerbPlayDTMF     SessionVerbRequestVerb = "playDtmf"
+	SessionVerbRequestVerbMute         SessionVerbRequestVerb = "mute"
+	SessionVerbRequestVerbUnmute       SessionVerbRequestVerb = "unmute"
+	SessionVerbRequestVerbSetVariable  SessionVerbRequestVerb = "setVariable"
+	SessionVerbRequestVerbSleep        SessionVerbRequestVerb = "sleep"
+	SessionVerbRequestVerbHangup       SessionVerbRequestVerb = "hangup"
 )
 
 // SessionVerbRequestVerbValues lists every member of the vocabulary, in contract order.
@@ -2393,6 +2685,8 @@ var SessionVerbRequestVerbValues = []SessionVerbRequestVerb{
 	SessionVerbRequestVerbStopPlay,
 	SessionVerbRequestVerbGather,
 	SessionVerbRequestVerbRecord,
+	SessionVerbRequestVerbPauseRecord,
+	SessionVerbRequestVerbResumeRecord,
 	SessionVerbRequestVerbDial,
 	SessionVerbRequestVerbBridge,
 	SessionVerbRequestVerbUnbridge,
@@ -2613,26 +2907,28 @@ type SessionVerbResponse struct {
 type SessionVerbResponseVerb string
 
 const (
-	SessionVerbResponseVerbAnswer      SessionVerbResponseVerb = "answer"
-	SessionVerbResponseVerbRinging     SessionVerbResponseVerb = "ringing"
-	SessionVerbResponseVerbPlay        SessionVerbResponseVerb = "play"
-	SessionVerbResponseVerbStopPlay    SessionVerbResponseVerb = "stopPlay"
-	SessionVerbResponseVerbGather      SessionVerbResponseVerb = "gather"
-	SessionVerbResponseVerbRecord      SessionVerbResponseVerb = "record"
-	SessionVerbResponseVerbDial        SessionVerbResponseVerb = "dial"
-	SessionVerbResponseVerbBridge      SessionVerbResponseVerb = "bridge"
-	SessionVerbResponseVerbUnbridge    SessionVerbResponseVerb = "unbridge"
-	SessionVerbResponseVerbTransfer    SessionVerbResponseVerb = "transfer"
-	SessionVerbResponseVerbHold        SessionVerbResponseVerb = "hold"
-	SessionVerbResponseVerbUnhold      SessionVerbResponseVerb = "unhold"
-	SessionVerbResponseVerbPark        SessionVerbResponseVerb = "park"
-	SessionVerbResponseVerbUnpark      SessionVerbResponseVerb = "unpark"
-	SessionVerbResponseVerbPlayDTMF    SessionVerbResponseVerb = "playDtmf"
-	SessionVerbResponseVerbMute        SessionVerbResponseVerb = "mute"
-	SessionVerbResponseVerbUnmute      SessionVerbResponseVerb = "unmute"
-	SessionVerbResponseVerbSetVariable SessionVerbResponseVerb = "setVariable"
-	SessionVerbResponseVerbSleep       SessionVerbResponseVerb = "sleep"
-	SessionVerbResponseVerbHangup      SessionVerbResponseVerb = "hangup"
+	SessionVerbResponseVerbAnswer       SessionVerbResponseVerb = "answer"
+	SessionVerbResponseVerbRinging      SessionVerbResponseVerb = "ringing"
+	SessionVerbResponseVerbPlay         SessionVerbResponseVerb = "play"
+	SessionVerbResponseVerbStopPlay     SessionVerbResponseVerb = "stopPlay"
+	SessionVerbResponseVerbGather       SessionVerbResponseVerb = "gather"
+	SessionVerbResponseVerbRecord       SessionVerbResponseVerb = "record"
+	SessionVerbResponseVerbPauseRecord  SessionVerbResponseVerb = "pauseRecord"
+	SessionVerbResponseVerbResumeRecord SessionVerbResponseVerb = "resumeRecord"
+	SessionVerbResponseVerbDial         SessionVerbResponseVerb = "dial"
+	SessionVerbResponseVerbBridge       SessionVerbResponseVerb = "bridge"
+	SessionVerbResponseVerbUnbridge     SessionVerbResponseVerb = "unbridge"
+	SessionVerbResponseVerbTransfer     SessionVerbResponseVerb = "transfer"
+	SessionVerbResponseVerbHold         SessionVerbResponseVerb = "hold"
+	SessionVerbResponseVerbUnhold       SessionVerbResponseVerb = "unhold"
+	SessionVerbResponseVerbPark         SessionVerbResponseVerb = "park"
+	SessionVerbResponseVerbUnpark       SessionVerbResponseVerb = "unpark"
+	SessionVerbResponseVerbPlayDTMF     SessionVerbResponseVerb = "playDtmf"
+	SessionVerbResponseVerbMute         SessionVerbResponseVerb = "mute"
+	SessionVerbResponseVerbUnmute       SessionVerbResponseVerb = "unmute"
+	SessionVerbResponseVerbSetVariable  SessionVerbResponseVerb = "setVariable"
+	SessionVerbResponseVerbSleep        SessionVerbResponseVerb = "sleep"
+	SessionVerbResponseVerbHangup       SessionVerbResponseVerb = "hangup"
 )
 
 // SessionVerbResponseVerbValues lists every member of the vocabulary, in contract order.
@@ -2643,6 +2939,8 @@ var SessionVerbResponseVerbValues = []SessionVerbResponseVerb{
 	SessionVerbResponseVerbStopPlay,
 	SessionVerbResponseVerbGather,
 	SessionVerbResponseVerbRecord,
+	SessionVerbResponseVerbPauseRecord,
+	SessionVerbResponseVerbResumeRecord,
 	SessionVerbResponseVerbDial,
 	SessionVerbResponseVerbBridge,
 	SessionVerbResponseVerbUnbridge,
@@ -2873,6 +3171,104 @@ func (v ConferenceControlResponseReason) Valid() bool {
 }
 
 func (v ConferenceControlResponseReason) String() string { return string(v) }
+
+// CallControlRequest is the request body of rpc.engine.v1.call-control.
+type CallControlRequest struct {
+	OrgID    string                 `json:"orgId"`
+	CallID   string                 `json:"callId"`
+	LegID    *string                `json:"legId,omitempty"`
+	Verb     CallControlRequestVerb `json:"verb"`
+	ByUserID *string                `json:"byUserId,omitempty"`
+}
+
+// CallControlRequestVerb is the closed vocabulary of CallControlRequest.verb.
+type CallControlRequestVerb string
+
+const (
+	CallControlRequestVerbPauseRecord  CallControlRequestVerb = "pauseRecord"
+	CallControlRequestVerbResumeRecord CallControlRequestVerb = "resumeRecord"
+	CallControlRequestVerbStopRecord   CallControlRequestVerb = "stopRecord"
+)
+
+// CallControlRequestVerbValues lists every member of the vocabulary, in contract order.
+var CallControlRequestVerbValues = []CallControlRequestVerb{
+	CallControlRequestVerbPauseRecord,
+	CallControlRequestVerbResumeRecord,
+	CallControlRequestVerbStopRecord,
+}
+
+// Valid reports whether v is a member of the CallControlRequestVerb vocabulary.
+func (v CallControlRequestVerb) Valid() bool { return slices.Contains(CallControlRequestVerbValues, v) }
+
+func (v CallControlRequestVerb) String() string { return string(v) }
+
+// CallControlResponse is the reply body of rpc.engine.v1.call-control.
+type CallControlResponse struct {
+	Ok         bool                       `json:"ok"`
+	Verb       CallControlResponseVerb    `json:"verb"`
+	InstanceID string                     `json:"instanceId"`
+	LegID      *string                    `json:"legId,omitempty"`
+	Recording  *bool                      `json:"recording,omitempty"`
+	Paused     *bool                      `json:"paused,omitempty"`
+	Reason     *CallControlResponseReason `json:"reason,omitempty"`
+	Error      *string                    `json:"error,omitempty"`
+}
+
+// CallControlResponseVerb is the closed vocabulary of CallControlResponse.verb.
+type CallControlResponseVerb string
+
+const (
+	CallControlResponseVerbPauseRecord  CallControlResponseVerb = "pauseRecord"
+	CallControlResponseVerbResumeRecord CallControlResponseVerb = "resumeRecord"
+	CallControlResponseVerbStopRecord   CallControlResponseVerb = "stopRecord"
+)
+
+// CallControlResponseVerbValues lists every member of the vocabulary, in contract order.
+var CallControlResponseVerbValues = []CallControlResponseVerb{
+	CallControlResponseVerbPauseRecord,
+	CallControlResponseVerbResumeRecord,
+	CallControlResponseVerbStopRecord,
+}
+
+// Valid reports whether v is a member of the CallControlResponseVerb vocabulary.
+func (v CallControlResponseVerb) Valid() bool {
+	return slices.Contains(CallControlResponseVerbValues, v)
+}
+
+func (v CallControlResponseVerb) String() string { return string(v) }
+
+// CallControlResponseReason is the closed vocabulary of CallControlResponse.reason.
+type CallControlResponseReason string
+
+const (
+	CallControlResponseReasonBadRequest    CallControlResponseReason = "bad_request"
+	CallControlResponseReasonUnknownCall   CallControlResponseReason = "unknown-call"
+	CallControlResponseReasonWrongInstance CallControlResponseReason = "wrong_instance"
+	CallControlResponseReasonNotRecording  CallControlResponseReason = "not-recording"
+	CallControlResponseReasonUnsupported   CallControlResponseReason = "unsupported"
+	CallControlResponseReasonMediaRefused  CallControlResponseReason = "media-refused"
+	CallControlResponseReasonShuttingDown  CallControlResponseReason = "shutting-down"
+	CallControlResponseReasonInternal      CallControlResponseReason = "internal"
+)
+
+// CallControlResponseReasonValues lists every member of the vocabulary, in contract order.
+var CallControlResponseReasonValues = []CallControlResponseReason{
+	CallControlResponseReasonBadRequest,
+	CallControlResponseReasonUnknownCall,
+	CallControlResponseReasonWrongInstance,
+	CallControlResponseReasonNotRecording,
+	CallControlResponseReasonUnsupported,
+	CallControlResponseReasonMediaRefused,
+	CallControlResponseReasonShuttingDown,
+	CallControlResponseReasonInternal,
+}
+
+// Valid reports whether v is a member of the CallControlResponseReason vocabulary.
+func (v CallControlResponseReason) Valid() bool {
+	return slices.Contains(CallControlResponseReasonValues, v)
+}
+
+func (v CallControlResponseReason) String() string { return string(v) }
 
 // SessionAnnounceRequest is the request body of rpc.session.v1.announce.
 type SessionAnnounceRequest struct {

@@ -24,7 +24,7 @@
 		},
 		"reason": {
 			"type": "string",
-			"enum": ["caller-hangup", "timeout", "overflow", "no-agents", "exit-key"]
+			"enum": ["caller-hangup", "timeout", "overflow", "no-agents", "exit-key", "callback"]
 		},
 		"exitKey": {
 			"type": "string",

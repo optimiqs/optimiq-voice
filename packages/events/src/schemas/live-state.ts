@@ -255,6 +255,42 @@ export function isLiveChannel(channel: LiveChannel): boolean {
 	return !TEARDOWN_SET.has(channel.state) && channel.hangupAt === undefined;
 }
 
+/**
+ * The flags that carry a leg's recording state. `packages/telephony`'s `CHANNEL_FLAGS` owns them.
+ *
+ * Copied here rather than imported for the reason {@link LIVE_CHANNEL_TEARDOWN_STATES} states:
+ * `packages/events` is the bottom of the dependency graph and must not depend on
+ * `packages/telephony`. Two strings, pinned by a spec on the telephony side.
+ */
+export const LIVE_CHANNEL_RECORDING_FLAGS = {
+	active: "recording",
+	paused: "recording-paused",
+} as const;
+
+/** Whether a leg is being recorded, and whether that recording is silenced. */
+export interface LiveChannelRecording {
+	readonly active: boolean;
+	/** The PCI pause. Always `false` when {@link active} is — a paused nothing is not a state. */
+	readonly paused: boolean;
+}
+
+/**
+ * What the recorder is doing on this leg, as the snapshot's flags report it.
+ *
+ * The reader's half of the rule the engine writes under: `recording-paused` is meaningless without
+ * `recording`, so it is IGNORED rather than trusted when the active flag is absent. A surface that
+ * read the two independently could render "Recording paused" for a call nothing is recording,
+ * which on a PCI control is the one wrong answer that matters — it tells an agent a card number is
+ * safe from a recorder that is not running and is therefore not the thing to check.
+ */
+export function recordingStateOf(channel: LiveChannel): LiveChannelRecording {
+	const active = channel.flags.includes(LIVE_CHANNEL_RECORDING_FLAGS.active);
+	return {
+		active,
+		paused: active && channel.flags.includes(LIVE_CHANNEL_RECORDING_FLAGS.paused),
+	};
+}
+
 // ---------------------------------------------------------------------------------------------
 // media-sessions — which mediad instance holds which RTP session
 // ---------------------------------------------------------------------------------------------
@@ -418,6 +454,112 @@ export function orphanedSipDialogClaims(
 	return claims.filter(
 		(claim) => claim.instanceId !== instanceId && isSipDialogClaimExpired(claim, now),
 	);
+}
+
+// ---------------------------------------------------------------------------------------------
+// sip-instances — which sipd processes are alive, right now
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One entry in the `sip-instances` KV bucket: a `sipd` process saying "I am still here".
+ *
+ * ## Why the dialog claims are not enough
+ *
+ * {@link sipDialogClaimSchema} already carries a lease, and a SURVIVING `sipd` reaps a dead peer's
+ * claims off it. That leaves the case a single-instance edge — which is every small deployment and
+ * every developer stack — cannot cover: when the only `sipd` dies there is no survivor to sweep, so
+ * the engine holds live channels for calls whose signalling plane no longer exists, and a BYE from
+ * the phone is answered `481` by the process that replaced it. The engine has to be able to notice
+ * on its own.
+ *
+ * One key per PROCESS rather than per dialog is what makes that cheap: the engine watches a handful
+ * of keys instead of every dialog on the fleet, and a lease measured in seconds is affordable on a
+ * key each instance rewrites anyway.
+ *
+ * ## Why this lease is short where the dialog lease is long
+ *
+ * The dialog claim's ninety seconds is sized against a heartbeat that walks every live dialog. This
+ * record is one write, so it can be renewed every few seconds, and its expiry is the time a stranded
+ * call spends live and unbillable after its edge dies. Short is the whole point.
+ *
+ * Unlike the dialog claim, this bucket's TTL and the record's {@link expiresAt} are deliberately
+ * the SAME horizon: there is no long-lived correct value here, so server-side expiry is not a
+ * backstop that could reap something live — it is a second reader of the same fact, and it is what
+ * lets a watcher learn of a death from a delete rather than by polling.
+ */
+export const sipInstanceLeaseSchema = z
+	.object({
+		/** The key, repeated in the value: the `sipd` process's own instance id. */
+		instanceId: z.string().min(1).max(128),
+		/** When this process booted. Distinguishes a restart from a renewal at a glance. */
+		startedAt: z.number(),
+		/** Epoch millis of the most recent renewal. */
+		renewedAt: z.number(),
+		/** Epoch millis after which a reader must treat the instance as gone. */
+		expiresAt: z.number(),
+		/** Live dialogs the instance held at the last renewal. Operator-facing; never authorising. */
+		dialogs: z.int().min(0).optional(),
+	})
+	.loose();
+
+export type SipInstanceLease = z.infer<typeof sipInstanceLeaseSchema>;
+
+/** Whether an instance lease has lapsed at `now` (epoch millis). */
+export function isSipInstanceLeaseExpired(lease: SipInstanceLease, now: number): boolean {
+	return now >= lease.expiresAt;
+}
+
+// ---------------------------------------------------------------------------------------------
+// engine-instances — which engine processes are alive, right now
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One entry in the `engine-instances` KV bucket: an engine process saying "I am still here".
+ *
+ * ## Why the channel ownership leases are not enough
+ *
+ * Every `channels` snapshot already carries `OPTIMIQ_ENGINE_INSTANCE_ID` and an expiry, and a
+ * surviving replica's ownership-maintenance pass already adopts a snapshot whose lease has lapsed.
+ * That lease is ninety seconds wide, because it is sized against a heartbeat that rewrites EVERY
+ * live channel — so between an engine being SIGKILLed and its calls being adopted there is up to a
+ * minute and a half in which the audio still flows through `mediad`, the dialog still stands in
+ * `sipd`, and no process in the fleet holds an aggregate for the call. A BYE arriving in that window
+ * reaches a replica with no aggregate and returns early: the call is never ended and never billed.
+ *
+ * One key per PROCESS collapses that window to the lease below, for the same reason
+ * {@link sipInstanceLeaseSchema} does it for the edge, and at the same cost: a handful of keys to
+ * watch instead of every channel on the fleet. The channel lease stays exactly as it is — it is the
+ * FENCE that makes an adoption safe, and a survivor that has proved the owner dead can contest an
+ * unexpired one, whereas a survivor with no such proof must not.
+ *
+ * ## Why this is symmetric with `sip-instances` and not merged with it
+ *
+ * The two record the same fact about two different planes, and the verdicts they drive are
+ * opposites: a dead `sipd` means its legs must be ENDED, because a dialog cannot be re-homed; a dead
+ * engine means its channels must be ADOPTED, because nothing about a channel is bound to the process
+ * that held it. Sharing a bucket would put those two verdicts one malformed value apart, and would
+ * let an engine's write reach a reader that ends calls.
+ */
+export const engineInstanceLeaseSchema = z
+	.object({
+		/** The key, repeated in the value: the engine process's own instance id. */
+		instanceId: z.string().min(1).max(128),
+		/** When this process booted. Distinguishes a restart from a renewal at a glance. */
+		startedAt: z.number(),
+		/** Epoch millis of the most recent renewal. */
+		renewedAt: z.number(),
+		/** Epoch millis after which a reader must treat the instance as gone. */
+		expiresAt: z.number(),
+		/** Live channels the instance held at the last renewal. Operator-facing; never authorising. */
+		channels: z.int().min(0).optional(),
+	})
+	.loose();
+
+export type EngineInstanceLease = z.infer<typeof engineInstanceLeaseSchema>;
+
+/** Whether an engine instance lease has lapsed at `now` (epoch millis). */
+export function isEngineInstanceLeaseExpired(lease: EngineInstanceLease, now: number): boolean {
+	return now >= lease.expiresAt;
 }
 
 // ---------------------------------------------------------------------------------------------

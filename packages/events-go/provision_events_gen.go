@@ -10,9 +10,10 @@ import "slices"
 // Event types carried on the provision family's subjects. The value is the envelope's
 // `type` discriminator, which is unique WITHIN the family only.
 const (
-	EventTypeProvisionDeviceRequested = "device.requested"
-	EventTypeProvisionDeviceRendered  = "device.rendered"
-	EventTypeProvisionDeviceRejected  = "device.rejected"
+	EventTypeProvisionDeviceRequested       = "device.requested"
+	EventTypeProvisionDeviceRendered        = "device.rendered"
+	EventTypeProvisionDeviceRejected        = "device.rejected"
+	EventTypeProvisionCredentialInvalidated = "credential.invalidated"
 )
 
 // ProvisionDeviceRequestedData is the payload of the "device.requested" event.
@@ -92,3 +93,12 @@ func (v ProvisionDeviceRejectedReason) Valid() bool {
 }
 
 func (v ProvisionDeviceRejectedReason) String() string { return string(v) }
+
+// ProvisionCredentialInvalidatedData is the payload of the "credential.invalidated" event.
+//
+// Subject: provision.evt.v1.<orgId>
+// Envelope: Envelope[ProvisionCredentialInvalidatedData]
+type ProvisionCredentialInvalidatedData struct {
+	Reason  string `json:"reason"`
+	Dropped int    `json:"dropped"`
+}

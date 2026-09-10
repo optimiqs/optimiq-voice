@@ -144,6 +144,7 @@ type MediaRecordingFinishedData struct {
 	Bytes        int                             `json:"bytes"`
 	ObjectKey    string                          `json:"objectKey"`
 	Direction    MediaRecordingFinishedDirection `json:"direction"`
+	Pauses       []MediaRecordingFinishedPauses  `json:"pauses,omitempty"`
 	Detail       *string                         `json:"detail,omitempty"`
 }
 
@@ -194,6 +195,12 @@ func (v MediaRecordingFinishedDirection) Valid() bool {
 }
 
 func (v MediaRecordingFinishedDirection) String() string { return string(v) }
+
+// MediaRecordingFinishedPauses is a payload fragment of the contract.
+type MediaRecordingFinishedPauses struct {
+	StartMs int `json:"startMs"`
+	EndMs   int `json:"endMs"`
+}
 
 // MediaDtmfReceivedData is the payload of the "dtmf.received" event.
 //

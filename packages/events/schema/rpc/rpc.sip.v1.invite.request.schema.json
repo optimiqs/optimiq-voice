@@ -17,6 +17,11 @@
 			"format": "uuid",
 			"pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
 		},
+		"deviceId": {
+			"type": "string",
+			"format": "uuid",
+			"pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+		},
 		"authentication": {
 			"type": "string",
 			"enum": ["digest", "trunk-acl"]
@@ -129,6 +134,33 @@
 				}
 			},
 			"required": ["mismatch", "private"],
+			"additionalProperties": false
+		},
+		"attestation": {
+			"type": "object",
+			"properties": {
+				"level": {
+					"type": "string",
+					"enum": ["A", "B", "C"]
+				},
+				"verstat": {
+					"type": "string",
+					"maxLength": 64
+				},
+				"assertedIdentity": {
+					"type": "string",
+					"maxLength": 256
+				},
+				"origId": {
+					"type": "string",
+					"maxLength": 128
+				},
+				"signed": {
+					"default": false,
+					"type": "boolean"
+				}
+			},
+			"required": ["signed"],
 			"additionalProperties": false
 		},
 		"userAgent": {

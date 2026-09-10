@@ -21,32 +21,36 @@ const (
 // Subject: cdr.leg.v1.<orgId>
 // Envelope: Envelope[CDRLegWriteData]
 type CDRLegWriteData struct {
-	ID               string                   `json:"id"`
-	CallID           string                   `json:"callId"`
-	Leg              LegSide                  `json:"leg"`
-	OriginatingLegID *string                  `json:"originatingLegId,omitempty"`
-	BridgeLegID      *string                  `json:"bridgeLegId,omitempty"`
-	Direction        CallDirection            `json:"direction"`
-	FromNumber       string                   `json:"fromNumber"`
-	FromName         *string                  `json:"fromName,omitempty"`
-	ToNumber         string                   `json:"toNumber"`
-	DestinationType  string                   `json:"destinationType"`
-	DestinationRef   *string                  `json:"destinationRef,omitempty"`
-	StartedAt        EventTime                `json:"startedAt"`
-	AnsweredAt       *EventTime               `json:"answeredAt,omitempty"`
-	EndedAt          *EventTime               `json:"endedAt,omitempty"`
-	DurationMs       int                      `json:"durationMs"`
-	BillsecMs        int                      `json:"billsecMs"`
-	HangupCause      string                   `json:"hangupCause"`
-	HangupCauseCode  int                      `json:"hangupCauseCode"`
-	HangupSide       *HangupSide              `json:"hangupSide,omitempty"`
-	Disposition      string                   `json:"disposition"`
-	QueueRef         *string                  `json:"queueRef,omitempty"`
-	QueueWaitMs      *int                     `json:"queueWaitMs,omitempty"`
-	QueueOutcome     *CDRLegWriteQueueOutcome `json:"queueOutcome,omitempty"`
-	QueueAgentRef    *string                  `json:"queueAgentRef,omitempty"`
-	AuthPinOrdinal   *int                     `json:"authPinOrdinal,omitempty"`
-	AuthPinLabel     *string                  `json:"authPinLabel,omitempty"`
+	ID               string                     `json:"id"`
+	CallID           string                     `json:"callId"`
+	Leg              LegSide                    `json:"leg"`
+	OriginatingLegID *string                    `json:"originatingLegId,omitempty"`
+	BridgeLegID      *string                    `json:"bridgeLegId,omitempty"`
+	Direction        CallDirection              `json:"direction"`
+	FromNumber       string                     `json:"fromNumber"`
+	FromName         *string                    `json:"fromName,omitempty"`
+	ToNumber         string                     `json:"toNumber"`
+	DestinationType  string                     `json:"destinationType"`
+	DestinationRef   *string                    `json:"destinationRef,omitempty"`
+	StartedAt        EventTime                  `json:"startedAt"`
+	AnsweredAt       *EventTime                 `json:"answeredAt,omitempty"`
+	EndedAt          *EventTime                 `json:"endedAt,omitempty"`
+	DurationMs       int                        `json:"durationMs"`
+	BillsecMs        int                        `json:"billsecMs"`
+	HangupCause      string                     `json:"hangupCause"`
+	HangupCauseCode  int                        `json:"hangupCauseCode"`
+	HangupSide       *HangupSide                `json:"hangupSide,omitempty"`
+	Disposition      string                     `json:"disposition"`
+	QueueRef         *string                    `json:"queueRef,omitempty"`
+	QueueWaitMs      *int                       `json:"queueWaitMs,omitempty"`
+	QueueOutcome     *CDRLegWriteQueueOutcome   `json:"queueOutcome,omitempty"`
+	QueueAgentRef    *string                    `json:"queueAgentRef,omitempty"`
+	RelatedCallID    *string                    `json:"relatedCallId,omitempty"`
+	AuthPinOrdinal   *int                       `json:"authPinOrdinal,omitempty"`
+	AuthPinLabel     *string                    `json:"authPinLabel,omitempty"`
+	SIPAttestation   *CDRLegWriteSIPAttestation `json:"sipAttestation,omitempty"`
+	SIPVerstat       *string                    `json:"sipVerstat,omitempty"`
+	SIPOrigID        *string                    `json:"sipOrigId,omitempty"`
 
 	// Extra carries every key outside the pinned contract, verbatim. The TS schema is a
 	// z.looseObject (see cdr-events.ts) precisely so a producer running ahead of the
@@ -99,8 +103,12 @@ var knownKeysCDRLegWriteData = map[string]struct{}{
 	"queueWaitMs":      {},
 	"queueOutcome":     {},
 	"queueAgentRef":    {},
+	"relatedCallId":    {},
 	"authPinOrdinal":   {},
 	"authPinLabel":     {},
+	"sipAttestation":   {},
+	"sipVerstat":       {},
+	"sipOrigId":        {},
 }
 
 // CDRLegWriteQueueOutcome is the closed vocabulary of CDRLegWriteData.queueOutcome.
@@ -113,6 +121,7 @@ const (
 	CDRLegWriteQueueOutcomeOverflow     CDRLegWriteQueueOutcome = "overflow"
 	CDRLegWriteQueueOutcomeNoAgents     CDRLegWriteQueueOutcome = "no-agents"
 	CDRLegWriteQueueOutcomeExitKey      CDRLegWriteQueueOutcome = "exit-key"
+	CDRLegWriteQueueOutcomeCallback     CDRLegWriteQueueOutcome = "callback"
 )
 
 // CDRLegWriteQueueOutcomeValues lists every member of the vocabulary, in contract order.
@@ -123,6 +132,7 @@ var CDRLegWriteQueueOutcomeValues = []CDRLegWriteQueueOutcome{
 	CDRLegWriteQueueOutcomeOverflow,
 	CDRLegWriteQueueOutcomeNoAgents,
 	CDRLegWriteQueueOutcomeExitKey,
+	CDRLegWriteQueueOutcomeCallback,
 }
 
 // Valid reports whether v is a member of the CDRLegWriteQueueOutcome vocabulary.
@@ -131,3 +141,26 @@ func (v CDRLegWriteQueueOutcome) Valid() bool {
 }
 
 func (v CDRLegWriteQueueOutcome) String() string { return string(v) }
+
+// CDRLegWriteSIPAttestation is the closed vocabulary of CDRLegWriteData.sipAttestation.
+type CDRLegWriteSIPAttestation string
+
+const (
+	CDRLegWriteSIPAttestationA CDRLegWriteSIPAttestation = "A"
+	CDRLegWriteSIPAttestationB CDRLegWriteSIPAttestation = "B"
+	CDRLegWriteSIPAttestationC CDRLegWriteSIPAttestation = "C"
+)
+
+// CDRLegWriteSIPAttestationValues lists every member of the vocabulary, in contract order.
+var CDRLegWriteSIPAttestationValues = []CDRLegWriteSIPAttestation{
+	CDRLegWriteSIPAttestationA,
+	CDRLegWriteSIPAttestationB,
+	CDRLegWriteSIPAttestationC,
+}
+
+// Valid reports whether v is a member of the CDRLegWriteSIPAttestation vocabulary.
+func (v CDRLegWriteSIPAttestation) Valid() bool {
+	return slices.Contains(CDRLegWriteSIPAttestationValues, v)
+}
+
+func (v CDRLegWriteSIPAttestation) String() string { return string(v) }

@@ -841,6 +841,31 @@ describe("resolveOutbound — digits and identity", () => {
 		).toBe("+15559990000");
 	});
 
+	it("carries the extension's caller-id presentation, and only when it withholds", () => {
+		const withheld = compiled(
+			aSnapshot({
+				extensions: [
+					anExtension(),
+					anExtension({
+						id: "ext-2",
+						number: "1002",
+						outboundCallerIdPresentation: "restricted",
+					}),
+				],
+				trunks: [aTrunk()],
+				outboundRoutes: [anOutboundRoute()],
+			}),
+		);
+		expect(
+			resolveOutbound(withheld, { from: "1002", dialed: "+15551230001", now: NOW })
+				.callerIdPresentation,
+		).toBe("restricted");
+		expect(
+			resolveOutbound(withheld, { from: "1001", dialed: "+15551230001", now: NOW })
+				.callerIdPresentation,
+		).toBeUndefined();
+	});
+
 	it("returns regex captures from the matching dial pattern", () => {
 		const regexRoute = compiled(
 			aSnapshot({

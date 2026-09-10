@@ -64,10 +64,23 @@ describe("mirrored vocabularies", () => {
 		expect([...CALL_BLOCK_ACTIONS]).toEqual(["block", "allow", "reject", "voicemail"]);
 	});
 
-	it("mirrors the twenty feature-code actions", () => {
-		expect(FEATURE_CODE_ACTIONS).toHaveLength(20);
+	/**
+	 * Twenty-four from `pbx-db`, plus the two this package adds. The two are NOT in the database's
+	 * list on purpose — no `feature_code` row may carry them, because both codes live on the entity
+	 * they act on — so the count is asserted as two numbers rather than one, and a new action on
+	 * either side has to say which side it is on. The hot-desk pair IS in the database's list, for
+	 * the reason recorded beside it: neither names an entity.
+	 */
+	it("mirrors the twenty-four feature-code actions and adds the two entity toggles", () => {
+		expect(FEATURE_CODE_ACTIONS).toHaveLength(26);
 		expect(FEATURE_CODE_ACTIONS).toContain("voicemail-check");
 		expect(FEATURE_CODE_ACTIONS).toContain("eavesdrop");
+		expect(FEATURE_CODE_ACTIONS).toContain("hotdesk-login");
+		expect(FEATURE_CODE_ACTIONS).toContain("hotdesk-logout");
+		expect(FEATURE_CODE_ACTIONS).toContain("caller-id-presentation-restrict");
+		expect(FEATURE_CODE_ACTIONS).toContain("caller-id-presentation-allow");
+		expect(FEATURE_CODE_ACTIONS).toContain("call-flow-toggle");
+		expect(FEATURE_CODE_ACTIONS).toContain("time-condition-override");
 	});
 });
 

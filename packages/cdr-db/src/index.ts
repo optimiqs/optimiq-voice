@@ -33,6 +33,7 @@ export {
 	CDR_PARTITION_KEYS,
 	createMonthlyPartition,
 	defaultPartitionName,
+	droppablePartitionsQuery,
 	dropPartitionsBeforeQuery,
 	ensureMonthlyPartitionQuery,
 	ensureMonthlyPartitions,

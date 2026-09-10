@@ -92,17 +92,33 @@ export {
 	type UpdateOutboundVoiceProfileInput,
 } from "./resources/outbound-voice-profiles";
 export {
+	assertCnamDetails,
 	isTelnyxNumberLive,
 	type ListPhoneNumbersQuery,
+	TELNYX_CNAM_DETAILS_MAX_LENGTH,
 	TELNYX_PHONE_NUMBER_STATUSES,
+	type TelnyxCnamListing,
+	TelnyxCnamFormatError,
 	type TelnyxPhoneNumber,
 	type TelnyxPhoneNumberStatus,
 	type TelnyxVoiceSettings,
 	telnyxPhoneNumberSchema,
 	telnyxVoiceSettingsSchema,
+	type UpdateCnamListingInput,
 	type UpdatePhoneNumberInput,
 	type UpdateVoiceSettingsInput,
 } from "./resources/phone-numbers";
+export {
+	type CreatePortingOrderInput,
+	type ListPortingOrdersQuery,
+	portingOrderSchema,
+	type PortingOrdersResource,
+	TELNYX_PORTING_ACTIVATION_STATUSES,
+	TELNYX_PORTING_ORDER_STATUSES,
+	type TelnyxPortingActivationStatus,
+	type TelnyxPortingOrder,
+	type TelnyxPortingOrderStatus,
+} from "./resources/porting-orders";
 export {
 	backoffDelayMs,
 	DEFAULT_RETRY_POLICY,

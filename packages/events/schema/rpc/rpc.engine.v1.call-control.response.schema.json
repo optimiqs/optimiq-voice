@@ -1,0 +1,47 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"ok": {
+			"type": "boolean"
+		},
+		"verb": {
+			"type": "string",
+			"enum": ["pauseRecord", "resumeRecord", "stopRecord"]
+		},
+		"instanceId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"legId": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"recording": {
+			"type": "boolean"
+		},
+		"paused": {
+			"type": "boolean"
+		},
+		"reason": {
+			"type": "string",
+			"enum": [
+				"bad_request",
+				"unknown-call",
+				"wrong_instance",
+				"not-recording",
+				"unsupported",
+				"media-refused",
+				"shutting-down",
+				"internal"
+			]
+		},
+		"error": {
+			"type": "string",
+			"maxLength": 512
+		}
+	},
+	"required": ["ok", "verb", "instanceId"],
+	"additionalProperties": false
+}

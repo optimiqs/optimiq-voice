@@ -178,6 +178,11 @@ export type VoicemailGreetingKind = (typeof VOICEMAIL_GREETING_KINDS)[number];
  */
 export const VOICEMAIL_LEAVE_GREETING_PRECEDENCE = ["temporary", "unavailable"] as const;
 
+/** Mirrored from `pbx-db` `extensions-schema.ts`. Absent on a row behaves as `allowed`. */
+export const CALLER_ID_PRESENTATIONS = ["allowed", "restricted"] as const;
+
+export type CallerIdPresentation = (typeof CALLER_ID_PRESENTATIONS)[number];
+
 /** Mirrored from `pbx-db` `features-schema.ts`. */
 export const FEATURE_CODE_ACTIONS = [
 	"voicemail-check",
@@ -200,6 +205,31 @@ export const FEATURE_CODE_ACTIONS = [
 	"agent-status",
 	"eavesdrop",
 	"transfer",
+	"hotdesk-login",
+	"hotdesk-logout",
+	/**
+	 * Per-call CLIR: `*67<destination>` withholds this call's caller id, `*82<destination>` presents
+	 * it. Both take the destination as their dialled argument — see `pbx-db` `features-schema.ts`.
+	 */
+	"caller-id-presentation-restrict",
+	"caller-id-presentation-allow",
+	/**
+	 * The two actions this package adds to `pbx-db`'s list, and the reason they are here and not
+	 * there.
+	 *
+	 * A `feature_code` ROW cannot carry either of them: the code that flips a call flow to night mode
+	 * lives on `call_flow.feature_code`, and the code that cycles a time-condition override lives on
+	 * `time_condition.override_feature_code` — because each belongs to one entity and a row in the
+	 * shared catalogue would need a `params` pointer back at it that nothing keeps honest. The DTO
+	 * enum therefore stays as it is, and a tenant cannot create a code with either action by hand.
+	 *
+	 * They exist HERE because the compiler synthesises a catalogue entry per flow and per condition,
+	 * which is what makes those codes dialable at all. Before this, both were validated on the form,
+	 * offered in the UI and reached neither `internal.featureCodes` nor `internal.numbers` — a `*65`
+	 * that fell through to "no outbound route matched", recorded in `E2E-routing2.md`.
+	 */
+	"call-flow-toggle",
+	"time-condition-override",
 ] as const;
 
 export type FeatureCodeAction = (typeof FEATURE_CODE_ACTIONS)[number];
@@ -291,6 +321,8 @@ export interface ExtensionInput extends RoutingEntityInput {
 	readonly callerIdNumber?: string | null;
 	readonly outboundCallerIdName?: string | null;
 	readonly outboundCallerIdNumber?: string | null;
+	/** `extension.outbound_caller_id_presentation`. Absent behaves as `allowed`. */
+	readonly outboundCallerIdPresentation?: CallerIdPresentation | null;
 	readonly emergencyCallerIdNumber?: string | null;
 	readonly voicemailEnabled: boolean;
 	readonly doNotDisturb: boolean;
@@ -557,6 +589,32 @@ export interface QueueInput extends RoutingEntityInput {
 	readonly exitDestinationType?: DestinationInput["destinationType"] | null;
 	readonly exitDestinationRef?: string | null;
 	readonly exitDestinationData?: DestinationInput["destinationData"];
+	/**
+	 * Virtual hold: whether a waiting caller may hang up and keep their place, to be called back
+	 * when an agent frees.
+	 *
+	 * Optional for the rollout reason every other late field here is optional: a loader that does
+	 * not select the column produces a queue with no callback, which is what every queue had.
+	 */
+	readonly callbackEnabled?: boolean | null;
+	/** The DTMF digit that accepts the offer. Null/absent means the offer is announcement-only. */
+	readonly callbackKey?: string | null;
+	/**
+	 * Wait after which the offer is announced unprompted. `0`/absent means it is never announced and
+	 * the caller reaches it only by pressing {@link callbackKey} — which is a real configuration and
+	 * not a mistake, so it earns no diagnostic on its own.
+	 */
+	readonly callbackOfferAfterSeconds?: number | null;
+	/** "Press 1 to keep your place and we will call you back." */
+	readonly callbackOfferPromptId?: string | null;
+	/** "Thank you — we will call you on this number." Played once the place is held. */
+	readonly callbackConfirmPromptId?: string | null;
+	/** How many times the callback is attempted before the place is given up. */
+	readonly callbackMaxAttempts?: number | null;
+	/** How long after a failed attempt the next one may be made. */
+	readonly callbackRetryDelaySeconds?: number | null;
+	/** How long the held place survives at all, across every attempt. */
+	readonly callbackExpiresAfterSeconds?: number | null;
 	/** `queue.default_priority`. A referring destination may override it per entry. */
 	readonly defaultPriority?: number | null;
 	readonly abandonedResumeAllowed?: boolean | null;
@@ -926,15 +984,25 @@ export interface PhraseStepInput extends RoutingEntityInput {
 /**
  * A `prompt` row, as far as routing is concerned.
  *
- * Only three fields, and only because of phrases: the compiler has to know which prompt ids are
+ * Four fields. The first two are for phrases: the compiler has to know which prompt ids are
  * PHRASES (so it can expand them) and which are audio (so it can refuse a nested phrase). The
- * object key, the duration and the checksum belong to the media layer; nothing about them changes a
- * routing decision.
+ * duration and the checksum belong to the media layer; nothing about them changes a routing
+ * decision.
+ *
+ * The object key does, though, and only because nothing else can supply it: a plan node names a
+ * prompt by ROW ID, the file lives under a different id inside the object store, and the engine
+ * holds no database handle. Without the key the reference is unresolvable at play time — the
+ * `object://` half of the same story `voicemail_greeting.object_key` already tells.
  */
 export interface PromptInput extends RoutingEntityInput {
 	readonly name: string;
 	/** `"phrase"` marks a sequence; everything else is a single piece of audio. */
 	readonly kind: string;
+	/**
+	 * Key into the deployment's object store. Null for a phrase, which has audio of its own only
+	 * through its steps, and absent from a loader that does not project the column yet.
+	 */
+	readonly objectKey?: string | null;
 }
 
 /** Mirrored from `pbx-db` `directory-schema.ts`. */
@@ -982,8 +1050,9 @@ export interface RoutingSettingsInput {
 	 * It rides `settings` for the same mechanical reason `maxConcurrentCalls` does: it is a per-org
 	 * fact the engine reads out of the compiled artifact, and the artifact is the ONLY per-org surface
 	 * the engine reads — it holds no database handle. Absent (or `null`) means the tenant has set no
-	 * realm, in which case the engine falls back to its fleet-wide `ENGINE_SIP_REALM` and, failing
-	 * that, the extension B-leg carries no target and the composite refuses `originate` by name. It
+	 * realm, in which case the extension B-leg carries no target and the composite refuses
+	 * `originate` by name — there is no deployment-wide fallback, because a realm names exactly one
+	 * tenant and borrowing one would dial into another organization's domain. It
 	 * lives in `org_setting` under `category='sip'`, `name='realm'` — the same row the provisioning
 	 * softphone path and sipd's realm→org mapping already read — not under the `routing` category.
 	 */
@@ -998,6 +1067,16 @@ export interface RoutingSettingsInput {
 	/** Org-wide outbound caller id, used when neither route nor extension supplies one. */
 	readonly outboundCallerIdNumber?: string | null;
 	readonly outboundCallerIdName?: string | null;
+	/**
+	 * The country calling code this organization's national numbers belong to — `"1"` for NANP,
+	 * `"44"` for the UK. Digits only; a leading `+` is tolerated and stripped.
+	 *
+	 * Read by nothing at call time. It exists so the compiler can canonicalise a DID or a caller id
+	 * that reached the database as a bare national number, and its absence is meaningful rather than
+	 * a default: with no code, `2125550100` is genuinely ambiguous, and `e164-ingest.ts` reports it
+	 * rather than guessing `+1` and pointing a British tenant's routing at Manhattan.
+	 */
+	readonly defaultCallingCode?: string | null;
 	/**
 	 * Hangup causes that let an outbound dial continue to the next trunk. Defaults to
 	 * `RETRYABLE_HANGUP_CAUSES` from `@optimiq-voice/telephony` — never "all causes", because

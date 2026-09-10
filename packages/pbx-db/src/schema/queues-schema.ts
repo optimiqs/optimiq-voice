@@ -152,6 +152,43 @@ export const queue = pgTable.withRLS(
 		/** Taken when a waiting caller presses {@link queue.exitKey}. */
 		...namedDestinationColumns("exit"),
 		/**
+		 * Virtual hold: whether a waiting caller may be offered a callback and keep their place.
+		 *
+		 * Default OFF, and the reason is the one {@link queue.abandonedResumeAllowed} gives — the held
+		 * place is keyed by CALLER NUMBER, so a queue whose callers share a switchboard number would
+		 * call one person back and hand another their place. The two features write the SAME
+		 * tombstone (`queueResumeTombstoneSchema`); the only difference is who dials, which is why a
+		 * caller who rings back before the system reaches them simply claims their own token.
+		 */
+		callbackEnabled: boolean("callback_enabled").notNull().default(false),
+		/**
+		 * The digit that accepts the offer. NULL means the offer is announced and cannot be taken,
+		 * which is only useful with a prompt that tells the caller to do something else.
+		 *
+		 * Same one-character rule, same database check and the same reason as {@link queue.exitKey}:
+		 * the engine compares it against a `DtmfEvent.digit` with `===`. It may not BE the exit key —
+		 * the compiler drops the callback's claim on the digit when it is, because leaving the queue
+		 * is the more destructive reading of a keypress.
+		 */
+		callbackKey: text("callback_key"),
+		/** Seconds of waiting after which the offer plays unprompted. 0 means only on the key. */
+		callbackOfferAfterSeconds: integer("callback_offer_after_seconds").notNull().default(0),
+		/** "Press 1 to keep your place and we will call you back." */
+		callbackOfferPromptId: uuidEntityId("callback_offer_prompt_id").references(() => prompt.id, {
+			onDelete: "set null",
+		}),
+		/** "Thank you — we will call you on this number." Played once the place is held. */
+		callbackConfirmPromptId: uuidEntityId("callback_confirm_prompt_id").references(
+			() => prompt.id,
+			{ onDelete: "set null" },
+		),
+		/** Attempts before the held place is given up. */
+		callbackMaxAttempts: integer("callback_max_attempts").notNull().default(3),
+		/** Seconds between a failed attempt and the next. */
+		callbackRetryDelaySeconds: integer("callback_retry_delay_seconds").notNull().default(300),
+		/** Seconds the held place survives at all, across every attempt. */
+		callbackExpiresAfterSeconds: integer("callback_expires_after_seconds").notNull().default(3600),
+		/**
 		 * The priority every caller entering this queue starts with, unless the destination that sent
 		 * them overrode it (`destination_data.args.priority` on a `queue` destination — an IVR option
 		 * saying "press 2 if you are a platinum customer" is exactly that).
@@ -182,6 +219,11 @@ export const queue = pgTable.withRLS(
 		 * that does nothing. A NULL passes — that is how the column spells "disabled".
 		 */
 		check("queue_exit_key_shape_check", sql`exit_key is null or exit_key ~ '^[0-9*#A-D]$'`),
+		/** The same shape rule, for the same reason, on the callback's accept digit. */
+		check(
+			"queue_callback_key_shape_check",
+			sql`callback_key is null or callback_key ~ '^[0-9*#A-D]$'`,
+		),
 		check(
 			"queue_default_priority_range_check",
 			sql.raw(

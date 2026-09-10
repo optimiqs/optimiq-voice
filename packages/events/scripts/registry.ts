@@ -4,10 +4,12 @@ import { CALL_EVENT_DEFINITIONS } from "../src/schemas/call-events";
 import { CDR_EVENT_DEFINITIONS } from "../src/schemas/cdr-events";
 import { baseEventEnvelopeSchema } from "../src/schemas/envelope";
 import {
+	engineInstanceLeaseSchema,
 	extensionPresenceSchema,
 	mediaSessionDirectoryEntrySchema,
 	sipAclEntrySchema,
 	sipDialogClaimSchema,
+	sipInstanceLeaseSchema,
 	trunkDirectoryEntrySchema,
 } from "../src/schemas/live-state";
 import { MEDIA_EVENT_DEFINITIONS } from "../src/schemas/media-events";
@@ -285,6 +287,7 @@ export const EVENT_ENTRIES: readonly EventEntry[] = [
 	registrationEntry("registered", "RegistrationRegistered"),
 	registrationEntry("unregistered", "RegistrationUnregistered"),
 	registrationEntry("expired", "RegistrationExpired"),
+	registrationEntry("auth-failed", "RegistrationAuthFailed"),
 
 	sipDialogEntry("dialog.progressed", "SIPDialogProgressed"),
 	sipDialogEntry("dialog.answered", "SIPDialogAnswered"),
@@ -297,6 +300,8 @@ export const EVENT_ENTRIES: readonly EventEntry[] = [
 	queueEntry("caller.answered", "QueueCallerAnswered"),
 	queueEntry("caller.abandoned", "QueueCallerAbandoned"),
 	queueEntry("agent.state", "QueueAgentState"),
+	queueEntry("callback.placed", "QueueCallbackPlaced"),
+	queueEntry("callback.failed", "QueueCallbackFailed"),
 
 	voicemailEntry("message.left", "VoicemailMessageLeft"),
 	voicemailEntry("mwi.updated", "VoicemailMWIUpdated"),
@@ -329,6 +334,7 @@ export const EVENT_ENTRIES: readonly EventEntry[] = [
 	provisionEntry("device.requested", "ProvisionDeviceRequested"),
 	provisionEntry("device.rendered", "ProvisionDeviceRendered"),
 	provisionEntry("device.rejected", "ProvisionDeviceRejected"),
+	provisionEntry("credential.invalidated", "ProvisionCredentialInvalidated"),
 ];
 
 /** One request-reply contract: the subject plus its request/response pair. */
@@ -372,6 +378,20 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		timeoutMs: RPC_CONTRACTS["rpc.pbx.v1.extension-feature"].timeoutMs,
 		request: RPC_CONTRACTS["rpc.pbx.v1.extension-feature"].request,
 		response: RPC_CONTRACTS["rpc.pbx.v1.extension-feature"].response,
+	},
+	{
+		subject: "rpc.pbx.v1.toggle-feature",
+		goName: "ToggleFeature",
+		timeoutMs: RPC_CONTRACTS["rpc.pbx.v1.toggle-feature"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.pbx.v1.toggle-feature"].request,
+		response: RPC_CONTRACTS["rpc.pbx.v1.toggle-feature"].response,
+	},
+	{
+		subject: "rpc.pbx.v1.hot-desk",
+		goName: "HotDesk",
+		timeoutMs: RPC_CONTRACTS["rpc.pbx.v1.hot-desk"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.pbx.v1.hot-desk"].request,
+		response: RPC_CONTRACTS["rpc.pbx.v1.hot-desk"].response,
 	},
 	{
 		subject: "rpc.pbx.v1.last-caller",
@@ -552,6 +572,13 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		request: RPC_CONTRACTS["rpc.media.v1.stop-recording"].request,
 		response: RPC_CONTRACTS["rpc.media.v1.stop-recording"].response,
 	},
+	{
+		subject: "rpc.media.v1.pause-recording",
+		goName: "MediaPauseRecording",
+		timeoutMs: RPC_CONTRACTS["rpc.media.v1.pause-recording"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.media.v1.pause-recording"].request,
+		response: RPC_CONTRACTS["rpc.media.v1.pause-recording"].response,
+	},
 	// Supervision. The one media pair emitted BEFORE its responder exists: `mediad` refuses the
 	// operation today (asymmetric routing is a mix, which is rung 6) and the Go structs are emitted
 	// anyway, because the whole argument for declaring the full shape now — see
@@ -598,6 +625,16 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		request: RPC_CONTRACTS["rpc.engine.v1.originate"].request,
 		response: RPC_CONTRACTS["rpc.engine.v1.originate"].response,
 	},
+	// Virtual hold's dialler. Engine to engine and TypeScript on both ends, emitted for the reason
+	// the originate above it is: the Go side reads the same taxonomy, and a subject the generated
+	// package does not name reads as a subject that does not exist.
+	{
+		subject: "rpc.engine.v1.queue-callback",
+		goName: "QueueCallback",
+		timeoutMs: RPC_CONTRACTS["rpc.engine.v1.queue-callback"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.engine.v1.queue-callback"].request,
+		response: RPC_CONTRACTS["rpc.engine.v1.queue-callback"].response,
+	},
 	// Engine to engine, and the only subject here whose emitted constant is a PREFIX: the wire
 	// subject appends the owning instance's token. Emitted anyway, because the Go side reads the
 	// same taxonomy and a missing entry reads as "this subject does not exist".
@@ -629,6 +666,18 @@ export const RPC_ENTRIES: readonly RpcEntry[] = [
 		timeoutMs: RPC_CONTRACTS["rpc.engine.v1.conference-control"].timeoutMs,
 		request: RPC_CONTRACTS["rpc.engine.v1.conference-control"].request,
 		response: RPC_CONTRACTS["rpc.engine.v1.conference-control"].response,
+	},
+	// The PBX recording control, api to engine. A PREFIX like the three above it — the wire subject
+	// appends the token of the instance the `channels` bucket says owns the leg — and emitted for
+	// the same reason: a subject the generated package does not name reads as one that does not
+	// exist. No Go process calls it today; sipd and mediad are on the other side of the engine from
+	// this surface.
+	{
+		subject: "rpc.engine.v1.call-control",
+		goName: "CallControl",
+		timeoutMs: RPC_CONTRACTS["rpc.engine.v1.call-control"].timeoutMs,
+		request: RPC_CONTRACTS["rpc.engine.v1.call-control"].request,
+		response: RPC_CONTRACTS["rpc.engine.v1.call-control"].response,
 	},
 	{
 		subject: "rpc.session.v1.announce",
@@ -674,6 +723,18 @@ export const LIVE_STATE_ENTRIES: readonly LiveStateEntry[] = [
 		goName: "SIPDialogClaim",
 		doc: "the claim one sipd instance holds on a dialog, in the sip-dialogs KV bucket.",
 		schema: sipDialogClaimSchema,
+	},
+	{
+		bucket: "sip-instances",
+		goName: "SIPInstanceLease",
+		doc: "the liveness lease one sipd instance renews, in the sip-instances KV bucket.",
+		schema: sipInstanceLeaseSchema,
+	},
+	{
+		bucket: "engine-instances",
+		goName: "EngineInstanceLease",
+		doc: "the liveness lease one engine instance renews, in the engine-instances KV bucket.",
+		schema: engineInstanceLeaseSchema,
 	},
 	{
 		bucket: "presence",

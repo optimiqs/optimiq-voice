@@ -943,6 +943,92 @@ export const SIP_DIALOGS_KV: KvBucketDefinition = {
 };
 
 /**
+ * `sip-instances` — which `sipd` processes are alive, right now, under a seconds-long lease.
+ *
+ * ## Why {@link SIP_DIALOGS_KV} does not already answer this
+ *
+ * That bucket's reaper is a SURVIVING `sipd` sweeping a dead peer. A single-instance edge — every
+ * developer stack and every small deployment — has no survivor, so when the only `sipd` dies its
+ * calls stay live in the engine with audio still flowing, unbillable, and the phone's BYE is
+ * answered `481` by the process that replaced it. The engine must be able to notice by itself, and
+ * one key per PROCESS is what makes that affordable: a handful of keys to watch instead of every
+ * dialog on the fleet.
+ *
+ * ## Why the TTL is the lease and not a backstop
+ *
+ * The opposite decision to `sip-dialogs`, deliberately. There, server-side expiry could not be the
+ * lease because a six-hour call is a correct long-lived value. Here there is no such value — a
+ * record nobody renewed IS a dead process — so the bucket TTL and the record's `expiresAt` describe
+ * the same horizon, and a watcher learns of a death from the delete the server publishes rather than
+ * by polling. The record still carries `expiresAt` so a reader that fetched the key just before it
+ * lapsed reaches the same verdict as the server.
+ *
+ * ## Not organization-scoped
+ *
+ * A process is not a tenant's. The key is the instance id alone.
+ */
+export const SIP_INSTANCES_KV: KvBucketDefinition = {
+	name: "sip-instances",
+	description: "sipd instance -> liveness lease, so the engine can end legs whose edge died.",
+	// Three renewals at the default five-second interval. Short enough that a stranded call is
+	// measured in seconds; long enough that a broker hiccup does not declare a live edge dead.
+	ttlMs: 15 * 1000,
+	history: 1,
+	// File-backed like every other claim bucket: a broker restart must not lose the fact that an
+	// instance is alive and silently strand every call on it.
+	storage: "file",
+	maxValueSizeBytes: 1024,
+	maxBytes: 8 * MIB,
+	numReplicas: 1,
+};
+
+/**
+ * `engine-instances` — which engine processes are alive, right now, under a seconds-long lease.
+ *
+ * ## Why the channel ownership lease does not already answer this
+ *
+ * It does, eventually, and that is the problem. A `channels` snapshot carries its owner and an
+ * expiry, and a survivor's ownership-maintenance pass adopts one whose lease has lapsed — but that
+ * lease is ninety seconds wide because it is renewed by a heartbeat that rewrites every live channel
+ * on the replica. Between an engine being SIGKILLed and its calls being adopted there is therefore
+ * up to a minute and a half in which the media still flows, the dialog still stands, and no process
+ * holds an aggregate: a BYE in that window reaches a replica with no aggregate and returns early, so
+ * the call is never ended and never billed. Proved live.
+ *
+ * One key per PROCESS is what closes it, exactly as {@link SIP_INSTANCES_KV} does for the edge — a
+ * handful of keys to watch instead of every channel on the fleet. The channel lease is unchanged and
+ * is still the fence: a survivor may contest an UNEXPIRED channel lease only when it has proof from
+ * this bucket that the owner is gone, and the revision-fenced write is what makes exactly one
+ * survivor win each channel.
+ *
+ * ## Why the TTL is the lease
+ *
+ * Same decision, and the same reasoning, as {@link SIP_INSTANCES_KV}: there is no long-lived correct
+ * value here — a record nobody renewed IS a dead process — so server-side expiry cannot reap
+ * anything live, and a watcher learns of a death from the delete the server publishes rather than by
+ * polling.
+ *
+ * ## Not organization-scoped
+ *
+ * A process is not a tenant's. The key is the instance id alone.
+ */
+export const ENGINE_INSTANCES_KV: KvBucketDefinition = {
+	name: "engine-instances",
+	description: "engine instance -> liveness lease, so a survivor can adopt a dead replica's calls.",
+	// Three renewals at the default five-second interval, matching `sip-instances` deliberately: the
+	// two buckets answer the same question about two planes and an operator should not have to hold
+	// two horizons in mind.
+	ttlMs: 15 * 1000,
+	history: 1,
+	// File-backed like every other claim bucket: a broker restart must not lose the fact that an
+	// instance is alive and have every survivor contest its live calls at once.
+	storage: "file",
+	maxValueSizeBytes: 1024,
+	maxBytes: 8 * MIB,
+	numReplicas: 1,
+};
+
+/**
  * `trunks` — the carrier directory the SIP edge dials and registers against.
  *
  * ## Why the edge cannot read this from the database
@@ -1043,6 +1129,8 @@ export const KV_BUCKETS: readonly KvBucketDefinition[] = [
 	MEDIA_OWNERS_KV,
 	QUEUE_WAITING_KV,
 	SIP_DIALOGS_KV,
+	SIP_INSTANCES_KV,
+	ENGINE_INSTANCES_KV,
 	TRUNKS_KV,
 	SIP_ACL_KV,
 ];
@@ -1252,6 +1340,24 @@ export const kvKeyFor = {
 		return assertKeyToken("legId", legId);
 	},
 	/**
+	 * `sip-instances`: the `sipd` instance id, and nothing else.
+	 *
+	 * Non-org-scoped for a simpler reason than the three above: a PROCESS belongs to no tenant. See
+	 * {@link SIP_INSTANCES_KV}.
+	 */
+	sipInstance(instanceId: string): string {
+		return assertKeyToken("instanceId", instanceId);
+	},
+	/**
+	 * `engine-instances`: the engine instance id, and nothing else.
+	 *
+	 * Non-org-scoped for the same reason as {@link kvKeyFor.sipInstance}: a PROCESS belongs to no
+	 * tenant. See {@link ENGINE_INSTANCES_KV}.
+	 */
+	engineInstance(instanceId: string): string {
+		return assertKeyToken("instanceId", instanceId);
+	},
+	/**
 	 * `trunks`: `<orgId>.<trunkId>` — one entry per trunk, holding its whole dialable configuration.
 	 *
 	 * Org-scoped, because the edge originates on behalf of a tenant the engine has already named, and
@@ -1262,31 +1368,48 @@ export const kvKeyFor = {
 		return `${assertKeyToken("orgId", orgId)}.${assertKeyToken("trunkId", trunkId)}`;
 	},
 	/**
-	 * `sip-acl`: the network, with `.`, `/` and `:` folded to `-`.
+	 * `sip-acl`: `<orgId>.<scope>.<network>`, with the network's `.`, `/` and `:` folded to `-`.
 	 *
-	 * The FOURTH non-org-scoped key, and the only one whose key needs a transformation at all. A CIDR
-	 * is `203.0.113.0/24` or `2001:db8::/32`, and none of the dots, the slash or the colons survives
-	 * as a KV key token — dots would silently become four tokens, and neither `/` nor `:` is in
-	 * `TOKEN_PATTERN` at all. **All three separators fold, not just the v4 pair**: `sip_acl_entry.network`
-	 * is a PostgreSQL `cidr`, which holds IPv6 as readily as IPv4, and a folder that handled only v4
-	 * would throw on the first IPv6 carrier — at write time in the control plane, or at boot in the
-	 * edge, both of which are worse places to find out than here.
+	 * The key is the table's unique index — `(organization_id, scope, network)` — spelled as subject
+	 * tokens, which is what makes the projection lossless. It did not always carry the first two, and
+	 * the network alone could not represent the table: two tenants naming one CIDR, or one tenant
+	 * naming it in both edge scopes, contended for a single key, so one tenant could suppress
+	 * another's rule on a security boundary by writing the same network. The organization and the
+	 * scope are in the key for that reason and not for readability.
+	 *
+	 * It stays non-org-SCOPED in the sense that matters: the edge WATCHES the whole bucket and
+	 * evaluates by network, because an arriving packet carries a source address and nothing else. The
+	 * organization in the key is for the WRITER — it makes a tenant's entries one range read, so a
+	 * reconcile no longer walks every ACL entry on the platform.
+	 *
+	 * The network is the one part that needs a transformation. A CIDR is `203.0.113.0/24` or
+	 * `2001:db8::/32`, and none of the dots, the slash or the colons survives as a KV key token —
+	 * dots would silently become four tokens, and neither `/` nor `:` is in `TOKEN_PATTERN` at all.
+	 * **All three separators fold, not just the v4 pair**: `sip_acl_entry.network` is a PostgreSQL
+	 * `cidr`, which holds IPv6 as readily as IPv4, and a folder that handled only v4 would throw on
+	 * the first IPv6 carrier — at write time in the control plane, or at boot in the edge, both of
+	 * which are worse places to find out than here.
 	 *
 	 * Both writers (the control plane, from the stored `cidr`) and the reader (the edge, at boot and
 	 * on watch) go through this one function, which is what makes the two agree.
 	 *
-	 * The result stays readable by inspection — `203-0-113-0-24`, `2001-db8---32`, where the run of
-	 * three dashes is the `::` — which matters because an operator debugging a refused carrier reads
-	 * these keys with `nats kv ls`. The mapping is not injective over ARBITRARY strings, and does not
-	 * need to be: the only inputs are values PostgreSQL's `cidr` type already accepted and normalised,
-	 * and no two distinct normalised CIDRs fold to the same key. This deliberately does NOT normalise
-	 * the network itself — a second normaliser here would be a second opinion about what a network is.
+	 * The result stays readable by inspection — `<org>.trunk.203-0-113-0-24`, `<org>.registration.2001-db8---32`,
+	 * where the run of three dashes is the `::` — which matters because an operator debugging a
+	 * refused carrier reads these keys with `nats kv ls`. The network fold is not injective over
+	 * ARBITRARY strings, and does not need to be: the only inputs are values PostgreSQL's `cidr` type
+	 * already accepted and normalised, and no two distinct normalised CIDRs fold to the same key.
+	 * This deliberately does NOT normalise the network itself — a second normaliser here would be a
+	 * second opinion about what a network is.
 	 *
-	 * @throws {SubjectTokenError} when the value contains no usable characters.
+	 * @throws {SubjectTokenError} when any of the three parts contains no usable characters.
 	 */
-	sipAcl(network: string): string {
+	sipAcl(orgId: string, scope: string, network: string): string {
 		const folded = network.trim().replaceAll(/[./:]/gu, "-");
-		return assertKeyToken("network", folded);
+		return `${assertKeyToken("orgId", orgId)}.${assertKeyToken("scope", scope)}.${assertKeyToken("network", folded)}`;
+	},
+	/** Every `sip-acl` key belonging to one organization, for a reconcile's range read. */
+	sipAclPrefix(orgId: string): string {
+		return `${assertKeyToken("orgId", orgId)}.>`;
 	},
 } as const;
 

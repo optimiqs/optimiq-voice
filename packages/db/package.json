@@ -33,6 +33,7 @@
 		"clean": "rimraf ./dist",
 		"db:check": "drizzle-kit check --config drizzle.config.ts",
 		"db:generate": "drizzle-kit generate --config drizzle.config.ts",
+		"db:encrypt-sso-secrets": "bun run scripts/encrypt-sso-secrets.ts",
 		"db:migrate": "bun run scripts/migrate.ts --expected-stage development",
 		"db:migrate:production": "bun run scripts/migrate.ts --expected-stage production",
 		"db:migrate:staging": "bun run scripts/migrate.ts --expected-stage staging",

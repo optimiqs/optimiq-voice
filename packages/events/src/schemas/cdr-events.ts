@@ -110,7 +110,7 @@ export const cdrLegWriteDataSchema = z.looseObject({
 	 * one of those tells a supervisor their exit key is working.
 	 */
 	queueOutcome: z
-		.enum(["answered", "caller-hangup", "timeout", "overflow", "no-agents", "exit-key"])
+		.enum(["answered", "caller-hangup", "timeout", "overflow", "no-agents", "exit-key", "callback"])
 		.nullish(),
 	/**
 	 * The `queue_agent` who took the call. Absent on every outcome except `answered`.
@@ -121,6 +121,15 @@ export const cdrLegWriteDataSchema = z.looseObject({
 	 * had to reason about.
 	 */
 	queueAgentRef: z.uuid().nullish(),
+	/**
+	 * Another CALL this one continues — the queued call a virtual-hold callback settles.
+	 *
+	 * The cross-call link, and the reason it is not `call_id` reuse: a callback happens minutes
+	 * later, has its own answer and its own billing, and folding it into the original call would
+	 * make every duration in the ledger a sum over time the customer was not on the phone. Written
+	 * onto `call_legs.related_call_id`; see `packages/cdr-db`.
+	 */
+	relatedCallId: z.uuid().nullish(),
 
 	// --- the authorisation code that paid for an outbound call -----------------------------------
 	/**
@@ -149,6 +158,39 @@ export const cdrLegWriteDataSchema = z.looseObject({
 	 */
 	authPinOrdinal: z.int().min(0).nullish(),
 	authPinLabel: z.string().max(128).nullish(),
+
+	// --- the carrier's STIR/SHAKEN claim about the caller --------------------------------------
+	/**
+	 * What the carrier said about the calling number's attestation, on an inbound trunk leg.
+	 *
+	 * ## Visibility, and nothing more
+	 *
+	 * Nothing here is signed by us and nothing here is verified by us — the carrier verifies and
+	 * states the outcome in headers, and this is that claim carried forward so a call record can
+	 * show it (see `rpc.ts` `sipAttestationSchema`). It is emphatically NOT an authorisation: no
+	 * routing decision reads these columns, and a `tn-validation-failed` call is on the ledger
+	 * because it was placed, not because it was allowed.
+	 *
+	 * ## Why the ledger and not a log line
+	 *
+	 * The question these answer — "was the number on this call attested, and by whom" — is asked
+	 * about a call somebody has already found, months later, in a dispute or a traceback request.
+	 * That is exactly the shape of a CDR column and exactly the wrong shape for a log with a
+	 * retention window.
+	 *
+	 * `sipVerstat` is free text on purpose: it is carrier-writable, and an unrecognised value must
+	 * reach a record rather than fail an INVITE. `sipOrigId` is the originating provider's opaque
+	 * call identifier, which is what a traceback is keyed on. The `Identity` JWS itself is never
+	 * carried — multi-kilobyte, unverified here, and a field nobody checks that looks like proof is
+	 * worse than no field.
+	 *
+	 * All three absent on every call that arrived without the headers, which is most of them, and
+	 * on every internal leg — a digest phone can write a `P-Asserted-Identity` as easily as a
+	 * `From`, so the edge reads these only off a trunk.
+	 */
+	sipAttestation: z.enum(["A", "B", "C"]).nullish(),
+	sipVerstat: z.string().max(64).nullish(),
+	sipOrigId: z.string().max(128).nullish(),
 });
 
 export const CDR_LEG_WRITE = defineEvent("cdr", "cdr.leg.write", cdrLegWriteDataSchema);

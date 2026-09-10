@@ -23,6 +23,7 @@ export {
 	DEFAULT_SESSION_UPDATE_AGE_SECONDS,
 	emailMatchesDomain,
 	ORGANIZATION_MEMBERSHIP_ROLES,
+	type OrganizationCreatedEvent,
 	type OrganizationMembershipRole,
 	resolveSsoProviderOrganizationId,
 	SESSION_COOKIE_CACHE_VERSION,

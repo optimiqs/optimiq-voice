@@ -67,6 +67,10 @@
 			"type": "string",
 			"maxLength": 128
 		},
+		"callerIdPresentation": {
+			"type": "string",
+			"enum": ["allowed", "restricted"]
+		},
 		"sdpOffer": {
 			"type": "string",
 			"maxLength": 16384

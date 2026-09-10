@@ -7,7 +7,9 @@ import {
 	aConference,
 	anExtension,
 	aMohClass,
+	anIvrMenu,
 	aParkLot,
+	aPrompt,
 	aQueue,
 	aRingGroup,
 	aRingGroupMember,
@@ -486,5 +488,155 @@ describe("compile — the embeddings are deterministic", () => {
 		expect(() =>
 			compileRoutingArtifact(snapshotWithout, { compiledAt: COMPILED_AT }),
 		).not.toThrow();
+	});
+});
+
+/**
+ * The other half of "nothing plays": a plan naming audio that is not there.
+ *
+ * `dangling-moh-class` has always been checked because the compiler RESOLVES a class to a name.
+ * Prompt ids are passed through unresolved, so until this code existed an IVR whose greeting had
+ * been deleted compiled clean, published, and produced a caller who heard silence and was routed to
+ * the timeout branch — a failure that looks, in every log and every CDR, exactly like a caller
+ * hanging up.
+ */
+describe("compile — prompts a plan names but the library does not have", () => {
+	it("warns, naming the reference, when an IVR greeting is not in the snapshot", () => {
+		const result = compileAttempt(
+			aSnapshot({ ivrMenus: [anIvrMenu({ greetingPromptId: "gone" })], prompts: [aPrompt()] }),
+		);
+
+		expect(result.ok).toBe(true);
+		expect(codesOf(result)).toContain("dangling-prompt");
+		expect(result.diagnostics.find((entry) => entry.code === "dangling-prompt")?.message).toContain(
+			"gone",
+		);
+		expect(result.diagnostics.find((entry) => entry.code === "dangling-prompt")?.path).toBe(
+			"greetingPromptId",
+		);
+	});
+
+	it("still emits the id, because dropping it would change the plan's shape", () => {
+		const result = compileAttempt(
+			aSnapshot({ ivrMenus: [anIvrMenu({ greetingPromptId: "gone" })], prompts: [] }),
+		);
+
+		const node = (result.ok ? result.artifact.nodes["ivr-menu:ivr-1"] : undefined) as {
+			greetingPromptId?: string;
+		};
+		expect(node.greetingPromptId).toBe("gone");
+	});
+
+	it("does not block a save — a missing prompt is a configuration gap, not an unroutable PBX", () => {
+		const result = compileAttempt(
+			aSnapshot({ ivrMenus: [anIvrMenu({ timeoutPromptId: "gone" })], prompts: [] }),
+		);
+		expect(result.ok).toBe(true);
+	});
+
+	it("says nothing about a prompt the library does have", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				ivrMenus: [anIvrMenu({ greetingPromptId: "prompt-1" })],
+				prompts: [aPrompt({ id: "prompt-1" })],
+			}),
+		);
+		expect(codesOf(result)).not.toContain("dangling-prompt");
+	});
+
+	it("checks the queue's three prompts too", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				queues: [
+					aQueue({
+						greetingPromptId: "gone-1",
+						announcePromptId: "gone-2",
+						agentWhisperPromptId: "gone-3",
+					}),
+				],
+				prompts: [],
+			}),
+		);
+
+		const paths = result.diagnostics
+			.filter((entry) => entry.code === "dangling-prompt")
+			.map((entry) => entry.path);
+		expect(paths).toEqual(["greetingPromptId", "announcePromptId", "agentWhisperPromptId"]);
+	});
+
+	it("stays silent when the loader supplies no prompt library at all", () => {
+		// The same rollout rule `dangling-moh-class` follows: a loader that has not learned the table
+		// is not a tenant with a dozen broken references.
+		const snapshot = aSnapshot({ ivrMenus: [anIvrMenu({ greetingPromptId: "gone" })] });
+		delete (snapshot as { prompts?: unknown }).prompts;
+
+		expect(codesOf(compileAttempt(snapshot))).not.toContain("dangling-prompt");
+	});
+});
+
+/**
+ * The resolution half of the same story: the file behind the id.
+ *
+ * A plan node names a prompt by ROW id, the audio was uploaded under a DIFFERENT id, and the engine
+ * holds no database handle — so before this table a tenant's prompt was unplayable on every
+ * deployment, which is what `mediad` was saying with `no such prompt: sound:<uuid>`.
+ */
+describe("compile — the prompt id → object-ref table", () => {
+	it("maps every audio prompt to its object ref", () => {
+		const artifact = compiled(
+			aSnapshot({
+				prompts: [aPrompt({ id: "prompt-1", objectKey: "prompts/org-0001/file-1.wav" })],
+			}),
+		);
+
+		expect(artifact.prompts?.["prompt-1"]).toBe("object://prompts/org-0001/file-1.wav");
+	});
+
+	it("leaves phrases out — their audio is their steps'", () => {
+		const artifact = compiled(
+			aSnapshot({ prompts: [aPrompt({ id: "phrase-1", kind: "phrase", objectKey: null })] }),
+		);
+
+		expect(artifact.prompts?.["phrase-1"]).toBe(undefined);
+	});
+
+	it("omits the table entirely when nothing in the library has a key", () => {
+		const artifact = compiled(aSnapshot({ prompts: [aPrompt({ objectKey: null })] }));
+
+		expect(artifact.prompts).toBe(undefined);
+	});
+
+	it("warns when a named prompt exists but has no audio behind it", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				ivrMenus: [anIvrMenu({ greetingPromptId: "prompt-1" })],
+				prompts: [aPrompt({ id: "prompt-1", objectKey: null })],
+			}),
+		);
+
+		expect(result.ok).toBe(true);
+		expect(codesOf(result)).toContain("dangling-prompt");
+		expect(result.diagnostics.find((entry) => entry.code === "dangling-prompt")?.message).toContain(
+			"no audio in the object store",
+		);
+	});
+
+	it("stays silent when the loader does not project the key at all", () => {
+		// `undefined` is a loader that has not learned the column; `null` is a row saying it has no
+		// file. The rollout rule the rest of this compiler follows.
+		const prompt = { ...aPrompt({ id: "prompt-1" }) };
+		delete (prompt as { objectKey?: unknown }).objectKey;
+		const result = compileAttempt(
+			aSnapshot({ ivrMenus: [anIvrMenu({ greetingPromptId: "prompt-1" })], prompts: [prompt] }),
+		);
+
+		expect(codesOf(result)).not.toContain("dangling-prompt");
+	});
+
+	it("changes the snapshot hash when a prompt is re-uploaded under a new key", () => {
+		const before = aSnapshot({ prompts: [aPrompt({ objectKey: "prompts/org-0001/a.wav" })] });
+		const after = aSnapshot({ prompts: [aPrompt({ objectKey: "prompts/org-0001/b.wav" })] });
+
+		expect(snapshotHash(before)).not.toBe(snapshotHash(after));
 	});
 });

@@ -71,6 +71,7 @@ export {
 export {
 	organizationBranding,
 	organizationHierarchy,
+	organizationSsoProvider,
 } from "./schema/platform/organization-platform-schema";
 export {
 	type BrandingPatch,
@@ -108,3 +109,14 @@ export {
 	type SsoProviderSecretRow,
 	updateSsoProvider,
 } from "./platform-sso";
+export {
+	decryptSecret,
+	encryptSecret,
+	isEncryptedSecret,
+	loadSecretKey,
+	openStoredSecret,
+	SECRET_ENCRYPTION_KEY_VARIABLE,
+	SecretCipherError,
+	requireSecretKey,
+	secretsEqual,
+} from "./secret-cipher";

@@ -47,6 +47,7 @@ var EventTypes = []EventTypeInfo{
 	{Family: FamilyRegistration, Type: EventTypeRegistrationRegistered, SubjectTemplate: "sip.reg.v1.<orgId>.<aorHash>.registered"},
 	{Family: FamilyRegistration, Type: EventTypeRegistrationUnregistered, SubjectTemplate: "sip.reg.v1.<orgId>.<aorHash>.unregistered"},
 	{Family: FamilyRegistration, Type: EventTypeRegistrationExpired, SubjectTemplate: "sip.reg.v1.<orgId>.<aorHash>.expired"},
+	{Family: FamilyRegistration, Type: EventTypeRegistrationAuthFailed, SubjectTemplate: "sip.reg.v1.<orgId>.<aorHash>.auth-failed"},
 	{Family: FamilySIPDialog, Type: EventTypeSIPDialogProgressed, SubjectTemplate: "sip.evt.v1.<orgId>.<legId>.dialog.progressed"},
 	{Family: FamilySIPDialog, Type: EventTypeSIPDialogAnswered, SubjectTemplate: "sip.evt.v1.<orgId>.<legId>.dialog.answered"},
 	{Family: FamilySIPDialog, Type: EventTypeSIPDialogHeld, SubjectTemplate: "sip.evt.v1.<orgId>.<legId>.dialog.held"},
@@ -57,6 +58,8 @@ var EventTypes = []EventTypeInfo{
 	{Family: FamilyQueue, Type: EventTypeQueueCallerAnswered, SubjectTemplate: "queue.evt.v1.<orgId>.<queueId>.caller.answered"},
 	{Family: FamilyQueue, Type: EventTypeQueueCallerAbandoned, SubjectTemplate: "queue.evt.v1.<orgId>.<queueId>.caller.abandoned"},
 	{Family: FamilyQueue, Type: EventTypeQueueAgentState, SubjectTemplate: "queue.evt.v1.<orgId>.<queueId>.agent.state"},
+	{Family: FamilyQueue, Type: EventTypeQueueCallbackPlaced, SubjectTemplate: "queue.evt.v1.<orgId>.<queueId>.callback.placed"},
+	{Family: FamilyQueue, Type: EventTypeQueueCallbackFailed, SubjectTemplate: "queue.evt.v1.<orgId>.<queueId>.callback.failed"},
 	{Family: FamilyVoicemail, Type: EventTypeVoicemailMessageLeft, SubjectTemplate: "voicemail.evt.v1.<orgId>.<mailboxId>.message.left"},
 	{Family: FamilyVoicemail, Type: EventTypeVoicemailMWIUpdated, SubjectTemplate: "voicemail.evt.v1.<orgId>.<mailboxId>.mwi.updated"},
 	{Family: FamilyMedia, Type: EventTypeMediaSessionEnded, SubjectTemplate: "media.evt.v1.<orgId>.<sessionId>.session.ended"},
@@ -70,6 +73,7 @@ var EventTypes = []EventTypeInfo{
 	{Family: FamilyProvision, Type: EventTypeProvisionDeviceRequested, SubjectTemplate: "provision.evt.v1.<orgId>"},
 	{Family: FamilyProvision, Type: EventTypeProvisionDeviceRendered, SubjectTemplate: "provision.evt.v1.<orgId>"},
 	{Family: FamilyProvision, Type: EventTypeProvisionDeviceRejected, SubjectTemplate: "provision.evt.v1.<orgId>"},
+	{Family: FamilyProvision, Type: EventTypeProvisionCredentialInvalidated, SubjectTemplate: "provision.evt.v1.<orgId>"},
 }
 
 // NewDataFor returns a pointer to a zero payload struct for eventType, or nil when the
@@ -139,6 +143,8 @@ func NewDataFor(eventType string) any {
 		return new(RegistrationUnregisteredData)
 	case EventTypeRegistrationExpired:
 		return new(RegistrationExpiredData)
+	case EventTypeRegistrationAuthFailed:
+		return new(RegistrationAuthFailedData)
 	case EventTypeSIPDialogProgressed:
 		return new(SIPDialogProgressedData)
 	case EventTypeSIPDialogAnswered:
@@ -159,6 +165,10 @@ func NewDataFor(eventType string) any {
 		return new(QueueCallerAbandonedData)
 	case EventTypeQueueAgentState:
 		return new(QueueAgentStateData)
+	case EventTypeQueueCallbackPlaced:
+		return new(QueueCallbackPlacedData)
+	case EventTypeQueueCallbackFailed:
+		return new(QueueCallbackFailedData)
 	case EventTypeVoicemailMessageLeft:
 		return new(VoicemailMessageLeftData)
 	case EventTypeVoicemailMWIUpdated:
@@ -185,6 +195,8 @@ func NewDataFor(eventType string) any {
 		return new(ProvisionDeviceRenderedData)
 	case EventTypeProvisionDeviceRejected:
 		return new(ProvisionDeviceRejectedData)
+	case EventTypeProvisionCredentialInvalidated:
+		return new(ProvisionCredentialInvalidatedData)
 	}
 	return nil
 }
@@ -204,6 +216,10 @@ func NewRPCRequestFor(subject string) any {
 		return new(VoicemailListRequest)
 	case SubjectExtensionFeatureRPC:
 		return new(ExtensionFeatureRequest)
+	case SubjectToggleFeatureRPC:
+		return new(ToggleFeatureRequest)
+	case SubjectHotDeskRPC:
+		return new(HotDeskRequest)
 	case SubjectLastCallerRPC:
 		return new(LastCallerRequest)
 	case SubjectFileGreetingRPC:
@@ -252,6 +268,8 @@ func NewRPCRequestFor(subject string) any {
 		return new(MediaStartRecordingRequest)
 	case SubjectMediaStopRecordingRPC:
 		return new(MediaStopRecordingRequest)
+	case SubjectMediaPauseRecordingRPC:
+		return new(MediaPauseRecordingRequest)
 	case SubjectMediaTapSessionRPC:
 		return new(MediaTapSessionRequest)
 	case SubjectMediaUntapSessionRPC:
@@ -262,12 +280,16 @@ func NewRPCRequestFor(subject string) any {
 		return new(MediaHoldSessionRequest)
 	case SubjectOriginateRPC:
 		return new(OriginateRequest)
+	case SubjectQueueCallbackRPC:
+		return new(QueueCallbackRequest)
 	case SubjectParkHandoffRPC:
 		return new(ParkHandoffRequest)
 	case SubjectSessionVerbRPC:
 		return new(SessionVerbRequest)
 	case SubjectConferenceControlRPC:
 		return new(ConferenceControlRequest)
+	case SubjectCallControlRPC:
+		return new(CallControlRequest)
 	case SubjectSessionAnnounceRPC:
 		return new(SessionAnnounceRequest)
 	}
@@ -285,6 +307,10 @@ func NewRPCResponseFor(subject string) any {
 		return new(VoicemailListResponse)
 	case SubjectExtensionFeatureRPC:
 		return new(ExtensionFeatureResponse)
+	case SubjectToggleFeatureRPC:
+		return new(ToggleFeatureResponse)
+	case SubjectHotDeskRPC:
+		return new(HotDeskResponse)
 	case SubjectLastCallerRPC:
 		return new(LastCallerResponse)
 	case SubjectFileGreetingRPC:
@@ -333,6 +359,8 @@ func NewRPCResponseFor(subject string) any {
 		return new(MediaStartRecordingResponse)
 	case SubjectMediaStopRecordingRPC:
 		return new(MediaStopRecordingResponse)
+	case SubjectMediaPauseRecordingRPC:
+		return new(MediaPauseRecordingResponse)
 	case SubjectMediaTapSessionRPC:
 		return new(MediaTapSessionResponse)
 	case SubjectMediaUntapSessionRPC:
@@ -343,12 +371,16 @@ func NewRPCResponseFor(subject string) any {
 		return new(MediaHoldSessionResponse)
 	case SubjectOriginateRPC:
 		return new(OriginateResponse)
+	case SubjectQueueCallbackRPC:
+		return new(QueueCallbackResponse)
 	case SubjectParkHandoffRPC:
 		return new(ParkHandoffResponse)
 	case SubjectSessionVerbRPC:
 		return new(SessionVerbResponse)
 	case SubjectConferenceControlRPC:
 		return new(ConferenceControlResponse)
+	case SubjectCallControlRPC:
+		return new(CallControlResponse)
 	case SubjectSessionAnnounceRPC:
 		return new(SessionAnnounceResponse)
 	}

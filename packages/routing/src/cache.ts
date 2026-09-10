@@ -147,6 +147,25 @@ export const ROUTING_TABLE_TO_ENTITY: Readonly<Record<string, RoutingEntityKind>
 	// and which button lights, which is a compiled fact, so a write to the appearance evicts exactly
 	// as a write to the line does.
 	shared_line_appearance: "sharedLines",
+	/**
+	 * A routing input as of HOT DESKING, and it is the one entry here that is not a table the
+	 * compiler reads.
+	 *
+	 * `devices.resource.ts` argues — correctly, for everything else on a device — that re-pointing
+	 * line 2 of a desk phone changes which physical box rings for an extension the dial plan already
+	 * resolved, and not the dial plan. A hot-desk login is the case that breaks the argument in one
+	 * direction: `device_line.extension_id` becomes the answer to "which extension is this handset",
+	 * an agent expects their calls at the new desk within seconds rather than within a cache TTL,
+	 * and the compile-on-write path is the ONLY seam in this system that pushes a tenant's state to
+	 * a running engine on the commit.
+	 *
+	 * It maps to `extensions` because that is the collection whose meaning moved. The cost is that
+	 * an administrator editing a line's label also recompiles — `device_line` is a hot admin table —
+	 * and it is bounded by `isArtifactFresh`: the recompile is cheap, the snapshot hash does not
+	 * move, and the KV write is skipped. `device` itself is deliberately NOT here; nothing on the
+	 * parent row is a binding.
+	 */
+	device_line: "extensions",
 } as const;
 
 export function isRoutingEntityKind(value: string): value is RoutingEntityKind {

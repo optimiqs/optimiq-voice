@@ -38,18 +38,25 @@ function buildAuth(overrides: Partial<Parameters<typeof createAuth>[0]> = {}) {
 }
 
 /** The composed plugin object keeps the options it was constructed with. */
-function organizationPluginOptions(auth: ReturnType<typeof createAuth>): {
+interface OrganizationPluginSpecOptions {
 	ac?: unknown;
 	roles?: Record<string, unknown>;
 	creatorRole?: string;
-} {
+	organizationHooks?: {
+		afterCreateOrganization?: (data: {
+			organization: { id: string; name: string; slug?: string | null };
+			member: { id: string };
+			user: { id: string; email: string };
+		}) => Promise<void>;
+	};
+}
+
+function organizationPluginOptions(
+	auth: ReturnType<typeof createAuth>,
+): OrganizationPluginSpecOptions {
 	const plugins = auth.options.plugins as { id: string; options?: unknown }[];
 	const plugin = plugins.find((candidate) => candidate.id === "organization");
-	return (plugin?.options ?? {}) as {
-		ac?: unknown;
-		roles?: Record<string, unknown>;
-		creatorRole?: string;
-	};
+	return (plugin?.options ?? {}) as OrganizationPluginSpecOptions;
 }
 
 /** The one `genericOAuth` config entry a spec reaches into. */
@@ -156,6 +163,55 @@ describe("createAuth", () => {
 		const sendOTP = twoFactorPluginOptions(withOtp).otpOptions?.sendOTP;
 		await sendOTP?.({ user: { id: "u1" }, otp: "123456" });
 		expect(called).toBe(0);
+	});
+
+	it("registers no organization-created hook when the host has nothing to seed", () => {
+		expect(organizationPluginOptions(auth).organizationHooks).toBeUndefined();
+	});
+
+	it("wires the tenant-created callback onto the plugin's own hook name", async () => {
+		// `organizationHooks.afterCreateOrganization` is what better-auth 1.6 calls; anything else
+		// composes silently and a new tenant is born with none of its defaults.
+		const seen: unknown[] = [];
+		const withHook = buildAuth({
+			onOrganizationCreated: async (event) => {
+				seen.push(event);
+			},
+		});
+		const afterCreate =
+			organizationPluginOptions(withHook).organizationHooks?.afterCreateOrganization;
+		expect(afterCreate).toBeFunction();
+		await afterCreate?.({
+			organization: { id: "org1", name: "Acme", slug: "acme" },
+			member: { id: "m1" },
+			user: { id: "u1", email: "a@b.test" },
+		});
+		expect(seen).toEqual([
+			{
+				organizationId: "org1",
+				organizationName: "Acme",
+				organizationSlug: "acme",
+				userId: "u1",
+				userEmail: "a@b.test",
+			},
+		]);
+	});
+
+	it("never fails organization creation because seeding failed", async () => {
+		// A tenant with no defaults is one idempotent re-seed away from correct; a sign-up that
+		// 500s after the organization row is committed is not.
+		const withHook = buildAuth({
+			onOrganizationCreated: async () => {
+				throw new Error("the seeder is down");
+			},
+		});
+		const afterCreate =
+			organizationPluginOptions(withHook).organizationHooks?.afterCreateOrganization;
+		await afterCreate?.({
+			organization: { id: "org1", name: "Acme", slug: null },
+			member: { id: "m1" },
+			user: { id: "u1", email: "a@b.test" },
+		});
 	});
 
 	it("publishes JWKS so service and per-call tokens can be verified offline", () => {

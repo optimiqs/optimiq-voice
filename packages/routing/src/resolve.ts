@@ -38,7 +38,12 @@ import type {
 } from "./artifact";
 import type { Diagnostic } from "./diagnostics";
 import type { ExecutionPlan, PlanNode, PlanNodeId } from "./plan";
-import type { CallBlockAction, CallBlockDirection, TollClass } from "./snapshot";
+import type {
+	CallBlockAction,
+	CallBlockDirection,
+	CallerIdPresentation,
+	TollClass,
+} from "./snapshot";
 import type { TimeConditionEvaluation } from "./time-conditions";
 
 /** How far a chain of time-condition gates may be followed before it is called a loop. */
@@ -102,6 +107,11 @@ export interface ResolvedRoute {
 	readonly featureArgument?: string;
 	readonly callerIdName?: string;
 	readonly callerIdNumber?: string;
+	/**
+	 * Whether the caller's number is presented to the far end — CLIR. Outbound only, and absent on
+	 * the emergency path on purpose: a 911 call presents the ELIN whatever the extension asked for.
+	 */
+	readonly callerIdPresentation?: CallerIdPresentation;
 	/** Regex capture groups from the matching pattern, `$1` first. */
 	readonly captures?: readonly string[];
 	readonly recordEnabled?: boolean;
@@ -884,6 +894,9 @@ export function resolveOutbound(
 				caller?.outboundCallerIdNumber ??
 				artifact.settings.outboundCallerIdNumber,
 			callerIdName: caller?.outboundCallerIdName ?? artifact.settings.outboundCallerIdName,
+			// The standing setting only. A per-call `*67`/`*82` overrides it further down, on the leg
+			// itself, because the code is dialled by the caller and the resolver never sees it.
+			callerIdPresentation: caller?.outboundCallerIdPresentation,
 			reason: `matched outbound route "${rule.name}"`,
 			diagnostics,
 		});

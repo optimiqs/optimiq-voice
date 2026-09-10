@@ -1,0 +1,23 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"applied": {
+			"type": "boolean"
+		},
+		"target": {
+			"type": "string",
+			"enum": ["call-flow", "time-condition"]
+		},
+		"state": {
+			"type": "string",
+			"maxLength": 32
+		},
+		"reason": {
+			"type": "string",
+			"maxLength": 256
+		}
+	},
+	"required": ["applied", "target"],
+	"additionalProperties": false
+}

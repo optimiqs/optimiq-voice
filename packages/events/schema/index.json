@@ -227,6 +227,13 @@
 			"goType": "RegistrationExpiredData"
 		},
 		{
+			"family": "registration",
+			"type": "auth-failed",
+			"subject": "sip.reg.v1.<orgId>.<aorHash>.auth-failed",
+			"dataSchema": "events/registration.auth-failed.schema.json",
+			"goType": "RegistrationAuthFailedData"
+		},
+		{
 			"family": "sipDialog",
 			"type": "dialog.progressed",
 			"subject": "sip.evt.v1.<orgId>.<legId>.dialog.progressed",
@@ -295,6 +302,20 @@
 			"subject": "queue.evt.v1.<orgId>.<queueId>.agent.state",
 			"dataSchema": "events/queue.agent.state.schema.json",
 			"goType": "QueueAgentStateData"
+		},
+		{
+			"family": "queue",
+			"type": "callback.placed",
+			"subject": "queue.evt.v1.<orgId>.<queueId>.callback.placed",
+			"dataSchema": "events/queue.callback.placed.schema.json",
+			"goType": "QueueCallbackPlacedData"
+		},
+		{
+			"family": "queue",
+			"type": "callback.failed",
+			"subject": "queue.evt.v1.<orgId>.<queueId>.callback.failed",
+			"dataSchema": "events/queue.callback.failed.schema.json",
+			"goType": "QueueCallbackFailedData"
 		},
 		{
 			"family": "voicemail",
@@ -386,6 +407,13 @@
 			"subject": "provision.evt.v1.<orgId>",
 			"dataSchema": "events/provision.device.rejected.schema.json",
 			"goType": "ProvisionDeviceRejectedData"
+		},
+		{
+			"family": "provision",
+			"type": "credential.invalidated",
+			"subject": "provision.evt.v1.<orgId>",
+			"dataSchema": "events/provision.credential.invalidated.schema.json",
+			"goType": "ProvisionCredentialInvalidatedData"
 		}
 	],
 	"rpc": [
@@ -420,6 +448,22 @@
 			"responseSchema": "rpc/rpc.pbx.v1.extension-feature.response.schema.json",
 			"goRequestType": "ExtensionFeatureRequest",
 			"goResponseType": "ExtensionFeatureResponse"
+		},
+		{
+			"subject": "rpc.pbx.v1.toggle-feature",
+			"timeoutMs": 5000,
+			"requestSchema": "rpc/rpc.pbx.v1.toggle-feature.request.schema.json",
+			"responseSchema": "rpc/rpc.pbx.v1.toggle-feature.response.schema.json",
+			"goRequestType": "ToggleFeatureRequest",
+			"goResponseType": "ToggleFeatureResponse"
+		},
+		{
+			"subject": "rpc.pbx.v1.hot-desk",
+			"timeoutMs": 8000,
+			"requestSchema": "rpc/rpc.pbx.v1.hot-desk.request.schema.json",
+			"responseSchema": "rpc/rpc.pbx.v1.hot-desk.response.schema.json",
+			"goRequestType": "HotDeskRequest",
+			"goResponseType": "HotDeskResponse"
 		},
 		{
 			"subject": "rpc.pbx.v1.last-caller",
@@ -614,6 +658,14 @@
 			"goResponseType": "MediaStopRecordingResponse"
 		},
 		{
+			"subject": "rpc.media.v1.pause-recording",
+			"timeoutMs": 500,
+			"requestSchema": "rpc/rpc.media.v1.pause-recording.request.schema.json",
+			"responseSchema": "rpc/rpc.media.v1.pause-recording.response.schema.json",
+			"goRequestType": "MediaPauseRecordingRequest",
+			"goResponseType": "MediaPauseRecordingResponse"
+		},
+		{
 			"subject": "rpc.media.v1.tap-session",
 			"timeoutMs": 500,
 			"requestSchema": "rpc/rpc.media.v1.tap-session.request.schema.json",
@@ -654,6 +706,14 @@
 			"goResponseType": "OriginateResponse"
 		},
 		{
+			"subject": "rpc.engine.v1.queue-callback",
+			"timeoutMs": 5000,
+			"requestSchema": "rpc/rpc.engine.v1.queue-callback.request.schema.json",
+			"responseSchema": "rpc/rpc.engine.v1.queue-callback.response.schema.json",
+			"goRequestType": "QueueCallbackRequest",
+			"goResponseType": "QueueCallbackResponse"
+		},
+		{
 			"subject": "rpc.engine.v1.park-handoff",
 			"timeoutMs": 3000,
 			"requestSchema": "rpc/rpc.engine.v1.park-handoff.request.schema.json",
@@ -676,6 +736,14 @@
 			"responseSchema": "rpc/rpc.engine.v1.conference-control.response.schema.json",
 			"goRequestType": "ConferenceControlRequest",
 			"goResponseType": "ConferenceControlResponse"
+		},
+		{
+			"subject": "rpc.engine.v1.call-control",
+			"timeoutMs": 2000,
+			"requestSchema": "rpc/rpc.engine.v1.call-control.request.schema.json",
+			"responseSchema": "rpc/rpc.engine.v1.call-control.response.schema.json",
+			"goRequestType": "CallControlRequest",
+			"goResponseType": "CallControlResponse"
 		},
 		{
 			"subject": "rpc.session.v1.announce",
@@ -701,6 +769,16 @@
 			"bucket": "sip-dialogs",
 			"schema": "live-state/sip-dialogs.schema.json",
 			"goType": "SIPDialogClaim"
+		},
+		{
+			"bucket": "sip-instances",
+			"schema": "live-state/sip-instances.schema.json",
+			"goType": "SIPInstanceLease"
+		},
+		{
+			"bucket": "engine-instances",
+			"schema": "live-state/engine-instances.schema.json",
+			"goType": "EngineInstanceLease"
 		},
 		{
 			"bucket": "presence",

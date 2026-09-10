@@ -14,6 +14,8 @@ const (
 	EventTypeQueueCallerAnswered  = "caller.answered"
 	EventTypeQueueCallerAbandoned = "caller.abandoned"
 	EventTypeQueueAgentState      = "agent.state"
+	EventTypeQueueCallbackPlaced  = "callback.placed"
+	EventTypeQueueCallbackFailed  = "callback.failed"
 )
 
 // QueueCallerJoinedData is the payload of the "caller.joined" event.
@@ -92,6 +94,7 @@ const (
 	QueueCallerAbandonedReasonOverflow     QueueCallerAbandonedReason = "overflow"
 	QueueCallerAbandonedReasonNoAgents     QueueCallerAbandonedReason = "no-agents"
 	QueueCallerAbandonedReasonExitKey      QueueCallerAbandonedReason = "exit-key"
+	QueueCallerAbandonedReasonCallback     QueueCallerAbandonedReason = "callback"
 )
 
 // QueueCallerAbandonedReasonValues lists every member of the vocabulary, in contract order.
@@ -101,6 +104,7 @@ var QueueCallerAbandonedReasonValues = []QueueCallerAbandonedReason{
 	QueueCallerAbandonedReasonOverflow,
 	QueueCallerAbandonedReasonNoAgents,
 	QueueCallerAbandonedReasonExitKey,
+	QueueCallerAbandonedReasonCallback,
 }
 
 // Valid reports whether v is a member of the QueueCallerAbandonedReason vocabulary.
@@ -120,4 +124,27 @@ type QueueAgentStateData struct {
 	PreviousStatus *AgentStatus `json:"previousStatus,omitempty"`
 	QueueIDs       []string     `json:"queueIds,omitempty"`
 	Reason         *string      `json:"reason,omitempty"`
+}
+
+// QueueCallbackPlacedData is the payload of the "callback.placed" event.
+//
+// Subject: queue.evt.v1.<orgId>.<queueId>.callback.placed
+// Envelope: Envelope[QueueCallbackPlacedData]
+type QueueCallbackPlacedData struct {
+	CallID         string  `json:"callId"`
+	OriginalCallID *string `json:"originalCallId,omitempty"`
+	CallerNumber   string  `json:"callerNumber"`
+	Attempts       int     `json:"attempts"`
+	HeldMs         int     `json:"heldMs"`
+}
+
+// QueueCallbackFailedData is the payload of the "callback.failed" event.
+//
+// Subject: queue.evt.v1.<orgId>.<queueId>.callback.failed
+// Envelope: Envelope[QueueCallbackFailedData]
+type QueueCallbackFailedData struct {
+	CallerNumber string  `json:"callerNumber"`
+	Attempts     int     `json:"attempts"`
+	Dropped      bool    `json:"dropped"`
+	Reason       *string `json:"reason,omitempty"`
 }

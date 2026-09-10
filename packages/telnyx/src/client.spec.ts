@@ -5,6 +5,7 @@ import { type FakeTelnyxServer, startFakeTelnyxServer } from "./fake";
 import { availableNumbersQuery } from "./resources/available-numbers";
 import { assertTelnyxPassword, assertTelnyxUserName } from "./resources/credential-connections";
 import { isTelnyxFaxEvent, TelnyxFaxRequestError } from "./resources/faxes";
+import { TelnyxCnamFormatError } from "./resources/phone-numbers";
 import { asFaxWebhook, parseTelnyxWebhookEvent } from "./webhooks/events";
 
 /**
@@ -765,5 +766,208 @@ describe("creation calls are never auto-retried", () => {
 			TelnyxApiError,
 		);
 		expect(attempts).toEqual([0]);
+	});
+});
+
+/**
+ * Porting and CNAM, against the same fake.
+ *
+ * `orderOne` is re-declared here rather than hoisted out of the `phoneNumbers` block: both copies
+ * are three lines, and lifting a helper to module scope so two `describe`s can share it is how a
+ * spec file acquires a private framework.
+ */
+async function ownOne(client: ReturnType<typeof makeClient>) {
+	const search = await client.availableNumbers.search({ countryCode: "US", limit: 1 });
+	const phoneNumber = search.data[0]?.phone_number ?? "";
+	await client.numberOrders.create({ phoneNumbers: [phoneNumber], customerReference: "cnam" });
+	const [owned] = await client.phoneNumbers.list({ phoneNumber });
+	return owned;
+}
+
+describe("portingOrders", () => {
+	/** The shape the whole module is built around. See its header. */
+	it("returns a LIST from the create, not a single order", async () => {
+		const client = makeClient();
+		const created = await client.portingOrders.create({
+			phoneNumbers: ["+12125550199"],
+			customerReference: "optimiq-port-1",
+		});
+		expect(Array.isArray(created)).toBe(true);
+		expect(created).toHaveLength(1);
+		expect(created[0]?.status).toBe("draft");
+		expect(created[0]?.support_key).toMatch(/^sk-/u);
+	});
+
+	/**
+	 * The reason the create returns an array at all: numbers spread across losing carriers become
+	 * several orders. A client that modelled this as one order would drop the second one silently,
+	 * and the numbers in it would simply never port.
+	 */
+	it("surfaces every order when the carrier splits the request", async () => {
+		const client = makeClient();
+		const created = await client.portingOrders.create({
+			phoneNumbers: ["+12125550199", "+442075550100"],
+			customerReference: "optimiq-port-2",
+		});
+		expect(created).toHaveLength(2);
+		expect(new Set(created.map((order) => order.id)).size).toBe(2);
+	});
+
+	it("reads one order back by id", async () => {
+		const client = makeClient();
+		const [created] = await client.portingOrders.create({
+			phoneNumbers: ["+12125550199"],
+			customerReference: "optimiq-port-3",
+		});
+		const read = await client.portingOrders.get(created?.id ?? "");
+		expect(read.id).toBe(created?.id ?? "");
+		expect(read.phone_numbers[0]?.phone_number).toBe("+12125550199");
+	});
+
+	it("lists with the page metadata rather than discarding it", async () => {
+		const client = makeClient();
+		await client.portingOrders.create({
+			phoneNumbers: ["+12125550199"],
+			customerReference: "optimiq-port-4",
+		});
+		const page = await client.portingOrders.list({ pageSize: 20 });
+		expect(page.data).toHaveLength(1);
+		expect(page.meta?.total_pages).toBe(1);
+	});
+
+	it("filters by status, so 'what is stuck' is one request", async () => {
+		const client = makeClient();
+		await client.portingOrders.create({
+			phoneNumbers: ["+12125550199"],
+			customerReference: "optimiq-port-5",
+		});
+		expect((await client.portingOrders.list({ status: "draft" })).data).toHaveLength(1);
+		expect((await client.portingOrders.list({ status: "ported" })).data).toHaveLength(0);
+	});
+
+	/** The stand-in for the idempotency Telnyx does not offer on this endpoint. */
+	it("reconciles by customer reference instead of retrying", async () => {
+		const client = makeClient();
+		await client.portingOrders.create({
+			phoneNumbers: ["+12125550199"],
+			customerReference: "optimiq-port-6",
+		});
+		expect(await client.portingOrders.findByCustomerReference("optimiq-port-6")).toHaveLength(1);
+		expect(await client.portingOrders.findByCustomerReference("nope")).toHaveLength(0);
+	});
+
+	/**
+	 * A port-in commits the organization to a bill and to a regulatory workflow a human unwinds by
+	 * hand. One attempt, then reconcile — never a second POST.
+	 */
+	it("makes exactly one attempt at POST /porting_orders", async () => {
+		const client = makeClient();
+		server.state.failNext(500).failNext(500);
+		let attempts = 0;
+		const counting = makeClient({
+			fetch: async (url: string, init: RequestInit) => {
+				attempts += 1;
+				return await fetch(url, init);
+			},
+		});
+		await expect(
+			counting.portingOrders.create({
+				phoneNumbers: ["+12125550199"],
+				customerReference: "optimiq-port-7",
+			}),
+		).rejects.toThrow(TelnyxApiError);
+		expect(attempts).toBe(1);
+		// The reconciliation read that follows such a failure is a GET and retries normally.
+		expect((await client.portingOrders.list()).data).toHaveLength(0);
+	});
+});
+
+describe("cnam listing", () => {
+	/**
+	 * The whole reason `getCnamListing` exists: neither endpoint answers the question on its own.
+	 */
+	it("merges the two halves Telnyx keeps on two different endpoints", async () => {
+		const client = makeClient();
+		const owned = await ownOne(client);
+		const listing = await client.phoneNumbers.updateCnamListing(owned?.id ?? "", {
+			enabled: true,
+			listingEnabled: true,
+			details: "OPTIMIQ VOICE",
+		});
+		expect(listing).toEqual({
+			enabled: true,
+			listingEnabled: true,
+			listingDetails: "OPTIMIQ VOICE",
+		});
+		expect(await client.phoneNumbers.getCnamListing(owned?.id ?? "")).toEqual(listing);
+	});
+
+	/**
+	 * The asymmetry, asserted from the other side: the flag the PATCH accepted is readable on the
+	 * parent number and absent from the voice GET. A client that trusted the voice GET would report
+	 * CNAM as off on every number that has it on.
+	 */
+	it("reads caller_id_name_enabled from the parent, never from the voice GET", async () => {
+		const client = makeClient();
+		const owned = await ownOne(client);
+		await client.phoneNumbers.updateCnamListing(owned?.id ?? "", { enabled: true });
+		const voice = await client.phoneNumbers.getVoiceSettings(owned?.id ?? "");
+		expect((voice as Record<string, unknown>).caller_id_name_enabled).toBeUndefined();
+		expect((await client.phoneNumbers.get(owned?.id ?? "")).caller_id_name_enabled).toBe(true);
+	});
+
+	it("defaults both flags off for a number that has never been configured", async () => {
+		const client = makeClient();
+		const owned = await ownOne(client);
+		expect(await client.phoneNumbers.getCnamListing(owned?.id ?? "")).toEqual({
+			enabled: false,
+			listingEnabled: false,
+			listingDetails: "",
+		});
+	});
+
+	it("leaves untouched halves alone across two partial updates", async () => {
+		const client = makeClient();
+		const owned = await ownOne(client);
+		await client.phoneNumbers.updateCnamListing(owned?.id ?? "", { details: "ACME LTD" });
+		const listing = await client.phoneNumbers.updateCnamListing(owned?.id ?? "", {
+			enabled: true,
+		});
+		expect(listing.listingDetails).toBe("ACME LTD");
+		expect(listing.enabled).toBe(true);
+	});
+
+	/**
+	 * Refused locally, before a round trip, because the carrier accepts it and truncates: the
+	 * failure would otherwise surface weeks later as "our calls show up wrong".
+	 */
+	it("refuses a CNAM string longer than the NANP field before any request", async () => {
+		const client = makeClient();
+		const owned = await ownOne(client);
+		const before = server.state.requests.length;
+		await expect(
+			client.phoneNumbers.updateCnamListing(owned?.id ?? "", {
+				details: "SIXTEEN CHARS!!!",
+			}),
+		).rejects.toThrow(TelnyxCnamFormatError);
+		expect(server.state.requests.length).toBe(before);
+	});
+
+	it("refuses a non-ASCII CNAM string the carrier database cannot carry", async () => {
+		const client = makeClient();
+		const owned = await ownOne(client);
+		await expect(
+			client.phoneNumbers.updateCnamListing(owned?.id ?? "", { details: "CAFÉ" }),
+		).rejects.toThrow(TelnyxCnamFormatError);
+	});
+
+	it("also writes the cnam_listing group through updateVoiceSettings", async () => {
+		const client = makeClient();
+		const owned = await ownOne(client);
+		const voice = await client.phoneNumbers.updateVoiceSettings(owned?.id ?? "", {
+			cnamListing: { cnamListingEnabled: true, cnamListingDetails: "SUPPORT" },
+		});
+		expect(voice.cnam_listing?.cnam_listing_enabled).toBe(true);
+		expect(voice.cnam_listing?.cnam_listing_details).toBe("SUPPORT");
 	});
 });

@@ -111,6 +111,29 @@ export const RPC_SUBJECTS = {
 	 */
 	pbxExtensionFeature: `rpc.pbx.${SUBJECT_VERSION}.extension-feature`,
 	/**
+	 * An ORGANIZATION-wide toggle dialled from a handset — a call flow's day/night switch and a time
+	 * condition's override: `apps/engine` → `apps/api`.
+	 *
+	 * Its own subject rather than a member of `extension-feature`, and the difference is not
+	 * cosmetic. That one changes a column on the CALLER's own extension, which is why its responder
+	 * treats `extensionNumber` as a claim to resolve and needs no authorisation beyond owning the
+	 * line. This one changes what every caller to the tenant hears, so the thing it must be granted
+	 * on at the broker is different, and folding them together would make "may divert my own calls"
+	 * and "may put the whole company into night mode" one permission.
+	 */
+	pbxToggleFeature: `rpc.pbx.${SUBJECT_VERSION}.toggle-feature`,
+	/**
+	 * Hot desking — an agent claiming a shared handset, and giving it back:
+	 * `apps/engine` → `apps/api`.
+	 *
+	 * Its own subject for the reason the two above have theirs, and one more. It carries a PIN, in
+	 * the clear, inside the request: the digits are collected by the engine and verified against
+	 * `pin_set_entry.pin_hash` by the process that owns the row, because putting a hot-desk gate in
+	 * the compiled artifact would broadcast every agent's digest to every engine on a KV bucket.
+	 * A subject carrying a credential is one that has to be grantable — and refusable — on its own.
+	 */
+	pbxHotDesk: `rpc.pbx.${SUBJECT_VERSION}.hot-desk`,
+	/**
 	 * `*69` — who rang this extension last: `apps/engine` → `apps/api`.
 	 *
 	 * Separate from the subject above because it is a READ, and a read of a different database:
@@ -246,6 +269,16 @@ export const RPC_SUBJECTS = {
 	mediaStartRecording: `rpc.media.${SUBJECT_VERSION}.start-recording`,
 	mediaStopRecording: `rpc.media.${SUBJECT_VERSION}.stop-recording`,
 	/**
+	 * PCI: stop capturing while the caller reads a card number, WITHOUT ending the file.
+	 *
+	 * One subject with a `resume` bit rather than a pair, because both halves carry a reference and
+	 * nothing else — the same shape `mute-session` uses and for the same reason. A stop/start pair
+	 * would end the artifact at exactly the interesting moment and give the second half a different
+	 * object key; this keeps one file with a silence gap on the recorder's own clock, and the
+	 * intervals ride `recording.finished`.
+	 */
+	mediaPauseRecording: `rpc.media.${SUBJECT_VERSION}.pause-recording`,
+	/**
 	 * Supervision: a third party joining a live conversation on ASYMMETRIC terms.
 	 *
 	 * The pair behind `*0` — eavesdrop, whisper and barge — and the one media subject on this list
@@ -285,6 +318,20 @@ export const RPC_SUBJECTS = {
 	 * picks for you.
 	 */
 	engineOriginate: `rpc.engine.${SUBJECT_VERSION}.originate`,
+	/**
+	 * Virtual hold: a queue asking the call engine to ring a caller back.
+	 *
+	 * A SIBLING of the originate above rather than a variant of it, because the two requests have
+	 * different subjects in the grammatical sense. An originate is an EXTENSION placing a call and
+	 * every refusal it can produce is about that extension; a callback is the QUEUE placing one, has
+	 * no extension at all, presents the queue's identity, and is authorised by the queue's own
+	 * outbound routing. Folding them into one schema would make `fromExtension` optional, which is
+	 * how a required field stops being checked.
+	 *
+	 * FLAT and queue-grouped, for the originate's reason exactly: a callback CREATES a call, so
+	 * there is no owner to address and whichever instance answers becomes it.
+	 */
+	engineQueueCallback: `rpc.engine.${SUBJECT_VERSION}.queue-callback`,
 	/**
 	 * The engine-to-engine command surface. A PREFIX, not a complete subject.
 	 *
@@ -331,6 +378,27 @@ export const RPC_SUBJECTS = {
 	 * per-member ownership that would have to be written on every join and reaped on every crash.
 	 */
 	engineConferenceControl: `rpc.engine.${SUBJECT_VERSION}.conference-control`,
+	/**
+	 * A leg-scoped control command on a call NOBODY handed out: the control plane pausing or
+	 * stopping the recording on a call an agent placed from a desk phone or the softphone. A PREFIX,
+	 * like the three above it, and for the same reason — the leg lives on ONE instance's media
+	 * channel.
+	 *
+	 * The one thing that distinguishes it from {@link RPC_SUBJECTS.engineSessionVerb} is WHO may be
+	 * addressed. A session verb commands a leg an application was handed and is authorised against
+	 * the session id the engine minted; there is no such handle for a PBX call, and inventing one
+	 * would mean minting a session for every call in the platform so that a pause button could
+	 * exist. This subject authorises on the two things a control plane genuinely has: the call's
+	 * organization, which it takes from the operator's own session and never from a payload, and
+	 * ownership of the leg, which the engine re-checks against its own registry.
+	 *
+	 * The address comes from the `channels` bucket, whose every value carries
+	 * `variables.OPTIMIQ_ENGINE_INSTANCE_ID` — the same lookup `park-handoff` makes against
+	 * `park-claims`, against a bucket the api already reads for the live-calls topic. An engine that
+	 * is addressed for a call it no longer holds answers `wrong_instance`, exactly as `apps/mediad`
+	 * does, so a stale entry is a retry rather than a lie.
+	 */
+	engineCallControl: `rpc.engine.${SUBJECT_VERSION}.call-control`,
 	/**
 	 * The session protocol's other half: a call has reached an `application` destination, and the
 	 * engine is asking whoever holds that application's socket to take it.
@@ -486,8 +554,19 @@ export const CALL_EVENTS = [
 ] as const;
 export type CallEvent = (typeof CALL_EVENTS)[number];
 
-/** SIP registrar vocabulary. `expired` is the registrar's TTL sweep, not a client REGISTER. */
-export const REGISTRATION_EVENTS = ["registered", "unregistered", "expired"] as const;
+/**
+ * SIP registrar vocabulary. `expired` is the registrar's TTL sweep, not a client REGISTER.
+ *
+ * `auth-failed` is the only member that is not a binding transition: it is the edge reporting a
+ * REGISTER it refused, so that `sip_auth_event` has a `bad-credentials` writer at all. It rides
+ * this family because only the registrar can raise it and it is keyed by the same AOR.
+ */
+export const REGISTRATION_EVENTS = [
+	"registered",
+	"unregistered",
+	"expired",
+	"auth-failed",
+] as const;
 export type RegistrationEvent = (typeof REGISTRATION_EVENTS)[number];
 
 /**
@@ -533,6 +612,8 @@ export const QUEUE_EVENTS = [
 	"caller.answered",
 	"caller.abandoned",
 	"agent.state",
+	"callback.placed",
+	"callback.failed",
 ] as const;
 export type QueueEvent = (typeof QUEUE_EVENTS)[number];
 
@@ -871,6 +952,14 @@ export const subjectFor = {
 	pbxExtensionFeatureRpc(): string {
 		return RPC_SUBJECTS.pbxExtensionFeature;
 	},
+	/** `rpc.pbx.v1.toggle-feature` */
+	pbxToggleFeatureRpc(): string {
+		return RPC_SUBJECTS.pbxToggleFeature;
+	},
+	/** `rpc.pbx.v1.hot-desk` */
+	pbxHotDeskRpc(): string {
+		return RPC_SUBJECTS.pbxHotDesk;
+	},
 	/** `rpc.pbx.v1.last-caller` */
 	pbxLastCallerRpc(): string {
 		return RPC_SUBJECTS.pbxLastCaller;
@@ -933,6 +1022,13 @@ export const subjectFor = {
 		return RPC_SUBJECTS.engineOriginate;
 	},
 	/**
+	 * `rpc.engine.v1.queue-callback` — flat, queue-grouped. See
+	 * {@link RPC_SUBJECTS.engineQueueCallback}.
+	 */
+	engineQueueCallbackRpc(): string {
+		return RPC_SUBJECTS.engineQueueCallback;
+	},
+	/**
 	 * `rpc.engine.v1.park-handoff.<instanceToken>` — addressed at ONE engine instance.
 	 *
 	 * The token comes from {@link instanceSubjectToken}, so a responder subscribing with its own
@@ -956,6 +1052,13 @@ export const subjectFor = {
 	 */
 	engineConferenceControlRpc(instanceId: string): string {
 		return `${RPC_SUBJECTS.engineConferenceControl}.${instanceSubjectToken(instanceId)}`;
+	},
+	/**
+	 * `rpc.engine.v1.call-control.<instanceToken>` — addressed at the engine instance that owns the
+	 * leg, as the `channels` bucket names it. See {@link RPC_SUBJECTS.engineCallControl}.
+	 */
+	engineCallControlRpc(instanceId: string): string {
+		return `${RPC_SUBJECTS.engineCallControl}.${instanceSubjectToken(instanceId)}`;
 	},
 	/**
 	 * `rpc.session.v1.announce.<orgId>.<applicationToken>` — the subject that IS the registration.

@@ -291,6 +291,8 @@ describe("kv bucket definitions", () => {
 			"media-owners",
 			"queue-waiting",
 			"sip-dialogs",
+			"sip-instances",
+			"engine-instances",
 			"trunks",
 			"sip-acl",
 		]);
@@ -390,23 +392,40 @@ describe("kvKeyFor", () => {
 	 * The SIP edge's three keys, and the one transformation in this whole file.
 	 *
 	 * `sipDialog` is the third non-org-scoped key, for the reason `didIndex` and `mediaSession` are:
-	 * the reader does not know the tenant. `sipAcl` is the fourth, and it is the only key that has to
-	 * REWRITE its argument — a CIDR carries `.`, `/` and, for IPv6, `:`, and none of the three
-	 * survives as a key token. The folding is asserted against the same vectors `packages/events-go`
-	 * checks, because a control plane and an edge that folded differently would write and read two
-	 * different keys and the ACL would silently admit nobody.
+	 * the reader does not know the tenant. `sipAcl` carries the organization and the scope — it is the
+	 * table's unique index spelled as tokens, so two tenants naming one CIDR cannot contend for one
+	 * key — and it is the only key that has to REWRITE part of its argument: a CIDR carries `.`, `/`
+	 * and, for IPv6, `:`, and none of the three survives as a key token. The folding is asserted
+	 * against the same vectors `packages/events-go` checks, because a control plane and an edge that
+	 * folded differently would write and read two different keys and the ACL would silently admit
+	 * nobody.
 	 */
 	it("builds the SIP edge's keys, folding a CIDR into one token", () => {
 		expect(kvKeyFor.sipDialog(leg)).toBe(leg);
+		expect(kvKeyFor.sipInstance("sipd-7c9f")).toBe("sipd-7c9f");
+		expect(kvKeyFor.engineInstance("engine-2")).toBe("engine-2");
 		expect(kvKeyFor.trunk(ORG, call)).toBe(`${ORG}.${call}`);
-		expect(kvKeyFor.sipAcl("203.0.113.0/24")).toBe("203-0-113-0-24");
+		expect(kvKeyFor.sipAcl(ORG, "trunk", "203.0.113.0/24")).toBe(`${ORG}.trunk.203-0-113-0-24`);
 		// IPv6 too: `sip_acl_entry.network` is a PostgreSQL `cidr`, so a folder that handled only the
 		// v4 separators would throw on the first IPv6 carrier.
-		expect(kvKeyFor.sipAcl("2001:db8::/32")).toBe("2001-db8---32");
+		expect(kvKeyFor.sipAcl(ORG, "registration", "2001:db8::/32")).toBe(
+			`${ORG}.registration.2001-db8---32`,
+		);
+		expect(kvKeyFor.sipAclPrefix(ORG)).toBe(`${ORG}.>`);
+	});
+
+	it("keeps two tenants naming one network on two keys", () => {
+		const other = "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293";
+		expect(kvKeyFor.sipAcl(ORG, "trunk", "203.0.113.0/24")).not.toBe(
+			kvKeyFor.sipAcl(other, "trunk", "203.0.113.0/24"),
+		);
+		expect(kvKeyFor.sipAcl(ORG, "trunk", "203.0.113.0/24")).not.toBe(
+			kvKeyFor.sipAcl(ORG, "registration", "203.0.113.0/24"),
+		);
 	});
 
 	it("refuses a network with nothing usable in it", () => {
-		expect(() => kvKeyFor.sipAcl("   ")).toThrow(SubjectTokenError);
+		expect(() => kvKeyFor.sipAcl(ORG, "trunk", "   ")).toThrow(SubjectTokenError);
 	});
 
 	/**

@@ -178,7 +178,15 @@
 			"anyOf": [
 				{
 					"type": "string",
-					"enum": ["answered", "caller-hangup", "timeout", "overflow", "no-agents", "exit-key"]
+					"enum": [
+						"answered",
+						"caller-hangup",
+						"timeout",
+						"overflow",
+						"no-agents",
+						"exit-key",
+						"callback"
+					]
 				},
 				{
 					"type": "null"
@@ -186,6 +194,18 @@
 			]
 		},
 		"queueAgentRef": {
+			"anyOf": [
+				{
+					"type": "string",
+					"format": "uuid",
+					"pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+				},
+				{
+					"type": "null"
+				}
+			]
+		},
+		"relatedCallId": {
 			"anyOf": [
 				{
 					"type": "string",
@@ -210,6 +230,39 @@
 			]
 		},
 		"authPinLabel": {
+			"anyOf": [
+				{
+					"type": "string",
+					"maxLength": 128
+				},
+				{
+					"type": "null"
+				}
+			]
+		},
+		"sipAttestation": {
+			"anyOf": [
+				{
+					"type": "string",
+					"enum": ["A", "B", "C"]
+				},
+				{
+					"type": "null"
+				}
+			]
+		},
+		"sipVerstat": {
+			"anyOf": [
+				{
+					"type": "string",
+					"maxLength": 64
+				},
+				{
+					"type": "null"
+				}
+			]
+		},
+		"sipOrigId": {
 			"anyOf": [
 				{
 					"type": "string",

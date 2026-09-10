@@ -29,7 +29,12 @@ import type { Diagnostic } from "./diagnostics";
 import type { CompiledFeatureCode } from "./feature-codes";
 import type { CompiledPattern } from "./patterns";
 import type { PlanNodeId, PlanNodeTable } from "./plan";
-import type { CallBlockAction, CallBlockDirection, TollClass } from "./snapshot";
+import type {
+	CallBlockAction,
+	CallBlockDirection,
+	CallerIdPresentation,
+	TollClass,
+} from "./snapshot";
 import type { CompiledTimeCondition } from "./time-conditions";
 import type { CompiledTranslationRuleset } from "./translations";
 
@@ -343,6 +348,16 @@ export interface ExtensionIndexEntry {
 	readonly enabled: boolean;
 	readonly outboundCallerIdNumber?: string;
 	readonly outboundCallerIdName?: string;
+	/**
+	 * Withhold this extension's number on outbound calls — CLIR.
+	 *
+	 * Written ONLY when the row says `restricted`: `allowed` is the behaviour every artifact
+	 * compiled before this field had, so emitting it would rewrite every tenant's artifact to say
+	 * what its absence already said. Absent therefore means `allowed`, and a reader that predates
+	 * the field ignores it and presents the number, which is the pre-existing behaviour rather than
+	 * a silent withhold.
+	 */
+	readonly outboundCallerIdPresentation?: CallerIdPresentation;
 	readonly emergencyCallerIdNumber?: string;
 	/**
 	 * The caller's pickup group, when they are in one.
@@ -401,9 +416,9 @@ export interface CompiledRoutingSettings {
 	 *
 	 * Absent means the tenant configured no realm — every artifact compiled before this field existed
 	 * carries it absent, so an old reader ignores it and behaves exactly as it did, which is why this
-	 * is NOT an artifact-version bump (the same argument {@link maxConcurrentCalls} makes). The engine
-	 * falls back to its fleet-wide `ENGINE_SIP_REALM` when it is absent, and refuses the B-leg
-	 * `originate` by name when neither is set, rather than dialling a URI it cannot resolve.
+	 * is NOT an artifact-version bump (the same argument {@link maxConcurrentCalls} makes). There is no
+	 * deployment-wide fallback — a realm names exactly one tenant — so the engine refuses the B-leg
+	 * `originate` by name when it is absent, rather than dialling a URI it cannot resolve.
 	 */
 	readonly realm?: string;
 	/**
@@ -454,6 +469,18 @@ export interface RoutingArtifact {
 	 * every prompt id as a single file, which is what every release before this one did.
 	 */
 	readonly phrases?: Readonly<Record<string, CompiledPhrase>>;
+	/**
+	 * Where each single-audio prompt's file is, keyed by the `prompt` row id a plan node names.
+	 *
+	 * The value is a domain `MediaRef` — `object://<objectKey>` — for the same reason a voicemail
+	 * greeting's is: the key is a key, not a path, and only the reader knows where the store is
+	 * mounted. It sits beside {@link phrases} and is read the same way: a node keeps its bare
+	 * `…PromptId`, and a reader about to play one looks here for the file. A MISS is not an error
+	 * — it is an artifact compiled before this table existed, or a phrase (whose audio is its
+	 * steps') — and the reader falls back to the deployment-wide prompt prefix, which is what every
+	 * release before this one did.
+	 */
+	readonly prompts?: Readonly<Record<string, string>>;
 	/** Calling-party lookup, keyed by extension number. */
 	readonly extensionsByNumber: Readonly<Record<string, ExtensionIndexEntry>>;
 	/** Warnings that survived the compile. Errors never reach an artifact. */

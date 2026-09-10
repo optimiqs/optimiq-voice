@@ -15,7 +15,12 @@ import { macAddressSchema } from "./telephony";
  * authenticated, and every rejected attempt is published so anti-fraud can count them.
  */
 
-export const PROVISION_EVENTS = ["device.requested", "device.rendered", "device.rejected"] as const;
+export const PROVISION_EVENTS = [
+	"device.requested",
+	"device.rendered",
+	"device.rejected",
+	"credential.invalidated",
+] as const;
 export type ProvisionEvent = (typeof PROVISION_EVENTS)[number];
 
 const provisionBase = {
@@ -83,10 +88,59 @@ export const deviceRejectedDataSchema = z.object({
 	detail: z.string().max(512).optional(),
 });
 
+/**
+ * `credential.invalidated` — the SIP credentials this organization's phones hold have changed.
+ *
+ * ## The channel that did not exist
+ *
+ * `apps/sipd` caches the answer to `rpc.sip.v1.credential` for 30 s and, until this event, had no
+ * way to learn that one had become wrong: the RPC is pull-only with no paired push subject, a
+ * `sipSecretRef` rotation does not move the routing snapshot hash, and the `trunks` bucket carries
+ * a secret reference only for CARRIER trunks. The measured consequence was a phone knocked offline
+ * for up to the whole TTL after a rotation, and the edge's only compensation was re-asking once
+ * after a failed digest. `apps/api` holds the same answer in its own cache
+ * (`pbx/sip-credentials/sip-credentials.cache.ts`) and evicts it on the commit; this is that
+ * eviction, said out loud, so the second cache can follow the first.
+ *
+ * ## Why it is in THIS family
+ *
+ * The provisioning family is the one whose subject stops at the organization and puts the
+ * discriminator in the envelope `type`, "because provisioning volume is tiny and every consumer
+ * wants the whole org feed" — which is this event exactly: it fires when an administrator clicks
+ * save, and its only consumer wants all of them for the tenant. It is also the family that OWNS
+ * the password in question: `provision.service.ts` derives what a phone is given, and the
+ * credential responder repeats that derivation. A root of its own would have bought a narrower
+ * grant and cost a fourth stream, a fourth family and a fourth consumer.
+ *
+ * ## Whole-organization, and no account list
+ *
+ * The API's mutation seam reports a TABLE and a tenant, not a row identity — and a
+ * `device_line.auth_user` edit invalidates the entry under the OLD username, which the new row does
+ * not know. So the honest event says "everything you hold for this tenant is suspect", and a
+ * consumer that keys its cache by `(realm, username)` with one realm per deployment drops the lot.
+ * It carries no username, no realm and no digest: a subscriber learns that something changed, never
+ * what it changed to.
+ */
+export const credentialInvalidatedDataSchema = z.object({
+	/**
+	 * What moved, as `"<operation> on <table>"` — e.g. `update on extension`. A human string for a
+	 * log line and nothing a consumer should branch on; the event means the same thing whatever it
+	 * says, and a consumer that parsed it would break the first time a table was renamed.
+	 */
+	reason: z.string().max(128),
+	/** How many entries the API dropped from its own cache. Diagnostics; may legitimately be 0. */
+	dropped: z.int().min(0),
+});
+
 export const PROVISION_EVENT_DEFINITIONS = {
 	"device.requested": defineEvent("provision", "device.requested", deviceRequestedDataSchema),
 	"device.rendered": defineEvent("provision", "device.rendered", deviceRenderedDataSchema),
 	"device.rejected": defineEvent("provision", "device.rejected", deviceRejectedDataSchema),
+	"credential.invalidated": defineEvent(
+		"provision",
+		"credential.invalidated",
+		credentialInvalidatedDataSchema,
+	),
 } as const;
 
 export type ProvisionEventDefinitions = typeof PROVISION_EVENT_DEFINITIONS;
@@ -103,6 +157,7 @@ export const provisionEventSchema = z.discriminatedUnion("type", [
 	PROVISION_EVENT_DEFINITIONS["device.requested"].envelope,
 	PROVISION_EVENT_DEFINITIONS["device.rendered"].envelope,
 	PROVISION_EVENT_DEFINITIONS["device.rejected"].envelope,
+	PROVISION_EVENT_DEFINITIONS["credential.invalidated"].envelope,
 ]);
 
 export type ProvisionEventEnvelope = z.infer<typeof provisionEventSchema>;

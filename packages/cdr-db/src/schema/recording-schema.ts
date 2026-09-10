@@ -4,6 +4,7 @@ import {
 	check,
 	index,
 	integer,
+	jsonb,
 	pgPolicy,
 	pgTable,
 	text,
@@ -49,6 +50,21 @@ export const recordings = pgTable.withRLS(
 
 		durationMs: integer("duration_ms").notNull().default(0),
 		sizeBytes: bigint("size_bytes", { mode: "number" }).notNull().default(0),
+
+		/**
+		 * Every stretch a PCI pause silenced, `[startMs, endMs)` against this object's timeline.
+		 *
+		 * A pause keeps the recording ONE object with quiet in the middle of it, which is the whole
+		 * point — a stop and a restart would split the artifact at exactly the moment a reviewer is
+		 * looking at. Nothing in the audio distinguishes a deliberate gap from a caller thinking, so
+		 * this column is the only record that says which, and it is what a compliance reviewer reads.
+		 *
+		 * `jsonb` and not a second table: the intervals are read only with the row that owns them,
+		 * there are a handful per recording, and nothing joins or filters on them. Null on every row
+		 * written before pausing existed, and on every recording nobody paused — the two mean the
+		 * same thing to a reader and neither is worth distinguishing.
+		 */
+		pauses: jsonb("pauses").$type<{ startMs: number; endMs: number }[]>(),
 
 		/** When the retention policy allows the object to be purged. Null = keep indefinitely. */
 		retentionUntil: utcTimestamp("retention_until"),

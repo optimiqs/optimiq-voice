@@ -10,6 +10,7 @@ import {
 	type OutboundVoiceProfilesResource,
 } from "./resources/outbound-voice-profiles";
 import { makePhoneNumbers, type PhoneNumbersResource } from "./resources/phone-numbers";
+import { makePortingOrders, type PortingOrdersResource } from "./resources/porting-orders";
 import { createTelnyxTransport, type TelnyxClientOptions } from "./transport";
 
 /**
@@ -31,6 +32,13 @@ export interface TelnyxClient {
 	readonly availableNumbers: AvailableNumbersResource;
 	readonly numberOrders: NumberOrdersResource;
 	readonly phoneNumbers: PhoneNumbersResource;
+	/**
+	 * Porting a number in from another carrier (LNP). Deliberately a sibling of `numberOrders`
+	 * rather than a mode of it: buying an unowned number and taking over one a customer already
+	 * pays someone else for share a word ("get me this DID") and nothing else — different
+	 * endpoint, different lifecycle, different failure modes, and weeks rather than seconds.
+	 */
+	readonly portingOrders: PortingOrdersResource;
 	readonly credentialConnections: CredentialConnectionsResource;
 	readonly outboundVoiceProfiles: OutboundVoiceProfilesResource;
 	/** Programmable Fax: send a fax, read one back. Inbound arrives over the `fax.*` webhooks. */
@@ -45,6 +53,7 @@ export function createTelnyxClient(options: TelnyxClientOptions): TelnyxClient {
 		availableNumbers: makeAvailableNumbers(transport),
 		numberOrders: makeNumberOrders(transport),
 		phoneNumbers: makePhoneNumbers(transport),
+		portingOrders: makePortingOrders(transport),
 		credentialConnections: makeCredentialConnections(transport),
 		outboundVoiceProfiles: makeOutboundVoiceProfiles(transport),
 		faxes: makeFaxes(transport),

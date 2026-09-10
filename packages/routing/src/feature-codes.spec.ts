@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
 	DEFAULT_FEATURE_CODES,
 	FEATURE_CODE_ARGUMENT_MODE,
+	featureCodeArgumentMode,
 	featureCodeIssues,
 	isWellFormedFeatureCode,
 	matchFeatureCode,
@@ -75,6 +76,53 @@ describe("default catalogue", () => {
 
 	it("keeps the vanilla group-pickup code", () => {
 		expect(DEFAULT_FEATURE_CODES.find((entry) => entry.action === "group-pickup")?.code).toBe("*8");
+	});
+
+	/**
+	 * The pair that is easiest to number wrongly: `*31` takes an argument, and `*3` is already in the
+	 * catalogue. It is safe only because record-toggle takes NO argument, so the two are separated by
+	 * exact matching — assert both halves, since renumbering either one silently breaks the other.
+	 */
+	it("seeds a hot-desk pair that survives the prefix rule beside *3", () => {
+		const login = DEFAULT_FEATURE_CODES.find((entry) => entry.action === "hotdesk-login");
+		const logout = DEFAULT_FEATURE_CODES.find((entry) => entry.action === "hotdesk-logout");
+		expect(login?.code).toBe("*31");
+		expect(logout?.code).toBe("*32");
+		expect(FEATURE_CODE_ARGUMENT_MODE["hotdesk-login"]).toBe("required");
+		expect(FEATURE_CODE_ARGUMENT_MODE["hotdesk-logout"]).toBe("none");
+		expect(featureCodeIssues(DEFAULT_FEATURE_CODES)).toEqual([]);
+	});
+
+	/**
+	 * `*67`/`*82` are prefixes, so the pair that could break them is `*8` — group pickup, dialled
+	 * bare. It takes no argument and is therefore matched exactly, which is what lets `*82` sit
+	 * beside it; assert the match, not just the absence of a compile issue.
+	 */
+	it("seeds the CLIR pair as prefixes that coexist with *8", () => {
+		const restrict = DEFAULT_FEATURE_CODES.find(
+			(entry) => entry.action === "caller-id-presentation-restrict",
+		);
+		const allow = DEFAULT_FEATURE_CODES.find(
+			(entry) => entry.action === "caller-id-presentation-allow",
+		);
+		expect(restrict?.code).toBe("*67");
+		expect(allow?.code).toBe("*82");
+		expect(FEATURE_CODE_ARGUMENT_MODE["caller-id-presentation-restrict"]).toBe("required");
+		expect(FEATURE_CODE_ARGUMENT_MODE["caller-id-presentation-allow"]).toBe("required");
+		expect(featureCodeIssues(DEFAULT_FEATURE_CODES)).toEqual([]);
+
+		const seeded = table(
+			code("*8", "group-pickup"),
+			code("*82", "caller-id-presentation-allow"),
+			code("*67", "caller-id-presentation-restrict"),
+		);
+		expect(matchFeatureCode(seeded, "*8215551230001")).toEqual({
+			featureCode: seeded.find((entry) => entry.code === "*82") as CompiledFeatureCode,
+			argument: "15551230001",
+		});
+		expect(matchFeatureCode(seeded, "*8")?.featureCode.action).toBe("group-pickup");
+		// Dialled bare there is no call to present: `required` makes it no match at all.
+		expect(matchFeatureCode(seeded, "*67")).toBeNull();
 	});
 
 	it("labels every entry, because the admin UI renders the list", () => {
@@ -220,5 +268,49 @@ describe("matchFeatureCode", () => {
 
 	it("returns null against an empty table", () => {
 		expect(matchFeatureCode([], "*97")).toBeNull();
+	});
+});
+
+describe("featureCodeArgumentMode", () => {
+	it("reads the action's own mode when nothing is pinned", () => {
+		expect(featureCodeArgumentMode("paging", undefined)).toBe("required");
+		expect(featureCodeArgumentMode("call-park", undefined)).toBe("optional");
+		expect(featureCodeArgumentMode("do-not-disturb", undefined)).toBe("none");
+	});
+
+	/**
+	 * The defect `E2E-routing2.md` recorded: `*81` pinned to a group read as `required`, so
+	 * `matchFeatureCode` skipped it when it was dialled alone and the tenant's page code did nothing.
+	 */
+	it("takes no argument once the row pins the group it pages", () => {
+		expect(featureCodeArgumentMode("paging", { groupId: "pg-1" })).toBe("none");
+		expect(
+			matchFeatureCode(
+				[
+					{
+						id: "fc-1",
+						code: "*81",
+						action: "paging",
+						argumentMode: featureCodeArgumentMode("paging", { groupId: "pg-1" }),
+						params: { groupId: "pg-1" },
+						nodeId: "paging:pg-1",
+					},
+				],
+				"*81",
+			),
+		).toEqual({
+			featureCode: expect.objectContaining({ code: "*81" }),
+			argument: "",
+		});
+	});
+
+	it("ignores a pin that is not the argument it would replace", () => {
+		// The lot pins WHERE to park; the orbit still selects a slot inside it.
+		expect(featureCodeArgumentMode("call-park", { lotId: "lot-1" })).toBe("optional");
+	});
+
+	it("ignores an empty or non-string pin", () => {
+		expect(featureCodeArgumentMode("paging", { groupId: "" })).toBe("required");
+		expect(featureCodeArgumentMode("paging", { groupId: 7 })).toBe("required");
 	});
 });

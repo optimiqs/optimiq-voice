@@ -87,9 +87,11 @@ describe("partitioned CDR tables", () => {
 describe("call_legs", () => {
 	const config = getTableConfig(callLegs);
 
-	it("is the ~40-column trim of the FusionPBX 90-column CDR plus a jsonb tail", () => {
+	it("is the ~45-column trim of the FusionPBX 90-column CDR plus a jsonb tail", () => {
+		// The ceiling moves only when a column is added deliberately; the point of the band is that
+		// the 90-column original was never copied wholesale, not that the number is frozen.
 		expect(config.columns.length).toBeGreaterThanOrEqual(35);
-		expect(config.columns.length).toBeLessThanOrEqual(45);
+		expect(config.columns.length).toBeLessThanOrEqual(50);
 		expect(config.columns.find((column) => column.name === "raw")?.notNull).toBe(true);
 	});
 
@@ -99,9 +101,23 @@ describe("call_legs", () => {
 			"call_legs_organization_from_idx",
 			"call_legs_organization_started_idx",
 			"call_legs_organization_to_idx",
+			"call_legs_queue_agent_idx",
 			"call_legs_queue_idx",
 			"call_legs_recording_idx",
+			"call_legs_related_call_idx",
 		]);
+	});
+
+	/**
+	 * Sparse on purpose. The column is null on every leg but a virtual-hold callback, so the index
+	 * is the size of the feature rather than of the ledger.
+	 */
+	it("indexes the cross-call link partially, because almost no leg carries one", () => {
+		const related = config.indexes.find(
+			(entry) => entry.config.name === "call_legs_related_call_idx",
+		);
+
+		expect(related?.config.where).toBeDefined();
 	});
 
 	it("indexes recordings partially so the retention sweep never scans answered-only legs", () => {

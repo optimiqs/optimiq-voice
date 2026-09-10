@@ -1,4 +1,14 @@
-CREATE ROLE "pbx_tenant_tls" WITH NOINHERIT;--> statement-breakpoint
+-- HAND-EDITED: roles are cluster-wide, and the PBX database shares a cluster with the CDR and auth
+-- databases in every environment, so creation must tolerate a role that already exists. The CDR and
+-- API baselines carry the identical guard; this one was missed, and without it a PBX database
+-- recreated in an existing cluster fails its first migration with "role already exists".
+DO $$
+BEGIN
+	IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pbx_tenant_tls') THEN
+		CREATE ROLE "pbx_tenant_tls" WITH NOINHERIT;
+	END IF;
+END
+$$;--> statement-breakpoint
 CREATE TABLE "conference" (
 	"id" uuid PRIMARY KEY,
 	"organization_id" uuid NOT NULL,

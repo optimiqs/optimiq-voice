@@ -271,9 +271,66 @@ export interface IvrMenuPlanNode extends PlanNodeBase {
 	readonly maxTimeouts: number;
 	/** Lets a caller dial an internal number that is not an explicit option. */
 	readonly directDialEnabled: boolean;
+	/**
+	 * How many digits a direct dial may need — the longest extension number in this artifact.
+	 *
+	 * Present only when {@link directDialEnabled} is set and the organization has an extension, and
+	 * it exists because {@link maxDigits} cannot serve both jobs at once. A menu of single-digit
+	 * options is configured with `maxDigits: 1`, and a collection capped at one digit ends the
+	 * moment the caller presses the first digit of `1104` — the option matches, the call routes, and
+	 * the remaining three digits fall on the floor. That is exactly the failure `FIX-ivr-dtmf.md`
+	 * recorded as a product limit.
+	 *
+	 * So the collection is capped at the LARGER of the two, and the inter-digit timeout is what
+	 * separates the two intents: a caller who presses `1` and stops is on the option after
+	 * {@link interDigitTimeoutMs}, and a caller who types `1104` without pausing is on the
+	 * extension. `maxDigits` still means what it says for a menu that has no direct dial.
+	 *
+	 * An OPTIONAL field, so a reader compiled before it existed ignores it and behaves exactly as it
+	 * did — which is why it is not an artifact version bump.
+	 */
+	readonly directDialMaxDigits?: number;
 	readonly options: readonly IvrOption[];
 	readonly timeoutNodeId?: PlanNodeId;
 	readonly invalidNodeId?: PlanNodeId;
+}
+
+/**
+ * Virtual hold, compiled.
+ *
+ * # Why one sub-object rather than nine fields on the queue
+ *
+ * Because the nine are only meaningful together. A `retryDelaySeconds` on a queue with no callback
+ * is a number nothing reads, and a reader that has to check `callbackEnabled` before trusting the
+ * other eight has been handed a shape that can lie. Present means the queue offers a callback and
+ * every field here is usable; absent means it does not, and there is no second way to say so.
+ *
+ * It is also what keeps this off the artifact version. A v4 reader ignores an unknown optional
+ * FIELD and runs the queue exactly as it did — callers wait, nobody is offered anything — which is
+ * a correct degradation. A new node KIND would not have that property, which is the line
+ * `ROUTING_ARTIFACT_VERSION` draws.
+ *
+ * # The place, and what holds it
+ *
+ * A caller who accepts is ABANDONED as far as the waiting line is concerned — they hang up, and
+ * every other caller moves up one. What survives is a token keyed by their number, holding the
+ * place they had. That is deliberately the same shape the queue already uses for
+ * `abandonedResumeAllowed`, because it is the same fact: the difference between the two features is
+ * only who dials when the time comes.
+ */
+export interface QueueCallbackPlan {
+	/** The DTMF digit that accepts. Absent means the offer is announced and cannot be taken. */
+	readonly key?: string;
+	/** Seconds of waiting after which the offer plays unprompted. `0` means only on the key. */
+	readonly offerAfterSeconds: number;
+	readonly offerPromptId?: string;
+	readonly confirmPromptId?: string;
+	/** Attempts before the held place is given up. At least 1. */
+	readonly maxAttempts: number;
+	/** Seconds between a failed attempt and the next. */
+	readonly retryDelaySeconds: number;
+	/** Seconds the held place survives at all, across every attempt. */
+	readonly expiresAfterSeconds: number;
 }
 
 export interface QueuePlanNode extends PlanNodeBase {
@@ -336,6 +393,16 @@ export interface QueuePlanNode extends PlanNodeBase {
 	 * not be a priority.
 	 */
 	readonly priority: number;
+	/**
+	 * Virtual hold, when this queue offers it. See {@link QueueCallbackPlan}.
+	 *
+	 * Its relationship to {@link abandonedResumeAllowed} is worth stating, because the two look
+	 * alike and are not: that one holds a place for a caller who hung up UNPROMPTED and dials back
+	 * themselves, this one holds a place for a caller who was ASKED and the system dials. A queue
+	 * may sensibly have both — they write the same kind of token and the first of them to be
+	 * claimed wins.
+	 */
+	readonly callback?: QueueCallbackPlan;
 	/** Whether a caller who hung up may reclaim their place on a call-back. */
 	readonly abandonedResumeAllowed: boolean;
 	/** How long that place is held. Also the resume tombstone's TTL. */

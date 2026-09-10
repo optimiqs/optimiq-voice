@@ -1,11 +1,24 @@
 import { and, eq } from "drizzle-orm";
 import { organizationSsoProvider } from "./schema/platform/organization-platform-schema";
+import { encryptSecret, loadSecretKey, openStoredSecret, requireSecretKey } from "./secret-cipher";
 import type { AdminDatabase } from "./client";
 
 /**
  * Reads and writes over per-organization SSO providers — the base-database repository the auth
  * slice configures IdPs through. Built with this package's Drizzle for the version-pin reason the
  * other platform repositories state.
+ *
+ * ## `client_secret` is encrypted at rest, and this file is the only place that knows it
+ *
+ * The column holds a credential the platform must PRESENT to the IdP again, so it cannot be hashed
+ * or derived the way `provision-secret.ts` handles a SIP password — it has to survive a round trip.
+ * It is therefore sealed with {@link encryptSecret} on the way in and opened on the way out, and
+ * both ends live here so that no caller ever holds a ciphertext it might store, log, or compare.
+ *
+ * The migration is LAZY as well as one-shot. A row written before this existed is plaintext, and
+ * {@link openStoredSecret} says so; {@link listEnabledSsoProvidersWithSecrets} re-writes those rows
+ * sealed as it reads them. A deployment that has not run `scripts/encrypt-sso-secrets.ts` therefore
+ * still signs in, and converges the first time the auth boot reads each row.
  */
 
 /**
@@ -103,10 +116,27 @@ export async function readSsoProvider(
 export async function listEnabledSsoProvidersWithSecrets(
 	db: AdminDatabase,
 ): Promise<readonly SsoProviderSecretRow[]> {
-	return await db
+	const key = loadSecretKey();
+	const rows = await db
 		.select(SECRET_COLUMNS)
 		.from(organizationSsoProvider)
 		.where(eq(organizationSsoProvider.enabled, true));
+
+	const opened: SsoProviderSecretRow[] = [];
+	for (const row of rows) {
+		const { plaintext, wasEncrypted } = openStoredSecret(row.clientSecret, key);
+		// The lazy half of the migration: a row that was still plaintext is sealed now, while the
+		// boot already has the value in hand. Best-effort on purpose — a read-only replica or a
+		// revoked grant must not take SSO down to finish a migration a script can also do.
+		if (!wasEncrypted && key) {
+			await db
+				.update(organizationSsoProvider)
+				.set({ clientSecret: encryptSecret(plaintext, key) })
+				.where(eq(organizationSsoProvider.id, row.id));
+		}
+		opened.push({ ...row, clientSecret: plaintext });
+	}
+	return opened;
 }
 
 export async function createSsoProvider(
@@ -120,7 +150,7 @@ export async function createSsoProvider(
 			providerId: input.providerId,
 			issuer: input.issuer,
 			clientId: input.clientId,
-			clientSecret: input.clientSecret,
+			clientSecret: encryptSecret(input.clientSecret, requireSecretKey()),
 			discoveryUrl: input.discoveryUrl ?? null,
 			scopes: input.scopes ?? null,
 			emailDomain: input.emailDomain ?? null,
@@ -147,7 +177,12 @@ export async function updateSsoProvider(
 		"enabled",
 	] as const) {
 		if (patch[key] !== undefined) {
-			set[key] = patch[key];
+			// A rotated secret is sealed on the way in exactly as a new one is; every other key in
+			// the whitelist is ordinary configuration and is written verbatim.
+			set[key] =
+				key === "clientSecret"
+					? encryptSecret(patch.clientSecret!, requireSecretKey())
+					: patch[key];
 		}
 	}
 	if (Object.keys(set).length === 0) {

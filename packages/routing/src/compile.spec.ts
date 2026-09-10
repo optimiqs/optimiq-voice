@@ -5,6 +5,7 @@ import { snapshotHash } from "./cache";
 import { canonicalJson } from "./canonical-json";
 import { callBlockHangupCause, compileRoutingArtifact, tryCompileRoutingArtifact } from "./compile";
 import { RoutingCompileError, RoutingSnapshotError } from "./errors";
+import { matchFeatureCode } from "./feature-codes";
 import {
 	aCallBlockRule,
 	aCallFlow,
@@ -424,6 +425,21 @@ describe("compile — extensions", () => {
 			tollClass: "national",
 		});
 	});
+
+	it("carries a withheld caller id, and writes nothing when it is presented", () => {
+		const withheld = compiled(
+			aSnapshot({ extensions: [anExtension({ outboundCallerIdPresentation: "restricted" })] }),
+		);
+		expect(withheld.extensionsByNumber["1001"]?.outboundCallerIdPresentation).toBe("restricted");
+		for (const value of ["allowed", null, undefined] as const) {
+			const artifact = compiled(
+				aSnapshot({ extensions: [anExtension({ outboundCallerIdPresentation: value })] }),
+			);
+			expect(artifact.extensionsByNumber["1001"]).not.toHaveProperty(
+				"outboundCallerIdPresentation",
+			);
+		}
+	});
 });
 
 /**
@@ -606,6 +622,38 @@ describe("compile — feature codes", () => {
 	it("errors on a code that is not dialable", () => {
 		const result = compileAttempt(aSnapshot({ featureCodes: [aFeatureCode({ code: "97" })] }));
 		expect(result.ok).toBe(false);
+	});
+
+	it("warns when a hot-desk login has no logout beside it", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				featureCodes: [aFeatureCode({ id: "fc-hd", code: "*31", action: "hotdesk-login" })],
+			}),
+		);
+		expect(codesOf(result)).toContain("hotdesk-logout-missing");
+	});
+
+	it("does not warn when the hot-desk pair is complete", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				featureCodes: [
+					aFeatureCode({ id: "fc-hd", code: "*31", action: "hotdesk-login" }),
+					aFeatureCode({ id: "fc-hd2", code: "*32", action: "hotdesk-logout" }),
+				],
+			}),
+		);
+		expect(codesOf(result)).not.toContain("hotdesk-logout-missing");
+	});
+
+	it("keeps a hot-desk login argument-taking, so *311104 carries the extension", () => {
+		const artifact = compiled(
+			aSnapshot({
+				featureCodes: [aFeatureCode({ id: "fc-hd", code: "*31", action: "hotdesk-login" })],
+			}),
+		);
+		const match = matchFeatureCode(artifact.internal.featureCodes, "*311104");
+		expect(match?.featureCode.action).toBe("hotdesk-login");
+		expect(match?.argument).toBe("1104");
 	});
 
 	it("skips a disabled code", () => {
@@ -1380,6 +1428,289 @@ describe("compile — screening and whisper", () => {
 	it("omits the whisper when a queue has none", () => {
 		const artifact = compiled(aSnapshot({ queues: [aQueue()] }));
 		expect(artifact.nodes["queue:q-1"]).not.toHaveProperty("agentWhisperPromptId");
+	});
+});
+
+describe("compile — queue callback (virtual hold)", () => {
+	it("compiles the block only for a queue that offers one", () => {
+		const artifact = compiled(aSnapshot({ extensions: [anExtension()], queues: [aQueue()] }));
+		expect((artifact.nodes["queue:q-1"] as QueuePlanNode).callback).toBeUndefined();
+	});
+
+	it("carries the offer, the key and the bounded retry policy", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				queues: [
+					aQueue({
+						callbackEnabled: true,
+						callbackKey: "2",
+						callbackOfferAfterSeconds: 90,
+						callbackMaxAttempts: 4,
+						callbackRetryDelaySeconds: 600,
+						callbackExpiresAfterSeconds: 7200,
+					}),
+				],
+			}),
+		);
+		expect((artifact.nodes["queue:q-1"] as QueuePlanNode).callback).toEqual({
+			key: "2",
+			offerAfterSeconds: 90,
+			maxAttempts: 4,
+			retryDelaySeconds: 600,
+			expiresAfterSeconds: 7200,
+		});
+	});
+
+	it("clamps a value that reached the row from somewhere other than the form", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				queues: [
+					aQueue({
+						callbackEnabled: true,
+						callbackKey: "2",
+						callbackMaxAttempts: 0,
+						callbackRetryDelaySeconds: 1,
+						callbackExpiresAfterSeconds: 1,
+					}),
+				],
+			}),
+		);
+		const callback = (artifact.nodes["queue:q-1"] as QueuePlanNode).callback;
+		expect(callback).toMatchObject({
+			maxAttempts: 1,
+			retryDelaySeconds: 30,
+			expiresAfterSeconds: 60,
+		});
+	});
+
+	/** One digit cannot mean two things, and the exit key keeps it. */
+	it("refuses to give the callback a digit the exit key already claims", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension()],
+				queues: [
+					aQueue({
+						exitKey: "2",
+						exitDestinationType: "hangup",
+						callbackEnabled: true,
+						callbackKey: "2",
+						callbackOfferAfterSeconds: 60,
+					}),
+				],
+			}),
+		);
+		expect(codesOf(result)).toContain("queue-callback-unusable");
+		const node = result.ok ? (result.artifact.nodes["queue:q-1"] as QueuePlanNode) : undefined;
+		expect(node?.exitKey).toBe("2");
+		expect(node?.callback?.key).toBeUndefined();
+	});
+
+	it("drops an accept key a phone cannot send, and says so", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension()],
+				queues: [
+					aQueue({ callbackEnabled: true, callbackKey: "22", callbackOfferAfterSeconds: 60 }),
+				],
+			}),
+		);
+		expect(codesOf(result)).toContain("queue-callback-unusable");
+		const node = result.ok ? (result.artifact.nodes["queue:q-1"] as QueuePlanNode) : undefined;
+		expect(node?.callback?.key).toBeUndefined();
+		expect(node?.callback?.offerAfterSeconds).toBe(60);
+	});
+
+	it("compiles no callback at all when no caller could ever be offered one", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension()],
+				queues: [aQueue({ callbackEnabled: true })],
+			}),
+		);
+		expect(codesOf(result)).toContain("queue-callback-unusable");
+		const node = result.ok ? (result.artifact.nodes["queue:q-1"] as QueuePlanNode) : undefined;
+		expect(node?.callback).toBeUndefined();
+	});
+
+	it("allows an announcement-only offer, which is a real configuration", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension()],
+				queues: [aQueue({ callbackEnabled: true, callbackOfferAfterSeconds: 60 })],
+			}),
+		);
+		expect(codesOf(result)).not.toContain("queue-callback-unusable");
+	});
+});
+
+describe("compile — the entity toggle codes", () => {
+	/**
+	 * `*65` on a call flow and `*64` on a time condition. Both were validated on write and offered in
+	 * the admin UI while reaching neither `internal.featureCodes` nor `internal.numbers` — a code
+	 * answered by "no outbound route matched" (`E2E-routing2.md`).
+	 */
+	it("puts a call flow's toggle code in the catalogue, pinned to that flow", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				callFlows: [aCallFlow({ featureCode: "*65" })],
+			}),
+		);
+		const entry = artifact.internal.featureCodes.find((code) => code.code === "*65");
+		expect(entry).toMatchObject({
+			action: "call-flow-toggle",
+			argumentMode: "none",
+			params: { callFlowId: "cf-1" },
+		});
+		expect(artifact.nodes[entry?.nodeId ?? ""]).toMatchObject({
+			kind: "feature-code",
+			action: "call-flow-toggle",
+		});
+	});
+
+	it("puts a time condition's override code in the catalogue, pinned to that condition", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				timeConditions: [aTimeCondition({ overrideFeatureCode: "*64" })],
+				timeConditionRules: [aTimeRule()],
+			}),
+		);
+		const entry = artifact.internal.featureCodes.find((code) => code.code === "*64");
+		expect(entry).toMatchObject({
+			action: "time-condition-override",
+			argumentMode: "none",
+			params: { timeConditionId: "tc-1" },
+		});
+	});
+
+	it("matches the toggle code the way the engine will, longest code first", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				callFlows: [aCallFlow({ featureCode: "*65" })],
+				featureCodes: [aFeatureCode({ code: "*6", action: "redial" })],
+			}),
+		);
+		expect(matchFeatureCode(artifact.internal.featureCodes, "*65")?.featureCode.code).toBe("*65");
+	});
+
+	it("leaves a disabled flow's code out of the catalogue", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				callFlows: [aCallFlow({ featureCode: "*65", enabled: false })],
+			}),
+		);
+		expect(artifact.internal.featureCodes.map((code) => code.code)).not.toContain("*65");
+	});
+
+	it("still reports a real feature code that would swallow the toggle code", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension()],
+				callFlows: [aCallFlow({ featureCode: "*65" })],
+				featureCodes: [aFeatureCode({ code: "*65", action: "redial" })],
+			}),
+		);
+		expect(result.ok).toBe(false);
+		expect(codesOf(result)).toContain("conflicting-feature-code");
+	});
+
+	it("does not report a toggle code as colliding with the entry compiled from it", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension()],
+				callFlows: [aCallFlow({ featureCode: "*65" })],
+			}),
+		);
+		expect(codesOf(result)).not.toContain("conflicting-feature-code");
+	});
+});
+
+describe("compile — IVR direct dial", () => {
+	it("puts the directory's width on the node so the walker can collect a whole number", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [
+					anExtension({ number: "1001" }),
+					anExtension({ id: "ext-2", number: "20001" }),
+				],
+				ivrMenus: [anIvrMenu({ directDialEnabled: true })],
+			}),
+		);
+		const node = artifact.nodes["ivr-menu:ivr-1"] as IvrMenuPlanNode;
+		expect(node.maxDigits).toBe(1);
+		expect(node.directDialMaxDigits).toBe(5);
+	});
+
+	it("carries no width at all when the menu does not allow direct dial", () => {
+		const artifact = compiled(aSnapshot({ extensions: [anExtension()], ivrMenus: [anIvrMenu()] }));
+		const node = artifact.nodes["ivr-menu:ivr-1"] as IvrMenuPlanNode;
+		expect(node.directDialMaxDigits).toBeUndefined();
+	});
+
+	it("warns that an option is a prefix of an extension number, and names the cost", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension({ number: "1001" })],
+				ivrMenus: [anIvrMenu({ directDialEnabled: true, interDigitTimeoutMs: 2500 })],
+				ivrMenuOptions: [anIvrOption({ matchValue: "1" })],
+			}),
+		);
+		expect(result.ok).toBe(true);
+		const warning = result.diagnostics.find((entry) => entry.code === "ivr-direct-dial-ambiguous");
+		expect(warning?.message).toContain("extension 1001 starts with");
+		expect(warning?.message).toContain("2500ms");
+	});
+
+	it("warns that an option IS an extension number, which direct dial can never reach", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension({ number: "1001" })],
+				ivrMenus: [anIvrMenu({ directDialEnabled: true, maxDigits: 4 })],
+				ivrMenuOptions: [anIvrOption({ matchValue: "1001" })],
+			}),
+		);
+		const warning = result.diagnostics.find((entry) => entry.code === "ivr-direct-dial-ambiguous");
+		expect(warning?.message).toContain("cannot be reached by direct dial");
+	});
+
+	it("says nothing about an option no extension number starts with", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension({ number: "1001" })],
+				ivrMenus: [anIvrMenu({ directDialEnabled: true })],
+				ivrMenuOptions: [anIvrOption({ matchValue: "9" })],
+			}),
+		);
+		expect(codesOf(result)).not.toContain("ivr-direct-dial-ambiguous");
+	});
+
+	it("does not judge a regex option, whose shadow is not decidable from the pattern", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension({ number: "1001" })],
+				ivrMenus: [anIvrMenu({ directDialEnabled: true })],
+				ivrMenuOptions: [anIvrOption({ matchKind: "regex", matchValue: "^1$" })],
+			}),
+		);
+		expect(codesOf(result)).not.toContain("ivr-direct-dial-ambiguous");
+	});
+
+	it("warns when direct dial is on for an organization with no extension to dial", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				ivrMenus: [anIvrMenu({ directDialEnabled: true })],
+			}),
+		);
+		expect(codesOf(result)).toContain("ivr-direct-dial-empty");
+		const node = result.ok
+			? (result.artifact.nodes["ivr-menu:ivr-1"] as IvrMenuPlanNode)
+			: undefined;
+		expect(node?.directDialMaxDigits).toBeUndefined();
 	});
 });
 

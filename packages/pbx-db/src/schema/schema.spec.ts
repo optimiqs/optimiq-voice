@@ -7,7 +7,12 @@ import { CALL_FLOW_MODES } from "./call-flows-schema";
 import { CARRIER_PROVIDERS } from "./carrier-schema";
 import { destinationCheck, namedDestinationColumns } from "./columns";
 import { DIRECTORY_SEARCH_FIELDS } from "./directory-schema";
-import { EXTENSION_USER_ROLES, RECORD_POLICIES, TOLL_CLASSES } from "./extensions-schema";
+import {
+	CALLER_ID_PRESENTATIONS,
+	EXTENSION_USER_ROLES,
+	RECORD_POLICIES,
+	TOLL_CLASSES,
+} from "./extensions-schema";
 import { FAX_DIRECTIONS, FAX_MESSAGE_STATUSES } from "./fax-schema";
 import { FEATURE_CODE_ACTIONS } from "./features-schema";
 import { PROMPT_KINDS } from "./media-schema";
@@ -28,6 +33,7 @@ const tables = Object.values(pbxTables);
 
 const CONST_TUPLES = {
 	CALL_FLOW_MODES,
+	CALLER_ID_PRESENTATIONS,
 	CARRIER_PROVIDERS,
 	DESTINATION_TYPES,
 	DIRECTORY_SEARCH_FIELDS,
@@ -354,6 +360,74 @@ describe("pickup groups", () => {
 			index.config.columns.map((entry) => ("name" in entry ? entry.name : "")),
 		);
 		expect(indexed).not.toContain("pickup_group");
+	});
+});
+
+/**
+ * Hot desking.
+ *
+ * Four columns across two tables, and every one of them is pinned because a later change could
+ * quietly take away the property it exists for.
+ *
+ * `device_line.home_extension_id` is the whole design: it is what makes a logout a RESTORE rather
+ * than a guess, and it is what keeps the handset's SIP credential fixed while `extension_id` moves
+ * (`sip-credentials.service.ts` resolves a registration against the home binding). It must stay
+ * NULLABLE, because NULL is what "not logged in" means, and `ON DELETE SET NULL` rather than
+ * cascade, because deleting an extension must not delete the phone that once pointed at it.
+ *
+ * `extension.hot_desk_pin_set_id` is the gate, and it must stay nullable for the opposite reason to
+ * every other nullable column here: NULL is not a default, it is a REFUSAL. An extension nobody
+ * configured a set for cannot be claimed, because an ungated `*31` would let anybody in the
+ * building take anybody's calls by knowing a number printed on a phone.
+ */
+describe("hot desking", () => {
+	const lineConfig = getTableConfig(pbxTables.deviceLine);
+	const columnOf = (table: typeof pbxTables.deviceLine, name: string) =>
+		getTableConfig(table).columns.find((candidate) => candidate.name === name);
+
+	it("carries the home binding and the session bounds on device_line", () => {
+		const home = columnOf(pbxTables.deviceLine, "home_extension_id");
+		expect(home).toBeDefined();
+		expect(home?.getSQLType()).toBe("uuid");
+		// Nullable, because NULL is what "not hot-desked" means.
+		expect(home?.notNull).toBe(false);
+		expect(home?.hasDefault).toBe(false);
+
+		for (const name of ["hot_desk_expires_at", "hot_desk_login_at"]) {
+			const column = columnOf(pbxTables.deviceLine, name);
+			expect(column, name).toBeDefined();
+			expect(column?.getSQLType(), name).toBe("timestamp with time zone");
+			expect(column?.notNull, name).toBe(false);
+		}
+	});
+
+	it("restores rather than deletes when the home extension goes away", () => {
+		const key = lineConfig.foreignKeys.find((candidate) =>
+			candidate.reference().columns.some((column) => column.name === "home_extension_id"),
+		);
+		expect(key).toBeDefined();
+		// `cascade` here would delete the PHONE when somebody removed an extension it had once been
+		// hot-desked onto, which is the worst possible way for that delete to succeed.
+		expect(key?.onDelete).toBe("set null");
+	});
+
+	it("gates a claim on the extension's own PIN set, and fails closed when it has none", () => {
+		const column = columnOf(pbxTables.extension as never, "hot_desk_pin_set_id");
+		expect(column).toBeDefined();
+		expect(column?.getSQLType()).toBe("uuid");
+		expect(column?.notNull).toBe(false);
+		expect(column?.hasDefault).toBe(false);
+	});
+
+	it("indexes the expiry behind the tenant, for the sweeper", () => {
+		const index = lineConfig.indexes.find(
+			(candidate) => candidate.config.name === "device_line_organization_hot_desk_expires_idx",
+		);
+		expect(index).toBeDefined();
+		expect(index?.config.columns.map((entry) => ("name" in entry ? entry.name : ""))).toEqual([
+			"organization_id",
+			"hot_desk_expires_at",
+		]);
 	});
 });
 

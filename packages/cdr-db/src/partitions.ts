@@ -144,6 +144,41 @@ export function dropPartitionsBeforeQuery(table: PartitionedCdrTable, cutoff: Da
 	return sql`select ${sql.raw(CDR_DROP_PARTITIONS_FUNCTION)}(${table}, ${toDateLiteral(monthStart(cutoff))}::date) as dropped_partition`;
 }
 
+/**
+ * The partitions {@link dropPartitionsBeforeQuery} WOULD drop, without dropping them.
+ *
+ * The predicate is the one inside `cdr_drop_partitions_before` — same catalogue join, same upper-
+ * bound extraction, same `DEFAULT`/NULL skip — because a dry run that answered a different
+ * question from the sweep it previews would be worse than no dry run at all. The one difference is
+ * that this is a plain SELECT: it needs no DDL privilege, so an operator can be shown what a
+ * retention pass would destroy without being able to destroy it.
+ *
+ * It also returns each partition's size, which is the number an operator actually wants before
+ * approving the first pass a deployment ever runs.
+ */
+export function droppablePartitionsQuery(table: PartitionedCdrTable, cutoff: Date): SQL {
+	return sql`
+		with candidates as (
+			select child.relname as name,
+				child.oid as oid,
+				pg_get_expr(child.relpartbound, child.oid) as bound
+			from pg_inherits
+			join pg_class as parent on parent.oid = pg_inherits.inhparent
+			join pg_class as child on child.oid = pg_inherits.inhrelid
+			join pg_namespace as ns on ns.oid = parent.relnamespace
+			where ns.nspname = 'public' and parent.relname = ${table}
+		)
+		select name as partition_name,
+			pg_total_relation_size(oid) as bytes,
+			(regexp_match(bound, 'TO \(''([^'']+)''\)'))[1]::date as upper_bound
+		from candidates
+		where bound is not null
+			and bound <> 'DEFAULT'
+			and (regexp_match(bound, 'TO \(''([^'']+)''\)'))[1]::date <= ${toDateLiteral(monthStart(cutoff))}::date
+		order by name
+	`;
+}
+
 /** Minimal execution surface: any Drizzle handle or transaction satisfies it. */
 export interface PartitionExecutor {
 	readonly execute: (query: SQL) => PromiseLike<unknown>;

@@ -68,3 +68,19 @@ func probeStatus(t *testing.T, addr, path string) int {
 	defer response.Body.Close()
 	return response.StatusCode
 }
+
+func TestMetricsIsOffUnlessAsked(t *testing.T) {
+	addr := startProbeServer(t)
+	if status := probeStatus(t, addr, "/metrics"); status != http.StatusNotFound {
+		t.Errorf("/metrics answered %d on a listener that did not enable it", status)
+	}
+}
+
+func TestMetricsServesWhenEnabled(t *testing.T) {
+	addr := startProbeServer(t, WithMetrics(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("# HELP up\n"))
+	})))
+	if status := probeStatus(t, addr, "/metrics"); status != http.StatusOK {
+		t.Errorf("/metrics answered %d with WithMetrics", status)
+	}
+}

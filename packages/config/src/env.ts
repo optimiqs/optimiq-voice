@@ -215,6 +215,8 @@ const envSchema = z.object({
 	AUTH_COOKIE_DOMAIN: optionalString,
 	AUTH_COOKIE_SAMESITE: z.enum(["strict", "lax", "none"]).optional(),
 	AUTH_ISSUER: optionalString,
+	/** 32-byte key (hex or base64) sealing stored IdP client secrets; required in production. */
+	PLATFORM_SECRET_ENCRYPTION_KEY: optionalString,
 	AUTH_SESSION_TTL_SECONDS: z.coerce.number().int().min(60).max(2_592_000).default(86_400),
 	/** Size of the better-auth Postgres pool; every authenticated request and socket revalidation draws on it. */
 	AUTH_DATABASE_MAX_CONNECTIONS: z.coerce.number().int().min(1).max(100).default(10),

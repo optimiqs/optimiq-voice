@@ -77,6 +77,16 @@ export const QUEUE_OUTCOMES = [
 	"overflow",
 	"no-agents",
 	"exit-key",
+	/**
+	 * The caller accepted virtual hold: they hung up, their place is held as a callback token, and
+	 * the platform owes them a call.
+	 *
+	 * Its own member and not folded into `caller-hangup`, for the reason `exit-key` is not folded
+	 * into `overflow`: both left the line without an agent, and a service level that could not tell
+	 * "gave up" from "took the offer" would show a queue whose callback feature works as a queue
+	 * bleeding callers.
+	 */
+	"callback",
 ] as const;
 export type QueueOutcome = (typeof QUEUE_OUTCOMES)[number];
 

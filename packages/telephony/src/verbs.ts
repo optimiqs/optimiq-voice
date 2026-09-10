@@ -41,6 +41,8 @@ export const VERB_NAMES = [
 	"stopSay",
 	"gather",
 	"record",
+	"pauseRecord",
+	"resumeRecord",
 	"dial",
 	"bridge",
 	"unbridge",
@@ -246,6 +248,21 @@ export type RecordVerb = {
 };
 
 /**
+ * Silence the leg's running recording, and resume it (§5).
+ *
+ * A pair rather than one verb with a flag, because that is how every other two-state verb on this
+ * union is spelled — `hold`/`unhold`, `mute`/`unmute` — and because the PCI use these exist for is
+ * a feature code on a keypad, where one code means one verb.
+ *
+ * Neither carries a handle: a leg has at most one on-demand recording, and a pause that named a
+ * recording id would let an application silence a recording running on somebody else's leg.
+ */
+export type PauseRecordVerb = { readonly verb: "pauseRecord" };
+
+/** See {@link PauseRecordVerb}. */
+export type ResumeRecordVerb = { readonly verb: "resumeRecord" };
+
+/**
  * Originate one or more legs and bridge the first that answers (§2).
  *
  * `simultaneous` rings every target at once and hangs the losers up with `LOSE_RACE`;
@@ -420,6 +437,8 @@ export type Verb =
 	| StopSayVerb
 	| GatherVerb
 	| RecordVerb
+	| PauseRecordVerb
+	| ResumeRecordVerb
 	| DialVerb
 	| BridgeVerb
 	| UnbridgeVerb

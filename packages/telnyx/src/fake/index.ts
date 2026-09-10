@@ -11,6 +11,7 @@ export {
 	type FakeConnection,
 	type FakeNumberInventoryEntry,
 	type FakeOrder,
+	type FakePortingOrder,
 	type FakeProfile,
 	FakeTelnyxState,
 } from "./state";

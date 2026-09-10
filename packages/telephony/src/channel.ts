@@ -37,6 +37,8 @@ export type ChannelDirection = (typeof CHANNEL_DIRECTIONS)[number];
  * - `proxy-mode` — media is bypassed for this leg (SDP passthrough).
  * - `proxy-media` — media is relayed but not decoded.
  * - `video` — a video stream is negotiated.
+ * - `recording` — the platform is writing this leg's conversation to the recording store.
+ * - `recording-paused` — that recording is silenced right now (the PCI pause). Never set alone.
  */
 export const CHANNEL_FLAGS = [
 	"answered",
@@ -51,6 +53,15 @@ export const CHANNEL_FLAGS = [
 	"proxy-mode",
 	"proxy-media",
 	"video",
+	// The two recording flags are the ONLY thing that tells a surface outside the engine that a
+	// call is being recorded. They ride the snapshot rather than a new event because the snapshot is
+	// already mirrored into the `channels` bucket on every change and already reaches the live
+	// topic a wallboard and the softphone read — so the pause control the platform grew had a
+	// producer for one flag write, and would otherwise have needed an event, a stream and a reader.
+	// `recording-paused` is meaningless without `recording` and is never set alone; see
+	// `recordingStateOf` in `@optimiq-voice/events`, which is the reader's half of that rule.
+	"recording",
+	"recording-paused",
 ] as const;
 
 export type ChannelFlag = (typeof CHANNEL_FLAGS)[number];

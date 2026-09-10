@@ -30,6 +30,27 @@
 			"type": "integer",
 			"minimum": 0,
 			"maximum": 9007199254740991
+		},
+		"pauses": {
+			"maxItems": 256,
+			"type": "array",
+			"items": {
+				"type": "object",
+				"properties": {
+					"startMs": {
+						"type": "integer",
+						"minimum": 0,
+						"maximum": 9007199254740991
+					},
+					"endMs": {
+						"type": "integer",
+						"minimum": 0,
+						"maximum": 9007199254740991
+					}
+				},
+				"required": ["startMs", "endMs"],
+				"additionalProperties": false
+			}
 		}
 	},
 	"required": ["legId", "recordingId", "objectKey", "durationMs", "reason"],

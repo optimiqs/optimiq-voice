@@ -66,7 +66,67 @@ export const FEATURE_CODE_ARGUMENT_MODE: Readonly<
 	eavesdrop: "required",
 	// In-call blind transfer: the destination follows the code.
 	transfer: "required",
+	/**
+	 * Hot desking. Login takes the extension being claimed, because the whole point is that the
+	 * handset is NOT that extension's — the caller is standing at somebody else's desk, and the
+	 * calling number tells the switch nothing about who they are. Logout takes nothing: the session
+	 * to end is whichever one this handset is holding, and letting a second argument name a
+	 * different one would let anybody log anybody else out from any phone in the building.
+	 */
+	"hotdesk-login": "required",
+	"hotdesk-logout": "none",
+	/**
+	 * Per-call CLIR is a PREFIX, not a toggle: `*67<destination>` decides how this one call is
+	 * presented and then dials it. Dialled bare there is no call to apply it to — the standing
+	 * setting is `extension.outboundCallerIdPresentation`, which is edited on a form and not from a
+	 * handset — so `required` is the mode, and `matchFeatureCode` skips a bare `*67` rather than
+	 * running a code that would do nothing.
+	 */
+	"caller-id-presentation-restrict": "required",
+	"caller-id-presentation-allow": "required",
+	// Both are dialled bare and act on the ONE entity the compiler pinned into the node. A trailing
+	// argument would have to name a second flow or condition, which is what a second code is for.
+	"call-flow-toggle": "none",
+	"time-condition-override": "none",
 } as const;
+
+/**
+ * The `params` key that SUPPLIES an action's argument, for the actions that have one.
+ *
+ * `FEATURE_CODE_ARGUMENT_MODE` above answers "does this action need something after the code",
+ * which is a question about the ACTION. It is the wrong question for a row that has already been
+ * told the answer: `*81` with `params.groupId` pinned to the warehouse page group is a code that
+ * pages the warehouse, and reading its mode off the action table makes it `required` — so
+ * {@link matchFeatureCode} skips it when it is dialled alone and the tenant's `*81` reaches
+ * nothing at all. That is the defect `E2E-routing2.md` recorded.
+ *
+ * Only an action whose argument the pin REPLACES belongs here. `call-park` is deliberately absent:
+ * `params.lotId` pins the lot and the argument selects an orbit WITHIN it, so both are meaningful at
+ * once. `intercom` is absent because it cannot be pinned at all (see `featureCodeTarget`).
+ */
+const FEATURE_CODE_PINNED_ARGUMENT: Partial<Record<FeatureCodeAction, string>> = {
+	paging: "groupId",
+};
+
+/**
+ * How a code is matched, given both its action and what its row already pins.
+ *
+ * The static table is the default and the pin narrows it, never the other way round: a code with no
+ * params behaves exactly as it did before this function existed.
+ */
+export function featureCodeArgumentMode(
+	action: FeatureCodeAction,
+	params: FeatureCodeParams | undefined,
+): FeatureCodeArgumentMode {
+	const pinned = FEATURE_CODE_PINNED_ARGUMENT[action];
+	if (pinned !== undefined) {
+		const value = params?.[pinned];
+		if (typeof value === "string" && value.length > 0) {
+			return "none";
+		}
+	}
+	return FEATURE_CODE_ARGUMENT_MODE[action];
+}
 
 /** A seed entry: the code, what it does, and what it is called in the admin UI. */
 export interface FeatureCodeSeed {
@@ -106,6 +166,26 @@ export const DEFAULT_FEATURE_CODES: readonly FeatureCodeSeed[] = [
 	{ code: "*22", action: "queue-toggle", label: "Log in or out of a queue" },
 	{ code: "*23", action: "agent-status", label: "Set my agent status" },
 	{ code: "*43", action: "echo-test", label: "Echo test" },
+	/**
+	 * Hot desking. Vanilla has no numbering for it, so the pair is chosen to survive
+	 * {@link featureCodeIssues}: `*31` takes an argument, and the only seeded code that is a prefix
+	 * of it is `*3` (record-toggle), which takes none — so exact matching separates them and
+	 * longest-code-first sends `*311104` to the login rather than the recorder.
+	 */
+	{ code: "*31", action: "hotdesk-login", label: "Log in to this phone" },
+	{ code: "*32", action: "hotdesk-logout", label: "Log out of this phone" },
+	/**
+	 * The vanilla NANP pair, and the numbering everybody already knows: `*67` withholds, `*82`
+	 * presents. Both survive {@link featureCodeIssues} against the rest of this catalogue — nothing
+	 * seeded starts with either string — and against `*8` (group pickup), which takes no argument
+	 * and is therefore matched exactly, so longest-code-first sends `*8215551234` to `*82`.
+	 */
+	{
+		code: "*67",
+		action: "caller-id-presentation-restrict",
+		label: "Withhold my number on this call",
+	},
+	{ code: "*82", action: "caller-id-presentation-allow", label: "Present my number on this call" },
 ] as const;
 
 /** Codes must be dialable and must not collide with an extension range by accident. */

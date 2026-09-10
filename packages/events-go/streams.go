@@ -545,6 +545,51 @@ var SIPDialogsKV = KVBucketDefinition{
 	NumReplicas:  1,
 }
 
+// SIPInstancesKV maps a sipd instance to a liveness lease it renews every few seconds.
+//
+// SIPDialogsKV's reaper is a SURVIVING sipd sweeping a dead peer, which a single-instance edge does
+// not have: when the only sipd dies its calls stay live in the engine with audio still flowing and
+// the phone's BYE is answered 481 by the process that replaced it. This bucket is what lets the
+// engine notice on its own — one key per process, so it watches a handful of keys rather than every
+// dialog on the fleet.
+//
+// The TTL IS the lease here, the opposite of SIPDialogsKV: a record nobody renewed is a dead
+// process, so there is no long-lived correct value that server-side expiry could wrongly reap, and
+// a watcher learns of a death from the delete the server publishes. Not organization-scoped: a
+// process belongs to no tenant.
+var SIPInstancesKV = KVBucketDefinition{
+	Name:         "sip-instances",
+	Description:  "sipd instance -> liveness lease, so the engine can end legs whose edge died.",
+	TTL:          15 * time.Second,
+	History:      1,
+	Storage:      StorageFile,
+	MaxValueSize: 1024,
+	MaxBytes:     8 * mib,
+	NumReplicas:  1,
+}
+
+// EngineInstancesKV maps an engine instance to a liveness lease it renews every few seconds.
+//
+// The channel ownership lease already names an owner and an expiry, but it is ninety seconds wide
+// because it is renewed by a heartbeat that rewrites every live channel on the replica. Between an
+// engine being SIGKILLed and its calls being adopted there is therefore up to a minute and a half in
+// which media still flows, the dialog still stands, and no process holds an aggregate — so a BYE in
+// that window ends nothing and the call is never billed. One key per process closes that window, the
+// same shape SIPInstancesKV uses for the edge.
+//
+// The TTL IS the lease, as in SIPInstancesKV. Not organization-scoped: a process belongs to no
+// tenant.
+var EngineInstancesKV = KVBucketDefinition{
+	Name:         "engine-instances",
+	Description:  "engine instance -> liveness lease, so a survivor can adopt a dead replica's calls.",
+	TTL:          15 * time.Second,
+	History:      1,
+	Storage:      StorageFile,
+	MaxValueSize: 1024,
+	MaxBytes:     8 * mib,
+	NumReplicas:  1,
+}
+
 // TrunksKV holds the carrier directory this process dials and registers against.
 //
 // A derived read model written by apps/api from the trunk table, on the same seam did-index and
@@ -607,6 +652,8 @@ var KVBuckets = []KVBucketDefinition{
 	MediaOwnersKV,
 	QueueWaitingKV,
 	SIPDialogsKV,
+	SIPInstancesKV,
+	EngineInstancesKV,
 	TrunksKV,
 	SIPACLKV,
 }
@@ -779,6 +826,21 @@ func SIPDialogKVKey(legID string) (string, error) {
 	return token("legId", legID)
 }
 
+// SIPInstanceKVKey builds the sip-instances key: the sipd instance id, and nothing else.
+//
+// Not organization-scoped for a simpler reason than SIPDialogKVKey's: a process belongs to no
+// tenant.
+func SIPInstanceKVKey(instanceID string) (string, error) {
+	return token("instanceId", instanceID)
+}
+
+// EngineInstanceKVKey builds the engine-instances key: the engine instance id, and nothing else.
+//
+// Not organization-scoped, for the same reason as SIPInstanceKVKey: a process belongs to no tenant.
+func EngineInstanceKVKey(instanceID string) (string, error) {
+	return token("instanceId", instanceID)
+}
+
 // TrunkKVKey builds the trunks key <orgId>.<trunkId>: one entry per trunk, holding its whole
 // dialable configuration.
 func TrunkKVKey(orgID, trunkID string) (string, error) {
@@ -793,18 +855,37 @@ func TrunkKVKey(orgID, trunkID string) (string, error) {
 	return org + "." + trunk, nil
 }
 
-// SIPACLKVKey builds the sip-acl key: the network with ".", "/" and ":" folded to "-".
+// SIPACLKVKey builds the sip-acl key: <orgId>.<scope>.<network>, with the network's ".", "/" and
+// ":" folded to "-".
 //
-// Not organization-scoped, and the only key here needing a transformation: none of a CIDR's dots,
-// slash or colons survives as a KV key token, so all three fold to "-". IPv6 folds too, since
-// sip_acl_entry.network is a PostgreSQL cidr. Writer and reader go through this one function, which
-// is what makes them agree.
+// The key is sip_acl_entry's unique index — (organization_id, scope, network) — spelled as tokens,
+// so two tenants naming one CIDR cannot contend for one key. The edge still WATCHES the whole
+// bucket and evaluates by network, because an arriving packet carries a source address and nothing
+// else; the organization is in the key for the writer's benefit.
 //
-// The result stays readable — "203-0-113-0-24", "2001-db8---32", where the run of three dashes is
-// the "::" — because an operator debugging a refused carrier reads these keys with `nats kv ls`. The
-// mapping need not be injective over arbitrary strings: the only inputs are values PostgreSQL's cidr
-// type already normalised. It deliberately does not normalise the network itself.
-func SIPACLKVKey(network string) (string, error) {
+// The network is the only part needing a transformation: none of a CIDR's dots, slash or colons
+// survives as a KV key token, so all three fold to "-". IPv6 folds too, since sip_acl_entry.network
+// is a PostgreSQL cidr. Writer and reader go through this one function, which is what makes them
+// agree.
+//
+// The result stays readable — "<org>.trunk.203-0-113-0-24", "<org>.registration.2001-db8---32",
+// where the run of three dashes is the "::" — because an operator debugging a refused carrier reads
+// these keys with `nats kv ls`. The fold need not be injective over arbitrary strings: the only
+// inputs are values PostgreSQL's cidr type already normalised. It deliberately does not normalise
+// the network itself.
+func SIPACLKVKey(orgID, scope, network string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	scopeToken, err := token("scope", scope)
+	if err != nil {
+		return "", err
+	}
 	folded := strings.NewReplacer(".", "-", "/", "-", ":", "-").Replace(strings.TrimSpace(network))
-	return token("network", folded)
+	networkToken, err := token("network", folded)
+	if err != nil {
+		return "", err
+	}
+	return org + "." + scopeToken + "." + networkToken, nil
 }

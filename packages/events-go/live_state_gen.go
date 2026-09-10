@@ -269,6 +269,90 @@ func (v SIPDialogClaimRole) Valid() bool { return slices.Contains(SIPDialogClaim
 
 func (v SIPDialogClaimRole) String() string { return string(v) }
 
+// SIPInstanceLease is the liveness lease one sipd instance renews, in the sip-instances KV bucket.
+type SIPInstanceLease struct {
+	InstanceID string  `json:"instanceId"`
+	StartedAt  float64 `json:"startedAt"`
+	RenewedAt  float64 `json:"renewedAt"`
+	ExpiresAt  float64 `json:"expiresAt"`
+	Dialogs    *int    `json:"dialogs,omitempty"`
+
+	// Extra carries every key outside the pinned contract, verbatim. The TS schema is a
+	// z.looseObject (see cdr-events.ts) precisely so a producer running ahead of the
+	// consumer is not silently truncated; dropping these on the Go side would reintroduce
+	// the loss the loose schema exists to prevent.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+// MarshalJSON merges Extra back into the object, pinned fields winning on conflict.
+func (v SIPInstanceLease) MarshalJSON() ([]byte, error) {
+	type alias SIPInstanceLease
+	return marshalWithExtras(alias(v), v.Extra)
+}
+
+// UnmarshalJSON captures unknown keys into Extra instead of discarding them.
+func (v *SIPInstanceLease) UnmarshalJSON(data []byte) error {
+	type alias SIPInstanceLease
+	var inner alias
+	extra, err := unmarshalWithExtras(data, &inner, knownKeysSIPInstanceLease)
+	if err != nil {
+		return err
+	}
+	*v = SIPInstanceLease(inner)
+	v.Extra = extra
+	return nil
+}
+
+var knownKeysSIPInstanceLease = map[string]struct{}{
+	"instanceId": {},
+	"startedAt":  {},
+	"renewedAt":  {},
+	"expiresAt":  {},
+	"dialogs":    {},
+}
+
+// EngineInstanceLease is the liveness lease one engine instance renews, in the engine-instances KV bucket.
+type EngineInstanceLease struct {
+	InstanceID string  `json:"instanceId"`
+	StartedAt  float64 `json:"startedAt"`
+	RenewedAt  float64 `json:"renewedAt"`
+	ExpiresAt  float64 `json:"expiresAt"`
+	Channels   *int    `json:"channels,omitempty"`
+
+	// Extra carries every key outside the pinned contract, verbatim. The TS schema is a
+	// z.looseObject (see cdr-events.ts) precisely so a producer running ahead of the
+	// consumer is not silently truncated; dropping these on the Go side would reintroduce
+	// the loss the loose schema exists to prevent.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+// MarshalJSON merges Extra back into the object, pinned fields winning on conflict.
+func (v EngineInstanceLease) MarshalJSON() ([]byte, error) {
+	type alias EngineInstanceLease
+	return marshalWithExtras(alias(v), v.Extra)
+}
+
+// UnmarshalJSON captures unknown keys into Extra instead of discarding them.
+func (v *EngineInstanceLease) UnmarshalJSON(data []byte) error {
+	type alias EngineInstanceLease
+	var inner alias
+	extra, err := unmarshalWithExtras(data, &inner, knownKeysEngineInstanceLease)
+	if err != nil {
+		return err
+	}
+	*v = EngineInstanceLease(inner)
+	v.Extra = extra
+	return nil
+}
+
+var knownKeysEngineInstanceLease = map[string]struct{}{
+	"instanceId": {},
+	"startedAt":  {},
+	"renewedAt":  {},
+	"expiresAt":  {},
+	"channels":   {},
+}
+
 // ExtensionPresenceValue is the value a busy-lamp key renders, in the presence KV bucket.
 type ExtensionPresenceValue struct {
 	OrgID           string                      `json:"orgId"`

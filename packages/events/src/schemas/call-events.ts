@@ -111,6 +111,18 @@ export const channelRecordStoppedDataSchema = z.object({
 	durationMs: z.int().min(0),
 	reason: recordingStopReasonSchema,
 	bytes: z.int().min(0).optional(),
+	/**
+	 * Every stretch a PCI pause silenced, `[startMs, endMs)` against the object's own timeline.
+	 *
+	 * The recording is ONE object with quiet in the middle of it, and nothing in the audio says
+	 * whether the quiet was the agent pausing or the caller thinking. This is what tells a
+	 * compliance reviewer which, so it lands on `recordings` beside the duration. Absent when
+	 * nothing was paused, and absent on a media plane that cannot pause.
+	 */
+	pauses: z
+		.array(z.object({ startMs: z.int().min(0), endMs: z.int().min(0) }))
+		.max(256)
+		.optional(),
 });
 
 /**
@@ -331,6 +343,18 @@ export const callEmergencyDialedDataSchema = z.object({
 	number: dialStringSchema,
 	/** The calling station, when there is one. An API-originated leg may have none. */
 	callerNumber: dialStringSchema.optional(),
+	/**
+	 * The registered device the call was placed FROM, when the edge knew which one it was.
+	 *
+	 * This is the field that turns a dispatchable location from an inference into a fact. Without
+	 * it a consumer has to walk `callerNumber → extension → device_line → device`, which is right
+	 * for one desk on one extension and a coin flip for two — the case Ray Baum's Act exists for.
+	 *
+	 * Absent means the consumer falls back to that inference: an API-originated leg has no
+	 * registration, a trunk INVITE has no device, and a SIP edge that predates the field sends
+	 * none. Absence is therefore never an error, and a consumer must not treat it as one.
+	 */
+	deviceId: z.uuid().optional(),
 	callerName: z.string().max(128).optional(),
 	/** The ELIN actually presented. Absent means the call went out with no caller id at all. */
 	elin: dialStringSchema.optional(),

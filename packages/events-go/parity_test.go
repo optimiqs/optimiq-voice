@@ -191,6 +191,8 @@ func TestParityConstants(t *testing.T) {
 		"pbxExtensionFeature":     SubjectExtensionFeatureRPC,
 		"pbxLastCaller":           SubjectLastCallerRPC,
 		"pbxFileGreeting":         SubjectFileGreetingRPC,
+		"pbxToggleFeature":        SubjectToggleFeatureRPC,
+		"pbxHotDesk":              SubjectHotDeskRPC,
 		"sipCredential":           SubjectSipCredentialRPC,
 		"sipTrunkCredential":      SubjectSipTrunkCredentialRPC,
 		"sipTransfer":             SubjectSipTransferRPC,
@@ -217,10 +219,13 @@ func TestParityConstants(t *testing.T) {
 		"mediaUntapSession":       SubjectMediaUntapSessionRPC,
 		"mediaMuteSession":        SubjectMediaMuteSessionRPC,
 		"mediaHoldSession":        SubjectMediaHoldSessionRPC,
+		"mediaPauseRecording":     SubjectMediaPauseRecordingRPC,
 		"engineOriginate":         SubjectOriginateRPC,
 		"engineParkHandoff":       SubjectParkHandoffRPC,
+		"engineQueueCallback":     SubjectQueueCallbackRPC,
 		"engineSessionVerb":       SubjectSessionVerbRPC,
 		"engineConferenceControl": SubjectConferenceControlRPC,
+		"engineCallControl":       SubjectCallControlRPC,
 		"sessionAnnounce":         SubjectSessionAnnounceRPC,
 	}
 	if !reflect.DeepEqual(rpc, g.RPCSubjects) {
@@ -466,7 +471,7 @@ func TestParityKVKeys(t *testing.T) {
 		case "trunk":
 			got, err = TrunkKVKey(tc.Args[0], tc.Args[1])
 		case "sipAcl":
-			got, err = SIPACLKVKey(tc.Args[0])
+			got, err = SIPACLKVKey(tc.Args[0], tc.Args[1], tc.Args[2])
 		default:
 			t.Fatalf("golden names KV key builder %q, which this package does not implement", tc.Builder)
 		}

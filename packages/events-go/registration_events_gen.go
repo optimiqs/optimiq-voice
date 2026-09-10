@@ -13,6 +13,7 @@ const (
 	EventTypeRegistrationRegistered   = "registered"
 	EventTypeRegistrationUnregistered = "unregistered"
 	EventTypeRegistrationExpired      = "expired"
+	EventTypeRegistrationAuthFailed   = "auth-failed"
 )
 
 // RegistrationRegisteredData is the payload of the "registered" event.
@@ -88,3 +89,39 @@ type RegistrationExpiredData struct {
 	ExtensionID          *string      `json:"extensionId,omitempty"`
 	RegisteredForSeconds *int         `json:"registeredForSeconds,omitempty"`
 }
+
+// RegistrationAuthFailedData is the payload of the "auth-failed" event.
+//
+// Subject: sip.reg.v1.<orgId>.<aorHash>.auth-failed
+// Envelope: Envelope[RegistrationAuthFailedData]
+type RegistrationAuthFailedData struct {
+	AOR           string                       `json:"aor"`
+	AORHash       string                       `json:"aorHash"`
+	Transport     SIPTransport                 `json:"transport"`
+	SourceAddress *string                      `json:"sourceAddress,omitempty"`
+	UserAgent     *string                      `json:"userAgent,omitempty"`
+	Username      string                       `json:"username"`
+	Reason        RegistrationAuthFailedReason `json:"reason"`
+	Locked        *bool                        `json:"locked,omitempty"`
+}
+
+// RegistrationAuthFailedReason is the closed vocabulary of RegistrationAuthFailedData.reason.
+type RegistrationAuthFailedReason string
+
+const (
+	RegistrationAuthFailedReasonBadCredentials RegistrationAuthFailedReason = "bad-credentials"
+	RegistrationAuthFailedReasonStaleNonce     RegistrationAuthFailedReason = "stale-nonce"
+)
+
+// RegistrationAuthFailedReasonValues lists every member of the vocabulary, in contract order.
+var RegistrationAuthFailedReasonValues = []RegistrationAuthFailedReason{
+	RegistrationAuthFailedReasonBadCredentials,
+	RegistrationAuthFailedReasonStaleNonce,
+}
+
+// Valid reports whether v is a member of the RegistrationAuthFailedReason vocabulary.
+func (v RegistrationAuthFailedReason) Valid() bool {
+	return slices.Contains(RegistrationAuthFailedReasonValues, v)
+}
+
+func (v RegistrationAuthFailedReason) String() string { return string(v) }

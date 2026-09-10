@@ -9,6 +9,8 @@ import {
 	mediaSendDtmfResponseSchema,
 	mediaStartRecordingRequestSchema,
 	mediaStartRecordingResponseSchema,
+	mediaPauseRecordingRequestSchema,
+	mediaPauseRecordingResponseSchema,
 	mediaStopRecordingRequestSchema,
 	mediaStopRecordingResponseSchema,
 } from "./rpc";
@@ -150,6 +152,22 @@ describe("rpc.media.v1.stop-recording", () => {
 	});
 });
 
+describe("rpc.media.v1.pause-recording", () => {
+	it("is one subject with a resume bit, and pausing is the default", () => {
+		// Both halves carry a reference and nothing else, which is `mute-session`'s argument for a
+		// bit rather than a second subject.
+		const parsed = mediaPauseRecordingRequestSchema.parse({ recordingRef: "rec-1" });
+		expect(parsed).toEqual({ recordingRef: "rec-1", resume: false });
+	});
+
+	it("treats pausing a recording that is not running as a success", () => {
+		const parsed = mediaPauseRecordingResponseSchema.parse({ ok: true, recordingRef: "rec-1" });
+		expect(parsed.ok).toBe(true);
+		expect(parsed.applied).toBe(false);
+		expect(parsed.paused).toBe(false);
+	});
+});
+
 describe("media.evt.v1 recording.finished", () => {
 	it("derives its subject from the session, not the call", () => {
 		const event = makeMediaEvent("recording.finished", {
@@ -179,6 +197,46 @@ describe("media.evt.v1 recording.finished", () => {
 			"session-ended",
 			"error",
 		]);
+	});
+
+	it("carries the paused intervals a compliance reviewer needs, against the file's timeline", () => {
+		// The whole point of pausing rather than stopping: one artifact, and the only record that
+		// the quiet stretch was deliberate.
+		const event = makeMediaEvent("recording.finished", {
+			orgId: ORG,
+			source: "mediad",
+			data: {
+				sessionId: SESSION,
+				instanceId: "mediad-7c9f",
+				callId: CALL,
+				recordingRef: "rec-1",
+				reason: "stopped",
+				durationMs: 30_000,
+				bytes: 480_044,
+				objectKey: `${ORG}/${CALL}/rec-1.wav`,
+				direction: "both",
+				pauses: [{ startMs: 8_000, endMs: 14_000 }],
+			},
+		});
+		expect(event.data.pauses).toEqual([{ startMs: 8_000, endMs: 14_000 }]);
+	});
+
+	it("still parses a recording.finished from a media plane that cannot pause", () => {
+		const event = makeMediaEvent("recording.finished", {
+			orgId: ORG,
+			source: "mediad",
+			data: {
+				sessionId: SESSION,
+				instanceId: "mediad-7c9f",
+				recordingRef: "rec-1",
+				reason: "stopped",
+				durationMs: 1_000,
+				bytes: 16_044,
+				objectKey: `${ORG}/${CALL}/rec-1.wav`,
+				direction: "both",
+			},
+		});
+		expect(event.data.pauses).toBeUndefined();
 	});
 
 	it("carries the byte count nothing else on this backbone can supply", () => {
