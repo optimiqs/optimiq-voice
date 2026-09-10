@@ -3,6 +3,7 @@ package events
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -103,6 +104,18 @@ func NewEventID() string {
 		panic(fmt.Sprintf("events: cannot generate a UUID v7: %v", err))
 	}
 	return id.String()
+}
+
+// eventIDNamespace names the derived-id space. A fixed UUID, so the same facts produce the same id
+// in every process and across restarts.
+var eventIDNamespace = uuid.MustParse("6f9d6f6f-2f1f-4b8a-9d5f-2f0a6a1c7b21")
+
+// DerivedEventID returns the id an event carries when a retry must reuse it: a UUID v5 over the
+// facts that identify the OCCURRENCE, not the attempt. It is what makes the broker's Nats-Msg-Id
+// dedupe window collapse two publications of the same event — two reapers acting on one orphan, or
+// a republish after a failed claim deletion — into one message.
+func DerivedEventID(parts ...string) string {
+	return uuid.NewSHA1(eventIDNamespace, []byte(strings.Join(parts, "\x00"))).String()
 }
 
 // NewEnvelope assembles an envelope, defaulting ID to a fresh UUID v7 and At to now.
