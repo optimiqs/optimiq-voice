@@ -1,6 +1,13 @@
 import { z } from "zod/v4";
-import { RECORD_POLICIES, TOLL_CLASSES } from "@optimiq-voice/pbx-db";
-import { dialableString, displayName, internalNumber, patchOf, resettable } from "../shared/dto";
+import { CALLER_ID_PRESENTATIONS, RECORD_POLICIES, TOLL_CLASSES } from "@optimiq-voice/pbx-db";
+import {
+	callerIdNumber,
+	dialableString,
+	displayName,
+	internalNumber,
+	patchOf,
+	resettable,
+} from "../shared/dto";
 
 /**
  * The follow-me ladder, stored whole as JSON because it is small, ordered and read as a unit.
@@ -47,11 +54,21 @@ export const createExtensionDto = z.strictObject({
 	sipSecretRef: z.string().min(1).max(256),
 	sipPasswordHa1: z.string().min(1).max(128).nullish(),
 	callerIdName: z.string().max(128).nullish(),
-	callerIdNumber: z.string().max(32).nullish(),
+	callerIdNumber,
 	outboundCallerIdName: z.string().max(128).nullish(),
-	outboundCallerIdNumber: z.string().max(32).nullish(),
+	outboundCallerIdNumber: callerIdNumber,
+	/**
+	 * Whether that number is shown to the far end — CLIR.
+	 *
+	 * `allowed` is the column default and stays the default here: an extension nobody has configured
+	 * presents its number, which is what every extension did before this field existed. `restricted`
+	 * is a standing withhold; a caller lifts it for one call with `*82`, or takes it for one call
+	 * with `*67`. The number itself is unaffected — it still travels in `P-Asserted-Identity` for the
+	 * carrier, and the emergency path ignores the setting outright.
+	 */
+	outboundCallerIdPresentation: z.enum(CALLER_ID_PRESENTATIONS).optional(),
 	emergencyCallerIdName: z.string().max(128).nullish(),
-	emergencyCallerIdNumber: z.string().max(32).nullish(),
+	emergencyCallerIdNumber: callerIdNumber,
 	voicemailEnabled: z.boolean().optional(),
 	/**
 	 * Screen external callers: record a name, play it to the extension, 1 accepts / 2 rejects.
@@ -87,6 +104,14 @@ export const createExtensionDto = z.strictObject({
 	tollClass: z.enum(TOLL_CLASSES).optional(),
 	/** Which `*8` pickup group this extension belongs to. Blank/absent means none — see above. */
 	pickupGroup: pickupGroupName,
+	/**
+	 * The PIN set whose codes may claim this extension on a shared handset — the hot-desk gate.
+	 *
+	 * `null` (the default) is not "no PIN needed", it is "this extension cannot be hot-desked". The
+	 * column fails closed for the reason `devices-schema.ts` gives: an ungated `*31` would let
+	 * anybody in the building take anybody's calls by knowing an extension number printed on a phone.
+	 */
+	hotDeskPinSetId: z.uuid().nullish(),
 	callTimeoutSeconds: resettable(z.int().min(5).max(300)),
 	maxRegistrations: resettable(z.int().min(1).max(20)),
 	codecOverride: z.string().max(128).nullish(),

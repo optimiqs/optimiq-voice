@@ -1,3 +1,4 @@
+import { Readable } from "node:stream";
 import { expect } from "chai";
 import {
 	BRANDING_LOGO_MAX_UPLOAD_BYTES,
@@ -8,7 +9,9 @@ import {
 	BRANDING_LOGO_KEY_PREFIX,
 	BrandingLogoUploadService,
 } from "../../src/pbx/branding-logo/branding-logo-upload.service";
+import { BrandingLogoController } from "../../src/pbx/branding-logo/branding-logo.controller";
 import type { BrandingService } from "../../src/auth/branding/branding.service";
+import type { MediaReply } from "../../src/media/media-http";
 import type { MultipartRequest } from "../../src/pbx/media/media-upload";
 import type { OrgLimitsService } from "../../src/pbx/org-limits/org-limits.service";
 import type { ObjectStore } from "../../src/storage";
@@ -322,5 +325,113 @@ describe("branding logo upload service", () => {
 		// Nothing reached the store and nothing reached the row: the gate is in front of both.
 		expect(store.puts).to.deep.equal([]);
 		expect(branding.setKeys).to.deep.equal([]);
+	});
+});
+
+/**
+ * The READ route's tenant resolution.
+ *
+ * `readByHost` goes through `organization_branding.custom_domain`, so it can only ever answer for a
+ * tenant that has its own login host. Before the `host` parameter became optional, that was the
+ * ONLY way to reach the bytes — which meant every tenant on the shared platform host could upload a
+ * logo, see the key land on its row, and have nothing in the product able to render it. These pin
+ * the two resolutions apart, and the cache directive that has to follow them.
+ */
+describe("branding logo read: which tenant answers", () => {
+	interface Recorded {
+		readonly headers: Record<string, string>;
+		readonly status: number | null;
+	}
+
+	function fakeReply(): MediaReply & { readonly recorded: Recorded } {
+		const headers: Record<string, string> = {};
+		const recorded: Recorded = { headers, status: null };
+		return {
+			recorded,
+			header(name: string, value: string) {
+				headers[name.toLowerCase()] = value;
+				return this;
+			},
+			status(code: number) {
+				(recorded as { status: number | null }).status = code;
+				return this;
+			},
+		};
+	}
+
+	const LOGO_KEY = `${BRANDING_LOGO_KEY_PREFIX}/${ORG}/logo.png`;
+
+	function controller(options: {
+		readonly byHost?: string | null;
+		readonly byOrganization?: string | null;
+	}) {
+		const asked: string[] = [];
+		const branding = {
+			async readByHost(host: string) {
+				asked.push(`host:${host}`);
+				return { logoObjectKey: options.byHost ?? null };
+			},
+			async resolveForOrganization(organizationId: string) {
+				asked.push(`org:${organizationId}`);
+				return { logoObjectKey: options.byOrganization ?? null };
+			},
+		} as unknown as BrandingService;
+		const store = {
+			async head() {
+				return { sizeBytes: PNG.byteLength };
+			},
+			async getStream() {
+				return Readable.from([PNG]);
+			},
+		} as unknown as ObjectStore;
+		const instance = new BrandingLogoController(branding, store, {} as BrandingLogoUploadService);
+		return { instance, asked };
+	}
+
+	it("resolves by host when one is named, and lets a shared cache keep that answer", async () => {
+		const { instance, asked } = controller({ byHost: LOGO_KEY });
+		const reply = fakeReply();
+		await instance.logo({ host: "acme.example" }, null, {}, reply);
+		expect(asked).to.deep.equal(["host:acme.example"]);
+		expect(reply.recorded.headers["cache-control"]).to.equal("public, max-age=300");
+	});
+
+	it("resolves the acting organization when no host is named, and keeps that answer private", async () => {
+		const { instance, asked } = controller({ byOrganization: LOGO_KEY });
+		const reply = fakeReply();
+		await instance.logo({}, sessionFor(ORG), {}, reply);
+		expect(asked).to.deep.equal([`org:${ORG}`]);
+		// A shared cache must never hand one tenant's logo to the next caller of this same URL.
+		expect(reply.recorded.headers["cache-control"]).to.equal("private, max-age=300");
+	});
+
+	it("prefers the named host even when the caller also has a session", async () => {
+		const { instance, asked } = controller({ byHost: LOGO_KEY, byOrganization: LOGO_KEY });
+		await instance.logo({ host: "acme.example" }, sessionFor(ORG), {}, fakeReply());
+		expect(asked).to.deep.equal(["host:acme.example"]);
+	});
+
+	it("refuses a caller that names neither a host nor an organization", async () => {
+		const { instance, asked } = controller({});
+		let status: number | undefined;
+		try {
+			await instance.logo({}, sessionFor(null), {}, fakeReply());
+		} catch (error) {
+			status = (error as { getStatus?: () => number }).getStatus?.();
+		}
+		expect(status).to.equal(400);
+		// Nothing was resolved: an unresolvable request must not fall back to the platform default.
+		expect(asked).to.deep.equal([]);
+	});
+
+	it("still refuses a key outside the branding prefix, on the session path too", async () => {
+		const { instance } = controller({ byOrganization: "recordings/other-org/secret.wav" });
+		let status: number | undefined;
+		try {
+			await instance.logo({}, sessionFor(ORG), {}, fakeReply());
+		} catch (error) {
+			status = (error as { getStatus?: () => number }).getStatus?.();
+		}
+		expect(status).to.equal(404);
 	});
 });

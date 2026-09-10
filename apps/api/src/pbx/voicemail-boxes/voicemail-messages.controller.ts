@@ -20,6 +20,7 @@ import { applyMediaResponse, readRangeHeader } from "../../media/media-http";
 import { parseDto } from "../shared/dto";
 import {
 	deleteVoicemailMessageQuerySchema,
+	forwardVoicemailMessageDto,
 	updateVoicemailMessageDto,
 	voicemailMessageListQuerySchema,
 } from "./voicemail-messages.dto";
@@ -44,6 +45,7 @@ import type { AppSession } from "@optimiq-voice/auth";
  * | `PATCH …/messages/:id`         | `voicemail.write.own`  | Changing a mailbox's state           |
  * | `DELETE …/messages/:id`        | `voicemail.delete.own` | The registry already separates it from write |
  * | `POST …/messages/:id/play-url` | `voicemail.listen.own` | Seeing that a message exists and LISTENING to it are different decisions |
+ * | `POST …/messages/:id/forward`  | `voicemail.write.own`  | Sending a message on is a change to the mailbox it leaves, and to the one it lands in |
  *
  * The `.own` variants are the FLOOR, not a narrowing: `hasPermission` lets the unscoped grant
  * satisfy a scoped requirement, so a manager holding `voicemail.read` still passes, while a
@@ -137,6 +139,30 @@ export class VoicemailMessagesController {
 	) {
 		const { purge } = parseDto(deleteVoicemailMessageQuerySchema, query ?? {});
 		return await this.messages.remove(session, id, messageId, purge);
+	}
+
+	/**
+	 * Forwards or copies a message into another mailbox in the same organization.
+	 *
+	 * `voicemail.write.own` because the SOURCE mailbox is the one the caller has to be entitled to:
+	 * a forward removes a message from it, and a copy reads one out of it. The TARGET is proved by
+	 * tenancy alone inside the service — a user who could only forward into boxes they own could
+	 * only forward to themselves, which is the opposite of what the feature is for.
+	 */
+	@Post(":id/messages/:messageId/forward")
+	@RequirePermissions("voicemail.write.own")
+	async forward(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+		@Param("messageId", ParseUUIDPipe) messageId: string,
+		@Body() body: unknown,
+	) {
+		return await this.messages.forward(
+			session,
+			id,
+			messageId,
+			parseDto(forwardVoicemailMessageDto, body),
+		);
 	}
 
 	/**

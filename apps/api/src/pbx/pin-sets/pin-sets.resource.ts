@@ -31,6 +31,21 @@ export const PIN_SET_RESOURCE: PbxResource = {
 			column: "pin_set_id",
 			nameColumn: "name",
 		},
+		/**
+		 * The hot-desk gate, on exactly the same terms and for a sharper reason.
+		 *
+		 * `extension.hot_desk_pin_set_id` is `on delete set null` too, so deleting the set an agent's
+		 * extension is gated by would not fail — it would silently make that extension
+		 * un-hot-deskable, and the agent would find out by standing at a desk with a correct PIN and
+		 * being refused. A 409 that names the extensions puts that in front of the person while they
+		 * still have the context to act on it.
+		 */
+		{
+			table: "extension",
+			kind: "extension",
+			column: "hot_desk_pin_set_id",
+			nameColumn: "number",
+		},
 	],
 };
 

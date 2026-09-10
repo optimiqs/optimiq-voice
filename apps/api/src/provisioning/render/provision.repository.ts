@@ -8,6 +8,7 @@ import {
 	deviceLine,
 	deviceProfile,
 	deviceProfileKey,
+	emergencyAddress,
 	eq,
 	extension,
 	inArray,
@@ -123,13 +124,43 @@ export class ProvisionRepository {
 			 * drop it from the rendered config. The renderer needs to SEE that line so it can leave the
 			 * account disabled rather than shifting every subsequent account up by one — which would
 			 * hand line 3's credentials to the key labelled line 2.
+			 *
+			 * ## The join is on the HOME binding, and hot desking is why
+			 *
+			 * `coalesce(home_extension_id, extension_id)` — the same expression
+			 * `sip-credentials.service.ts` resolves a registration through, and it must stay the same
+			 * one. A hot-desk login moves `extension_id` to the agent who logged in; the handset keeps
+			 * its OWN SIP credentials, and only routing follows the new binding. Joining on the live
+			 * `extension_id` instead would make a config resync mid-session render the agent's digest
+			 * username and secret into the phone's account — so the phone would re-provision, re-REGISTER
+			 * as somebody else, and stop being reachable the moment they logged out.
 			 */
 			const lineRows = await transaction
 				.select({ line: deviceLine, extension })
 				.from(deviceLine)
-				.leftJoin(extension, eq(deviceLine.extensionId, extension.id))
+				.leftJoin(
+					extension,
+					sql`${extension.id} = coalesce(${deviceLine.homeExtensionId}, ${deviceLine.extensionId})`,
+				)
 				.where(eq(deviceLine.deviceId, deviceId))
 				.orderBy(asc(deviceLine.lineNumber));
+
+			/**
+			 * The handset's own dispatchable location, if it has one.
+			 *
+			 * A second read rather than a join onto the device query, because it is conditional: the
+			 * column is NULL on every device that has not been given a desk-level address, which is the
+			 * common case, and a left join would put an eight-column address on every row of a query
+			 * that runs on every config fetch a fleet makes.
+			 */
+			const emergencyAddressRows =
+				deviceRow.emergencyAddressId === null
+					? []
+					: await transaction
+							.select()
+							.from(emergencyAddress)
+							.where(eq(emergencyAddress.id, deviceRow.emergencyAddressId))
+							.limit(1);
 
 			const keyRows = await transaction
 				.select()
@@ -202,6 +233,7 @@ export class ProvisionRepository {
 				lines: lineRows,
 				keys: keyRows,
 				profileKeys: profileKeyRows,
+				emergencyAddress: emergencyAddressRows[0],
 				organizationSettings: toSettings(settingRows.filter((row) => row.category !== "sip")),
 				sipRealm: settingRows.find((row) => row.category === "sip" && row.name === "realm")?.value,
 				sharedLineExtensionIds: new Set(sharedLineMemberRows.map((row) => row.extensionId)),
@@ -350,6 +382,15 @@ export interface RenderSnapshot {
 	readonly lines: readonly SnapshotLineRow[];
 	readonly keys: readonly (typeof deviceKey.$inferSelect)[];
 	readonly profileKeys: readonly (typeof deviceProfileKey.$inferSelect)[];
+	/**
+	 * The `emergency_address` this DEVICE points at, when it points at one.
+	 *
+	 * `undefined` is the ordinary state and means the handset has no location of its own — the
+	 * dispatch falls back to the extension's number and then to the DID, exactly as it did before
+	 * `device.emergency_address_id` existed. See the column's own comment for why per-device
+	 * granularity is what RAY BAUM'S §9.8 asks for.
+	 */
+	readonly emergencyAddress: typeof emergencyAddress.$inferSelect | undefined;
 	readonly organizationSettings: ProvisioningSettings;
 	readonly sipRealm?: unknown;
 	/**

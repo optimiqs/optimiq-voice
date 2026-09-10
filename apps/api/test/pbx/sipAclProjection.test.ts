@@ -35,6 +35,7 @@ const ORG = "019fd3c2-1111-76be-a6b3-b0f1914e39b6";
 const OTHER_ORG = "019fd3c2-2222-76be-a6b3-b0f1914e39b6";
 const TRUNK = "019fd3c2-3333-76be-a6b3-b0f1914e39b6";
 const UPDATED = new Date("2026-08-12T09:00:00.000Z");
+const KEY = kvKeyFor.sipAcl(ORG, "trunk", "203.0.113.0/24");
 
 function row(overrides: Partial<SipAclRow> = {}): SipAclRow {
 	return {
@@ -86,7 +87,16 @@ function fakeBucket(seed: Record<string, unknown> = {}): FakeBucket {
 			store.delete(key);
 			await Promise.resolve();
 		},
-		keys: async () => await Promise.resolve([...store.keys()]),
+		// The filter is honoured, because the reconcile's whole delete pass now depends on it: a fake
+		// that returned every key would hide a prefix that does not match what was written.
+		keys: async (filter?: string) => {
+			if (filter === "*") {
+				// `*` is one token, not a prefix — the legacy key shape the reconcile sweeps.
+				return await Promise.resolve([...store.keys()].filter((key) => !key.includes(".")));
+			}
+			const prefix = filter === undefined ? "" : filter.replace(/>$/u, "");
+			return await Promise.resolve([...store.keys()].filter((key) => key.startsWith(prefix)));
+		},
 	} as unknown as KV;
 	return { kv, store, puts, deletes };
 }
@@ -106,14 +116,17 @@ function storedAt(bucket: FakeBucket, key: string): SipAclEntry {
 
 describe("kvKeyFor.sipAcl", () => {
 	/**
-	 * The one transformation in the whole key space, and the one both sides have to agree on. Pinned
-	 * against literals rather than against a re-implementation, because a test that folded the CIDR
-	 * itself would agree with a broken folder.
+	 * The key is `(organization_id, scope, network)` — the table's unique index — with the network's
+	 * separators folded. The fold is the one transformation in the whole key space and the one both
+	 * sides have to agree on; it is pinned against literals rather than against a re-implementation,
+	 * because a test that folded the CIDR itself would agree with a broken folder.
 	 */
 	it("folds every separator a CIDR can contain", () => {
-		expect(kvKeyFor.sipAcl("203.0.113.0/24")).to.equal("203-0-113-0-24");
-		expect(kvKeyFor.sipAcl("198.51.100.7/32")).to.equal("198-51-100-7-32");
-		expect(kvKeyFor.sipAcl("0.0.0.0/0")).to.equal("0-0-0-0-0");
+		expect(kvKeyFor.sipAcl(ORG, "trunk", "203.0.113.0/24")).to.equal(`${ORG}.trunk.203-0-113-0-24`);
+		expect(kvKeyFor.sipAcl(ORG, "trunk", "198.51.100.7/32")).to.equal(
+			`${ORG}.trunk.198-51-100-7-32`,
+		);
+		expect(kvKeyFor.sipAcl(ORG, "trunk", "0.0.0.0/0")).to.equal(`${ORG}.trunk.0-0-0-0-0`);
 	});
 
 	/**
@@ -122,13 +135,30 @@ describe("kvKeyFor.sipAcl", () => {
 	 * at boot in the edge, and both are worse places to discover it.
 	 */
 	it("folds IPv6, whose colons are as unusable as the dots", () => {
-		expect(kvKeyFor.sipAcl("2001:db8::/32")).to.equal("2001-db8---32");
-		expect(kvKeyFor.sipAcl("2001:db8:1:2::/64")).to.equal("2001-db8-1-2---64");
+		expect(kvKeyFor.sipAcl(ORG, "trunk", "2001:db8::/32")).to.equal(`${ORG}.trunk.2001-db8---32`);
+		expect(kvKeyFor.sipAcl(ORG, "trunk", "2001:db8:1:2::/64")).to.equal(
+			`${ORG}.trunk.2001-db8-1-2---64`,
+		);
+	});
+
+	/**
+	 * The reason the organization and the scope are in the key at all: without them, two tenants
+	 * naming one CIDR — or one tenant naming it in both edge scopes — contended for a single entry on
+	 * a security boundary, and the loser's rule was published as nothing.
+	 */
+	it("keeps two tenants, and two scopes, on separate keys", () => {
+		expect(kvKeyFor.sipAcl(ORG, "trunk", "203.0.113.0/24")).to.not.equal(
+			kvKeyFor.sipAcl(OTHER_ORG, "trunk", "203.0.113.0/24"),
+		);
+		expect(kvKeyFor.sipAcl(ORG, "trunk", "203.0.113.0/24")).to.not.equal(
+			kvKeyFor.sipAcl(ORG, "registration", "203.0.113.0/24"),
+		);
+		expect(kvKeyFor.sipAclPrefix(ORG)).to.equal(`${ORG}.>`);
 	});
 
 	it("refuses a network with nothing usable left in it", () => {
-		expect(() => kvKeyFor.sipAcl("")).to.throw();
-		expect(() => kvKeyFor.sipAcl("   ")).to.throw();
+		expect(() => kvKeyFor.sipAcl(ORG, "trunk", "")).to.throw();
+		expect(() => kvKeyFor.sipAcl(ORG, "trunk", "   ")).to.throw();
 	});
 });
 
@@ -175,15 +205,15 @@ describe("SipAclPublisher.reconcile", () => {
 
 		expect(result.published).to.equal(1);
 		expect(result.skipped).to.equal(false);
-		expect(bucket.puts).to.deep.equal(["203-0-113-0-24"]);
-		expect(storedAt(bucket, "203-0-113-0-24").orgId).to.equal(ORG);
+		expect(bucket.puts).to.deep.equal([KEY]);
+		expect(storedAt(bucket, KEY).orgId).to.equal(ORG);
 	});
 
 	it("carries trunkId into the bucket", async () => {
 		const bucket = fakeBucket();
 		await publisherOn(bucket).reconcile(ORG, [row({ trunkId: TRUNK })]);
 
-		expect(storedAt(bucket, "203-0-113-0-24").trunkId).to.equal(TRUNK);
+		expect(storedAt(bucket, KEY).trunkId).to.equal(TRUNK);
 	});
 
 	it("rewrites the key in place when the rule changes", async () => {
@@ -194,7 +224,7 @@ describe("SipAclPublisher.reconcile", () => {
 
 		expect(second.published).to.equal(1);
 		expect(bucket.store.size).to.equal(1);
-		expect(storedAt(bucket, "203-0-113-0-24").action).to.equal("deny");
+		expect(storedAt(bucket, KEY).action).to.equal("deny");
 	});
 
 	/**
@@ -208,7 +238,7 @@ describe("SipAclPublisher.reconcile", () => {
 		const second = await publisher.reconcile(ORG, [row({ trunkId: TRUNK })]);
 
 		expect(second.published).to.equal(1);
-		expect(storedAt(bucket, "203-0-113-0-24").trunkId).to.equal(TRUNK);
+		expect(storedAt(bucket, KEY).trunkId).to.equal(TRUNK);
 	});
 
 	/**
@@ -238,8 +268,52 @@ describe("SipAclPublisher.reconcile", () => {
 		const second = await publisher.reconcile(ORG, []);
 
 		expect(second.deleted).to.equal(1);
+		expect(bucket.deletes).to.deep.equal([KEY]);
+		expect(bucket.store.has(KEY)).to.equal(false);
+	});
+
+	/**
+	 * The same failure, from the key change. Before the organization and the scope entered the key an
+	 * entry was the folded network alone, and the reconcile's range read over this organization's
+	 * prefix cannot see one. The edge watches the whole bucket by network, so a legacy key left behind
+	 * keeps admitting a network whose rule was deleted.
+	 */
+	it("deletes a legacy key this organization wrote before the key carried the organization", async () => {
+		const bucket = fakeBucket({
+			"203-0-113-0-24": {
+				network: "203.0.113.0/24",
+				orgId: ORG,
+				action: "allow",
+				scope: "trunk",
+				priority: 100,
+				enabled: true,
+				updatedAt: UPDATED.getTime(),
+			},
+		});
+		const result = await publisherOn(bucket).reconcile(ORG, []);
+
+		expect(result.deleted).to.equal(1);
 		expect(bucket.deletes).to.deep.equal(["203-0-113-0-24"]);
 		expect(bucket.store.has("203-0-113-0-24")).to.equal(false);
+	});
+
+	/** Another tenant's legacy key is not this reconcile's to remove; the rebuild script reports it. */
+	it("leaves a legacy key belonging to another organization alone", async () => {
+		const bucket = fakeBucket({
+			"198-51-100-0-24": {
+				network: "198.51.100.0/24",
+				orgId: OTHER_ORG,
+				action: "allow",
+				scope: "trunk",
+				priority: 100,
+				enabled: true,
+				updatedAt: UPDATED.getTime(),
+			},
+		});
+		const result = await publisherOn(bucket).reconcile(ORG, []);
+
+		expect(result.deleted).to.equal(0);
+		expect(bucket.store.has("198-51-100-0-24")).to.equal(true);
 	});
 
 	/** `provisioning` and `api` are HTTP surfaces with in-tenant readers; the edge guards two scopes. */
@@ -252,52 +326,54 @@ describe("SipAclPublisher.reconcile", () => {
 			row({ network: "10.0.0.0/8", scope: "api" }),
 		]);
 
-		expect([...bucket.store.keys()].sort()).to.deep.equal(["198-51-100-0-24", "203-0-113-0-24"]);
+		expect([...bucket.store.keys()].sort()).to.deep.equal(
+			[kvKeyFor.sipAcl(ORG, "registration", "198.51.100.0/24"), KEY].sort(),
+		);
 	});
 
 	/**
-	 * Two of one tenant's own rows on one key. Not resolved by picking: the `allow` would admit what
-	 * the `deny` refuses and vice versa, and priority would make it turn on write order.
+	 * The same network in both edge scopes. Two legal rows, two keys, both published — before the key
+	 * carried the scope they contended and neither was.
 	 */
-	it("publishes nothing for a network two of a tenant's own scopes claim", async () => {
+	it("publishes a network a tenant claims in both edge scopes", async () => {
 		const bucket = fakeBucket();
 		const result = await publisherOn(bucket).reconcile(ORG, [
 			row({ scope: "trunk", action: "allow" }),
 			row({ scope: "registration", action: "deny" }),
 		]);
 
-		expect(result.published).to.equal(0);
-		expect(result.conflicts).to.have.length(1);
-		expect(result.conflicts[0]?.reason).to.equal("duplicate-network");
-		expect(bucket.store.has("203-0-113-0-24")).to.equal(false);
+		expect(result.published).to.equal(2);
+		expect(storedAt(bucket, KEY).action).to.equal("allow");
+		expect(
+			storedAt(bucket, kvKeyFor.sipAcl(ORG, "registration", "203.0.113.0/24")).action,
+		).to.equal("deny");
 	});
 
 	/**
-	 * Another tenant holds the key. Never overwritten and never deleted — it is not ours — so OUR
-	 * rule goes unpublished, which refuses our own traffic rather than admitting somebody else's.
+	 * Another tenant naming the same network. Its entry is on its own key, so ours publishes and
+	 * theirs is neither overwritten nor deleted — the cross-tenant suppression the old key allowed.
 	 */
-	it("refuses to take a network another tenant already holds", async () => {
-		const bucket = fakeBucket({
-			"203-0-113-0-24": projectSipAclEntry(OTHER_ORG, row()),
-		});
+	it("publishes a network another tenant also claims, without touching theirs", async () => {
+		const theirKey = kvKeyFor.sipAcl(OTHER_ORG, "trunk", "203.0.113.0/24");
+		const bucket = fakeBucket({ [theirKey]: projectSipAclEntry(OTHER_ORG, row()) });
 		const result = await publisherOn(bucket).reconcile(ORG, [row()]);
 
-		expect(result.published).to.equal(0);
-		expect(result.conflicts[0]?.reason).to.equal("cross-tenant");
-		expect(result.conflicts[0]?.heldBy).to.equal(OTHER_ORG);
-		expect(storedAt(bucket, "203-0-113-0-24").orgId).to.equal(OTHER_ORG);
+		expect(result.published).to.equal(1);
+		expect(storedAt(bucket, KEY).orgId).to.equal(ORG);
+		expect(storedAt(bucket, theirKey).orgId).to.equal(OTHER_ORG);
 		expect(bucket.deletes).to.deep.equal([]);
 	});
 
 	/** Another tenant's untouched rules are not swept by our reconcile's delete pass. */
 	it("leaves another tenant's unrelated rules alone", async () => {
+		const theirKey = kvKeyFor.sipAcl(OTHER_ORG, "trunk", "198.51.100.0/24");
 		const bucket = fakeBucket({
-			"198-51-100-0-24": projectSipAclEntry(OTHER_ORG, row({ network: "198.51.100.0/24" })),
+			[theirKey]: projectSipAclEntry(OTHER_ORG, row({ network: "198.51.100.0/24" })),
 		});
 		await publisherOn(bucket).reconcile(ORG, []);
 
 		expect(bucket.deletes).to.deep.equal([]);
-		expect(bucket.store.has("198-51-100-0-24")).to.equal(true);
+		expect(bucket.store.has(theirKey)).to.equal(true);
 	});
 
 	/** No broker means nothing was attempted — distinct from "there was nothing to do". */

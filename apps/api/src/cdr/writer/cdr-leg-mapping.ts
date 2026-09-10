@@ -80,8 +80,13 @@ const MAPPED_KEYS = new Set([
 	"queueWaitMs",
 	"queueOutcome",
 	"queueAgentRef",
+	"relatedCallId",
 	"authPinOrdinal",
 	"authPinLabel",
+	"sipAttestation",
+	"sipVerstat",
+	"sipOrigId",
+	"sipCallId",
 ]);
 
 /**
@@ -156,6 +161,9 @@ export interface CallLegInsertValues {
 	readonly toNumber: string;
 	readonly destinationType: CallDestinationType;
 	readonly destinationRef: string | null;
+	/** `destinationRef` filed under its type, for the per-IVR and per-group indexes. */
+	readonly ivrRef: string | null;
+	readonly ringGroupRef: string | null;
 	readonly startedAt: Date;
 	readonly answeredAt: Date | null;
 	readonly endedAt: Date | null;
@@ -177,8 +185,14 @@ export interface CallLegInsertValues {
 	readonly queueWaitMs: number | null;
 	readonly queueOutcome: QueueOutcome | null;
 	readonly queueAgentRef: string | null;
+	readonly relatedCallId: string | null;
 	readonly authPinOrdinal: number | null;
 	readonly authPinLabel: string | null;
+	readonly sipAttestation: string | null;
+	readonly sipVerstat: string | null;
+	readonly sipOrigId: string | null;
+	/** The SIP `Call-ID` of the leg's dialog. Null on a leg that had no dialog. */
+	readonly sipCallId: string | null;
 	readonly raw: Record<string, unknown>;
 }
 
@@ -421,6 +435,43 @@ export function mapCdrLegWrite(
 					authPinLabel: asString(payload.authPinLabel)?.slice(0, 128) ?? null,
 				};
 
+	/**
+	 * The carrier's STIR/SHAKEN claim, when the INVITE carried one.
+	 *
+	 * Not the all-or-nothing pair the authorisation is, and for the opposite reason: each field is
+	 * an independent thing a carrier chose to say, and a `verstat` stated without an `attest` level
+	 * is the single most useful of the three. So each is taken on its own.
+	 *
+	 * The LEVEL is validated and an unrecognised one is DROPPED rather than passed through — the
+	 * column's vocabulary is `A`/`B`/`C`, the edge already refuses anything else, and a writer that
+	 * admitted a fourth value would make that refusal decorative and put a level in a report that
+	 * nothing can interpret. The other two are free text truncated rather than refused, for the
+	 * reason `fromName` is: a carrier that over-filled a header is not a payload worth quarantining
+	 * a billing record over.
+	 */
+	const attestationRaw = asString(payload.sipAttestation);
+	const sipAttestation =
+		attestationRaw === "A" || attestationRaw === "B" || attestationRaw === "C"
+			? attestationRaw
+			: null;
+	if (attestationRaw !== undefined && sipAttestation === null) {
+		record("sipAttestation", payload.sipAttestation, "null");
+	}
+	const attestation = {
+		sipAttestation,
+		sipVerstat: asString(payload.sipVerstat)?.slice(0, 64) ?? null,
+		sipOrigId: asString(payload.sipOrigId)?.slice(0, 128) ?? null,
+	};
+	/**
+	 * The dialog's `Call-ID`, which is what a carrier traceback is keyed on.
+	 *
+	 * Truncated rather than refused, like `sipOrigId` and for the same reason: a peer that sent an
+	 * over-long opaque token is not a payload worth quarantining a billing record over. The engine
+	 * already caps it at 256 (`normalizeSipCallId`), so this bound only ever bites a foreign
+	 * producer.
+	 */
+	const sipCallId = asString(payload.sipCallId)?.slice(0, 256) ?? null;
+
 	return {
 		values: {
 			id,
@@ -435,6 +486,11 @@ export function mapCdrLegWrite(
 			toNumber: toNumber.slice(0, 128),
 			destinationType,
 			destinationRef,
+			// The engine names the routed node once, as the destination; the dedicated columns are
+			// the same id filed under the type it belongs to, so the per-IVR and per-group indexes
+			// see it without a type predicate.
+			ivrRef: destinationType === "ivr" ? destinationRef : null,
+			ringGroupRef: destinationType === "ring_group" ? destinationRef : null,
 			startedAt,
 			answeredAt: asDate(payload.answeredAt),
 			endedAt: asDate(payload.endedAt),
@@ -445,7 +501,12 @@ export function mapCdrLegWrite(
 			hangupSide,
 			disposition,
 			...queueLeg,
+			// Independent of `queueLeg`: the link is a fact about this CALL, and a callback leg that
+			// was never distributed to an agent still settles the wait it was placed for.
+			relatedCallId: asUuid(payload.relatedCallId),
 			...authorization,
+			...attestation,
+			sipCallId,
 			raw,
 		},
 		coercions,

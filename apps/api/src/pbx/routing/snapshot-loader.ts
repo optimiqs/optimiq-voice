@@ -213,6 +213,7 @@ export async function loadOrgRoutingSnapshot(
 			callerIdNumber: row.callerIdNumber,
 			outboundCallerIdName: row.outboundCallerIdName,
 			outboundCallerIdNumber: row.outboundCallerIdNumber,
+			outboundCallerIdPresentation: row.outboundCallerIdPresentation,
 			emergencyCallerIdNumber: row.emergencyCallerIdNumber,
 			voicemailEnabled: row.voicemailEnabled,
 			doNotDisturb: row.doNotDisturb,
@@ -419,6 +420,14 @@ export async function loadOrgRoutingSnapshot(
 			exitDestinationType: row.exitDestinationType,
 			exitDestinationRef: row.exitDestinationRef,
 			exitDestinationData: row.exitDestinationData,
+			callbackEnabled: row.callbackEnabled,
+			callbackKey: row.callbackKey,
+			callbackOfferAfterSeconds: row.callbackOfferAfterSeconds,
+			callbackOfferPromptId: row.callbackOfferPromptId,
+			callbackConfirmPromptId: row.callbackConfirmPromptId,
+			callbackMaxAttempts: row.callbackMaxAttempts,
+			callbackRetryDelaySeconds: row.callbackRetryDelaySeconds,
+			callbackExpiresAfterSeconds: row.callbackExpiresAfterSeconds,
 			defaultPriority: row.defaultPriority,
 			abandonedResumeAllowed: row.abandonedResumeAllowed,
 			discardAbandonedAfterSeconds: row.discardAbandonedAfterSeconds,
@@ -675,13 +684,15 @@ export async function loadOrgRoutingSnapshot(
 			fallbackDestinationData: row.fallbackDestinationData,
 		})),
 		/**
-		 * Three columns of the media library, and no more.
+		 * Four columns of the media library, and no more.
 		 *
 		 * The compiler needs to know which prompt ids are PHRASES (so it can expand them) and which
-		 * are audio (so it can refuse a nested phrase). The object key, the duration and the checksum
-		 * belong to the media layer; nothing about them changes a routing decision, and shipping a
-		 * tenant's whole file list into a KV bucket every engine can read would be a cost with no
-		 * routing upside.
+		 * are audio (so it can refuse a nested phrase), and it needs the object key to compile the
+		 * artifact's prompt table — a plan node names a prompt by row id, the file lives under a
+		 * different id, and the engine holds no database handle, so this column is the only way the
+		 * reference ever becomes audio. The duration and the checksum belong to the media layer;
+		 * nothing about them changes a routing decision, and shipping a tenant's whole file list into
+		 * a KV bucket every engine can read would be a cost with no routing upside.
 		 */
 		prompts: prompts.map((row) => ({
 			id: row.id,
@@ -690,6 +701,7 @@ export async function loadOrgRoutingSnapshot(
 			enabled: true,
 			name: row.name,
 			kind: row.kind,
+			objectKey: row.objectKey,
 		})),
 		phraseSteps: phraseSteps.map((row) => ({
 			id: row.id,
@@ -821,6 +833,12 @@ export function readRoutingSettings(
 		...(asNullableString("outboundCallerIdName") === undefined
 			? {}
 			: { outboundCallerIdName: asNullableString("outboundCallerIdName") }),
+		// Read by no call. It is what lets the compiler canonicalise a DID or caller id that reached
+		// the database as a bare national number — see `e164-ingest.ts` for why its absence is a
+		// refusal rather than a guess.
+		...(asNullableString("defaultCallingCode") === undefined
+			? {}
+			: { defaultCallingCode: asNullableString("defaultCallingCode") }),
 		...(Array.isArray(trunkContinueOnCauses)
 			? {
 					trunkContinueOnCauses: trunkContinueOnCauses.filter(

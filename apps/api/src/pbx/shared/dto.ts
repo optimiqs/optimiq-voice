@@ -1,6 +1,7 @@
 import { BadRequestException, HttpStatus } from "@nestjs/common";
 import { z } from "zod/v4";
 import { DESTINATION_TYPES } from "@optimiq-voice/pbx-db";
+import { normalizeE164Message } from "@optimiq-voice/telephony";
 
 /**
  * DTO validation at the edge.
@@ -156,12 +157,58 @@ export const dialableString = z
 	.max(64)
 	.regex(/^[+*#0-9A-Za-z._-]+$/u, "must be a dialable string");
 
-/** E.164, `+` included — how every DID is stored. */
-export const e164 = z
-	.string()
-	.min(2)
-	.max(20)
-	.regex(/^\+[1-9]\d{1,18}$/u, "must be E.164, e.g. +12125550100");
+/**
+ * E.164, `+` included — how every DID is stored, and now how every DID is WRITTEN.
+ *
+ * This used to be a regex, and a regex is the wrong tool: `(212) 555-0100` and `+1 212 555 0100`
+ * are the same number, and refusing them made the person do a conversion the machine does better.
+ * Worse, three DTO files had three slightly different copies of that regex — `fax.dto.ts` trimmed
+ * and capped at the real 15 digits, this one did neither and allowed 19 — so the platform disagreed
+ * with itself about what a phone number is depending on which form you filled in.
+ *
+ * It normalises through `@optimiq-voice/telephony`'s {@link normalizeE164} now, which is the one
+ * implementation, and it is deliberately the STRICT arm of it: no `defaultCallingCode`, so a bare
+ * national number is still refused rather than guessed at. Guessing needs the organization's
+ * country, which a schema does not have and a service does — see {@link e164In} for the surface
+ * that does have it.
+ *
+ * The bound tightened from 19 digits to E.164's actual 15 in the process. Nothing legitimate lives
+ * between the two; a 19-digit "number" was a typo this accepted and the carrier would have refused.
+ */
+export const e164 = e164In(undefined);
+
+/**
+ * {@link e164}, but for a surface that knows which country a bare national number belongs to.
+ *
+ * Returned as a factory rather than exported as a schema because the calling code is per-request
+ * data — the organization's `outboundCountryCode` setting — and a module-level schema would have to
+ * close over a value that does not exist at import time. A controller resolves the setting and
+ * parses with `e164In(code)`; one that cannot resolve one uses {@link e164} and refuses.
+ */
+export function e164In(defaultCallingCode: string | undefined): z.ZodType<string, string> {
+	return z.string().transform((value, context): string => {
+		const { e164: normalized, message } = normalizeE164Message(value, { defaultCallingCode });
+		if (normalized !== null) {
+			return normalized;
+		}
+		context.addIssue({
+			code: "custom",
+			message: `must be E.164, e.g. +12125550100 — ${message}`,
+		});
+		return z.NEVER;
+	});
+}
+
+/**
+ * A caller-ID number: E.164, or explicitly none.
+ *
+ * The gap the audit found. `callerIdNumber`, `outboundCallerIdNumber`, `emergencyCallerIdNumber`
+ * and the two `callerIdNumberOverride` columns were all bare `z.string().max(32)` — free text in a
+ * field the carrier will reject, or worse, silently replace with the account's default, so the
+ * tenant sees a presented number nobody in this system chose. Same normalisation as a DID, because
+ * it IS one: a caller ID a carrier will accept is a number the platform has.
+ */
+export const callerIdNumber = e164.nullish();
 
 /** An internal number: digits only, no leading `*` (that space belongs to feature codes). */
 export const internalNumber = z

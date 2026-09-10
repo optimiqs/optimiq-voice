@@ -1,10 +1,14 @@
 import { createHmac } from "node:crypto";
-import { NotFoundException, ServiceUnavailableException } from "@nestjs/common";
 import { expect } from "chai";
 import { loadProvisioningEnv } from "../../src/provisioning/provisioning-env";
 import { deriveSipPassword } from "../../src/provisioning/render/provision-secret";
 import { SoftphoneCredentialsService } from "../../src/provisioning/softphone/softphone.service";
 import type { ProvisioningEnv } from "../../src/provisioning/provisioning-env";
+import type {
+	SoftphoneConfiguredResponse,
+	SoftphoneCredentialsResponse,
+	SoftphoneUnavailableResponse,
+} from "../../src/provisioning/softphone/softphone.service";
 import type { AppSession } from "@optimiq-voice/auth";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
@@ -15,6 +19,9 @@ import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
  * `withTenantScope` that answers a queue of result sets in the order the service issues its selects
  * — the extension lookup first, then the realm setting. The claims are about the REPLY (the derived
  * password, the realm, the WSS URL and the honesty flag), not the SQL.
+ *
+ * Every answer is a 200 — see the service header for why none of the three "no softphone" states is
+ * a request failure — so the assertions narrow on `configured` rather than catching an exception.
  */
 
 const ORG = "019fd3c2-1111-7000-8000-000000000001";
@@ -70,6 +77,18 @@ const EXTENSION_ROW = {
 	voicemailEnabled: true,
 };
 
+/** Narrows the reply to the configured arm, failing the test with a readable message if it is not. */
+function asConfigured(reply: SoftphoneCredentialsResponse): SoftphoneConfiguredResponse {
+	expect(reply.configured, `expected credentials, got ${JSON.stringify(reply)}`).to.equal(true);
+	return reply as SoftphoneConfiguredResponse;
+}
+
+/** The other arm, narrowed the same way. */
+function asUnavailable(reply: SoftphoneCredentialsResponse): SoftphoneUnavailableResponse {
+	expect(reply.configured, `expected a refusal, got credentials`).to.equal(false);
+	return reply as SoftphoneUnavailableResponse;
+}
+
 describe("SoftphoneCredentialsService", () => {
 	it("returns a derived-password account for the caller's own extension", async () => {
 		const service = new SoftphoneCredentialsService(
@@ -77,7 +96,7 @@ describe("SoftphoneCredentialsService", () => {
 			env({ PROVISION_SIP_WSS_URL: "wss://sip.example.test:8089" }),
 		);
 
-		const reply = await service.forSelf(session());
+		const reply = asConfigured(await service.forSelf(session()));
 
 		expect(reply.extension).to.deep.equal({
 			id: EXTENSION_ID,
@@ -116,7 +135,7 @@ describe("SoftphoneCredentialsService", () => {
 			}),
 		);
 		const before = Math.floor(Date.now() / 1000);
-		const reply = await service.forSelf(session());
+		const reply = asConfigured(await service.forSelf(session()));
 		const ice = reply.media.iceServers[0]!;
 		expect(reply.media.webrtcSupported).to.equal(true);
 		expect(ice.urls).to.have.length(2);
@@ -148,53 +167,72 @@ describe("SoftphoneCredentialsService", () => {
 		).to.throw(/TURN URLs/);
 	});
 
-	it("falls back to PROVISION_SIP_SERVER as the realm when no org realm setting exists", async () => {
+	it("refuses by name when the organization has no SIP domain, even with a deployment default", async () => {
+		// PROVISION_SIP_SERVER is the deployment's SIP edge, not a tenant's realm: a realm resolves to
+		// exactly one organization, so handing this one out would hand over another tenant's identity.
 		const service = new SoftphoneCredentialsService(
 			fakeDatabase([EXTENSION_ROW], []),
 			env({ PROVISION_SIP_SERVER: "sip.fallback.test" }),
 		);
-		const reply = await service.forSelf(session());
-		expect(reply.account.realm).to.equal("sip.fallback.test");
+		const reply = asUnavailable(await service.forSelf(session()));
+		expect(reply.reason).to.equal("no-realm");
+		expect(reply.code).to.equal("SOFTPHONE_NO_REALM");
+		expect(reply.message).to.match(/SIP domain not configured/i);
+		// The refusal carries no realm at all — the bug it replaced handed out another tenant's.
+		expect(JSON.stringify(reply)).not.to.contain("sip.fallback.test");
+	});
+
+	it("hands out the organization's own realm when it has one", async () => {
+		const service = new SoftphoneCredentialsService(
+			fakeDatabase([EXTENSION_ROW], [{ value: "tenant-b.example.test" }]),
+			env({ PROVISION_SIP_SERVER: "sip.fallback.test" }),
+		);
+		const reply = asConfigured(await service.forSelf(session()));
+		expect(reply.account.realm).to.equal("tenant-b.example.test");
 		// No explicit WSS URL configured → null, and the web derives one from its own https origin.
 		expect(reply.transport.wssUrl).to.equal(null);
 	});
 
-	it("404s when the caller holds no extension", async () => {
+	/**
+	 * The finding this shape exists for (E2E-admin F-4).
+	 *
+	 * An administrator holding no extension is the ORDINARY case, and the docked provider asks on
+	 * every authenticated page — so a 404 here wrote a console error onto all 35 admin screens.
+	 */
+	it("answers 200 with reason no-extension when the caller holds no extension", async () => {
 		const service = new SoftphoneCredentialsService(fakeDatabase([], []), env());
-		let thrown: unknown;
-		try {
-			await service.forSelf(session());
-		} catch (error) {
-			thrown = error;
-		}
-		expect(thrown).to.be.instanceOf(NotFoundException);
+		const reply = asUnavailable(await service.forSelf(session()));
+		expect(reply.reason).to.equal("no-extension");
+		expect(reply.code).to.equal("SOFTPHONE_NO_EXTENSION");
 	});
 
-	it("503s when the deployment has no SIP secret key to derive a password from", async () => {
+	it("answers 200 with reason not-provisioned when there is no SIP secret key", async () => {
 		const service = new SoftphoneCredentialsService(
 			fakeDatabase([EXTENSION_ROW], [{ value: "pbx.example.test" }]),
 			env({ PROVISION_SIP_SECRET_KEY: undefined }),
 		);
-		let thrown: unknown;
-		try {
-			await service.forSelf(session());
-		} catch (error) {
-			thrown = error;
-		}
-		expect(thrown).to.be.instanceOf(ServiceUnavailableException);
+		const reply = asUnavailable(await service.forSelf(session()));
+		expect(reply.reason).to.equal("not-provisioned");
+		expect(reply.code).to.equal("SOFTPHONE_NOT_CONFIGURED");
+		// It names the variable an operator has to set, and nothing about the caller.
+		expect(reply.message).to.contain("PROVISION_SIP_SECRET_KEY");
 	});
 
-	it("503s when neither an org realm nor PROVISION_SIP_SERVER is configured", async () => {
+	it("answers 200 with reason no-realm when neither the org nor the deployment names one", async () => {
 		const service = new SoftphoneCredentialsService(
 			fakeDatabase([EXTENSION_ROW], []),
 			env({ PROVISION_SIP_SERVER: undefined }),
 		);
-		let thrown: unknown;
-		try {
-			await service.forSelf(session());
-		} catch (error) {
-			thrown = error;
-		}
-		expect(thrown).to.be.instanceOf(ServiceUnavailableException);
+		expect(asUnavailable(await service.forSelf(session())).reason).to.equal("no-realm");
+	});
+
+	/**
+	 * The union is closed and discriminated: a client that narrows on `configured` never has to
+	 * guess, and a refusal never carries a password-shaped field for one to leak through.
+	 */
+	it("never carries account material on the unavailable arm", async () => {
+		const service = new SoftphoneCredentialsService(fakeDatabase([], []), env());
+		const reply = await service.forSelf(session());
+		expect(Object.keys(reply).sort()).to.deep.equal(["code", "configured", "message", "reason"]);
 	});
 });

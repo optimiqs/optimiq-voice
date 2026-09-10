@@ -12,21 +12,14 @@
  * ## When this is the answer
  *
  * The bucket is a DERIVED read model (see `src/pbx/security/sip-acl.publisher.ts`), maintained after
- * every write to `sip_acl_entry`. Four things break that, and this is the repair for all four:
+ * every write to `sip_acl_entry`. Three things break that, and this is the repair for all three:
  *
  * 1. **The API died between the commit and the publish.** The rule is in the database and not in the
  *    bucket. Under the bucket's "an address matching nothing is REFUSED" rule that means a carrier
  *    an operator just allowed is still being refused — the safe direction, and still an outage.
  * 2. **The broker lost the bucket** — a fresh cluster, a restored snapshot, a `nats kv del`. Then
  *    every ip-auth trunk on the platform is refused at once.
- * 3. **A network is CONTESTED.** `kvKeyFor.sipAcl` keys on the network alone while the table's
- *    uniqueness is `(organization_id, scope, network)`, so two legal rows can land on one key. The
- *    publisher refuses to arbitrate and so does this script; both report, and the contested network
- *    is published as nothing, which refuses it. Resolving it is a human decision — and the real fix
- *    is a scope-qualified key in `packages/events`. `sip_acl_entry.trunk_id` is NOT that fix and
- *    does not narrow the contest — the unique index stays `(organization_id, scope, network)` on
- *    purpose, because widening it would manufacture contested keys rather than resolve them.
- * 4. **An ORPHAN** — an entry whose organization has no ACL rows left, typically a deleted tenant.
+ * 3. **An ORPHAN** — an entry whose organization has no ACL rows left, typically a deleted tenant.
  *    This is the failure the bucket's zero TTL guarantees will never heal on its own, and it cuts
  *    both ways: an orphaned `deny` is a carrier silently blocked with no rule anybody can find to
  *    explain it, and an orphaned `allow` is a network still being admitted by a rule that no longer
@@ -43,19 +36,17 @@
  * does not match; dropping it here would make "an operator turned this rule off" and "a publish was
  * lost" the same wire fact.
  *
- * A contested key is DELETED rather than left alone, which is the one place this diverges from
- * `rebuild-did-index.ts`. Over there a contested DID keeps its existing entry, because the database's
- * global unique index says the contest is a bucket-versus-database divergence and the existing value
- * is probably right. Here the contest is REAL — both rows are legal — so there is no "probably
- * right" value to keep, and keeping one would let one tenant's rule govern another's traffic.
- * Absence refuses, which is the only outcome that is safe in both directions.
+ * It also repairs the key change: `kvKeyFor.sipAcl` used to key on the folded network alone, so two
+ * tenants naming one CIDR contested a single entry. The key now carries the organization and the
+ * scope, and an entry left behind under an old-shape key has no row backing it and is removed by the
+ * same pass that removes any other.
  *
  * `--dry-run` prints the plan and writes nothing. `--prune-orphans` removes entries whose
  * organization has no ACL rows left.
  *
  * ## Exit code
  *
- * Non-zero when anything was contested, orphaned-and-left, or unkeyable. Every one of those is a
+ * Non-zero when anything was orphaned-and-left or unkeyable. Every one of those is a
  * network whose admission decision is not the one the database describes, and a deploy pipeline must
  * not treat that as a success on a boundary whose whole job is toll fraud.
  */
@@ -168,12 +159,11 @@ async function main(): Promise<void> {
 			skippedScopes: all.length - rows.length,
 		});
 
-		// Group by KV key BEFORE touching the broker, so a contest is known before anything is written.
-		const byKey = new Map<string, SipAclEntryRow[]>();
+		const byKey = new Map<string, SipAclEntryRow>();
 		for (const row of rows) {
 			let key: string;
 			try {
-				key = kvKeyFor.sipAcl(row.network);
+				key = kvKeyFor.sipAcl(row.organization_id, row.scope, row.network);
 			} catch {
 				failures += 1;
 				log("SKIP: a network with no usable characters cannot be keyed", {
@@ -182,23 +172,10 @@ async function main(): Promise<void> {
 				});
 				continue;
 			}
-			byKey.set(key, [...(byKey.get(key) ?? []), row]);
-		}
-
-		const contested = [...byKey.entries()].filter(([, group]) => group.length > 1);
-		const contestedKeys = new Set(contested.map(([key]) => key));
-		for (const [key, group] of contested) {
-			failures += 1;
-			log(
-				"CONTESTED: more than one rule lands on this KV key, so the network is published as " +
-					"NOTHING and is therefore REFUSED",
-				{
-					key,
-					network: group[0]?.network,
-					organizations: [...new Set(group.map((row) => row.organization_id))],
-					scopes: group.map((row) => row.scope),
-				},
-			);
+			// The key is `(organization_id, scope, network)`, which is the table's unique index, so no
+			// two rows can land here. It was not always: the key was the folded network alone, and this
+			// script's contest report existed for the rows that collided on it.
+			byKey.set(key, row);
 		}
 
 		connection = await connect({
@@ -211,11 +188,7 @@ async function main(): Promise<void> {
 		const bucket = await manager.jetstream().views.kv(SIP_ACL_KV.name);
 
 		const desired = new Map<string, StoredEntry>();
-		for (const [key, group] of byKey) {
-			const row = group[0];
-			if (row === undefined || contestedKeys.has(key)) {
-				continue;
-			}
+		for (const [key, row] of byKey) {
 			desired.set(key, {
 				network: row.network,
 				orgId: row.organization_id,
@@ -280,17 +253,6 @@ async function main(): Promise<void> {
 				removed += 1;
 				continue;
 			}
-			if (contestedKeys.has(key)) {
-				// Deleted, NOT kept — the divergence from `rebuild-did-index.ts` argued in the header.
-				// Both contending rows are legal, so there is no correct value to preserve, and absence
-				// refuses.
-				if (!dryRun) {
-					await bucket.delete(key);
-				}
-				removed += 1;
-				log("REMOVED a contested network's entry; resolve the duplicate rules first", { key });
-				continue;
-			}
 			if (!liveOrganizations.has(existing.orgId)) {
 				orphans += 1;
 				if (!pruneOrphans) {
@@ -317,7 +279,6 @@ async function main(): Promise<void> {
 			written,
 			unchanged,
 			removed,
-			contested: contested.length,
 			orphans,
 			failures,
 		});

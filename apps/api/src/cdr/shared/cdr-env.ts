@@ -275,6 +275,58 @@ export const cdrEnvSchema = z.object({
 	 * because that is the record an audit of "who extracted the call history" reads.
 	 */
 	CDR_EXPORT_TTL_HOURS: z.coerce.number().int().min(1).max(8_760).default(168),
+
+	/**
+	 * How many months of call records the PLATFORM keeps, `0` to keep them for ever.
+	 *
+	 * Zero by default, and it will stay zero: this is the number behind a `DROP TABLE` against the
+	 * billing ledger, and no upgrade may start destroying a deployment's call history because a
+	 * release shipped a scheduler for it. An operator turns it on deliberately, reads a dry run,
+	 * and only then clears `CDR_RETENTION_DRY_RUN`.
+	 *
+	 * Months rather than days because the unit of deletion is a monthly PARTITION —
+	 * `packages/cdr-db`'s `DEFAULT_CDR_RETENTION_MONTHS` is 13 for the reason it states, a full
+	 * year plus the current partial month. A window expressed in days would round to the same
+	 * partition boundary anyway and would only invite the belief that it does not.
+	 *
+	 * ## It is the platform's window and cannot be a tenant's
+	 *
+	 * A partition holds every tenant's legs for that month, so the drop is all-or-nothing across
+	 * the deployment. `leg-retention-sweeper.service.ts` sets out why a shorter per-organization
+	 * window would be a different storage layout rather than a flag, and why a longer one is not
+	 * expressible at all. The per-tenant window that DOES exist is `recordings.retentionDays`,
+	 * which governs the audio, is stamped per row, and is enforced by the recording sweep.
+	 */
+	CDR_LEG_RETENTION_MONTHS: z.coerce.number().int().min(0).max(240).default(0),
+
+	/**
+	 * Whether the retention sweep only REPORTS what it would drop. Default true.
+	 *
+	 * The safety interlock on an irreversible operation: with the window set and this still true,
+	 * every pass computes the plan, lists the partitions and their sizes, tallies the rows per
+	 * organization and logs all of it, and drops nothing. That is the artifact an operator approves
+	 * a first real pass from.
+	 */
+	CDR_RETENTION_DRY_RUN: z
+		.stringbool({ truthy: ["true", "1"], falsy: ["false", "0"] })
+		.default(true),
+
+	/**
+	 * How often the retention sweep runs in this process. `0` disables it.
+	 *
+	 * Daily. A window measured in months has nothing to gain from a finer interval, and the pass
+	 * takes a brief `ACCESS EXCLUSIVE` lock on the parent table for each `DROP TABLE` — cheap, but
+	 * not something to do every hour for no reason.
+	 *
+	 * Under `CDR_WRITER_ENABLED` with the other singleton workloads: N replicas racing on the same
+	 * `DROP TABLE` would have N-1 of them report a failure that is really somebody else's success.
+	 */
+	CDR_RETENTION_SWEEP_INTERVAL_MS: z.coerce
+		.number()
+		.int()
+		.min(0)
+		.max(604_800_000)
+		.default(86_400_000),
 });
 
 export type CdrEnv = z.infer<typeof cdrEnvSchema>;

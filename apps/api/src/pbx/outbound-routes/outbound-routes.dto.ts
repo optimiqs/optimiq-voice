@@ -1,6 +1,12 @@
 import { z } from "zod/v4";
 import { ROUTE_MATCH_KINDS, TOLL_CLASSES } from "@optimiq-voice/pbx-db";
-import { displayName, namedDestinationShape, patchOf, resettable } from "../shared/dto";
+import {
+	callerIdNumber,
+	displayName,
+	namedDestinationShape,
+	patchOf,
+	resettable,
+} from "../shared/dto";
 
 /** One trunk in the ordered failover chain. `weight` shares load between equal `order`s. */
 const trunkPriorityEntry = z.strictObject({
@@ -38,7 +44,7 @@ export const createOutboundRouteDto = z.strictObject({
 	pinSetId: z.uuid().nullish(),
 	/** The shared rewrite applied to the dialled number, AFTER this route's own strip/prepend. */
 	translationRulesetId: z.uuid().nullish(),
-	callerIdNumberOverride: z.string().max(32).nullish(),
+	callerIdNumberOverride: callerIdNumber,
 	recordEnabled: z.boolean().optional(),
 	enabled: z.boolean().optional(),
 });

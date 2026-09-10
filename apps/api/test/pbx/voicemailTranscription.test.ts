@@ -710,6 +710,7 @@ function messagesHarness(message: {
 		database,
 		{ publish: async () => {} } as never,
 		{} as never,
+		{} as never,
 	);
 	return { service };
 }

@@ -6,6 +6,7 @@ import {
 	SIP_TRANSPORT_SETTING,
 } from "../../provisioning/catalog/transport-preference";
 import { ROUTING_SETTINGS_CATEGORY } from "../routing/snapshot-loader";
+import { e164 } from "../shared/dto";
 import type { Permission } from "@optimiq-voice/auth";
 import type { SettingValueType } from "@optimiq-voice/pbx-db";
 
@@ -270,11 +271,9 @@ export const ROUTING_SETTINGS: readonly SettingDescriptor[] = [
 		label: "Organization outbound caller id",
 		description:
 			"Used when neither the outbound route nor the extension supplies a caller id number.",
-		schema: z
-			.string()
-			.trim()
-			.regex(/^\+[1-9]\d{1,18}$/u, "must be E.164, e.g. +12125550100")
-			.nullable(),
+		// The shared `e164`, not the fourth hand-copied regex: this one had drifted to 19 digits and
+		// no normalisation, so the same number a DID form accepted was refused here.
+		schema: e164.nullable(),
 		defaultValue: null,
 	}),
 	descriptor({
@@ -284,6 +283,24 @@ export const ROUTING_SETTINGS: readonly SettingDescriptor[] = [
 		label: "Organization outbound caller name",
 		description: "Display name presented outbound when nothing more specific supplies one.",
 		schema: z.string().trim().min(1).max(64).nullable(),
+		defaultValue: null,
+	}),
+	descriptor({
+		category: ROUTING_SETTINGS_CATEGORY,
+		name: "defaultCallingCode",
+		valueType: "string",
+		label: "Default country calling code",
+		description:
+			"The calling code this organization's national numbers belong to — 1 for NANP, 44 for the " +
+			"UK. It lets the routing compiler canonicalise a DID or caller id stored as a bare " +
+			"national number. Empty means a bare national number is reported rather than guessed at.",
+		// Digits with an optional leading `+`, which is what a person types. `e164-ingest.ts` strips
+		// the plus; the bound is the four digits the ITU assigns.
+		schema: z
+			.string()
+			.trim()
+			.regex(/^\+?[1-9]\d{0,3}$/u, "must be a country calling code, e.g. 1 or +44")
+			.nullable(),
 		defaultValue: null,
 	}),
 	descriptor({

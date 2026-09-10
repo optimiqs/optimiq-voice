@@ -311,11 +311,22 @@ const UNIQUE_VIOLATION = "23505";
  * "contact the owner": the existence of the claim is already the minimum this constraint has to
  * disclose in order to be enforceable at all.
  */
-const PLATFORM_WIDE_CONSTRAINTS: Readonly<Record<string, string>> = {
-	org_setting_sip_realm_global_key: "This SIP domain is already assigned to another organization.",
-	phone_number_e164_global_key:
-		"That number is already provisioned on this platform. A DID has exactly one owner, so it " +
-		"has to be released from wherever it is configured before it can be added here.",
+const PLATFORM_WIDE_CONSTRAINTS: Readonly<
+	Record<string, { readonly detail: string; readonly field?: string }>
+> = {
+	org_setting_sip_realm_global_key: {
+		detail: "This SIP domain is already assigned to another organization.",
+		// `field` is stated rather than derived: the index is on the EXPRESSION
+		// `lower(btrim(value #>> '{}'))`, so `constraintField` finds no column and would answer "",
+		// leaving the settings form with a 409 it cannot attach to an input. The name is the
+		// catalogue's (`sip`/`realm`), which is the key the patch body carries.
+		field: "realm",
+	},
+	phone_number_e164_global_key: {
+		detail:
+			"That number is already provisioned on this platform. A DID has exactly one owner, so it " +
+			"has to be released from wherever it is configured before it can be added here.",
+	},
 };
 /** Postgres `check_violation` — a table-level invariant the row broke. */
 const CHECK_VIOLATION = "23514";
@@ -376,11 +387,12 @@ export function toPbxFailure(
 	const error = asPostgresError(cause);
 	if (error?.code === UNIQUE_VIOLATION) {
 		const constraint = error.constraint_name ?? "unique index";
+		const platformWide = PLATFORM_WIDE_CONSTRAINTS[constraint];
 		return new PbxConflictFailure({
 			kind,
-			field: constraintField(constraint, table),
+			field: platformWide?.field ?? constraintField(constraint, table),
 			detail:
-				PLATFORM_WIDE_CONSTRAINTS[constraint] ??
+				platformWide?.detail ??
 				`Another ${kind} in this organization already uses that value (${constraint}).`,
 		});
 	}

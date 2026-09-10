@@ -15,6 +15,23 @@ import type { AppSession } from "@optimiq-voice/auth";
  * `devices.write` can still bring a softphone online. The endpoint resolves the caller's OWN
  * extension from the session — no id is accepted from the client — so the authorization IS the
  * ownership. See `softphone.service.ts`.
+ *
+ * ## The contract, stated where a client reader lands first
+ *
+ * Always 200 for an authenticated caller. The body is one of two shapes, discriminated by
+ * `configured`:
+ *
+ * ```
+ * { "configured": true,  "extension": {…}, "account": {…}, "transport": {…}, "media": {…} }
+ * { "configured": false, "reason": "no-extension" | "no-realm" | "not-provisioned",
+ *   "code": "SOFTPHONE_NO_EXTENSION" | …, "message": "…" }
+ * ```
+ *
+ * A client narrows on `configured` and, when it is false, explains `reason` — never the prose.
+ * Holding no extension is the ordinary state of an administrator, not a request failure, and this
+ * provider is mounted on every authenticated page; answering it 404 wrote a console error onto
+ * every screen in the product. `softphone.service.ts` has the full argument. `code` mirrors the
+ * status codes this route used to refuse with and is deprecated.
  */
 @Controller("api/v1/me/softphone")
 export class SoftphoneController {

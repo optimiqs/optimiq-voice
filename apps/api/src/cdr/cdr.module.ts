@@ -11,6 +11,7 @@ import { LastCallerService } from "./query/last-caller.service";
 import { CdrRecordingRetentionSweeper } from "./recordings/recording-retention-sweeper.service";
 import { CdrRecordingsController } from "./recordings/recordings.controller";
 import { RecordingsService } from "./recordings/recordings.service";
+import { CdrLegRetentionSweeper } from "./retention/leg-retention-sweeper.service";
 import { createCdrDatabase } from "./shared/cdr-database";
 import { loadCdrEnv } from "./shared/cdr-env";
 import { CDR_DATABASE, CDR_ENV, CDR_EXPORT_STORE, CDR_RECORDING_STORE } from "./shared/cdr.tokens";
@@ -126,6 +127,7 @@ const logger = getLogger("api.cdr");
 		CdrLegWriter,
 		CdrRecordingWriter,
 		CdrRecordingRetentionSweeper,
+		CdrLegRetentionSweeper,
 		CdrExportWorker,
 	],
 	exports: [
@@ -138,6 +140,7 @@ const logger = getLogger("api.cdr");
 		LastCallerService,
 		RecordingsService,
 		CdrRecordingRetentionSweeper,
+		CdrLegRetentionSweeper,
 		CdrExportWorker,
 	],
 })

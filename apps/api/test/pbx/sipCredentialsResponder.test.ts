@@ -1,5 +1,6 @@
 import { expect } from "chai";
 import { RPC_SUBJECTS } from "@optimiq-voice/events/subjects";
+import { SipCredentialCache } from "../../src/pbx/sip-credentials/sip-credentials.cache";
 import { SipCredentialsResponder } from "../../src/pbx/sip-credentials/sip-credentials.responder";
 import type { PbxEnv } from "../../src/pbx/shared/pbx-env";
 import type { SipCredentialsService } from "../../src/pbx/sip-credentials/sip-credentials.service";
@@ -54,6 +55,7 @@ function responderWithAnswer(answer: (raw: string) => Promise<unknown>): {
 		{} as PbxEnv,
 		{} as SipCredentialsService,
 		{} as TrunkCredentialsService,
+		new SipCredentialCache(),
 	);
 	const internals = responder as unknown as {
 		answer(raw: string): Promise<unknown>;

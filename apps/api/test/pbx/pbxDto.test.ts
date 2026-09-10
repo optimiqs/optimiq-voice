@@ -109,6 +109,31 @@ describe("pbx DTOs", () => {
 			expect(createExtensionDto.safeParse(tooMany).success).to.equal(false);
 		});
 
+		describe("the outbound caller-id presentation", () => {
+			const base = { number: "1001", label: "Alice", sipSecretRef: "s" };
+
+			it("accepts the two values and nothing else", () => {
+				for (const value of ["allowed", "restricted"]) {
+					expect(
+						createExtensionDto.safeParse({ ...base, outboundCallerIdPresentation: value }).success,
+					).to.equal(true);
+				}
+				expect(
+					createExtensionDto.safeParse({ ...base, outboundCallerIdPresentation: "anonymous" })
+						.success,
+				).to.equal(false);
+				// Not nullish: the column is NOT NULL with a default, so "clear it" is `allowed`.
+				expect(
+					createExtensionDto.safeParse({ ...base, outboundCallerIdPresentation: null }).success,
+				).to.equal(false);
+			});
+
+			it("leaves the stored setting alone when the key is absent", () => {
+				const untouched = updateExtensionDto.parse({}) as Record<string, unknown>;
+				expect("outboundCallerIdPresentation" in untouched).to.equal(false);
+			});
+		});
+
 		/**
 		 * The pickup group is the one text column on an extension where blank and absent are
 		 * different facts to the engine: absent (NULL) means "in no group" and gets the org-wide
@@ -532,6 +557,81 @@ describe("pbx DTOs", () => {
 
 		it("requires a destination — a DID that rings nothing is not expressible", () => {
 			expect(createPhoneNumberDto.safeParse({ e164: "+12125550100" }).success).to.equal(false);
+		});
+
+		/**
+		 * The half the audit found missing: the column was documented as E.164 and the DTO only ever
+		 * REFUSED what was not, so `+1 (212) 555-0100` — the shape a person copies out of a contact
+		 * card — was a 400 rather than the number it plainly is. Normalising also closes the
+		 * duplicate hole: two spellings of one DID used to be two rows that the uniqueness check
+		 * could not see, and an inbound route matched at most one of them.
+		 */
+		it("normalises the punctuation a person actually types", () => {
+			const destination = { destinationType: "hangup" as const };
+			for (const typed of [
+				"+1 (212) 555-0100",
+				"+1.212.555.0100",
+				"+1-212-555-0100",
+				"  +1 212 555 0100  ",
+				"0012125550100",
+				"01112125550100",
+			]) {
+				const parsed = createPhoneNumberDto.safeParse({ e164: typed, ...destination });
+				expect(parsed.success, typed).to.equal(true);
+				expect((parsed as { data: { e164: string } }).data.e164).to.equal("+12125550100");
+			}
+		});
+
+		it("still refuses a bare national number, because the schema has no country to assume", () => {
+			const destination = { destinationType: "hangup" as const };
+			expect(
+				createPhoneNumberDto.safeParse({ e164: "2125550100", ...destination }).success,
+			).to.equal(false);
+		});
+
+		it("refuses more digits than E.164 has, which the old 19-digit bound accepted", () => {
+			const destination = { destinationType: "hangup" as const };
+			expect(
+				createPhoneNumberDto.safeParse({ e164: `+${"9".repeat(16)}`, ...destination }).success,
+			).to.equal(false);
+			expect(
+				createPhoneNumberDto.safeParse({ e164: `+${"9".repeat(15)}`, ...destination }).success,
+			).to.equal(true);
+		});
+	});
+
+	/**
+	 * Caller-ID numbers were bare `z.string().max(32)` on the extension, the outbound route and the
+	 * trunk — free text in a field the carrier either rejects or silently replaces with the
+	 * account default, so the tenant sees a presented number nobody in this system chose.
+	 */
+	describe("caller-id numbers", () => {
+		const base = { number: "1001", label: "Alice", sipSecretRef: "s" };
+
+		it("normalises every caller-id number on an extension", () => {
+			const parsed = createExtensionDto.safeParse({
+				...base,
+				callerIdNumber: "+1 (212) 555-0100",
+				outboundCallerIdNumber: "+1.212.555.0101",
+				emergencyCallerIdNumber: "0012125550102",
+			});
+			expect(parsed.success).to.equal(true);
+			const data = (parsed as { data: Record<string, unknown> }).data;
+			expect(data.callerIdNumber).to.equal("+12125550100");
+			expect(data.outboundCallerIdNumber).to.equal("+12125550101");
+			expect(data.emergencyCallerIdNumber).to.equal("+12125550102");
+		});
+
+		it("refuses free text where a number belongs", () => {
+			expect(
+				createExtensionDto.safeParse({ ...base, callerIdNumber: "main line" }).success,
+			).to.equal(false);
+		});
+
+		it("still lets a caller-id be cleared", () => {
+			const parsed = createExtensionDto.safeParse({ ...base, callerIdNumber: null });
+			expect(parsed.success).to.equal(true);
+			expect((parsed as { data: Record<string, unknown> }).data.callerIdNumber).to.equal(null);
 		});
 	});
 

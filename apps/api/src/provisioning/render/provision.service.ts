@@ -1,5 +1,6 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logging";
+import { formatDispatchableLocation } from "../../mail";
 import { SipAuthEventService } from "../../pbx/security/sip-auth-event.service";
 import { resolveSettings } from "../catalog/cascade";
 import { modelDefaults, templateFor } from "../catalog/catalog";
@@ -23,6 +24,7 @@ import {
 import { ProvisionEventPublisher } from "./provision.publisher";
 import { ProvisionRepository } from "./provision.repository";
 import type {
+	DispatchableLocation,
 	RenderContext,
 	RenderKey,
 	RenderLine,
@@ -242,7 +244,25 @@ export class ProvisionService {
 			throw new ProvisionRefusedException({ reason: "unknown-vendor", ...identify(found) });
 		}
 
-		const context = this.buildContext(env, found.organizationId, snapshot, request.token);
+		/**
+		 * The organization's own SIP domain — `org_setting sip/realm` — and there is NO deployment
+		 * default for it (see {@link buildContext}). A tenant that has configured none is refused
+		 * rather than rendered against another tenant's realm.
+		 */
+		const sipDomain =
+			typeof snapshot.sipRealm === "string" ? snapshot.sipRealm.trim().toLowerCase() : "";
+		if (sipDomain === "") {
+			await this.reject(request, found, "not-configured", "SIP domain not configured");
+			throw new ProvisionRefusedException({ reason: "not-configured", ...identify(found) });
+		}
+
+		const context = this.buildContext(
+			env,
+			found.organizationId,
+			snapshot,
+			request.token,
+			sipDomain,
+		);
 		return { context, template };
 	}
 
@@ -257,11 +277,18 @@ export class ProvisionService {
 		organizationId: string,
 		snapshot: RenderSnapshot,
 		token: string,
+		sipDomain: string,
 	): RenderContext {
-		const sipServer =
-			typeof snapshot.sipRealm === "string" && snapshot.sipRealm.trim() !== ""
-				? snapshot.sipRealm.trim().toLowerCase()
-				: env.PROVISION_SIP_SERVER;
+		/**
+		 * The AOR domain, and it is the TENANT's — never the deployment's.
+		 *
+		 * `PROVISION_SIP_SERVER` names the SIP edge a packet is sent TO, which is legitimately
+		 * deployment-wide and is still the fallback for `serverAddress` below. The domain an account
+		 * registers INTO is a per-tenant claim: `sip_credentials.service.ts` maps one realm to exactly
+		 * one organization, so handing an organization that configured none the deployment default
+		 * hands it a realm that resolves to a DIFFERENT tenant, and the phone can never register.
+		 * `renderFor` resolves and refuses it, so it arrives here already checked.
+		 */
 		const rootKey = env.PROVISION_SIP_SECRET_KEY;
 
 		/**
@@ -312,7 +339,7 @@ export class ProvisionService {
 				registerUser,
 				authUser: row.line.authUser ?? registerUser,
 				password: deriveSipPassword({ rootKey, organizationId, secretRef }),
-				serverAddress: row.line.serverAddress ?? sipServer,
+				serverAddress: row.line.serverAddress ?? env.PROVISION_SIP_SERVER,
 				/**
 				 * The port and the transport, after the organization's preference.
 				 *
@@ -361,7 +388,8 @@ export class ProvisionService {
 			lines,
 			keys: mergeKeys(snapshot),
 			settings,
-			sipDomain: sipServer,
+			sipDomain,
+			dispatchableLocation: dispatchableLocationOf(snapshot),
 			payloadUrl:
 				this.env.PROVISION_BASE_URL === undefined
 					? undefined
@@ -600,5 +628,36 @@ function toRenderKey(row: {
 		value: row.value ?? undefined,
 		label: row.label ?? undefined,
 		lineNumber: row.lineNumber,
+	};
+}
+
+/**
+ * The handset's dispatchable location, or `undefined` when it has none.
+ *
+ * A device carrying only a `location_detail` and no address contributes nothing here, and that is
+ * deliberate: "Desk 12" is not a dispatchable location, it is a refinement of one, and rendering it
+ * alone would put a fragment in front of somebody who needs a street. The number-level fallback
+ * still applies at notification time (`emergency-notification.service.ts` joins the two), which is
+ * the only place both facts are in hand.
+ *
+ * `formatDispatchableLocation` is the mail area's helper and is reused rather than reimplemented so
+ * the address a user reads in the softphone is character-for-character the one a responder is read
+ * off the Kari's Law notification. Two formatters would drift, and the drift would be discovered by
+ * somebody comparing them during an incident.
+ */
+function dispatchableLocationOf(snapshot: RenderSnapshot): DispatchableLocation | undefined {
+	const address = snapshot.emergencyAddress;
+	if (address === undefined) {
+		return undefined;
+	}
+	const formatted = formatDispatchableLocation(address, snapshot.device.emergencyLocationDetail);
+	if (formatted.length === 0) {
+		return undefined;
+	}
+	return {
+		addressId: address.id,
+		formatted,
+		detail: snapshot.device.emergencyLocationDetail,
+		validated: address.validated,
 	};
 }

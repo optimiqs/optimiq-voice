@@ -52,6 +52,29 @@ describe("cdr.leg.write → call_legs", () => {
 		expect(result.values.billsecMs).to.equal(56_000);
 	});
 
+	it("files the destination id under the column of its type", () => {
+		const ivr = mapCdrLegWrite(
+			ORG,
+			payload({ destinationType: "ivr", destinationRef: "0195c0f0-1c2f-7000-8000-00000000a020" }),
+		);
+		expect(ivr.values.ivrRef).to.equal("0195c0f0-1c2f-7000-8000-00000000a020");
+		expect(ivr.values.ringGroupRef).to.equal(null);
+
+		const group = mapCdrLegWrite(
+			ORG,
+			payload({
+				destinationType: "ring_group",
+				destinationRef: "0195c0f0-1c2f-7000-8000-00000000a001",
+			}),
+		);
+		expect(group.values.ringGroupRef).to.equal("0195c0f0-1c2f-7000-8000-00000000a001");
+		expect(group.values.ivrRef).to.equal(null);
+
+		const extension = mapCdrLegWrite(ORG, payload());
+		expect(extension.values.ivrRef).to.equal(null);
+		expect(extension.values.ringGroupRef).to.equal(null);
+	});
+
 	it("takes the organization from the caller, never from the payload", () => {
 		// The event contract keeps `organizationId` out of the payload on purpose. A producer that
 		// smuggled one in must not be able to steer the write.
@@ -298,5 +321,95 @@ describe("the authorising PIN", () => {
 			const values = mapCdrLegWrite(ORG, { ...payload(), authPinOrdinal: ordinal }).values;
 			expect(values.authPinOrdinal, JSON.stringify(ordinal)).to.equal(null);
 		}
+	});
+});
+
+/**
+ * The carrier's STIR/SHAKEN claim.
+ *
+ * Not the all-or-nothing pair the PIN is, and deliberately: each field is an independent thing a
+ * carrier chose to say, and a `verstat` with no level is the most useful of the three.
+ */
+describe("the carrier's attestation", () => {
+	it("maps a full claim onto the row", () => {
+		const values = mapCdrLegWrite(ORG, {
+			...payload(),
+			sipAttestation: "A",
+			sipVerstat: "tn-validation-passed",
+			sipOrigId: "carrier-origid",
+		}).values;
+		expect(values.sipAttestation).to.equal("A");
+		expect(values.sipVerstat).to.equal("tn-validation-passed");
+		expect(values.sipOrigId).to.equal("carrier-origid");
+	});
+
+	it("leaves all three null on a call that arrived without the headers", () => {
+		const values = mapCdrLegWrite(ORG, payload()).values;
+		expect(values.sipAttestation).to.equal(null);
+		expect(values.sipVerstat).to.equal(null);
+		expect(values.sipOrigId).to.equal(null);
+	});
+
+	it("keeps a verstat stated without a level, which is the useful half", () => {
+		const values = mapCdrLegWrite(ORG, {
+			...payload(),
+			sipVerstat: "tn-validation-failed",
+		}).values;
+		expect(values.sipAttestation).to.equal(null);
+		expect(values.sipVerstat).to.equal("tn-validation-failed");
+	});
+
+	/** The column's vocabulary is A/B/C. A fourth value is a level no report could interpret. */
+	it("drops an unrecognised level and records the coercion", () => {
+		const result = mapCdrLegWrite(ORG, { ...payload(), sipAttestation: "D" });
+		expect(result.values.sipAttestation).to.equal(null);
+		expect(result.coercions.map((entry) => entry.field)).to.include("sipAttestation");
+	});
+
+	/** Carrier-writable text. A long one is an over-filled header, not a row worth quarantining. */
+	it("truncates over-long carrier text instead of refusing the row", () => {
+		const values = mapCdrLegWrite(ORG, {
+			...payload(),
+			sipVerstat: "x".repeat(400),
+			sipOrigId: "y".repeat(400),
+		}).values;
+		expect(values.sipVerstat).to.have.lengthOf(64);
+		expect(values.sipOrigId).to.have.lengthOf(128);
+	});
+
+	it("keeps the three out of the raw passthrough, being mapped columns now", () => {
+		const values = mapCdrLegWrite(ORG, { ...payload(), sipAttestation: "B" }).values;
+		expect(values.raw).to.not.have.property("sipAttestation");
+	});
+});
+
+/**
+ * The dialog's `Call-ID`.
+ *
+ * `call_legs.sip_call_id` existed and was queried, and every one of the 15 220 rows on the stack was
+ * null: nothing put the value on the payload and nothing here mapped it, so no billing record could
+ * be matched to a carrier's Call-ID in a traceback.
+ */
+describe("the SIP Call-ID", () => {
+	it("maps the dialog's Call-ID onto the column", () => {
+		const values = mapCdrLegWrite(ORG, {
+			...payload(),
+			sipCallId: "3c26700d-1c2f@carrier.example",
+		}).values;
+		expect(values.sipCallId).to.equal("3c26700d-1c2f@carrier.example");
+	});
+
+	it("is null on a leg that carried no dialog", () => {
+		expect(mapCdrLegWrite(ORG, payload()).values.sipCallId).to.equal(null);
+	});
+
+	it("truncates a foreign producer's over-long token rather than refusing the row", () => {
+		const values = mapCdrLegWrite(ORG, { ...payload(), sipCallId: "z".repeat(400) }).values;
+		expect(values.sipCallId).to.have.lengthOf(256);
+	});
+
+	it("stays out of the raw passthrough, being a mapped column now", () => {
+		const values = mapCdrLegWrite(ORG, { ...payload(), sipCallId: "abc@edge" }).values;
+		expect(values.raw).to.not.have.property("sipCallId");
 	});
 });

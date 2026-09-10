@@ -1,6 +1,6 @@
 import { z } from "zod/v4";
 import { SIP_TRANSPORTS, TRUNK_KINDS } from "@optimiq-voice/pbx-db";
-import { displayName, patchOf, resettable } from "../shared/dto";
+import { callerIdNumber, displayName, patchOf, resettable } from "../shared/dto";
 
 /**
  * `status`, `statusChangedAt`, `statusReason` and `statusLatencyMs` are deliberately absent: they
@@ -27,7 +27,7 @@ export const createTrunkDto = z.strictObject({
 	 */
 	inboundTranslationRulesetId: z.uuid().nullish(),
 	maxChannels: z.int().min(1).max(10_000).nullish(),
-	callerIdNumberOverride: z.string().max(32).nullish(),
+	callerIdNumberOverride: callerIdNumber,
 	enabled: z.boolean().optional(),
 });
 

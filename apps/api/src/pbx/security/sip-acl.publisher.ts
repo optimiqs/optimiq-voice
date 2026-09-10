@@ -18,12 +18,10 @@ const logger = getLogger("api.pbx");
 /**
  * Reads many keys with a bounded number of requests in flight.
  *
- * The reconcile has to look at every key in the bucket, and doing that with `await` inside the loop
- * made it n SEQUENTIAL broker round trips rather than a scan — minutes of wall clock at a hundred
- * thousand keys, in a fire-and-forget continuation holding a connection. The real fix is the
- * per-organization reverse key the class header proposes, which removes the whole-key-space walk;
- * this bounds the cost of the walk that is still here without letting an unbounded fan-out loose on
- * the connection.
+ * The reconcile reads back every key this organization holds, and doing that with `await` inside the
+ * loop made it n SEQUENTIAL broker round trips rather than a scan. The key's organization prefix
+ * already bounds the set to one tenant; this bounds the cost of reading it without letting an
+ * unbounded fan-out loose on the connection.
  */
 const READ_CONCURRENCY = 64;
 
@@ -64,45 +62,23 @@ const READ_CONCURRENCY = 64;
  * directly and in-tenant (`provisioning/render/provision.repository.ts`'s `checkAllowlist`), so
  * neither loses anything by staying out of the broker.
  *
- * They are excluded rather than carried-and-filtered because of the KEY, which is the one place this
- * read model is lossier than the table it derives from. See below — every row published is a row
- * that can collide, and a row with no reader is a collision bought for nothing.
+ * They are excluded rather than carried-and-filtered because a row with no reader is bytes on a
+ * security-critical bucket four services watch, bought for nothing.
  *
- * ## The key cannot express what the table's unique index can, so collisions are REFUSED
+ * ## The key IS the table's unique index
  *
- * `kvKeyFor.sipAcl(network)` folds a CIDR into a single token — the network and nothing else,
- * because a network is all an arriving packet has. The table's uniqueness is
- * `(organization_id, scope, network)`. Two rows can therefore be perfectly legal and land on one KV
- * key:
+ * `kvKeyFor.sipAcl(orgId, scope, network)` spells `(organization_id, scope, network)` as subject
+ * tokens, so the projection is lossless and two rows can never land on one key. It did not always:
+ * the key was the folded network alone, which meant two organizations naming the same CIDR — or one
+ * organization naming it in both edge scopes — contested a single key. Under "absence is refusal"
+ * a contested key had to be published as NOTHING, so a tenant could suppress another tenant's rule
+ * on a security boundary simply by writing the same network. The organization and the scope are in
+ * the key for that reason and not for readability.
  *
- * - **Across tenants.** Two organizations naming the same network. Nothing in the database forbids
- *   it and nothing here can arbitrate it — unlike `did-index`, whose global unique index on
- *   `phone_number.e164` is what makes its own conflict path a report of divergence rather than a
- *   real ambiguity.
- * - **Within one tenant.** The same network in the `registration` and `trunk` scopes. Restricting
- *   the published set to those two scopes is what keeps this to the pair an operator would actually
- *   have to think about, instead of also colliding with `provisioning` — which is the pair most
- *   likely to exist by accident, since the same office network is plausibly allowed to register
- *   phones and to fetch provisioning files.
- *
- * A collision is never resolved by picking one. Picking the `allow` would let one tenant's rule
- * admit another tenant's traffic; picking the `deny` would let one tenant's rule block another
- * tenant's carrier; picking by priority or by recency would make an access-control decision turn on
- * write order. So a contested key is **published as nothing and reported**, which under the "absence
- * is refusal" rule above is the one outcome that is safe in both directions and visible immediately.
- * The counter, the error log naming every contending row, and `scripts/rebuild-sip-acl.ts`'s
- * non-zero exit are how it reaches a human.
- *
- * **This is a contract gap, not a preference.** The key function cannot represent the table, and the
- * fix is in `packages/events` — a scope-qualified key. Until then this class fails closed and says
- * so.
- *
- * Note that `sip_acl_entry.trunk_id`, which landed with this bucket, is deliberately NOT that fix
- * and does not narrow the collision: the unique index stays `(organization_id, scope, network)`, so
- * one network still gets one rule and two rows can still only contend across the two edge scopes.
- * Widening the index to admit the same network under two trunks would MANUFACTURE contested keys
- * here rather than resolve them — the schema comment on the column records that as the reason it was
- * left alone.
+ * The edge is unaffected: it watches the whole bucket and evaluates by network, because an arriving
+ * packet carries a source address and nothing else. What the organization in the key buys the WRITER
+ * is a range read — `kvKeyFor.sipAclPrefix(organizationId)` — instead of the whole-key-space walk
+ * this reconcile used to need to answer "which networks did this organization used to allow?".
  *
  * ## `trunkId` attributes a matched packet to a carrier
  *
@@ -131,7 +107,6 @@ export class SipAclPublisher implements OnModuleInit, OnApplicationShutdown {
 	private written = 0;
 	private removed = 0;
 	private unchanged = 0;
-	private conflicts = 0;
 	private failed = 0;
 
 	constructor(
@@ -148,14 +123,12 @@ export class SipAclPublisher implements OnModuleInit, OnApplicationShutdown {
 		readonly written: number;
 		readonly removed: number;
 		readonly unchanged: number;
-		readonly conflicts: number;
 		readonly failed: number;
 	} {
 		return {
 			written: this.written,
 			removed: this.removed,
 			unchanged: this.unchanged,
-			conflicts: this.conflicts,
 			failed: this.failed,
 		};
 	}
@@ -204,7 +177,7 @@ export class SipAclPublisher implements OnModuleInit, OnApplicationShutdown {
 	/** Re-projects one organization's ACL entries and reconciles the bucket against them. */
 	async syncOrganization(organizationId: string): Promise<SipAclSyncResult> {
 		if (this.bucket === undefined) {
-			return { published: 0, deleted: 0, unchanged: 0, conflicts: [], failed: 0, skipped: true };
+			return { published: 0, deleted: 0, unchanged: 0, failed: 0, skipped: true };
 		}
 		const rows = await this.database.withTenantScope(
 			organizationId,
@@ -216,34 +189,31 @@ export class SipAclPublisher implements OnModuleInit, OnApplicationShutdown {
 	/**
 	 * The reconcile itself, also used by `scripts/rebuild-sip-acl.ts`.
 	 *
-	 * Deletion needs the WHOLE key space, because "which networks did this organization used to
-	 * allow?" is a question only the bucket can answer and the key carries no organization to range
-	 * over. That is an O(n) scan of every ACL entry on the platform per admin write — the same trade
-	 * `did-index` makes for the same reason, with the same ceiling and the same fix if it is ever
-	 * reached (a per-organization reverse key).
+	 * Deletion is a range read over this organization's prefix — "which networks did this organization
+	 * used to allow?" — plus a sweep of the keys written before the organization entered the key,
+	 * which are a single token and which that range read therefore cannot see. The edge still matches
+	 * them, so leaving one behind is a network admitted by a rule that was deleted: the one direction
+	 * this boundary must never fail in.
 	 *
-	 * It is also the scan that finds the orphan an operator would otherwise never see: an entry whose
-	 * organization has no rows left. A stale `allow` there is a network admitted by a rule nobody can
-	 * find; a stale `deny` is a carrier silently blocked. Both are removed here when this organization
-	 * owns them, and reported by the rebuild script when it is the tenant itself that is gone.
+	 * Both passes find the orphan an operator would otherwise never see: an entry whose row is gone.
+	 * A stale `allow` there is a network admitted by a rule nobody can find; a stale `deny` is a
+	 * carrier silently blocked. Both are removed here when this organization owns them, and reported
+	 * by the rebuild script when it is the tenant itself that is gone.
 	 */
 	async reconcile(organizationId: string, rows: readonly SipAclRow[]): Promise<SipAclSyncResult> {
 		const bucket = this.bucket;
 		if (bucket === undefined) {
-			return { published: 0, deleted: 0, unchanged: 0, conflicts: [], failed: 0, skipped: true };
+			return { published: 0, deleted: 0, unchanged: 0, failed: 0, skipped: true };
 		}
 
-		const conflicts: SipAclConflict[] = [];
 		const wanted = new Map<string, SipAclEntry>();
-		const contended = new Map<string, SipAclRow[]>();
-
 		for (const row of rows) {
 			if (!isEdgeSipAclScope(row.scope)) {
 				continue;
 			}
 			let key: string;
 			try {
-				key = kvKeyFor.sipAcl(row.network);
+				key = kvKeyFor.sipAcl(organizationId, row.scope, row.network);
 			} catch (error) {
 				// A stored network with no usable characters cannot be keyed and cannot be matched.
 				// Logged rather than thrown: one unusable row must not stop the other rules publishing.
@@ -254,92 +224,32 @@ export class SipAclPublisher implements OnModuleInit, OnApplicationShutdown {
 				);
 				continue;
 			}
-			contended.set(key, [...(contended.get(key) ?? []), row]);
-		}
-
-		for (const [key, group] of contended) {
-			const first = group[0];
-			if (first === undefined) {
-				continue;
-			}
-			if (group.length > 1) {
-				// Two of this tenant's own rows on one key — the same network in both edge scopes. Not
-				// resolved by picking one; see the class header. Absent means refused, which is the safe
-				// direction, and the log names every contender so the fix is one edit.
-				this.conflicts += 1;
-				conflicts.push({
-					key,
-					network: first.network,
-					heldBy: organizationId,
-					reason: "duplicate-network",
-					scopes: group.map((row) => row.scope),
-				});
-				logger.error(
-					{
-						key,
-						organizationId,
-						network: first.network,
-						scopes: group.map((row) => row.scope),
-					},
-					"refusing to publish a sip-acl entry: this organization has more than one rule for " +
-						"this network across the edge scopes and the KV key cannot tell them apart, so the " +
-						"network is published as NOTHING and is therefore REFUSED — delete one of the rules",
-				);
-				continue;
-			}
-			wanted.set(key, projectSipAclEntry(organizationId, first));
+			// No contest is possible: the key is the table's unique index, so two rows cannot land here.
+			wanted.set(key, projectSipAclEntry(organizationId, row));
 		}
 
 		let failed = 0;
 		let published = 0;
 		let deleted = 0;
 		let unchanged = 0;
-		const mine = new Map<string, SipAclEntry>();
 
-		const allKeys: string[] = [];
-		for await (const key of await bucket.keys()) {
-			allKeys.push(key);
+		// One range read over this organization's prefix. It is also what finds the orphan an operator
+		// would otherwise never see: an entry whose row is gone. A stale `allow` there is a network
+		// admitted by a rule nobody can find; a stale `deny` is a carrier silently blocked.
+		const mine = new Map<string, SipAclEntry>();
+		const myKeys: string[] = [];
+		for await (const key of await bucket.keys(kvKeyFor.sipAclPrefix(organizationId))) {
+			myKeys.push(key);
 		}
-		const scanned: { key: string; entry: SipAclEntry | undefined }[] = [];
-		for (let start = 0; start < allKeys.length; start += READ_CONCURRENCY) {
-			const batch = allKeys.slice(start, start + READ_CONCURRENCY);
+		for (let start = 0; start < myKeys.length; start += READ_CONCURRENCY) {
+			const batch = myKeys.slice(start, start + READ_CONCURRENCY);
 			const entries = await Promise.all(batch.map(async (key) => await readEntry(bucket, key)));
 			for (const [index, entry] of entries.entries()) {
 				const key = batch[index];
-				if (key !== undefined) {
-					scanned.push({ key, entry });
+				if (key !== undefined && entry !== undefined) {
+					mine.set(key, entry);
 				}
 			}
-		}
-		for (const { key, entry } of scanned) {
-			if (entry === undefined) {
-				continue;
-			}
-			if (entry.orgId === organizationId) {
-				mine.set(key, entry);
-				continue;
-			}
-			if (!wanted.has(key)) {
-				continue;
-			}
-			// Another tenant already holds this network. Never overwritten and never deleted — it is not
-			// ours — so OUR rule is the one that goes unpublished, and under "absence is refusal" that
-			// refuses our own traffic rather than admitting somebody else's. Reported so a human picks.
-			this.conflicts += 1;
-			conflicts.push({
-				key,
-				network: entry.network,
-				heldBy: entry.orgId,
-				reason: "cross-tenant",
-				scopes: [],
-			});
-			logger.error(
-				{ key, claimedBy: organizationId, heldBy: entry.orgId, network: entry.network },
-				"refusing to move a sip-acl entry to another organization; the sip-acl KV key is the " +
-					"network alone and two tenants have claimed it, so this organization's rule is NOT " +
-					"published and its traffic on that network is refused — run scripts/rebuild-sip-acl.ts",
-			);
-			wanted.delete(key);
 		}
 
 		for (const [key, entry] of wanted) {
@@ -376,19 +286,45 @@ export class SipAclPublisher implements OnModuleInit, OnApplicationShutdown {
 			}
 		}
 
-		return { published, deleted, unchanged, conflicts, failed, skipped: false };
+		// The keys written before the organization and the scope entered the key are the folded network
+		// alone. `*` matches exactly one token, which is precisely that shape, and the entry's own
+		// `orgId` says whose it is. They are removed unconditionally: this reconcile has just written
+		// every rule this organization still has under the current key, so a surviving legacy key can
+		// only be a rule that no longer exists — still matching at an edge that watches the whole
+		// bucket by network.
+		for await (const key of await bucket.keys("*")) {
+			const legacy = await readEntry(bucket, key);
+			if (legacy?.orgId !== organizationId) {
+				continue;
+			}
+			try {
+				await bucket.delete(key);
+				this.removed += 1;
+				deleted += 1;
+			} catch (error) {
+				this.failed += 1;
+				failed += 1;
+				logger.error({ key, organizationId, error }, "failed to delete a legacy sip-acl entry");
+			}
+		}
+
+		return { published, deleted, unchanged, failed, skipped: false };
 	}
 
-	/** One network's published rule. Used by verification and by the rebuild script's report. */
-	async lookup(network: string): Promise<SipAclEntry | undefined> {
+	/** One rule's published entry. Used by verification and by the rebuild script's report. */
+	async lookup(
+		organizationId: string,
+		scope: SipAclScope,
+		network: string,
+	): Promise<SipAclEntry | undefined> {
 		const bucket = this.bucket;
 		if (bucket === undefined) {
 			return undefined;
 		}
 		try {
-			return await readEntry(bucket, kvKeyFor.sipAcl(network));
+			return await readEntry(bucket, kvKeyFor.sipAcl(organizationId, scope, network));
 		} catch (error) {
-			logger.error({ network, error }, "failed to read a sip-acl entry");
+			logger.error({ organizationId, scope, network, error }, "failed to read a sip-acl entry");
 			return undefined;
 		}
 	}
@@ -423,7 +359,7 @@ export class SipAclPublisher implements OnModuleInit, OnApplicationShutdown {
  * The scopes the SIP EDGE guards, and therefore the only ones published.
  *
  * `provisioning` and `api` are HTTP surfaces inside `apps/api` with their own in-tenant readers. See
- * the class header for why carrying them anyway would be a key collision bought for nothing.
+ * the class header for why carrying them anyway would be bytes bought for nothing.
  */
 export const EDGE_SIP_ACL_SCOPES: readonly SipAclScope[] = ["registration", "trunk"];
 
@@ -496,22 +432,10 @@ export function projectSipAclEntry(organizationId: string, row: SipAclRow): SipA
 	};
 }
 
-/** Why one network could not be published. Both reasons are refusals, never silent resolutions. */
-export interface SipAclConflict {
-	readonly key: string;
-	readonly network: string;
-	/** The organization whose rows contend, or the one the bucket says already holds the key. */
-	readonly heldBy: string;
-	readonly reason: "cross-tenant" | "duplicate-network";
-	/** The contending scopes, for `duplicate-network`. Empty for the cross-tenant case. */
-	readonly scopes: readonly string[];
-}
-
 export interface SipAclSyncResult {
 	readonly published: number;
 	readonly deleted: number;
 	readonly unchanged: number;
-	readonly conflicts: readonly SipAclConflict[];
 	/**
 	 * KV writes and deletes that threw. Non-zero means the reconcile is incomplete, so the caller
 	 * must leave the outbox obligation owed and let the sweeper republish.

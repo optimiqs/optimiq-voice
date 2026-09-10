@@ -90,6 +90,26 @@ export const FEATURE_CODE_PARAM_SCHEMAS: Readonly<Record<FeatureCodeAction, z.Zo
 	"agent-status": noParams,
 	eavesdrop: noParams,
 	transfer: noParams,
+	/**
+	 * Hot desking takes no stored parameter, for the reason `intercom` does not.
+	 *
+	 * Which extension is being claimed is the argument dialled after the code, and which handset is
+	 * being claimed is whichever one the call came from — a fact about the leg, not about the row.
+	 * Pinning either would turn one code that works on every shared desk into a code that works on
+	 * exactly one. The PIN set that gates a login is on the EXTENSION
+	 * (`extension.hot_desk_pin_set_id`), because "who may claim this desk" is a property of the
+	 * person, not of the star code.
+	 */
+	"hotdesk-login": noParams,
+	"hotdesk-logout": noParams,
+	/**
+	 * Per-call CLIR takes no stored parameter for the reason `intercom` does not: the destination is
+	 * the argument dialled after the code, and pinning it would turn "withhold my number on this
+	 * call" into "withhold my number when I ring this one number". The standing setting is
+	 * `extension.outbound_caller_id_presentation`, on the extension's own form.
+	 */
+	"caller-id-presentation-restrict": noParams,
+	"caller-id-presentation-allow": noParams,
 };
 
 /**
@@ -158,6 +178,13 @@ export const FEATURE_CODE_PARAM_FIELDS: Readonly<
 	"agent-status": [],
 	eavesdrop: [],
 	transfer: [],
+	// Nothing to render: the extension is dialled after the code and the handset is the one the call
+	// came from. The gate is `extension.hot_desk_pin_set_id`, on the extension's own form.
+	"hotdesk-login": [],
+	"hotdesk-logout": [],
+	// Nothing to render: the destination is dialled after the code. See the schema note above.
+	"caller-id-presentation-restrict": [],
+	"caller-id-presentation-allow": [],
 };
 
 /** Validates `params` against the action it was sent with, reporting at `params.<key>`. */

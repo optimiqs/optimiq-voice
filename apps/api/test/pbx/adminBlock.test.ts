@@ -134,11 +134,15 @@ describe("T2 admin block resources", () => {
 	 * Neither a PIN set nor a ruleset is a destination, so the generic reverse scan cannot see the
 	 * foreign keys that name one. Without these, deleting a set would silently ungate every route it
 	 * was protecting — a change that appears to succeed and quietly removes a control.
+	 *
+	 * `extension.hot_desk_pin_set_id` is the second site, added with hot desking and gating the same
+	 * class of thing from the other side: deleting the set would make an agent's extension silently
+	 * un-hot-deskable, and they would find out by standing at a desk with a correct PIN.
 	 */
 	it("declares the scalar references the generic destination scan cannot see", () => {
 		expect(
 			PIN_SET_RESOURCE.scalarReferences?.map((site) => `${site.table}.${site.column}`),
-		).to.deep.equal(["outbound_route.pin_set_id"]);
+		).to.deep.equal(["outbound_route.pin_set_id", "extension.hot_desk_pin_set_id"]);
 		expect(
 			TRANSLATION_RULESET_RESOURCE.scalarReferences?.map((site) => `${site.table}.${site.column}`),
 		).to.deep.equal([

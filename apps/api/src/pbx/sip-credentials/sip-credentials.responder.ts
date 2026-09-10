@@ -1,7 +1,7 @@
 import { Inject, Injectable, OnApplicationShutdown, OnModuleInit } from "@nestjs/common";
 import { connect, type Msg, type NatsConnection, type Subscription } from "nats";
 import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
-import { sipCredentialRequestSchema } from "@optimiq-voice/events/schemas";
+import { makeProvisionEvent, sipCredentialRequestSchema } from "@optimiq-voice/events/schemas";
 import {
 	sipTrunkCredentialRequestSchema,
 	type SipTrunkCredentialResponse,
@@ -9,6 +9,7 @@ import {
 import { RPC_SUBJECTS } from "@optimiq-voice/events/subjects";
 import { getLogger } from "@optimiq-voice/logging";
 import { PBX_ENV } from "../shared/pbx.tokens";
+import { SipCredentialCache } from "./sip-credentials.cache";
 import { SipCredentialsService } from "./sip-credentials.service";
 import { TrunkCredentialsService } from "./trunk-credentials.service";
 import type { PbxEnv } from "../shared/pbx-env";
@@ -76,6 +77,7 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 	private subscription: Subscription | undefined;
 	private trunkSubscription: Subscription | undefined;
 	private handled = 0;
+	private announced = 0;
 	private readonly inFlight = new Set<Promise<void>>();
 	private stopped = false;
 
@@ -83,6 +85,7 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 		@Inject(PBX_ENV) private readonly env: PbxEnv,
 		@Inject(SipCredentialsService) private readonly credentials: SipCredentialsService,
 		@Inject(TrunkCredentialsService) private readonly trunks: TrunkCredentialsService,
+		@Inject(SipCredentialCache) private readonly cache: SipCredentialCache,
 	) {}
 
 	get isReady(): boolean {
@@ -95,6 +98,10 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 
 	get handledCount(): number {
 		return this.handled;
+	}
+
+	get announcedCount(): number {
+		return this.announced;
 	}
 
 	async onModuleInit(): Promise<void> {
@@ -126,6 +133,13 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 		// arrived first while the rest became garbage on the wire.
 		void this.serve("credential");
 		void this.serve("trunk");
+
+		// The cache announces its evictions through THIS connection rather than opening a third one.
+		// It is registered only once a broker exists, so a deployment without `NATS_URL` evicts
+		// silently — which is the whole of what it could do anyway.
+		this.cache.setAnnouncer((organizationId, reason, dropped) => {
+			this.announceInvalidation(organizationId, reason, dropped);
+		});
 
 		logger.info(
 			{
@@ -304,6 +318,37 @@ export class SipCredentialsResponder implements OnModuleInit, OnApplicationShutd
 			// string, constraint text or driver detail, and this reply lands on the backbone and in
 			// sipd's logs — the same refusal `answerTrunk` makes about carrier response bodies.
 			return refuse("credential lookup failed");
+		}
+	}
+
+	/**
+	 * `provision.evt.v1.<orgId>` / `credential.invalidated` — the eviction, said out loud.
+	 *
+	 * Published on the responder's own connection as a CORE publish, deliberately. The subject is
+	 * captured by `PROVISION_STREAM`, so a subscriber that was connected gets it and the record is
+	 * retained, but nothing here waits for a JetStream ack: the caller is a synchronous continuation
+	 * of a mutation that already committed, and the API's own cache is already correct by the time
+	 * this runs. A consumer that misses one falls back to its TTL, which is exactly what it had
+	 * before this subject existed.
+	 *
+	 * Failures are counted in the log and nowhere else. An administrator's save must not fail
+	 * because a broker is draining.
+	 */
+	private announceInvalidation(organizationId: string, reason: string, dropped: number): void {
+		const connection = this.connection;
+		if (connection === undefined || connection.isClosed()) {
+			return;
+		}
+		try {
+			const event = makeProvisionEvent("credential.invalidated", {
+				orgId: organizationId,
+				source: "api",
+				data: { reason: reason.slice(0, 128), dropped },
+			});
+			connection.publish(event.subject, new TextEncoder().encode(JSON.stringify(event)));
+			this.announced += 1;
+		} catch (error) {
+			logger.error({ err: error, organizationId }, "could not announce a credential invalidation");
 		}
 	}
 

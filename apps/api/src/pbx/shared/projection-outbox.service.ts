@@ -353,18 +353,6 @@ export class ProjectionOutboxSweeper implements OnModuleInit, OnApplicationShutd
 			if (result.skipped) {
 				throw new Error("the sip-acl bucket is not open");
 			}
-			if (result.conflicts.length > 0) {
-				// Not a transient failure and it must not be retried into the ground: the KV key for this
-				// bucket is the network alone and two rows have landed on one, which `sip-acl.publisher.ts`
-				// argues is a human decision (and, for the cross-tenant case, a gap in the key contract).
-				// Throwing is still right — the obligation genuinely was not met, and the contested
-				// network is REFUSED in the meantime — and the stuck report is how it reaches an operator
-				// with the tenant attached.
-				throw new Error(
-					`${String(result.conflicts.length)} sip-acl networks are contested and are therefore ` +
-						"refused; run scripts/rebuild-sip-acl.ts",
-				);
-			}
 			return;
 		}
 

@@ -80,13 +80,14 @@ describe("org settings catalogue", () => {
 
 	it("only catalogues routing names the compiler actually reads", () => {
 		// A name here that `readRoutingSettings` does not project is a setting a user can save and
-		// no call will ever observe. The list is pinned to the eight the loader reads.
+		// no call will ever observe. The list is pinned to the nine the loader reads.
 		expect(settingsInCategory(ROUTING_SETTINGS_CATEGORY).map((entry) => entry.name)).to.deep.equal([
 			"defaultTimezone",
 			"voicemailPrefix",
 			"voicemailCheckPrefix",
 			"outboundCallerIdNumber",
 			"outboundCallerIdName",
+			"defaultCallingCode",
 			"outboundEnabled",
 			"trunkContinueOnCauses",
 			"emergencyNumbers",
@@ -488,6 +489,74 @@ describe("the org-setting resource declaration", () => {
  * collide in one map. It rides `settings` so the engine can dial `sip:{number}@{realm}` off the
  * artifact without a database handle it does not have.
  */
+/**
+ * The `sip`/`realm` setting — a PER-TENANT unique claim, unlike every other setting in the cascade.
+ *
+ * Two organizations claiming one domain is not a cosmetic collision: `resolveOrganizationForRealm`
+ * refuses a realm more than one tenant claims, so BOTH tenants' phones stop registering. The claim
+ * is therefore enforced in three places and each is tested where it lives:
+ *   - the SHAPE, here — a lowercase hostname with no scheme, port or trailing dot;
+ *   - the UNIQUENESS, by `org_setting_sip_realm_global_key` in `packages/pbx-db`, a partial unique
+ *     index over `lower(btrim(value #>> '{}'))` where `category='sip' AND name='realm' AND enabled`,
+ *     so the write-time answer is a real 409 rather than a check with a race under it;
+ *   - the 409's FIELD, by `pbxErrors.test.ts` — the index is on an expression, so the field is
+ *     stated rather than derived.
+ */
+describe("the SIP realm setting's shape", () => {
+	const realm = findSetting("sip", "realm");
+
+	it("is catalogued, so a wrong-typed value is a 400 and not an unreadable row", () => {
+		expect(realm?.valueType).to.equal("string");
+		expect(realm?.defaultValue).to.equal(null);
+		expect(realm?.scope).to.equal("organization");
+	});
+
+	/**
+	 * Lower-casing on the way IN is what makes the uniqueness case-insensitive END TO END: the index
+	 * lowercases too, and `sip-credentials.service.ts` lowercases the realm a REGISTER names. Three
+	 * agreeing normalisations, so `ACME.EXAMPLE` and `acme.example` are one claim everywhere.
+	 */
+	it("normalises to lowercase and trims, so two casings are one claim", () => {
+		const parsed = parseCategoryPatch("sip", { realm: "  ACME.Example.COM  " });
+		expect(parsed.outcome).to.equal("valid");
+		expect(parsed.outcome === "valid" && parsed.values.get("realm")).to.equal("acme.example.com");
+		expect(realm?.schema.parse("  ACME.Example.COM  ")).to.equal("acme.example.com");
+	});
+
+	it("refuses a scheme, a port, a trailing dot, spaces and an over-long name", () => {
+		for (const bad of [
+			"sip://acme.example",
+			"https://acme.example",
+			"acme.example:5060",
+			"acme.example.",
+			".acme.example",
+			"acme example",
+			"acme..example",
+			"-acme.example",
+			"",
+			`${"a".repeat(64)}.example`,
+			"a".repeat(254),
+		]) {
+			expect(realm?.schema.safeParse(bad).success, `should refuse ${JSON.stringify(bad)}`).to.equal(
+				false,
+			);
+		}
+	});
+
+	it("accepts an ordinary hostname and a single label, and null to clear the claim", () => {
+		for (const good of ["acme.example.com", "pbx.acme-corp.example", "localhost", "a1.b2.c3"]) {
+			expect(realm?.schema.safeParse(good).success, `should accept ${good}`).to.equal(true);
+		}
+		expect(realm?.schema.safeParse(null).success).to.equal(true);
+	});
+
+	it("reports a bad domain against the realm field, so the settings form can blame the input", () => {
+		const parsed = parseCategoryPatch("sip", { realm: "not a domain!!" });
+		expect(parsed.outcome).to.equal("invalid");
+		expect(parsed.outcome === "invalid" && parsed.issues[0]?.field).to.equal("realm");
+	});
+});
+
 describe("the SIP realm in the routing snapshot", () => {
 	it("resolves the first enabled non-blank realm row", () => {
 		expect(resolveSipRealm([{ value: "pbx.acme.example", enabled: true }])).to.equal(

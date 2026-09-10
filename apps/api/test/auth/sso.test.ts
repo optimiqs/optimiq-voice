@@ -1,5 +1,14 @@
+import { randomBytes } from "node:crypto";
 import { expect } from "chai";
 import { assertSsoProviderOrganization } from "@optimiq-voice/auth";
+import {
+	decryptSecret,
+	encryptSecret,
+	isEncryptedSecret,
+	openStoredSecret,
+	requireSecretKey,
+	SecretCipherError,
+} from "@optimiq-voice/db";
 import { createSsoProviderDto, updateSsoProviderDto } from "../../src/auth/sso/sso.dto";
 import type { SsoProviderConfig } from "@optimiq-voice/auth";
 
@@ -95,5 +104,42 @@ describe("the SSO callback's tenant assertion", () => {
 				organizationId: ORG,
 			});
 		}).to.throw(/not a registered provider/u);
+	});
+});
+
+/**
+ * The at-rest half of the same secret.
+ *
+ * `client_secret` was stored verbatim and stripped from every read, which is one boundary and not
+ * two: a `pg_dump`, a replica, or a backup tape carries every tenant's IdP credential in the clear,
+ * and the read-stripping does nothing about any of them. `packages/db`'s `secret-cipher.ts` seals it
+ * now, and these are the properties the SSO path depends on — the crypto itself is exercised in
+ * `packages/db/src/secret-cipher.spec.ts`.
+ */
+describe("the SSO client secret at rest", () => {
+	const KEY = randomBytes(32);
+
+	it("stores a sealed value that does not contain the secret", () => {
+		const sealed = encryptSecret("okta-client-secret", KEY);
+		expect(sealed).to.not.contain("okta-client-secret");
+		expect(isEncryptedSecret(sealed)).to.equal(true);
+		expect(decryptSecret(sealed, KEY)).to.equal("okta-client-secret");
+	});
+
+	it("refuses to let a write path store plaintext when no platform key is configured", () => {
+		expect(() => requireSecretKey({})).to.throw(SecretCipherError);
+	});
+
+	it("reads a legacy plaintext row rather than failing the auth boot on it", () => {
+		expect(openStoredSecret("legacy-plaintext-secret", KEY)).to.deep.equal({
+			plaintext: "legacy-plaintext-secret",
+			wasEncrypted: false,
+		});
+	});
+
+	it("will not open a row sealed under a different platform key", () => {
+		expect(() => openStoredSecret(encryptSecret("s", KEY), randomBytes(32))).to.throw(
+			SecretCipherError,
+		);
 	});
 });

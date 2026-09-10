@@ -1,4 +1,5 @@
 import {
+	BadRequestException,
 	Controller,
 	Get,
 	Header,
@@ -15,7 +16,7 @@ import { z } from "zod/v4";
 import { BrandingService } from "../../auth/branding/branding.service";
 import { PublicRoute } from "../../auth/public-route.decorator";
 import { RequirePermissions } from "../../auth/require-permissions.decorator";
-import { Session } from "../../auth/session.decorator";
+import { OptionalSession, Session } from "../../auth/session.decorator";
 import {
 	applyMediaResponse,
 	type MediaReply,
@@ -33,7 +34,23 @@ import type { ObjectStore } from "../../storage";
 import type { MultipartRequest } from "../media/media-upload";
 import type { AppSession } from "@optimiq-voice/auth";
 
-const logoQuery = z.object({ host: z.string().trim().min(1).max(253) });
+/**
+ * `host` is OPTIONAL, and that is the difference between a logo that renders and one that does not.
+ *
+ * `readByHost` resolves through `organization_branding.custom_domain`, so it can only ever answer
+ * for a tenant that HAS a custom domain. Every other tenant — the whole shared-host majority —
+ * could upload a logo through `POST /branding/logo`, get the key back on their branding row, and
+ * then have no route in the product that would serve those bytes: the sidebar's `brandLogoSrc` had
+ * nothing to pass as a host, and passing the shared platform host resolved to no branding row and
+ * a 404. The logo was written and unreachable.
+ *
+ * So the host stays the ANONYMOUS path (the sign-in page, before any session exists) and a
+ * signed-in caller may omit it, in which case the acting organization's own branding answers. Both
+ * paths resolve the object key server-side from a row the caller is entitled to; neither lets a
+ * caller name an object. A caller with neither a host nor a session gets a 400, not the platform
+ * default, because "no logo" and "you did not say whose logo" are different answers.
+ */
+const logoQuery = z.object({ host: z.string().trim().min(1).max(253).optional() });
 
 /**
  * `GET /api/v1/branding/logo` — the bytes of a white-label logo, keyed by request host.
@@ -98,22 +115,45 @@ export class BrandingLogoController {
 
 	@Get("logo")
 	@PublicRoute()
-	@Header("Cache-Control", "public, max-age=300")
 	@Header("X-Content-Type-Options", "nosniff")
 	@Header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox")
 	async logo(
 		@Query() query: unknown,
+		@OptionalSession() session: AppSession | null,
 		@Req() request: MediaRequest,
 		@Res({ passthrough: true }) reply: MediaReply,
 	) {
 		const { host } = parseDto(logoQuery, query ?? {});
-		const branding = await this.branding.readByHost(host);
+		const organizationId = session?.session.activeOrganizationId ?? null;
+		if (host === undefined && organizationId === null) {
+			throw new BadRequestException({
+				statusCode: 400,
+				code: "BRANDING_LOGO_UNRESOLVABLE",
+				message:
+					"Name the host whose logo is wanted, or call this with a session that has an active " +
+					"organization.",
+			});
+		}
+		const branding =
+			host === undefined
+				? await this.branding.resolveForOrganization(organizationId as string)
+				: await this.branding.readByHost(host);
+		/**
+		 * The host-keyed answer is the same for everyone who asks and is shared-cacheable; the
+		 * session-resolved one is one tenant's logo behind a cookie, and a shared cache that stored it
+		 * under this URL would hand it to the next tenant that asked. So the directive follows which
+		 * question was asked, rather than being fixed on the decorator.
+		 */
+		void reply.header(
+			"cache-control",
+			host === undefined ? "private, max-age=300" : "public, max-age=300",
+		);
 		const objectKey = branding.logoObjectKey;
 		if (objectKey === null || objectKey.length === 0) {
 			throw new NotFoundException({
 				statusCode: 404,
 				code: "BRANDING_NO_LOGO",
-				message: "This host has no white-label logo configured.",
+				message: "No white-label logo is configured.",
 			});
 		}
 		if (!objectKey.startsWith(`${BRANDING_LOGO_KEY_PREFIX}/`)) {

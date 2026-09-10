@@ -1,5 +1,6 @@
 import { getLogger } from "@optimiq-voice/logging";
 import { attachUpgradeHandler } from "../core/http/upgrade-router";
+import { registerGauge } from "../core/metrics/metrics";
 import { LiveGateway } from "./live-gateway";
 import { LIVE_PATH } from "./live-protocol";
 import type { INestApplication } from "@nestjs/common";
@@ -39,6 +40,28 @@ export async function registerLiveTransport(app: INestApplication): Promise<bool
 	);
 
 	gateway.start();
+	// Read at scrape time off the gateway's own counters rather than mirrored into metrics of our
+	// own, so there is exactly one place a connection is counted.
+	registerGauge(
+		"api_live_ws_clients",
+		"Live-channel WebSocket clients currently connected.",
+		() => gateway.stats.connections,
+	);
+	registerGauge(
+		"api_live_ws_accepted_total",
+		"Live-channel upgrades accepted since boot.",
+		() => gateway.stats.accepted,
+	);
+	registerGauge(
+		"api_live_ws_refused_total",
+		"Live-channel upgrades refused since boot.",
+		() => gateway.stats.refused,
+	);
+	registerGauge(
+		"api_live_ws_messages_delivered_total",
+		"Live-channel messages fanned out to clients since boot.",
+		() => gateway.stats.delivered,
+	);
 	logger.info(`live WebSocket channel serving ${LIVE_PATH}`);
 	await Promise.resolve();
 	return true;

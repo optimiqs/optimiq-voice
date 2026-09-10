@@ -70,6 +70,28 @@ export const createQueueDto = z.strictObject({
 		.regex(/^[0-9*#A-D]$/u, "An exit key must be a single DTMF digit (0-9, *, #, A-D).")
 		.nullish(),
 	...namedDestinationShape("exit"),
+	/**
+	 * Virtual hold — a waiting caller keeps their place and the platform calls them back.
+	 *
+	 * The accept key takes the same shape as {@link exitKey} and for the same reason. It may not BE
+	 * the exit key; the compiler drops the callback's claim on the digit when it is, with a
+	 * `queue-callback-unusable` warning, because leaving the queue is the more destructive reading of
+	 * a keypress.
+	 */
+	callbackEnabled: z.boolean().optional(),
+	callbackKey: z
+		.string()
+		.trim()
+		.toUpperCase()
+		.regex(/^[0-9*#A-D]$/u, "A callback key must be a single DTMF digit (0-9, *, #, A-D).")
+		.nullish(),
+	/** 0 means the offer is never announced and the caller reaches it only by pressing the key. */
+	callbackOfferAfterSeconds: resettable(z.int().min(0).max(86_400)),
+	callbackOfferPromptId: z.uuid().nullish(),
+	callbackConfirmPromptId: z.uuid().nullish(),
+	callbackMaxAttempts: resettable(z.int().min(1).max(10)),
+	callbackRetryDelaySeconds: resettable(z.int().min(30).max(86_400)),
+	callbackExpiresAfterSeconds: resettable(z.int().min(60).max(604_800)),
 	/** Higher dequeues first. An IVR may override it per entry through the destination's args. */
 	defaultPriority: resettable(z.int().min(QUEUE_PRIORITY_MIN).max(QUEUE_PRIORITY_MAX)),
 	...namedDestinationShape("timeout"),

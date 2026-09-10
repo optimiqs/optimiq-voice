@@ -39,6 +39,7 @@ function service(): {
 		organizationId: string,
 		snapshot: RenderSnapshot,
 		token: string,
+		sipDomain: string,
 	): RenderContext;
 } {
 	return new ProvisionService(
@@ -53,16 +54,19 @@ function service(): {
 			organizationId: string,
 			snapshot: RenderSnapshot,
 			token: string,
+			sipDomain: string,
 		): RenderContext;
 	};
 }
 
 describe("organization SIP domain provisioning", () => {
-	it("renders the organization's domain into its device accounts", () => {
+	it("renders the organization's domain as the AOR domain, and the deployment's as the server", () => {
+		// The two are different facts: `sipDomain` is the tenant's realm (exactly one organization owns
+		// it), `serverAddress` is the edge a packet is sent to, which is legitimately deployment-wide.
 		const source = { ...snapshot(PLAIN_EXTENSION_ID, []), sipRealm: " Tenant-B.Example " };
-		const context = service().buildContext(ENV, ORG, source, "token");
+		const context = service().buildContext(ENV, ORG, source, "token", "tenant-b.example");
 		expect(context.sipDomain).to.equal("tenant-b.example");
-		expect(context.lines[0]?.serverAddress).to.equal("tenant-b.example");
+		expect(context.lines[0]?.serverAddress).to.equal("pbx.example.test");
 	});
 });
 
@@ -121,6 +125,7 @@ describe("provisioning — shared line derived from appearances", () => {
 			ORG,
 			snapshot(MEMBER_EXTENSION_ID, [MEMBER_EXTENSION_ID]),
 			"token",
+			"pbx.example.test",
 		);
 
 		expect(context.lines).to.have.length(1);
@@ -128,7 +133,13 @@ describe("provisioning — shared line derived from appearances", () => {
 	});
 
 	it("leaves sharedLine false when the extension is on no shared line", () => {
-		const context = service().buildContext(ENV, ORG, snapshot(PLAIN_EXTENSION_ID, []), "token");
+		const context = service().buildContext(
+			ENV,
+			ORG,
+			snapshot(PLAIN_EXTENSION_ID, []),
+			"token",
+			"pbx.example.test",
+		);
 
 		expect(context.lines[0]?.sharedLine).to.equal(false);
 	});
@@ -139,6 +150,7 @@ describe("provisioning — shared line derived from appearances", () => {
 			ORG,
 			snapshot(MEMBER_EXTENSION_ID, [MEMBER_EXTENSION_ID]),
 			"token",
+			"pbx.example.test",
 		);
 
 		const yealink = templateFor("yealink");

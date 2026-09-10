@@ -2,6 +2,7 @@ import {
 	type Auth,
 	type AuthEmailDelivery,
 	createAuth,
+	type OrganizationCreatedEvent,
 	type SsoProviderConfig,
 } from "@optimiq-voice/auth";
 import {
@@ -37,6 +38,42 @@ export interface AuthPlatform {
 	 */
 	readonly ssoProviders: readonly SsoProviderConfig[];
 	readonly close: () => Promise<void>;
+}
+
+type OrganizationCreatedHandler = (event: OrganizationCreatedEvent) => Promise<void>;
+
+let organizationCreatedHandler: OrganizationCreatedHandler | undefined;
+
+/**
+ * Register what happens to a brand-new tenant, late.
+ *
+ * `AUTH_PLATFORM` is constructed by `AuthModule`, and everything that provisions a tenant lives in
+ * `PbxModule`, which IMPORTS `AuthModule` — so the factory cannot inject the provisioner without
+ * making the two modules circular. The handler is therefore set by the provisioner when Nest
+ * initialises it (`PbxModule` is instantiated after its imports, so the platform already exists),
+ * and `createAuth` is handed a closure that reads this slot at call time rather than a function
+ * that has to exist at boot.
+ *
+ * Unset is a valid state and means "seed nothing": a process that mounts the auth slice without
+ * the PBX slice still creates organizations, they simply arrive empty.
+ */
+export function setOrganizationCreatedHandler(handler: OrganizationCreatedHandler): void {
+	organizationCreatedHandler = handler;
+}
+
+/** Test seam and shutdown hygiene — the slot is process-global, like the auth runtime registry. */
+export function clearOrganizationCreatedHandler(): void {
+	organizationCreatedHandler = undefined;
+}
+
+/**
+ * Whatever is registered, or `undefined`.
+ *
+ * The closure handed to `createAuth` reads the slot through this, and so does a spec that wants to
+ * invoke what a provider registered without standing up better-auth to deliver the call.
+ */
+export function getOrganizationCreatedHandler(): OrganizationCreatedHandler | undefined {
+	return organizationCreatedHandler;
 }
 
 /**
@@ -80,6 +117,9 @@ export async function createAuthPlatform(
 		requireEmailVerification: config.requireEmailVerification,
 		rateLimitEnabled: config.rateLimitEnabled,
 		ssoProviders,
+		onOrganizationCreated: async (event) => {
+			await getOrganizationCreatedHandler()?.(event);
+		},
 		cookies: {
 			...(config.cookieSameSite === undefined ? {} : { sameSite: config.cookieSameSite }),
 			...(config.cookieDomain === undefined ? {} : { crossSubDomain: config.cookieDomain }),

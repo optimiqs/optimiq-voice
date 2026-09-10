@@ -16,15 +16,20 @@ import type { PbxChildResource, PbxResource } from "../../pbx/shared/pbx-resourc
  * once. Writing a second repository here would be forty lines of Drizzle whose only distinguishing
  * feature is that a fix to the paging window would have to be applied twice.
  *
- * ## Why none of them is a routing input
+ * ## Why only one of them is a routing input
  *
  * `ROUTING_TABLE_TO_ENTITY` in `@optimiq-voice/routing` is the authority on what evicts a tenant's
- * compiled artifact, and it does not list `device`, `device_line`, `device_key`, `device_profile`
- * or `device_profile_key`. That is correct and worth stating: routing decides where a call GOES,
- * and a device is how an extension reaches a handset. Re-pointing line 2 of a desk phone changes
- * which physical box rings for an extension the dial plan already resolves to; it does not change
- * the dial plan. Making a key-layout edit republish the routing artifact would evict a cache for a
- * change that cannot affect it, on the tables administrators touch most often.
+ * compiled artifact, and it lists neither `device`, `device_key`, `device_profile` nor
+ * `device_profile_key`. That is correct and worth stating: routing decides where a call GOES, and a
+ * device is how an extension reaches a handset. Making a key-layout edit republish the routing
+ * artifact would evict a cache for a change that cannot affect it, on the tables administrators
+ * touch most often.
+ *
+ * `device_line` IS listed, and only since hot desking. `extension_id` on a line stopped being
+ * "which box rings for an extension the dial plan already resolved" the day a `*31` could move it:
+ * it became the answer to "which extension is this handset", written by an agent rather than an
+ * administrator, and expected to take effect on the next call rather than at the end of a TTL. The
+ * full argument is on the entry itself.
  *
  * ## Why nothing points at a device as a destination
  *

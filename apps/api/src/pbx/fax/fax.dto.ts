@@ -1,4 +1,5 @@
 import { z } from "zod/v4";
+import { e164 } from "../shared/dto";
 import { listQuerySchema } from "../shared/pagination";
 
 /**
@@ -6,12 +7,6 @@ import { listQuerySchema } from "../shared/pagination";
  * that thinks it is setting something, and dropping it silently is how "I set that and it did
  * nothing" bugs are born.
  */
-
-/** E.164, the one shape every number in this platform is stored and compared in. */
-const e164 = z
-	.string()
-	.trim()
-	.regex(/^\+[1-9]\d{1,14}$/u, "must be an E.164 number such as +13125551234");
 
 const optionalEmail = z.email().max(320).optional();
 

@@ -72,3 +72,24 @@ export const deleteVoicemailMessageQuerySchema = z.object({
 		.optional()
 		.default(false),
 });
+
+/**
+ * `POST …/messages/:id/forward`.
+ *
+ * One route and one `mode` rather than two verbs, because forward and copy are the SAME operation
+ * with one extra step: both write the audio and the row into another mailbox, and only forward then
+ * removes the original. Two endpoints would be two code paths that had to be kept in step about
+ * tenancy, MWI and the object copy, which is exactly the part worth having once.
+ *
+ * A recorded introduction — the "record your comment, then send" prompt of a desk phone — is NOT
+ * part of this. It needs a recording leg on the call path, which is the engine's to own; nothing
+ * here fabricates one.
+ */
+export const forwardVoicemailMessageDto = z.strictObject({
+	/** The mailbox the copy lands in. Must be in the caller's organization, or this is a 404. */
+	targetVoicemailBoxId: z.uuid(),
+	/** `forward` removes the original once the copy is filed; `copy` leaves it where it is. */
+	mode: z.enum(["forward", "copy"]).default("forward"),
+});
+
+export type ForwardVoicemailMessage = z.infer<typeof forwardVoicemailMessageDto>;

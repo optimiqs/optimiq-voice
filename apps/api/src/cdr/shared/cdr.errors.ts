@@ -14,6 +14,7 @@ import { HttpException, HttpStatus } from "@nestjs/common";
  * { "statusCode": 400, "code": "CDR_RANGE_TOO_WIDE",  "message": "…", "maxDays": 92 }
  * { "statusCode": 404, "code": "CDR_NOT_FOUND",       "message": "…", "kind": "call-leg", "id": "…" }
  * { "statusCode": 403, "code": "CDR_LINK_INVALID",    "message": "…" }
+ * { "statusCode": 403, "code": "CDR_SELF_SCOPE_UNAVAILABLE", "message": "…" }
  * { "statusCode": 410, "code": "CDR_LINK_EXPIRED",    "message": "…" }
  * { "statusCode": 501, "code": "CDR_SIGNING_UNAVAILABLE", "message": "…" }
  * ```
@@ -67,6 +68,30 @@ export class CdrInvalidCursorException extends HttpException {
 				message: `The pagination cursor could not be read (${detail}). Start the listing again.`,
 			},
 			HttpStatus.BAD_REQUEST,
+		);
+	}
+}
+
+/**
+ * A caller holds `cdr.read.own` on a deployment where "own" cannot be resolved.
+ *
+ * The link from a person to their calls is their extensions, which the PBX area owns; with that
+ * area absent this API has no way to work out which rows are theirs. 403 and by name, because both
+ * alternatives are worse: returning every row is a silent privilege escalation, and returning none
+ * is a screen that looks broken with nothing to explain it. Mirrors the PBX area's
+ * `SELF_SERVICE_SCOPE_FORBIDDEN` without importing it — the two areas are siblings and neither may
+ * depend on the other.
+ */
+export class CdrSelfScopeUnavailableException extends HttpException {
+	constructor() {
+		super(
+			{
+				statusCode: HttpStatus.FORBIDDEN,
+				code: "CDR_SELF_SCOPE_UNAVAILABLE",
+				message:
+					"Your access to call history is limited to your own calls, and this deployment cannot resolve which extensions you hold.",
+			},
+			HttpStatus.FORBIDDEN,
 		);
 	}
 }

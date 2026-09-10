@@ -1,5 +1,10 @@
 import { randomBytes } from "node:crypto";
-import { Inject, Injectable, UnprocessableEntityException } from "@nestjs/common";
+import {
+	Inject,
+	Injectable,
+	NotFoundException,
+	UnprocessableEntityException,
+} from "@nestjs/common";
 import { HttpStatus } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { createEntityId } from "@optimiq-voice/identifiers";
@@ -11,7 +16,9 @@ import {
 	telnyxSipProxy,
 	telnyxSipUri,
 	type TelnyxClient,
+	type TelnyxCnamListing,
 	type TelnyxNumberOrder,
+	type TelnyxPortingOrder,
 } from "@optimiq-voice/telnyx";
 import { PhoneNumbersService } from "../phone-numbers/phone-numbers.service";
 import { TrunksService } from "../trunks/trunks.service";
@@ -20,7 +27,13 @@ import { CARRIER_ENV, TELNYX_CLIENT } from "./carrier.tokens";
 import type { MutationEnvelope } from "../shared/pbx-resource.service";
 import type { WireDiagnostic } from "../shared/pbx.errors";
 import type { CarrierEnv } from "./carrier-env";
-import type { ProvisionTrunkBody, SearchAvailableNumbersQuery } from "./carrier.dto";
+import type {
+	CreatePortingOrderBody,
+	ListPortingOrdersQueryBody,
+	ProvisionTrunkBody,
+	SearchAvailableNumbersQuery,
+	UpdateCnamListingBody,
+} from "./carrier.dto";
 import type { AppSession } from "@optimiq-voice/auth";
 
 const logger = getLogger("api.pbx");
@@ -55,6 +68,36 @@ const logger = getLogger("api.pbx");
  * The same reasoning runs backwards on delete: the local row goes first, so the reference guards
  * ("an inbound route still points here") still get to refuse, and the upstream release follows.
  */
+
+/**
+ * A port-in, in the platform's own vocabulary.
+ *
+ * Reshaped for the same reason a number search is: the browser must never learn a carrier's field
+ * names, or changing carrier becomes a frontend rewrite. `supportKey` survives the translation
+ * because it is the one carrier-side string a human actually needs — it is what the losing
+ * carrier's support desk asks for when a port stalls, and hiding it would make the stall
+ * unresolvable from inside this product.
+ */
+export interface PortingOrderView {
+	readonly id: string;
+	readonly status: string;
+	readonly supportKey: string | null;
+	readonly e164s: readonly string[];
+	readonly numberCount: number;
+	/** The confirmed cutover moment, once the losing carrier grants one. Null until then. */
+	readonly focDatetime: string | null;
+	readonly createdAt: string | null;
+	readonly updatedAt: string | null;
+}
+
+/** A number's caller-ID-name listing, as the browser sees it. */
+export interface CnamListingView {
+	readonly phoneNumberId: string;
+	readonly e164: string;
+	readonly enabled: boolean;
+	readonly listingEnabled: boolean;
+	readonly listingDetails: string | null;
+}
 
 /** What a carrier operation adds to the standard mutation envelope. */
 export interface CarrierProvisionResult {
@@ -132,6 +175,29 @@ function randomAlphanumeric(length: number): string {
 /** The handle written into `trunk.sip_secret_ref`, following the area's existing `secret://` shape. */
 export function telnyxSecretRef(trunkId: string): string {
 	return `secret://telnyx/trunk/${trunkId}`;
+}
+
+/**
+ * Carrier porting order -> platform view.
+ *
+ * `foc_datetime_actual` wins over `foc_datetime_requested` when both are present: one is a date
+ * the losing carrier has committed to and the other is a date we asked for, and showing the ask as
+ * if it were the commitment is how a customer schedules a cutover for a day nothing happens.
+ */
+function toPortingOrderView(order: TelnyxPortingOrder): PortingOrderView {
+	return {
+		id: order.id,
+		status: order.status,
+		supportKey: order.support_key ?? null,
+		e164s: order.phone_numbers.map((entry) => entry.phone_number),
+		numberCount: order.phone_numbers_count ?? order.phone_numbers.length,
+		focDatetime:
+			order.activation_settings?.foc_datetime_actual ??
+			order.activation_settings?.foc_datetime_requested ??
+			null,
+		createdAt: order.created_at ?? null,
+		updatedAt: order.updated_at ?? null,
+	};
 }
 
 @Injectable()
@@ -489,6 +555,262 @@ export class CarrierService {
 			};
 			return { ...removed, warnings: [...removed.warnings, warning] };
 		}
+	}
+
+	// -----------------------------------------------------------------------------------------
+	// Porting in (LNP)
+	// -----------------------------------------------------------------------------------------
+
+	/**
+	 * Files a port-in with the carrier — and writes **nothing** locally.
+	 *
+	 * That absence is the design, and it is the opposite of {@link orderNumber}, so it is worth
+	 * being explicit about why. An ordered number is ours the moment Telnyx answers, which is why
+	 * ordering is carrier-first-then-DB with a compensating release. A **ported** number is not
+	 * ours for weeks: it still belongs to the losing carrier, it still routes to their switch, and
+	 * the port can be rejected on any day between now and the FOC date. Creating a `phone_number`
+	 * row now would put a DID into the routing compiler and the KV `did-index` for a number whose
+	 * calls will not arrive here — the engine would advertise a route it cannot serve, which is
+	 * precisely the "visible orphan beats an invisible lie" failure the class header rejects, in
+	 * its invisible direction.
+	 *
+	 * So the row is created the way any other DID is, by hand or by order, once the port completes
+	 * and `GET /porting-orders/:id` says `ported`. Until then a port is a carrier-side fact this
+	 * endpoint reports and does not mirror.
+	 *
+	 * Non-idempotent, like an order, and defended the same way: a `customerReference` token, a
+	 * create that never auto-retries, and reconciliation rather than a second POST on an ambiguous
+	 * transport failure. A duplicate port request is not merely a duplicate charge — it is two
+	 * regulatory workflows against one number, which the losing carrier resolves by rejecting
+	 * both.
+	 */
+	async createPortingOrder(
+		session: AppSession,
+		body: CreatePortingOrderBody,
+	): Promise<{ readonly data: readonly PortingOrderView[] }> {
+		const organizationId = requireActiveOrganizationId(session);
+		const client = this.client("Number porting");
+		const customerReference = `optimiq-port-${organizationId}-${createEntityId()}`;
+
+		let orders: readonly TelnyxPortingOrder[];
+		try {
+			orders = await client.portingOrders.create({
+				phoneNumbers: body.e164s,
+				customerReference,
+			});
+		} catch (error) {
+			if (error instanceof TelnyxTransportError) {
+				// "Did the port get filed?" is unanswerable from here and must not be resolved by
+				// asking again. The token makes it answerable.
+				const reconciled = await this.reconcilePortingOrders(client, customerReference);
+				if (reconciled.length === 0) {
+					logger.error(
+						{ organizationId, customerReference, error },
+						"carrier porting order outcome unknown",
+					);
+					throw toCarrierException(error, "the porting order");
+				}
+				logger.warn(
+					{ organizationId, customerReference, orderIds: reconciled.map((order) => order.id) },
+					"carrier porting order reconciled after a transport failure",
+				);
+				orders = reconciled;
+			} else {
+				logger.warn({ organizationId, error }, "carrier porting order refused");
+				throw toCarrierException(error, "the porting order");
+			}
+		}
+
+		logger.info(
+			{
+				organizationId,
+				customerReference,
+				orderIds: orders.map((order) => order.id),
+				numbers: body.e164s.length,
+			},
+			"carrier porting order filed",
+		);
+		return { data: orders.map(toPortingOrderView) };
+	}
+
+	/** The reconciliation read that stands in for the idempotency the carrier does not offer. */
+	private async reconcilePortingOrders(
+		client: TelnyxClient,
+		customerReference: string,
+	): Promise<readonly TelnyxPortingOrder[]> {
+		try {
+			return await client.portingOrders.findByCustomerReference(customerReference);
+		} catch (error) {
+			logger.error({ customerReference, error }, "carrier porting reconciliation failed");
+			return [];
+		}
+	}
+
+	/**
+	 * Ports in flight at the carrier.
+	 *
+	 * **Platform-wide, not tenant-scoped**, and that is a real limitation rather than an oversight:
+	 * a porting order carries no organization, only the `customer_reference` this platform stamped
+	 * on it, and Telnyx offers no filter that would let one tenant's orders be selected without
+	 * reading every page. Scoping is therefore done here, by matching the token prefix — which is
+	 * exactly as strong as the token, and is why the token embeds the organization id.
+	 */
+	async listPortingOrders(
+		session: AppSession,
+		query: ListPortingOrdersQueryBody,
+	): Promise<{ readonly data: readonly PortingOrderView[]; readonly total: number }> {
+		const organizationId = requireActiveOrganizationId(session);
+		const client = this.client("Number porting");
+		try {
+			const page = await client.portingOrders.list({
+				pageSize: query.pageSize,
+				pageNumber: query.pageNumber,
+				...(query.status === undefined ? {} : { status: query.status }),
+			});
+			const mine = page.data.filter((order) =>
+				(order.customer_reference ?? "").startsWith(`optimiq-port-${organizationId}-`),
+			);
+			return { data: mine.map(toPortingOrderView), total: mine.length };
+		} catch (error) {
+			logger.warn({ organizationId, error }, "carrier porting list failed");
+			throw toCarrierException(error, "the porting order list");
+		}
+	}
+
+	/**
+	 * One port's status.
+	 *
+	 * Refuses an order that does not carry this organization's token, as a **404 rather than a
+	 * 403**: telling a caller "that porting order exists but is not yours" would let any tenant
+	 * enumerate the platform's ports one id at a time, and the phone numbers in them are the whole
+	 * point of the enumeration.
+	 */
+	async getPortingOrder(
+		session: AppSession,
+		portingOrderId: string,
+	): Promise<{
+		readonly data: PortingOrderView;
+	}> {
+		const organizationId = requireActiveOrganizationId(session);
+		const client = this.client("Number porting");
+		let order: TelnyxPortingOrder;
+		try {
+			order = await client.portingOrders.get(portingOrderId);
+		} catch (error) {
+			logger.warn({ organizationId, portingOrderId, error }, "carrier porting read failed");
+			throw toCarrierException(error, "the porting order");
+		}
+		if (!(order.customer_reference ?? "").startsWith(`optimiq-port-${organizationId}-`)) {
+			throw new NotFoundException({
+				statusCode: HttpStatus.NOT_FOUND,
+				code: "NOT_FOUND",
+				message: `No porting order ${portingOrderId} belongs to this organization.`,
+			});
+		}
+		return { data: toPortingOrderView(order) };
+	}
+
+	// -----------------------------------------------------------------------------------------
+	// CNAM
+	// -----------------------------------------------------------------------------------------
+
+	/**
+	 * Reads the caller-ID-name listing for one of this organization's DIDs.
+	 *
+	 * Addressed by the **local** `phone_number` id, never by the carrier's. That is what makes the
+	 * endpoint tenant-safe without a single explicit check in this method: `PhoneNumbersService.get`
+	 * is organization-scoped, so an id belonging to another tenant is a 404 before a carrier
+	 * request is ever built. Accepting a Telnyx number id here would have made the route a
+	 * read-anyone's-CNAM oracle over a namespace shared with every other Telnyx customer.
+	 */
+	async getCnamListing(
+		session: AppSession,
+		phoneNumberId: string,
+	): Promise<{ readonly data: CnamListingView }> {
+		const { carrierRef, e164 } = await this.carrierManagedNumber(session, phoneNumberId);
+		const client = this.client("CNAM listing");
+		try {
+			return {
+				data: this.toCnamView(
+					phoneNumberId,
+					e164,
+					await client.phoneNumbers.getCnamListing(carrierRef),
+				),
+			};
+		} catch (error) {
+			logger.warn({ phoneNumberId, error }, "carrier cnam read failed");
+			throw toCarrierException(error, "the CNAM listing");
+		}
+	}
+
+	/**
+	 * Changes it.
+	 *
+	 * `numbers.write`, not `numbers.order`: this changes how a number the organization already pays
+	 * for behaves, and adds no recurring charge. It writes nothing locally for the plain reason
+	 * that there is nowhere to write it — CNAM has no column in `pbx-db`, and the carrier is the
+	 * system of record. Mirroring it into a column would create two sources of truth for a value
+	 * only one of them can actually change.
+	 */
+	async updateCnamListing(
+		session: AppSession,
+		phoneNumberId: string,
+		body: UpdateCnamListingBody,
+	): Promise<{ readonly data: CnamListingView }> {
+		const organizationId = requireActiveOrganizationId(session);
+		const { carrierRef, e164 } = await this.carrierManagedNumber(session, phoneNumberId);
+		const client = this.client("CNAM listing");
+		try {
+			const listing = await client.phoneNumbers.updateCnamListing(carrierRef, {
+				...(body.enabled === undefined ? {} : { enabled: body.enabled }),
+				...(body.listingEnabled === undefined ? {} : { listingEnabled: body.listingEnabled }),
+				...(body.details === undefined ? {} : { details: body.details }),
+			});
+			logger.info({ organizationId, phoneNumberId, e164 }, "carrier cnam listing updated");
+			return { data: this.toCnamView(phoneNumberId, e164, listing) };
+		} catch (error) {
+			logger.warn({ organizationId, phoneNumberId, error }, "carrier cnam update failed");
+			throw toCarrierException(error, "the CNAM listing");
+		}
+	}
+
+	private toCnamView(
+		phoneNumberId: string,
+		e164: string,
+		listing: TelnyxCnamListing,
+	): CnamListingView {
+		return {
+			phoneNumberId,
+			e164,
+			enabled: listing.enabled,
+			listingEnabled: listing.listingEnabled,
+			listingDetails: listing.listingDetails,
+		};
+	}
+
+	/**
+	 * The carrier's id for one of this organization's DIDs, refusing a number the carrier does not
+	 * manage.
+	 *
+	 * A hand-entered or BYO DID has no `carrier_ref`, so there is nothing at Telnyx whose CNAM
+	 * could be changed. 422 naming that is the honest answer; silently succeeding would leave an
+	 * admin believing they had set a caller-ID name that no switch anywhere will ever present.
+	 */
+	private async carrierManagedNumber(
+		session: AppSession,
+		phoneNumberId: string,
+	): Promise<{ readonly carrierRef: string; readonly e164: string }> {
+		const row = (await this.numbers.get(session, phoneNumberId)).data;
+		const e164 = typeof row.e164 === "string" ? row.e164 : "";
+		if (row.carrierProvider !== "telnyx" || typeof row.carrierRef !== "string") {
+			throw new UnprocessableEntityException({
+				statusCode: HttpStatus.UNPROCESSABLE_ENTITY,
+				code: "CARRIER_NUMBER_NOT_MANAGED",
+				message: `${e164} is not managed by the carrier, so its CNAM listing cannot be changed here. Set it with the provider that owns the number.`,
+				field: "id",
+			});
+		}
+		return { carrierRef: row.carrierRef, e164 };
 	}
 
 	// -----------------------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 import { cfgValue, renderSettingsAsCfg, sortedEntries } from "../format";
-import type { RenderContext } from "../render-context";
+import type { DispatchableLocation, RenderContext } from "../render-context";
 import type { VendorTemplate } from "../template";
 
 /**
@@ -111,6 +111,15 @@ export interface SoftphonePayload {
 		readonly model: string | null;
 	};
 	readonly accounts: readonly SoftphoneAccountPayload[];
+	/**
+	 * Where a 911 call from this client will be dispatched to, or `null` when nobody has said.
+	 *
+	 * The one endpoint that can show a user the answer BEFORE they need it. A desk phone's `.cfg`
+	 * has nowhere to put a street address, so this is the only surface where RAY BAUM'S per-device
+	 * location becomes something a human can check and correct — and `validated: false` is carried
+	 * rather than hidden, because an address nobody verified is exactly the one worth looking at.
+	 */
+	readonly dispatchableLocation: DispatchableLocation | null;
 	readonly settings: Readonly<Record<string, string | number | boolean>>;
 	/**
 	 * What a QR code should encode, and a plain statement of why.
@@ -168,6 +177,7 @@ export function softphonePayload(context: RenderContext): SoftphonePayload {
 				transport: line.transport,
 			}),
 		})),
+		dispatchableLocation: context.dispatchableLocation ?? null,
 		settings: Object.fromEntries(sortedEntries(context.settings)),
 		qr: { url: context.payloadUrl ?? null, note: QR_NOTE },
 		renderedAt: context.renderedAt.toISOString(),

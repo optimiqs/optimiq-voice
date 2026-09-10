@@ -1,5 +1,6 @@
 import { AckPolicy, DeliverPolicy } from "nats";
 import { getLogger } from "@optimiq-voice/logging";
+import { trackDurableConsumer } from "../../core/metrics/jetstream-metrics";
 import type { NatsConnection } from "nats";
 
 const logger = getLogger("api.cdr");
@@ -81,7 +82,14 @@ export async function ensureDurableConsumer(
 			filter_subject: spec.filterSubject,
 			max_deliver: spec.maxDeliver,
 		});
+		// Put on the scrape here rather than at each writer's call site: every durable this app
+		// creates goes through this function, so a new consumer cannot be added without its lag
+		// being visible.
+		trackDurableConsumer(connection, { stream: spec.streamName, durable: spec.durable });
 	} catch (error) {
+		// Still tracked on the "already exists" path — that is the normal case on every restart
+		// after the first, and it is exactly when lag matters.
+		trackDurableConsumer(connection, { stream: spec.streamName, durable: spec.durable });
 		if (!/consumer already exists/iu.test(String(error))) {
 			logger.error(
 				{

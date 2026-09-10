@@ -1,4 +1,4 @@
-import { Inject, Injectable } from "@nestjs/common";
+import { ForbiddenException, Inject, Injectable } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
 import { PbxChildResourceService, PbxResourceService } from "../../pbx/shared/pbx-resource.service";
 import { PBX_DATABASE, PBX_EFFECT_RUNTIME } from "../../pbx/shared/pbx.tokens";
@@ -30,6 +30,42 @@ import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
  */
 const NOT_YOURS =
 	"You hold access to your own devices only, and this device is not linked to any of your extensions.";
+
+/** The two columns that say where a 911 call from this handset comes from. */
+const DISPATCHABLE_LOCATION_FIELDS = ["emergencyAddressId", "emergencyLocationDetail"] as const;
+
+/**
+ * A dispatchable location is a `numbers.emergency` write, even though a device is a `devices.write`.
+ *
+ * The two grants answer different questions and the registry already separates them:
+ * `devices.write` is "who may configure a phone" — a deskside technician swapping a handset holds
+ * it — while `numbers.emergency`'s catalogue entry is the E911 address surface, held by whoever is
+ * accountable for what a dispatcher is told. Letting the wider grant move a phone's address would
+ * make the narrower one decorative: an operator refused at `PATCH /emergency-addresses/:id` could
+ * simply point every device at a different address instead.
+ *
+ * Checked here rather than in the decorator because it is CONDITIONAL: the whole point is that a
+ * `devices.write`-only holder can still rename a phone, change its profile and rotate its keys.
+ * `@RequirePermissions` declares an unconditional floor and cannot express "only when this key is
+ * present". Presence is what is tested, not a change of value — an unchanged field still asserts an
+ * address, and comparing against the stored row would need a read the caller may not be entitled to.
+ */
+export function assertMayWriteDispatchableLocation(
+	session: AppSession,
+	values: Record<string, unknown>,
+): void {
+	const touched = DISPATCHABLE_LOCATION_FIELDS.filter((field) => field in values);
+	if (touched.length === 0 || holdsUnscoped(session, "numbers.emergency")) {
+		return;
+	}
+	throw new ForbiddenException({
+		code: "EMERGENCY_LOCATION_FORBIDDEN",
+		message:
+			"Setting a device's dispatchable location needs the emergency address permission " +
+			"(numbers.emergency), not device configuration alone.",
+		fields: touched,
+	});
+}
 
 @Injectable()
 export class DeviceProfilesService extends PbxResourceService {

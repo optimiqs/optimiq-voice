@@ -36,6 +36,25 @@ const NOTICE: EmergencyDialedNotice = {
 	trunkName: "primary",
 };
 
+const EXTENSION_ID = "019fd3c2-6666-76be-a6b3-b0f1914e39b6";
+/** The handset the SIP edge said placed the call, when the event names one. */
+const DEVICE_ID = "019fd3c2-7777-76be-a6b3-b0f1914e39c7";
+
+const DEVICE_ADDRESS_ID = "019fd3c2-7777-76be-a6b3-b0f1914e39b6";
+
+/** The address the DID resolves to — the granularity that was all this product had. */
+const NUMBER_ADDRESS = {
+	label: "HQ",
+	streetLine1: "1 Main St",
+	streetLine2: null,
+	locationDetail: "Floor 3, Room 314",
+	locality: "New York",
+	administrativeArea: "NY",
+	postalCode: "10001",
+	country: "US",
+	validated: true,
+};
+
 interface SentMail {
 	readonly to: string;
 	readonly subject: string;
@@ -44,14 +63,26 @@ interface SentMail {
 	readonly headers: Record<string, string> | undefined;
 }
 
-/** A transaction whose selects answer with the rows the test lines up, in call order. */
+/**
+ * A transaction whose selects answer with the rows the test lines up, in call order.
+ *
+ * Both terminals resolve an answer: `limit` ends the single-row lookups, `orderBy` ends the device
+ * lookup, which reads every handset on the extension and therefore has no limit. Answers are
+ * consumed in the order `readContext` issues them — address, extension, then the handset lookup and
+ * its address. The handset lookup is a single-row `limit` when the notice NAMED a device and an
+ * `orderBy` over the extension's handsets when it did not; both terminals answer, so the order is
+ * the same either way. A test that supplies only the first two is asserting the pre-device
+ * behaviour unchanged.
+ */
 function fakeTransaction(answers: readonly (readonly Record<string, unknown>[])[]): unknown {
 	let call = 0;
 	const chain = {
 		select: () => chain,
 		from: () => chain,
 		where: () => chain,
+		innerJoin: () => chain,
 		limit: async () => answers[call++] ?? [],
+		orderBy: async () => answers[call++] ?? [],
 	};
 	return chain;
 }
@@ -241,6 +272,152 @@ describe("emergency notification gating", () => {
 		const outcome = await service.notify(ORGANIZATION_ID, NOTICE);
 		expect(outcome.outcome).to.equal("sent");
 		expect(sent[0]?.html ?? "").to.contain("Optimiq Voice");
+	});
+
+	it("prefers the handset's own dispatchable location over the number's", async () => {
+		// The audit's finding, closed: two desks on one extension share a DID and therefore shared one
+		// address, so a responder was sent to the building. A device that names its own address wins.
+		const { service, sent } = makeService({ emergencyNotificationEmails: ["desk@example.com"] }, [
+			[NUMBER_ADDRESS],
+			[{ id: EXTENSION_ID, number: "+12125550100", label: "Reception" }],
+			[
+				{
+					label: "Desk 12",
+					macAddress: "001565abcdef",
+					emergencyAddressId: DEVICE_ADDRESS_ID,
+					emergencyLocationDetail: "Desk 12, by the window",
+				},
+			],
+			[
+				{
+					...NUMBER_ADDRESS,
+					label: "HQ Annexe",
+					streetLine1: "2 Side St",
+					locationDetail: "Floor 7",
+				},
+			],
+		]);
+		await service.notify(ORGANIZATION_ID, NOTICE);
+		const body = sent[0]?.text ?? "";
+		expect(body).to.contain("2 Side St");
+		expect(body).to.contain("Floor 7, Desk 12, by the window");
+		expect(body).to.not.contain("1 Main St");
+		// And the handset is named, so somebody can walk to the right desk rather than the right floor.
+		expect(body).to.contain("Device:    Desk 12");
+	});
+
+	it("refines the number's address when the handset carries only a detail", async () => {
+		// "Desk 12" is not a dispatchable location, it is a refinement of one. A device with no address
+		// of its own must not replace a street with a fragment nobody could drive to.
+		const { service, sent } = makeService({ emergencyNotificationEmails: ["desk@example.com"] }, [
+			[NUMBER_ADDRESS],
+			[{ id: EXTENSION_ID, number: "+12125550100", label: "Reception" }],
+			[
+				{
+					label: null,
+					macAddress: "001565abcdef",
+					emergencyAddressId: null,
+					emergencyLocationDetail: "Desk 12",
+				},
+			],
+		]);
+		await service.notify(ORGANIZATION_ID, NOTICE);
+		const body = sent[0]?.text ?? "";
+		expect(body).to.contain("1 Main St");
+		expect(body).to.contain("Floor 3, Room 314, Desk 12");
+		// No label, so the MAC identifies the handset — an unlabelled phone is still findable.
+		expect(body).to.contain("Device:    001565abcdef");
+	});
+
+	it("uses the handset the event named, in preference to inferring one", async () => {
+		// `call.emergency.dialed.deviceId` is what the digest credential resolved to at the SIP edge —
+		// the registration that actually placed the call. With it there is no inference left to make,
+		// so the extension's other handsets are never consulted and no ambiguity is claimed.
+		const { service, sent } = makeService({ emergencyNotificationEmails: ["desk@example.com"] }, [
+			[NUMBER_ADDRESS],
+			[{ id: EXTENSION_ID, number: "+12125550100", label: "Reception" }],
+			[
+				{
+					label: "Desk 40",
+					macAddress: "001565abcdff",
+					emergencyAddressId: null,
+					emergencyLocationDetail: "Desk 40",
+				},
+			],
+		]);
+		await service.notify(ORGANIZATION_ID, { ...NOTICE, deviceId: DEVICE_ID });
+		const body = sent[0]?.text ?? "";
+		expect(body).to.contain("Floor 3, Room 314, Desk 40");
+		expect(body).to.contain("Device:    Desk 40");
+		expect(body).to.not.contain("other handset");
+	});
+
+	it("falls back to the inference when the named device no longer exists", async () => {
+		// A deleted handset is still better answered by the extension's than by silence.
+		const { service, sent } = makeService({ emergencyNotificationEmails: ["desk@example.com"] }, [
+			[NUMBER_ADDRESS],
+			[{ id: EXTENSION_ID, number: "+12125550100", label: "Reception" }],
+			[],
+			[
+				{
+					label: "Desk 12",
+					macAddress: "001565abcdef",
+					emergencyAddressId: null,
+					emergencyLocationDetail: "Desk 12",
+				},
+			],
+		]);
+		await service.notify(ORGANIZATION_ID, { ...NOTICE, deviceId: DEVICE_ID });
+		expect(sent[0]?.text ?? "").to.contain("Floor 3, Room 314, Desk 12");
+	});
+
+	it("admits the ambiguity when several handsets on the extension each claim a location", async () => {
+		// Absent a `deviceId` on the event this is an inference. Two located
+		// handsets means it picked one; saying so sends somebody to check both rather than to trust a
+		// coin flip.
+		const { service, sent } = makeService({ emergencyNotificationEmails: ["desk@example.com"] }, [
+			[NUMBER_ADDRESS],
+			[{ id: EXTENSION_ID, number: "+12125550100", label: "Reception" }],
+			[
+				{
+					label: "Desk 12",
+					macAddress: "001565abcdef",
+					emergencyAddressId: null,
+					emergencyLocationDetail: "Desk 12",
+				},
+				{
+					label: "Desk 40",
+					macAddress: "001565abcdff",
+					emergencyAddressId: null,
+					emergencyLocationDetail: "Desk 40",
+				},
+			],
+		]);
+		await service.notify(ORGANIZATION_ID, NOTICE);
+		expect(sent[0]?.text ?? "").to.contain(
+			"1 other handset on this extension registers a different location",
+		);
+	});
+
+	it("says an unvalidated address is unvalidated rather than suppressing it", async () => {
+		// The best information anybody has at the moment somebody dials 911 is still the best
+		// information. Withholding it leaves the recipient with nothing; labelling it sends them to
+		// check on the way.
+		const { service, sent } = makeService({ emergencyNotificationEmails: ["desk@example.com"] }, [
+			[NUMBER_ADDRESS],
+			[{ id: EXTENSION_ID, number: "+12125550100", label: "Reception" }],
+			[
+				{
+					label: "Desk 12",
+					macAddress: "001565abcdef",
+					emergencyAddressId: DEVICE_ADDRESS_ID,
+					emergencyLocationDetail: null,
+				},
+			],
+			[{ ...NUMBER_ADDRESS, validated: false }],
+		]);
+		await service.notify(ORGANIZATION_ID, NOTICE);
+		expect(sent[0]?.text ?? "").to.contain("(address not validated)");
 	});
 
 	it("says the location is unreadable rather than omitting the line", async () => {

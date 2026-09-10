@@ -1,5 +1,5 @@
 import { Inject, Module, type OnApplicationShutdown } from "@nestjs/common";
-import { APP_GUARD } from "@nestjs/core";
+import { APP_FILTER, APP_GUARD } from "@nestjs/core";
 import { Mailer, MailModule } from "../mail";
 import { createMailerEmailDelivery } from "./auth-email.delivery";
 import { clearAuthRuntime, publishAuthRuntime } from "./auth-platform.registry";
@@ -17,6 +17,7 @@ import { OrganizationsController } from "./organizations.controller";
 import { RequirePermissionsGuard } from "./require-permissions.guard";
 import { ResellerController } from "./reseller/reseller.controller";
 import { ResellerService } from "./reseller/reseller.service";
+import { SessionErrorsFilter } from "./session-errors.filter";
 import { SsoController } from "./sso/sso.controller";
 import { SsoService } from "./sso/sso.service";
 
@@ -72,6 +73,7 @@ import { SsoService } from "./sso/sso.service";
 		OrganizationSuspensionService,
 		RequirePermissionsGuard,
 		{ provide: APP_GUARD, useExisting: RequirePermissionsGuard },
+		{ provide: APP_FILTER, useClass: SessionErrorsFilter },
 	],
 	exports: [
 		AUTH_PLATFORM,

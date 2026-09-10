@@ -1,6 +1,7 @@
 import { createServer, type Server } from "node:http";
 import { expect } from "chai";
 import { WebSocket } from "ws";
+import { ControlledCalls } from "../../src/pbx/calls/controlled-calls";
 import { SessionGateway } from "../../src/session/session-gateway";
 import type { AuthPlatform } from "../../src/auth/auth.platform";
 import type { AuthService } from "../../src/auth/auth.service";
@@ -115,7 +116,8 @@ async function harness(options: HarnessOptions = {}) {
 		}),
 	} as unknown as AuthService;
 
-	const gateway = new SessionGateway(platform, authService, hub);
+	const controlled = new ControlledCalls();
+	const gateway = new SessionGateway(platform, authService, hub, controlled);
 	const server: Server = createServer();
 	server.on("upgrade", (request: IncomingMessage, socket: Duplex, head: Buffer) => {
 		void gateway.handleUpgrade(request, socket, head).catch(() => socket.destroy());
@@ -126,6 +128,7 @@ async function harness(options: HarnessOptions = {}) {
 	return {
 		gateway,
 		hub,
+		controlled,
 		verbs,
 		claims,
 		releases,
@@ -403,6 +406,31 @@ describe("a session's life", () => {
 
 		c.socket.close();
 		await h.close();
+	});
+
+	it("publishes the call to `ControlledCalls` for the life of the session, and no longer", async () => {
+		// What makes `POST /api/v1/calls/:id/recording/pause` reachable at all: the HTTP route has no
+		// session id and cannot be given one, so the socket leaves behind a closure over its own.
+		const { h, c } = await claimed();
+		await h.announce(announcement());
+
+		const controlled = h.controlled.find(ORG, "call-1");
+		expect(controlled?.legId).to.equal("leg-1");
+		expect(controlled?.application).to.equal("crm");
+		await controlled?.sendVerb("pauseRecord");
+		expect(h.verbs).to.deep.equal([
+			{
+				orgId: ORG,
+				sessionId: h.verbs[0]?.sessionId ?? "",
+				callId: "call-1",
+				legId: "leg-1",
+				verb: "pauseRecord",
+			},
+		]);
+
+		c.socket.close();
+		await h.close();
+		expect(h.controlled.find(ORG, "call-1")).to.equal(undefined);
 	});
 
 	it("refuses a verb for a session this socket does not hold", async () => {

@@ -1,12 +1,16 @@
-import { Inject, Injectable } from "@nestjs/common";
-import { requireActiveOrganizationId } from "@optimiq-voice/auth";
+import { Inject, Injectable, Optional } from "@nestjs/common";
+import { hasPermission, requireActiveOrganizationId } from "@optimiq-voice/auth";
 import {
 	CdrInvalidCursorException,
 	CdrNotFoundException,
 	CdrRangeTooWideException,
+	CdrSelfScopeUnavailableException,
 } from "../shared/cdr.errors";
 import { CDR_DATABASE } from "../shared/cdr.tokens";
+import { readAgentStats } from "./agent-stats";
+import { readCallVolume } from "./call-volume";
 import { CdrCursorError, nextCursorFrom } from "./cdr-cursor";
+import { hasAnyParty, ownPartyMatcher } from "./cdr-self-scope";
 import { MAX_RANGE_DAYS, rangeDays, resolveTimeRange } from "./cdr.dto";
 import {
 	getCallLeg,
@@ -15,7 +19,13 @@ import {
 	listRecordingsForLegs,
 } from "./cdr.repository";
 import { readQueueStats } from "./queue-stats";
+import { CDR_SELF_PARTIES } from "./self-parties";
+import type { AgentStatsRow } from "./agent-stats";
+import type { CallVolumeDestinationRow, CallVolumeRow } from "./call-volume";
+import type { OwnedParties } from "./cdr-self-scope";
 import type {
+	AgentStatsQueryDto,
+	CallVolumeQueryDto,
 	CdrCallQuery,
 	CdrLegQuery,
 	CdrListQuery,
@@ -24,6 +34,7 @@ import type {
 } from "./cdr.dto";
 import type { CallLegDetailRow, CallLegListRow, RecordingListRow } from "./cdr.repository";
 import type { QueueStatsRow } from "./queue-stats";
+import type { CdrSelfParties } from "./self-parties";
 import type { AppSession } from "@optimiq-voice/auth";
 import type { CdrDatabaseClient } from "@optimiq-voice/cdr-db";
 
@@ -57,6 +68,30 @@ export interface QueueStatsEnvelope {
 	readonly range: { readonly from: string; readonly to: string };
 }
 
+export interface AgentStatsEnvelope {
+	readonly data: readonly AgentStatsRow[];
+	/** Echoed so a table can label its wrap-up column with the cap that produced it. */
+	readonly wrapUpSeconds: number;
+	/**
+	 * The group ceiling was reached, so an agent's per-queue breakdown may be short.
+	 *
+	 * A flag rather than a `nextCursor`, and the difference is the point: there is no next page.
+	 * `agent-stats.ts` argues why a keyset cursor over aggregate groups is a correctness problem
+	 * invented to solve a size problem a tenant's agent roster does not have.
+	 */
+	readonly truncated: boolean;
+	readonly range: { readonly from: string; readonly to: string };
+}
+
+export interface CallVolumeEnvelope {
+	readonly data: readonly CallVolumeRow[];
+	/** The per-destination series for the same buckets. See `call-volume.ts` for why it is separate. */
+	readonly destinations: readonly CallVolumeDestinationRow[];
+	readonly bucket: string;
+	readonly truncated: boolean;
+	readonly range: { readonly from: string; readonly to: string };
+}
+
 export interface CdrListEnvelope {
 	readonly data: readonly CallLegListRow[];
 	readonly nextCursor: string | null;
@@ -78,10 +113,45 @@ export interface CdrCallEnvelope {
 
 @Injectable()
 export class CdrService {
-	constructor(@Inject(CDR_DATABASE) private readonly database: CdrDatabaseClient) {}
+	constructor(
+		@Inject(CDR_DATABASE) private readonly database: CdrDatabaseClient,
+		/**
+		 * The user → extension link, when the PBX area is mounted beside this one.
+		 *
+		 * `@Optional()` for the reason both of the recording ports are: the two areas are siblings and
+		 * either can boot without the other. See {@link CdrService.narrowing} for what its absence
+		 * means to a caller who holds only the scoped grant.
+		 */
+		@Optional() @Inject(CDR_SELF_PARTIES) private readonly selfParties?: CdrSelfParties,
+	) {}
 
 	private organizationId(session: AppSession): string {
 		return requireActiveOrganizationId(session);
+	}
+
+	/**
+	 * The `.own` decision, in one place: `undefined` means "every row in the tenant".
+	 *
+	 * The endpoints' floor is `cdr.read.own`, which an unscoped `cdr.read` holder satisfies by the
+	 * substitution rule — so the guard lets both in and this decides the reach, exactly as
+	 * `self-ownership.ts` set out for the PBX resources. A holder of only the scoped grant on a
+	 * deployment with no PBX area is refused by name: there is no link to resolve, and the two
+	 * alternatives are showing them the whole tenant (a silent privilege escalation) or showing them
+	 * nothing (a screen that looks broken).
+	 */
+	private async narrowing(
+		session: AppSession,
+		organizationId: string,
+	): Promise<OwnedParties | undefined> {
+		// `hasPermission` and not the PBX area's `holdsUnscoped`, which is the same call: importing it
+		// would pull `@optimiq-voice/pbx-db` into a module that must keep booting without it.
+		if (hasPermission(session.permissions ?? [], "cdr.read")) {
+			return undefined;
+		}
+		if (this.selfParties === undefined) {
+			throw new CdrSelfScopeUnavailableException();
+		}
+		return await this.selfParties.forUser(organizationId, session.user.id);
 	}
 
 	/**
@@ -136,6 +206,76 @@ export class CdrService {
 	}
 
 	/**
+	 * Per-agent handling over a window.
+	 *
+	 * One tenant-scoped transaction and one grouped aggregate, exactly like {@link
+	 * CdrService.queueStats} — the organization is never a predicate, RLS is the filter, and
+	 * `MAX_RANGE_DAYS` applies unchanged because this is a live query rather than a rollup.
+	 *
+	 * It does NOT go through {@link CdrService.narrowing}. The `.own` narrowing is about which CALLS
+	 * a person may see, and this endpoint returns no call: it returns counts and averages keyed on a
+	 * `queue_agent` row id. Its gate is `queues.monitor` — the same aggregate grant the wallboard's
+	 * service level rides, for the same reason the controller argues there.
+	 */
+	async agentStats(session: AppSession, query: AgentStatsQueryDto): Promise<AgentStatsEnvelope> {
+		const organizationId = this.organizationId(session);
+		const range = this.range(query);
+
+		const result = await this.database.withTenantScope(
+			organizationId,
+			async (transaction) =>
+				await readAgentStats(transaction, {
+					from: range.from,
+					to: range.to,
+					wrapUpCeilingMs: query.wrapUpSeconds * 1_000,
+					limit: query.limit,
+					...(query.agentId === undefined ? {} : { agentId: query.agentId }),
+					...(query.queueId === undefined ? {} : { queueId: query.queueId }),
+				}),
+		);
+
+		return {
+			data: result.rows,
+			wrapUpSeconds: query.wrapUpSeconds,
+			truncated: result.truncated,
+			range: { from: range.from.toISOString(), to: range.to.toISOString() },
+		};
+	}
+
+	/**
+	 * Call volume over time, bucketed.
+	 *
+	 * `cdr.read` and not `cdr.read.own`, which is the one place this area's floor is RAISED rather
+	 * than narrowed at the service layer. A bucketed count cannot be narrowed to a person's own
+	 * calls without becoming a different number that looks like the same one — "we took 400 calls
+	 * this week" rendered from one agent's slice is the kind of figure that ends up in a board pack.
+	 * So the grant is the unscoped one and there is no narrowing branch here to get wrong.
+	 */
+	async callVolume(session: AppSession, query: CallVolumeQueryDto): Promise<CallVolumeEnvelope> {
+		const organizationId = this.organizationId(session);
+		const range = this.range(query);
+
+		const result = await this.database.withTenantScope(
+			organizationId,
+			async (transaction) =>
+				await readCallVolume(transaction, {
+					from: range.from,
+					to: range.to,
+					bucket: query.bucket,
+					limit: query.limit,
+				}),
+		);
+
+		return {
+			data: result.rows,
+			destinations: result.destinations,
+			bucket: query.bucket,
+			truncated: result.truncated,
+			range: { from: range.from.toISOString(), to: range.to.toISOString() },
+		};
+	}
+
+	/**
 	 * One page of legs.
 	 *
 	 * `CdrCursorError` is translated here rather than left to a 500: an unreadable cursor is always
@@ -145,13 +285,20 @@ export class CdrService {
 	async list(session: AppSession, query: CdrListQuery): Promise<CdrListEnvelope> {
 		const organizationId = this.organizationId(session);
 		const range = this.range(query);
+		const owned = await this.narrowing(session, organizationId);
 
-		const page = await this.database
-			.withTenantScope(
-				organizationId,
-				async (transaction) => await listCallLegs(transaction, query, range),
-			)
-			.catch(rethrowCursorError);
+		// Nothing to match on, so nothing to ask the ledger. An empty page and not a 403: holding no
+		// extension is an ordinary state (a new member, an admin without a phone), and their own call
+		// history genuinely is empty.
+		const page =
+			owned !== undefined && !hasAnyParty(owned)
+				? { rows: [], fetched: 0 }
+				: await this.database
+						.withTenantScope(
+							organizationId,
+							async (transaction) => await listCallLegs(transaction, query, range, owned),
+						)
+						.catch(rethrowCursorError);
 
 		return {
 			data: page.rows,
@@ -170,11 +317,16 @@ export class CdrService {
 		// recovery silently widened an exact partition-key seek into a full range scan, which is the
 		// cost the parameter exists to avoid.
 		const startedAt = query.startedAt === undefined ? undefined : new Date(query.startedAt);
+		const owned = await this.narrowing(session, organizationId);
+		if (owned !== undefined && !hasAnyParty(owned)) {
+			throw new CdrNotFoundException("call-leg", id);
+		}
 
 		const found = await this.database.withTenantScope(organizationId, async (transaction) => {
 			const leg = await getCallLeg(transaction, id, {
 				...(startedAt === undefined ? {} : { startedAt }),
 				range,
+				...(owned === undefined ? {} : { owned }),
 			});
 			if (leg === undefined) {
 				return undefined;
@@ -205,10 +357,17 @@ export class CdrService {
 	): Promise<CdrCallEnvelope> {
 		const organizationId = this.organizationId(session);
 		const range = this.range(query);
+		const owned = await this.narrowing(session, organizationId);
 
 		const found = await this.database.withTenantScope(organizationId, async (transaction) => {
 			const legs = await listCallLegsForCall(transaction, callId, range);
 			if (legs.length === 0) {
+				return undefined;
+			}
+			// The WHOLE tree, once the caller is a party to any leg of it. Filtering leg by leg would
+			// hand a ring-group answerer their own B-leg with the A-leg that originated it missing,
+			// and the timeline the UI draws from `originating_leg_id` would start nowhere.
+			if (owned !== undefined && !legs.some(ownPartyMatcher(owned))) {
 				return undefined;
 			}
 			const media = await listRecordingsForLegs(

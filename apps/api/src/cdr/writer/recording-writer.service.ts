@@ -396,6 +396,14 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 		const durationMs = typeof data.durationMs === "number" ? Math.max(0, data.durationMs) : 0;
 		const sizeBytes = typeof data.bytes === "number" ? Math.max(0, data.bytes) : 0;
 		const usable = data.reason !== "failed" && durationMs > 0;
+		// The PCI half. Null rather than an empty array for a recording nobody paused: the column is
+		// null on every row written before pausing existed, and a reader must not have to tell the
+		// two apart. Copied out of the envelope so the row holds plain objects rather than whatever
+		// the parse handed back.
+		const pauses =
+			data.pauses === undefined || data.pauses.length === 0
+				? null
+				: data.pauses.map((pause) => ({ startMs: pause.startMs, endMs: pause.endMs }));
 		const retentionUntil = await this.retentionUntil(organizationId);
 
 		await withCdrWriterScope(this.database.adminDb, organizationId, async (transaction) => {
@@ -409,6 +417,7 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 					objectKey: data.objectKey,
 					durationMs,
 					sizeBytes,
+					...(pauses === null ? {} : { pauses }),
 					retentionUntil,
 				})
 				.onConflictDoUpdate({
@@ -417,7 +426,15 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 					// the recording started, and a redelivery of `stopped` (or a `stopped` that arrives
 					// after a settings change) must not quietly extend or shorten a window that has
 					// already been recorded against this object.
-					set: { durationMs, sizeBytes, updatedAt: new Date() },
+					set: {
+						durationMs,
+						sizeBytes,
+						// Only ever written FORWARD: a redelivery carrying no intervals must not erase
+						// the ones a previous delivery filed, because the absence would then read as
+						// "nobody paused this" on a recording somebody did.
+						...(pauses === null ? {} : { pauses }),
+						updatedAt: new Date(),
+					},
 					// The tenant predicate on the conflict path. `object_key` is unique across the
 					// BUCKET rather than within a tenant, so without it a producer that guessed another
 					// organization's key could rewrite its metadata.
@@ -537,6 +554,7 @@ interface RecordEventData {
 	readonly durationMs?: number;
 	readonly bytes?: number;
 	readonly reason?: string;
+	readonly pauses?: readonly { readonly startMs: number; readonly endMs: number }[];
 }
 
 interface RecordEnvelope {

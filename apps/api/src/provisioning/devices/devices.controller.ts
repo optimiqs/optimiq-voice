@@ -29,6 +29,7 @@ import {
 	updateDeviceProfileKeyDto,
 } from "./devices.dto";
 import {
+	assertMayWriteDispatchableLocation,
 	DeviceKeysService,
 	DeviceLinesService,
 	DeviceProfileKeysService,
@@ -108,7 +109,9 @@ export class DevicesController {
 	@Post()
 	@RequirePermissions("devices.write")
 	async create(@Session() session: AppSession, @Body() body: unknown) {
-		return await this.devices.createWithProvisioningToken(session, parseDto(createDeviceDto, body));
+		const values = parseDto(createDeviceDto, body);
+		assertMayWriteDispatchableLocation(session, values);
+		return await this.devices.createWithProvisioningToken(session, values);
 	}
 
 	@Patch(":id")
@@ -118,7 +121,9 @@ export class DevicesController {
 		@Param("id", ParseUUIDPipe) id: string,
 		@Body() body: unknown,
 	) {
-		return await this.devices.update(session, id, parseDto(updateDeviceDto, body));
+		const values = parseDto(updateDeviceDto, body);
+		assertMayWriteDispatchableLocation(session, values);
+		return await this.devices.update(session, id, values);
 	}
 
 	@Delete(":id")

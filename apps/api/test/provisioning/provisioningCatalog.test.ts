@@ -87,6 +87,7 @@ function context(overrides: Partial<RenderContext> = {}): RenderContext {
 		],
 		settings: {},
 		sipDomain: "pbx.example.com",
+		dispatchableLocation: undefined,
 		payloadUrl: "https://pbx.example.com/provision/ref.secret/payload",
 		renderedAt: new Date("2026-08-06T12:00:00.000Z"),
 		...overrides,

@@ -18,8 +18,13 @@ import { CallBlockService } from "./call-block/call-block.service";
 import { CallFlowPresencePublisher } from "./call-flows/call-flow-presence.publisher";
 import { CallFlowsController } from "./call-flows/call-flows.controller";
 import { CallFlowsService, TimeConditionOverrideService } from "./call-flows/call-flows.service";
+import { ToggleFeatureRpcController } from "./call-flows/toggle-feature-rpc.controller";
+import { ToggleFeatureService } from "./call-flows/toggle-feature.service";
+import { CallControlClient } from "./calls/call-control.client";
+import { CallRecordingService } from "./calls/call-recording.service";
 import { CallsController } from "./calls/calls.controller";
 import { CallsService } from "./calls/calls.service";
+import { ControlledCalls } from "./calls/controlled-calls";
 import { CarrierWebhookController } from "./carrier/carrier-webhook.controller";
 import { CarrierController, CarrierTrunkController } from "./carrier/carrier.controller";
 import { carrierProviders } from "./carrier/carrier.providers";
@@ -52,6 +57,9 @@ import { ExtensionUsersController } from "./extensions/extension-users.controlle
 import { ExtensionUsersService } from "./extensions/extension-users.service";
 import { ExtensionsController } from "./extensions/extensions.controller";
 import { ExtensionsService } from "./extensions/extensions.service";
+import { HotDeskRpcController } from "./extensions/hot-desk-rpc.controller";
+import { HotDeskSweeper } from "./extensions/hot-desk-sweeper.service";
+import { HotDeskService } from "./extensions/hot-desk.service";
 import { FaxEmailService } from "./fax/fax-email.service";
 import { loadFaxEnv } from "./fax/fax-env";
 import { FaxInboundService } from "./fax/fax-inbound.service";
@@ -66,6 +74,7 @@ import { InboundRoutesController } from "./inbound-routes/inbound-routes.control
 import { InboundRoutesService } from "./inbound-routes/inbound-routes.service";
 import { IvrMenusController } from "./ivr-menus/ivr-menus.controller";
 import { IvrMenuOptionsService, IvrMenusService } from "./ivr-menus/ivr-menus.service";
+import { SystemMediaService } from "./media/system-media.service";
 import { MohClassesController } from "./moh-classes/moh-classes.controller";
 import { MohClassesService } from "./moh-classes/moh-classes.service";
 import { OrgLimitsController } from "./org-limits/org-limits.controller";
@@ -110,6 +119,7 @@ import { RoutingService } from "./routing/routing.service";
 import { SipAclEntriesController } from "./security/sip-acl.controller";
 import { affectsSipAcl, SipAclPublisher } from "./security/sip-acl.publisher";
 import { SipAclEntriesService } from "./security/sip-acl.service";
+import { SipAuthEventConsumer } from "./security/sip-auth-event-consumer.service";
 import { SipAuthEventQueryService } from "./security/sip-auth-event-query.service";
 import { SipAuthEventController } from "./security/sip-auth-event.controller";
 import { SipAuthEventService } from "./security/sip-auth-event.service";
@@ -133,6 +143,11 @@ import {
 } from "./shared/pbx.tokens";
 import { dischargeProjection } from "./shared/projection-outbox";
 import { ProjectionOutboxSweeper } from "./shared/projection-outbox.service";
+import {
+	SipCredentialCache,
+	affectsSipCredentials,
+	changesTheSipRealm,
+} from "./sip-credentials/sip-credentials.cache";
 import { SipCredentialsResponder } from "./sip-credentials/sip-credentials.responder";
 import { SipCredentialsService } from "./sip-credentials/sip-credentials.service";
 import { TrunkCredentialsService } from "./sip-credentials/trunk-credentials.service";
@@ -372,6 +387,16 @@ const logger = getLogger("api.pbx");
 		 * see `extension-feature.service.ts`.
 		 */
 		ExtensionFeatureRpcController,
+		ToggleFeatureRpcController,
+		/**
+		 * `*31` and `*32` — an agent claiming a shared desk phone and giving it back.
+		 *
+		 * Beside the extension responders and not the call-flow one, because what it writes is a
+		 * device line's binding to an EXTENSION. `ToggleFeatureRpcController` is its template, not its
+		 * neighbour: the difference is that this request carries a live credential, which is why it
+		 * has its own subject to be granted on and why nothing on its path logs the payload.
+		 */
+		HotDeskRpcController,
 		/**
 		 * A handset filing the greeting it has just recorded into its own mailbox.
 		 *
@@ -456,6 +481,7 @@ const logger = getLogger("api.pbx");
 		FaxEmailService,
 		FaxInboundService,
 		FaxSendWorker,
+		SipCredentialCache,
 		SipCredentialsService,
 		TrunkCredentialsService,
 		SipCredentialsResponder,
@@ -547,6 +573,7 @@ const logger = getLogger("api.pbx");
 				sipAcl: SipAclPublisher,
 				env: PbxEnv,
 				audit: AuditLogService,
+				credentialCache: SipCredentialCache,
 			) => {
 				/**
 				 * The fast path's second half: mark the obligation the write recorded.
@@ -662,6 +689,30 @@ const logger = getLogger("api.pbx");
 					 */
 					onMutation: (event) => {
 						const cutoff = new Date();
+						/**
+						 * The credential cache, evicted FIRST and synchronously.
+						 *
+						 * First, because everything below it is a fire-and-forget publish and this is a
+						 * map delete: an `await`-free eviction that runs before any of them cannot be
+						 * reordered behind a broker that is slow or down. Synchronously, because the
+						 * property that lets `sip-credentials.cache.ts` hold an HA1 for a minute at all is
+						 * that a disable stops authenticating on the commit — a disable that took effect
+						 * "once the broker acknowledged something" would be a security control with a
+						 * network dependency.
+						 *
+						 * `provision.evt.v1.<orgId>` / `credential.invalidated` is published after it, and
+						 * is the OTHER end of the same eviction: `apps/sipd` holds its own 30 s copy and
+						 * had no channel to learn about a rotation. The publish is fire-and-forget — a
+						 * missed one costs the edge its TTL, which is exactly what it cost before the
+						 * subject existed.
+						 */
+						if (affectsSipCredentials(event.tableName)) {
+							credentialCache.invalidate(
+								event.organizationId,
+								`${event.operation} on ${event.tableName}`,
+								{ realmDirectory: changesTheSipRealm(event.tableName) },
+							);
+						}
 						if (affectsQueueMembership(event.tableName)) {
 							queueMembership
 								.syncOrganization(event.organizationId)
@@ -724,7 +775,7 @@ const logger = getLogger("api.pbx");
 							sipAcl
 								.syncOrganization(event.organizationId)
 								.then((result) => {
-									if (!result.skipped && result.failed === 0 && result.conflicts.length === 0) {
+									if (!result.skipped && result.failed === 0) {
 										discharge(event.organizationId, "sip-acl", cutoff);
 									}
 								})
@@ -748,6 +799,7 @@ const logger = getLogger("api.pbx");
 				SipAclPublisher,
 				PBX_ENV,
 				AuditLogService,
+				SipCredentialCache,
 			],
 		},
 		ExtensionsService,
@@ -764,6 +816,7 @@ const logger = getLogger("api.pbx");
 		 * repository path wrong for a status tick.
 		 */
 		TrunkStatusConsumer,
+		SipAuthEventConsumer,
 		InboundRoutesService,
 		OutboundRoutesService,
 		TimeConditionsService,
@@ -788,6 +841,14 @@ const logger = getLogger("api.pbx");
 		CallFlowPresencePublisher,
 		CallFlowsService,
 		TimeConditionOverrideService,
+		ToggleFeatureService,
+		HotDeskService,
+		/**
+		 * The half of a hot-desk session that nobody dials. The expiry lives in
+		 * `device_line.hot_desk_expires_at`, so this is a reconcile rather than the thing holding the
+		 * session — see the class note.
+		 */
+		HotDeskSweeper,
 		PinSetsService,
 		PinSetEntriesService,
 		TranslationRulesetsService,
@@ -798,6 +859,7 @@ const logger = getLogger("api.pbx");
 		SpeedDialsService,
 		OrgLimitsService,
 		PromptsService,
+		SystemMediaService,
 		PhrasesService,
 		PhraseStepsService,
 		MohClassesService,
@@ -846,6 +908,22 @@ const logger = getLogger("api.pbx");
 		 * integrator surface is not wired rather than a provider silently absent from the container.
 		 */
 		CallsService,
+		/**
+		 * The PCI recording pause, and the registry it reads.
+		 *
+		 * `ControlledCalls` is a plain in-memory map with no broker of its own: the session gateway
+		 * (in `SessionModule`, which imports this one) writes it, and `CallRecordingService` reads it.
+		 * It lives HERE rather than beside the gateway because a provider in `SessionModule` could not
+		 * be injected into this module's controller without closing the import cycle — see its header
+		 * for why the entry carries a closure instead of an instance id.
+		 */
+		ControlledCalls,
+		// The engine subject a PBX call's recording is paused over. Its own NATS connection, like
+		// `ConferenceControlClient`'s and for the same reasons: an instance-addressed subject no Nest
+		// `ClientProxy` can express, and a PCI pause whose availability must not ride a wallboard's
+		// watch.
+		CallControlClient,
+		CallRecordingService,
 		WebhooksService,
 		WebhookDispatcher,
 		/**
@@ -880,6 +958,7 @@ const logger = getLogger("api.pbx");
 		VoicemailTranscriptionSweeper,
 		TrunkStatusConsumer,
 		PromptsService,
+		ControlledCalls,
 	],
 })
 export class PbxModule implements OnApplicationShutdown {

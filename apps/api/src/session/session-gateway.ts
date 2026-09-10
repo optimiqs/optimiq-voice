@@ -7,6 +7,7 @@ import { getLogger } from "@optimiq-voice/logging";
 import { toAppSession, type RawAuthSession } from "../auth/app-session";
 import { AuthService } from "../auth/auth.service";
 import { AUTH_PLATFORM } from "../auth/auth.tokens";
+import { ControlledCalls } from "../pbx/calls/controlled-calls";
 import { SessionHub } from "./session-hub.service";
 import {
 	parseSessionFrame,
@@ -93,6 +94,7 @@ export class SessionGateway implements OnApplicationShutdown {
 		@Inject(AUTH_PLATFORM) private readonly platform: AuthPlatform,
 		@Inject(AuthService) private readonly authService: AuthService,
 		@Inject(SessionHub) private readonly hub: SessionHub,
+		@Inject(ControlledCalls) private readonly controlled: ControlledCalls,
 	) {}
 
 	get stats(): {
@@ -365,6 +367,29 @@ export class SessionGateway implements OnApplicationShutdown {
 		const stopTap = this.hub.watchCall(connection.organizationId, announcement.callId, (event) => {
 			this.onCallEvent(connection, sessionId, event);
 		});
+		/**
+		 * The same session, published to the control plane's own routes.
+		 *
+		 * What it registers is a CLOSURE over the identifiers this method already holds, so an HTTP
+		 * route can command the leg without being handed the session id — the capability stays on
+		 * this socket, and a route that could read it could address a call it was never given.
+		 * `POST /api/v1/calls/:id/recording/pause` is the only caller today.
+		 */
+		const releaseControl = this.controlled.register({
+			organizationId: connection.organizationId,
+			callId: announcement.callId,
+			legId: announcement.legId,
+			application,
+			sendVerb: async (verb, args) =>
+				await this.hub.sendVerb(announcement.instanceId, {
+					orgId: connection.organizationId,
+					sessionId,
+					callId: announcement.callId,
+					legId: announcement.legId,
+					verb,
+					...(args === undefined ? {} : { arguments: args }),
+				}),
+		});
 		connection.sessions.set(sessionId, {
 			sessionId,
 			application,
@@ -372,6 +397,7 @@ export class SessionGateway implements OnApplicationShutdown {
 			legId: announcement.legId,
 			instanceId: announcement.instanceId,
 			stopTap,
+			releaseControl,
 		});
 
 		this.send(connection, {
@@ -478,6 +504,7 @@ export class SessionGateway implements OnApplicationShutdown {
 			return;
 		}
 		session.stopTap();
+		session.releaseControl();
 		connection.sessions.delete(sessionId);
 		this.send(connection, {
 			op: "session.ended",
@@ -642,6 +669,8 @@ interface LiveSession {
 	/** The engine instance that owns the leg. Learned from the announcement; never looked up. */
 	readonly instanceId: string;
 	readonly stopTap: () => void;
+	/** Drops this call from `ControlledCalls`. Idempotent, like `stopTap`. */
+	readonly releaseControl: () => void;
 }
 
 interface SessionConnection {

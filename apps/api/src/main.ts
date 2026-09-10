@@ -12,6 +12,8 @@ import {
 import { assertCdrPreflight, isCdrAreaEnabled } from "./cdr/cdr-bootstrap";
 import { CdrModule } from "./cdr/cdr.module";
 import { httpLoggerOptions } from "./core/http/log-redaction";
+import { observeHttpRequest } from "./core/metrics/metrics";
+import { startMetricsServer, type MetricsServer } from "./core/metrics/metrics-server";
 import { HTTP_BRIDGE_PORT } from "./envs";
 import { registerLiveTransport } from "./live/live-bootstrap";
 import { LiveModule } from "./live/live.module";
@@ -38,6 +40,9 @@ const logger = getLogger("api.bootstrap");
  * cleanly.
  */
 let started: NestFastifyApplication | undefined;
+
+/** The private scrape listener, closed alongside the application on a boot failure. */
+let metricsServer: MetricsServer | undefined;
 
 async function bootstrap() {
 	/**
@@ -238,6 +243,37 @@ async function bootstrap() {
 	started = app;
 	app.enableShutdownHooks();
 
+	/**
+	 * Request latency, measured in the one place that sees every request.
+	 *
+	 * `onResponse` rather than a Nest interceptor: an interceptor only wraps requests that reached
+	 * a controller, so everything a guard refused, the 404s and the body-parse failures — exactly
+	 * the requests an operator is looking for — would be missing from the histogram.
+	 *
+	 * `request.routeOptions.url` is the matched PATTERN. See `observeHttpRequest` for why the raw
+	 * URL must never become a label.
+	 */
+	app
+		.getHttpAdapter()
+		.getInstance()
+		.addHook("onResponse", (request, reply, done) => {
+			observeHttpRequest(
+				request.method,
+				request.routeOptions?.url,
+				reply.statusCode,
+				reply.elapsedTime / 1_000,
+			);
+			done();
+		});
+	metricsServer = await startMetricsServer();
+	app
+		.getHttpAdapter()
+		.getInstance()
+		.addHook("onClose", async () => {
+			await metricsServer?.close();
+			metricsServer = undefined;
+		});
+
 	// Raw Fastify wiring has to exist before `listen`, which is when Nest installs its own router
 	// and not-found handler.
 	if (authSliceEnabled) {
@@ -266,6 +302,7 @@ bootstrap().catch(async (error) => {
 	 * either way.
 	 */
 	try {
+		await metricsServer?.close();
 		await started?.close();
 	} catch (closeError) {
 		logger.error({ err: closeError }, "failed to close the application after a boot failure");

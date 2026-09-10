@@ -4,7 +4,16 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { MissingActiveOrganizationError } from "@optimiq-voice/auth";
 import { makeTestModuleRuntime } from "@optimiq-voice/effect-runtime";
+import { DEFAULT_FEATURE_CODES } from "@optimiq-voice/routing";
+import {
+	clearOrganizationCreatedHandler,
+	getOrganizationCreatedHandler,
+} from "../../src/auth/auth.platform";
 import { ExtensionsService } from "../../src/pbx/extensions/extensions.service";
+import {
+	FeatureCodesService,
+	sessionForSeeding,
+} from "../../src/pbx/feature-codes/feature-codes.service";
 import { IvrMenuOptionsService } from "../../src/pbx/ivr-menus/ivr-menus.service";
 import { OrgLimitsService } from "../../src/pbx/org-limits/org-limits.service";
 import {
@@ -485,5 +494,62 @@ describe("PagingGroupMembersService", () => {
 		expect(received[3]).to.deep.equal(["b", "a"]);
 		expect(result.data.map((row) => row.id)).to.deep.equal(["b", "a"]);
 		expect(result.warnings).to.deep.equal([]);
+	});
+});
+
+/**
+ * The seam that gives a brand-new tenant its star codes.
+ *
+ * `seedDefaults` and `POST /api/v1/feature-codes/defaults` both predate this and neither ran on
+ * its own: an organization created through sign-up got an empty `feature_code` table. What is
+ * pinned here is the registration and the tenant it seeds under — the catalogue itself is
+ * `@optimiq-voice/routing`'s, and the SQL is `verify-pbx.ts`'s.
+ */
+describe("FeatureCodesService organization seeding", () => {
+	const NEW_ORGANIZATION_ID = "019fd3c2-3333-76be-a6b3-b0f1914e39b6";
+	const CREATOR_ID = "019fd3c2-4444-76be-a6b3-b0f1914e39b6";
+
+	const event = {
+		organizationId: NEW_ORGANIZATION_ID,
+		organizationName: "Acme",
+		organizationSlug: "acme",
+		userId: CREATOR_ID,
+		userEmail: "owner@acme.test",
+	} as const;
+
+	afterEach(() => {
+		clearOrganizationCreatedHandler();
+	});
+
+	it("seeds under the new organization, attributed to its creator", () => {
+		const session = sessionForSeeding(event);
+		expect(session.session.activeOrganizationId).to.equal(NEW_ORGANIZATION_ID);
+		expect(session.user.id).to.equal(CREATOR_ID);
+	});
+
+	it("writes the whole catalogue for an organization that has none of it", async () => {
+		const { runtime, calls } = fakeRuntime({});
+		new FeatureCodesService(runtime).onModuleInit();
+		await getOrganizationCreatedHandler()?.(event);
+		const created = calls.filter((call) => call.method === "create");
+		expect(created).to.have.length(DEFAULT_FEATURE_CODES.length);
+		for (const call of created) {
+			expect(call.args[0]).to.equal(NEW_ORGANIZATION_ID);
+		}
+	});
+
+	/**
+	 * A seed that cannot be written must not take the sign-up down with it: the organization row is
+	 * already committed by the time better-auth calls the hook, so a throw here would leave the
+	 * caller with a 500 and a tenant they cannot see.
+	 */
+	it("swallows a seeding failure rather than failing organization creation", async () => {
+		const { runtime } = fakeRuntime({
+			list: (() => {
+				throw new Error("the database is down");
+			}) as never,
+		});
+		new FeatureCodesService(runtime).onModuleInit();
+		await getOrganizationCreatedHandler()?.(event);
 	});
 });

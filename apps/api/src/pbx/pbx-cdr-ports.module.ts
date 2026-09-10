@@ -1,13 +1,19 @@
 import { Global, Module } from "@nestjs/common";
+import { CDR_SELF_PARTIES } from "../cdr/query/self-parties";
 import { RECORDING_PURGE_AUDIT } from "../cdr/recordings/purge-audit";
 import { RECORDING_RETENTION_POLICY } from "../cdr/recordings/retention-policy";
+import { CDR_LEG_RETENTION_AUDIT } from "../cdr/retention/leg-retention-audit";
 import { OrgSettingsService } from "./org-settings/org-settings.service";
 import { RecordingRetentionPolicyService } from "./org-settings/recording-retention-policy.service";
 import { PbxModule } from "./pbx.module";
+import { CdrLegRetentionAuditService } from "./shared/cdr-leg-retention-audit.service";
+import { CdrSelfPartiesService } from "./shared/cdr-self-parties.service";
 import { PBX_DATABASE } from "./shared/pbx.tokens";
 import { RecordingPurgeAuditService } from "./shared/recording-purge-audit.service";
+import type { CdrSelfParties } from "../cdr/query/self-parties";
 import type { RecordingPurgeAudit } from "../cdr/recordings/purge-audit";
 import type { RecordingRetentionPolicy } from "../cdr/recordings/retention-policy";
+import type { CdrLegRetentionAudit } from "../cdr/retention/leg-retention-audit";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
 /**
@@ -48,12 +54,29 @@ import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 			inject: [OrgSettingsService],
 		},
 		{
+			provide: CDR_SELF_PARTIES,
+			useFactory: (database: PbxDatabaseClient): CdrSelfParties =>
+				new CdrSelfPartiesService(database),
+			inject: [PBX_DATABASE],
+		},
+		{
+			provide: CDR_LEG_RETENTION_AUDIT,
+			useFactory: (database: PbxDatabaseClient): CdrLegRetentionAudit =>
+				new CdrLegRetentionAuditService(database),
+			inject: [PBX_DATABASE],
+		},
+		{
 			provide: RECORDING_PURGE_AUDIT,
 			useFactory: (database: PbxDatabaseClient): RecordingPurgeAudit =>
 				new RecordingPurgeAuditService(database),
 			inject: [PBX_DATABASE],
 		},
 	],
-	exports: [RECORDING_RETENTION_POLICY, RECORDING_PURGE_AUDIT],
+	exports: [
+		RECORDING_RETENTION_POLICY,
+		RECORDING_PURGE_AUDIT,
+		CDR_LEG_RETENTION_AUDIT,
+		CDR_SELF_PARTIES,
+	],
 })
 export class PbxCdrPortsModule {}

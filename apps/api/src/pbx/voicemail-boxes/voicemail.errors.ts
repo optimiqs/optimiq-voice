@@ -97,3 +97,22 @@ export class VoicemailMediaGoneException extends HttpException {
 		);
 	}
 }
+
+/**
+ * A forward or copy that names the mailbox it started in.
+ *
+ * A 400 rather than a silent no-op: the operation would file a second copy of a message into the
+ * box that already holds it and light that box's own lamp, which is never what the caller meant.
+ */
+export class VoicemailForwardTargetInvalidException extends HttpException {
+	constructor() {
+		super(
+			{
+				statusCode: HttpStatus.BAD_REQUEST,
+				code: "VOICEMAIL_FORWARD_TARGET_INVALID",
+				message: "A message cannot be forwarded or copied into the mailbox it is already in.",
+			},
+			HttpStatus.BAD_REQUEST,
+		);
+	}
+}

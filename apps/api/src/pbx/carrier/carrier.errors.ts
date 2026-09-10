@@ -6,7 +6,7 @@ import {
 	ServiceUnavailableException,
 	UnprocessableEntityException,
 } from "@nestjs/common";
-import { TelnyxApiError, TelnyxTransportError } from "@optimiq-voice/telnyx";
+import { TelnyxApiError, TelnyxCnamFormatError, TelnyxTransportError } from "@optimiq-voice/telnyx";
 
 /**
  * The carrier area's HTTP errors.
@@ -134,6 +134,19 @@ export function toCarrierException(error: unknown, operation: string): HttpExcep
 			message: `The carrier refused ${operation} with status ${error.status}.`,
 			carrierStatus: error.status,
 			carrierErrors: error.errors.map((entry) => ({ code: entry.code, title: entry.title })),
+		});
+	}
+
+	/**
+	 * A format the client refused before sending. It never reached the carrier, so calling it a
+	 * carrier failure would send an operator looking at Telnyx's status page for a typo in a form.
+	 * 422 with the client's own message, which already names the constraint and the offending value.
+	 */
+	if (error instanceof TelnyxCnamFormatError) {
+		return new UnprocessableEntityException({
+			statusCode: HttpStatus.UNPROCESSABLE_ENTITY,
+			code: "CARRIER_REJECTED",
+			message: error.message,
 		});
 	}
 

@@ -1,6 +1,13 @@
 import { ForbiddenException, HttpStatus } from "@nestjs/common";
 import { hasPermission } from "@optimiq-voice/auth";
-import { deviceLine, eq, extensionUser, inArray, voicemailBox } from "@optimiq-voice/pbx-db";
+import {
+	deviceLine,
+	eq,
+	extension,
+	extensionUser,
+	inArray,
+	voicemailBox,
+} from "@optimiq-voice/pbx-db";
 import type { AppSession, Permission } from "@optimiq-voice/auth";
 import type { PbxDatabaseClient, PbxDatabaseTransaction } from "@optimiq-voice/pbx-db";
 
@@ -21,9 +28,11 @@ import type { PbxDatabaseClient, PbxDatabaseTransaction } from "@optimiq-voice/p
  *
  * A user owns an EXTENSION through `extension_user` (`packages/pbx-db`, indexed on
  * `(organizationId, userId)`). A DEVICE is owned transitively — it has a `device_line` bound to an
- * owned extension — and a VOICEMAIL BOX is owned through its `extensionId`. Recordings and CDR have
- * NO such link (`cdr-db` stores numbers and entity refs, no user id), so their `.own` grants are not
- * enforceable here and stay documented as gaps; see
+ * owned extension — and a VOICEMAIL BOX is owned through its `extensionId`. The CDR ledger has no
+ * such link of its own (`cdr-db` stores numbers and entity refs, no user id), so it is reached the
+ * long way round: {@link ownedExtensionParties} resolves the user's extensions to the two spellings
+ * the ledger DOES record — the number and the row id — and the CDR area matches on those. Recordings
+ * have no equivalent yet and stay documented as a gap; see
  * `apps/api/test/auth/permissionEnforcement.test.ts`.
  *
  * Every query runs inside `withTenantScope`, so RLS is the tenant filter and no `organization_id`
@@ -73,6 +82,32 @@ export async function ownedVoicemailBoxIds(
 			.from(voicemailBox)
 			.where(inArray(voicemailBox.extensionId, [...extensionIds]));
 		return rows.map((row) => row.id);
+	});
+}
+
+/**
+ * The user's extensions as the CDR ledger spells them: the row ids AND the numbers.
+ *
+ * One join and one scope, for the reason `ownedVoicemailBoxIds` gives: this runs on every
+ * self-scoped call-history read, and resolving the ids and the numbers separately would take two
+ * connections and two `set local role` round trips to read one row set.
+ *
+ * Disabled extensions are included deliberately. This answers "was this person a party to that
+ * call", which is a question about history — an extension disabled last week was still the one that
+ * answered last month, and dropping it would silently delete calls from their own record.
+ */
+export async function ownedExtensionParties(
+	database: PbxDatabaseClient,
+	organizationId: string,
+	userId: string,
+): Promise<{ readonly extensionIds: readonly string[]; readonly numbers: readonly string[] }> {
+	return await database.withTenantScope(organizationId, async (transaction) => {
+		const rows = await transaction
+			.select({ id: extension.id, number: extension.number })
+			.from(extensionUser)
+			.innerJoin(extension, eq(extension.id, extensionUser.extensionId))
+			.where(eq(extensionUser.userId, userId));
+		return { extensionIds: rows.map((row) => row.id), numbers: rows.map((row) => row.number) };
 	});
 }
 

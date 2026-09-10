@@ -258,6 +258,7 @@ export class EmergencyConsumer implements OnModuleInit, OnApplicationShutdown {
 			number: data.number,
 			...(data.callerNumber === undefined ? {} : { callerNumber: data.callerNumber }),
 			...(data.callerName === undefined ? {} : { callerName: data.callerName }),
+			...(data.deviceId === undefined ? {} : { deviceId: data.deviceId }),
 			...(data.elin === undefined ? {} : { elin: data.elin }),
 			...(data.emergencyAddressId === undefined
 				? {}
@@ -307,6 +308,7 @@ interface EmergencyEnvelope {
 		readonly number: string;
 		readonly callerNumber?: string;
 		readonly callerName?: string;
+		readonly deviceId?: string;
 		readonly elin?: string;
 		readonly emergencyAddressId?: string;
 		readonly trunkName?: string;
