@@ -1,0 +1,12 @@
+-- HAND-EDITED (comment only). `recordings` is NOT partitioned — see `recording-schema.ts` — so this
+-- is a single metadata-only ADD COLUMN, nullable and with no default, and cheap on any history.
+-- Contrast 20260812153651_cdr_auth_pin, whose statements recurse into every `call_legs` partition.
+--
+-- No index. The intervals are read only with the row that owns them, nothing joins or filters on
+-- them, and a GIN index over a column that is null on nearly every recording would cost every
+-- insert to serve a query nobody has asked for.
+--
+-- Nothing is backfilled, and nothing could be. `rpc.media.v1.pause-recording` did not exist before
+-- this deploy, so no recording that predates it was ever paused. Null therefore means "nobody
+-- paused this", which is the honest shape of the data rather than a gap in it.
+ALTER TABLE "recordings" ADD COLUMN "pauses" jsonb;

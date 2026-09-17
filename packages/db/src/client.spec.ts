@@ -63,4 +63,16 @@ describe("resolvePostgresRuntimeGuardrails", () => {
 		expect(guardrails.promisePoolMaxConnections).toBe(2);
 		expect(guardrails.statementTimeoutMs).toBe(1_000);
 	});
+
+	it("keeps a zero timeout, which is how the migrator disables both guardrails", () => {
+		const guardrails = resolvePostgresRuntimeGuardrails({
+			url: "postgresql://localhost:5432/optimiq_voice",
+			applicationName: "optimiq-voice-migrator",
+			statementTimeoutMs: 0,
+			idleInTransactionSessionTimeoutMs: 0,
+		});
+
+		expect(guardrails.statementTimeoutMs).toBe(0);
+		expect(guardrails.idleInTransactionSessionTimeoutMs).toBe(0);
+	});
 });

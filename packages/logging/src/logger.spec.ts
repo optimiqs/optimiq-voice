@@ -1,5 +1,13 @@
 import { beforeEach, describe, expect, it } from "bun:test";
-import { AppLogger, getLogger, getPinoLogger, type PinoLogger, setPinoLogger } from "./logger";
+import { Writable } from "node:stream";
+import {
+	AppLogger,
+	createPinoLogger,
+	getLogger,
+	getPinoLogger,
+	type PinoLogger,
+	setPinoLogger,
+} from "./logger";
 
 interface CapturedLine {
 	level: string;
@@ -127,5 +135,46 @@ describe("getLogger", () => {
 		setPinoLogger(installed);
 
 		expect(getPinoLogger()).toBe(installed);
+	});
+});
+
+describe("createPinoLogger", () => {
+	/** Captures the NDJSON a real pino instance writes, so the hook itself is under test. */
+	function makeCapturingPino(): { logger: PinoLogger; lines: Record<string, unknown>[] } {
+		const lines: Record<string, unknown>[] = [];
+		const destination = new Writable({
+			write(chunk: Buffer, _encoding, callback) {
+				for (const line of chunk.toString().split("\n").filter(Boolean)) {
+					lines.push(JSON.parse(line) as Record<string, unknown>);
+				}
+				callback();
+			},
+		});
+
+		return { logger: createPinoLogger({ level: "trace" }, destination), lines };
+	}
+
+	it("redacts fields and messages written straight to the pino instance", () => {
+		const { logger, lines } = makeCapturingPino();
+
+		logger.error(
+			{ dsn: "postgres://svc:hunter2@db.internal:5432/app", sessionId: "sess-1" },
+			"call from +14155552671 failed",
+		);
+
+		expect(lines).toHaveLength(1);
+		const line = lines[0] as { dsn: string; sessionId: string; msg: string };
+		expect(line.dsn).toBe("postgres://svc:<REDACTED>@db.internal:5432/app");
+		// A correlation key survives; the secret and the E.164 do not.
+		expect(line.sessionId).toBe("sess-1");
+		expect(line.msg).toBe("call from [REDACTED-PHONE] failed");
+	});
+
+	it("blanks sensitive keys nested in a raw pino payload", () => {
+		const { logger, lines } = makeCapturingPino();
+
+		logger.info({ headers: { authorization: "Bearer abc123" } }, "upstream call");
+
+		expect(lines[0]?.headers).toEqual({ authorization: "[REDACTED]" });
 	});
 });

@@ -16,9 +16,7 @@ import (
 
 var publicAddr = netipMustParseStatic("203.0.113.10")
 
-// Every allocate in this file carries the same tenant and call. mediad does not route on either —
-// they exist so a lifecycle event and a directory entry can be attributed — so one value is enough
-// for everything except the tests that are specifically about them.
+// Every allocate in this file carries the same tenant and call; mediad routes on neither.
 const (
 	testOrg  = "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
 	testCall = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c"
@@ -94,9 +92,8 @@ func TestAllocateDescribesTheSession(t *testing.T) {
 	}
 }
 
-// Idempotency is the whole reason the session id is caller-assigned. The control surface is NATS
-// request-reply, so a retry after a timeout is indistinguishable here from a fresh request; without
-// this, every timed-out allocate would leak a port.
+// Idempotency is why the session id is caller-assigned: on NATS request-reply a retry after a
+// timeout is indistinguishable from a fresh request, and would otherwise leak a port.
 func TestAllocateIsIdempotentBySessionID(t *testing.T) {
 	manager := newManager(t, 55200, 55219, 0, nil)
 
@@ -146,10 +143,8 @@ func TestConcurrentAllocateForOneIDYieldsOneSession(t *testing.T) {
 		mu    sync.Mutex
 		ports = map[int]bool{}
 	)
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 8 {
+		wg.Go(func() {
 			descriptor, err := manager.Allocate(rtp.AllocateOptions{SessionID: "racing-id", OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU, Inactive: false})
 			if err != nil {
 				return
@@ -157,7 +152,7 @@ func TestConcurrentAllocateForOneIDYieldsOneSession(t *testing.T) {
 			mu.Lock()
 			defer mu.Unlock()
 			ports[descriptor.RTPPort] = true
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -274,6 +269,31 @@ func TestReapIdleClosesSessionsWithNoTraffic(t *testing.T) {
 	}
 }
 
+func TestReapIdleCollectsARingingLegThatNeverHeardAnything(t *testing.T) {
+	// A ringing leg is answered `inactive`, so the allocate sets both mute gates. The gates say
+	// "silence is expected here", not "never reap this", or a crashed engine leaks the port pair.
+	now := time.Now()
+	manager := newManager(t, 55940, 55959, 30*time.Second, func() time.Time { return now })
+
+	if _, err := manager.Allocate(rtp.AllocateOptions{
+		SessionID: "ringing", OrgID: testOrg, CallID: testCall,
+		AudioPayloadType: rtp.PayloadTypePCMU, Inactive: true, MuteIn: true, MuteOut: true,
+	}); err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	now = now.Add(20 * time.Second)
+	if reaped := manager.ReapIdle(); reaped != 0 {
+		t.Errorf("reaped %d sessions before the idle deadline", reaped)
+	}
+	now = now.Add(20 * time.Second)
+	if reaped := manager.ReapIdle(); reaped != 1 {
+		t.Fatalf("reaped %d abandoned ringing legs, want 1: the port pair is leaked otherwise", reaped)
+	}
+	if manager.Len() != 0 {
+		t.Errorf("Len() = %d after reaping, want 0", manager.Len())
+	}
+}
+
 func TestReapIdleIsDisabledByAZeroTimeout(t *testing.T) {
 	now := time.Now()
 	manager := newManager(t, 56000, 56019, 0, func() time.Time { return now })
@@ -362,7 +382,7 @@ func TestDrainClosesEverythingAndRefusesNewAllocations(t *testing.T) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
+	ctx, cancel := context.WithTimeout(t.Context(), readTimeout)
 	defer cancel()
 	if err := manager.Drain(ctx); err != nil {
 		t.Fatalf("Drain: %v", err)
@@ -381,6 +401,40 @@ func TestDrainClosesEverythingAndRefusesNewAllocations(t *testing.T) {
 	if err := manager.Drain(ctx); err != nil {
 		t.Errorf("the second Drain returned %v", err)
 	}
+}
+
+func TestDrainReleasesEveryPortEvenPastItsDeadline(t *testing.T) {
+	// Recorders finalising onto a wedged mount must not hold the drain past its deadline, and no
+	// socket may be left open behind it.
+	allocator, err := rtp.NewAllocator(loopback, 56340, 56379)
+	if err != nil {
+		t.Fatalf("NewAllocator: %v", err)
+	}
+	manager, err := rtp.NewManager(rtp.ManagerOptions{
+		Allocator:  allocator,
+		PublicAddr: publicAddr,
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	for _, id := range []string{"a", "b", "c", "d", "e"} {
+		if _, err := manager.Allocate(rtp.AllocateOptions{
+			SessionID: id, OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU,
+		}); err != nil {
+			t.Fatalf("Allocate %q: %v", id, err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the deadline has already landed when the drain starts
+	if err := manager.Drain(ctx); err == nil {
+		t.Error("Drain past its deadline reported success")
+	}
+	if manager.Len() != 0 {
+		t.Errorf("Len() = %d after a drain, want 0", manager.Len())
+	}
+	waitFor(t, "every port pair to come back", func() bool { return allocator.InUse() == 0 })
 }
 
 func netipMustParseStatic(raw string) netip.Addr {

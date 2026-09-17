@@ -149,9 +149,7 @@ export function MohClassesPanel() {
 				rowActions={(row) => (
 					<RowActions
 						label={`hold music class ${row.name}`}
-						extra={
-							canRead ? <MenuItem onClick={() => setFilesFor(row)}>Files…</MenuItem> : null
-						}
+						extra={canRead ? <MenuItem onClick={() => setFilesFor(row)}>Files…</MenuItem> : null}
 						onEdit={
 							canWrite
 								? () => {

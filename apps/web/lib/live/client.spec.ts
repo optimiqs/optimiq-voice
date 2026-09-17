@@ -14,6 +14,10 @@ interface Harness {
 	readonly sockets: FakeSocket[];
 	readonly latest: () => FakeSocket;
 	readonly runTimers: () => void;
+	/** Runs only the timers armed with `ms`, so the watchdog can be fired without the reconnect. */
+	readonly runTimersOfDelay: (ms: number) => void;
+	/** How many timers armed with `ms` are outstanding. */
+	readonly timersOfDelay: (ms: number) => number;
 }
 
 class FakeSocket implements LiveSocket {
@@ -57,7 +61,8 @@ class FakeSocket implements LiveSocket {
 
 function harness(): Harness {
 	const sockets: FakeSocket[] = [];
-	const timers: (() => void)[] = [];
+	const timers = new Map<number, { readonly run: () => void; readonly ms: number }>();
+	let nextHandle = 0;
 	const client = new LiveClient({
 		origin: "http://localhost:3100",
 		createSocket: () => {
@@ -65,11 +70,14 @@ function harness(): Harness {
 			sockets.push(socket);
 			return socket;
 		},
-		setTimeoutFn: (handler) => {
-			timers.push(handler);
-			return timers.length;
+		setTimeoutFn: (handler, ms) => {
+			nextHandle += 1;
+			timers.set(nextHandle, { run: handler, ms });
+			return nextHandle;
 		},
-		clearTimeoutFn: () => undefined,
+		clearTimeoutFn: (handle) => {
+			timers.delete(handle);
+		},
 		random: () => 0.5,
 	});
 	return {
@@ -77,10 +85,20 @@ function harness(): Harness {
 		sockets,
 		latest: () => sockets[sockets.length - 1] as FakeSocket,
 		runTimers: () => {
-			const pending = [...timers];
-			timers.length = 0;
-			for (const run of pending) {
-				run();
+			const pending = [...timers.values()];
+			timers.clear();
+			for (const timer of pending) {
+				timer.run();
+			}
+		},
+		timersOfDelay: (ms) => [...timers.values()].filter((timer) => timer.ms === ms).length,
+		runTimersOfDelay: (ms) => {
+			const pending = [...timers.entries()].filter(([, timer]) => timer.ms === ms);
+			for (const [handle] of pending) {
+				timers.delete(handle);
+			}
+			for (const [, timer] of pending) {
+				timer.run();
 			}
 		},
 	};
@@ -169,7 +187,12 @@ describe("LiveClient", () => {
 		h.latest().open();
 		release();
 		release();
-		expect(h.latest().ops().filter((op) => op === "unsubscribe")).toHaveLength(1);
+		expect(
+			h
+				.latest()
+				.ops()
+				.filter((op) => op === "unsubscribe"),
+		).toHaveLength(1);
 	});
 
 	it("routes a snapshot to the topic that asked for it, and to nobody else", () => {
@@ -188,7 +211,8 @@ describe("LiveClient", () => {
 		const h = harness();
 		const seen: { key?: string; kind: string }[] = [];
 		h.client.subscribe("registrations", {
-			onUpdate: (event) => seen.push({ kind: event.kind, ...(event.key === undefined ? {} : { key: event.key }) }),
+			onUpdate: (event) =>
+				seen.push({ kind: event.kind, ...(event.key === undefined ? {} : { key: event.key }) }),
 		});
 		h.latest().open();
 		h.latest().deliver({
@@ -236,6 +260,117 @@ describe("LiveClient", () => {
 		h.latest().open();
 		expect(() => h.latest().deliver({ op: "telemetry", value: 1 })).not.toThrow();
 		expect(() => h.latest().onmessage?.call(null, { data: "not json" })).not.toThrow();
+	});
+
+	/**
+	 * The N² this replaces: a wallboard's N tiles on one topic used to send N subscribes, and the
+	 * server's N whole-bucket answers were each fanned out to all N handlers.
+	 */
+	it("replays the held snapshot to a late lease instead of re-subscribing", () => {
+		const h = harness();
+		const first: unknown[] = [];
+		h.client.subscribe("agent-state", { onSnapshot: (event) => first.push(event) });
+		h.latest().open();
+		h.latest().deliver({ op: "snapshot", topic: "agent-state", at: "t", data: [] });
+		h.latest().sent.length = 0;
+
+		const second: unknown[] = [];
+		h.client.subscribe("agent-state", { onSnapshot: (event) => second.push(event) });
+		expect(second).toHaveLength(1);
+		expect(first).toHaveLength(1);
+		expect(h.latest().ops()).not.toContain("subscribe");
+	});
+
+	/** With no snapshot yet there is nothing to replay, so the server still has to be asked. */
+	it("still subscribes for a late lease when no snapshot has arrived", () => {
+		const h = harness();
+		h.client.subscribe("agent-state", {});
+		h.latest().open();
+		h.latest().sent.length = 0;
+		h.client.subscribe("agent-state", {});
+		expect(h.latest().ops()).toContain("subscribe");
+	});
+
+	/** A snapshot from before a reconnect describes the gap, not the present. */
+	it("does not replay a snapshot held from before a reconnect", () => {
+		const h = harness();
+		h.client.subscribe("agent-state", {});
+		h.latest().open();
+		h.latest().deliver({ op: "snapshot", topic: "agent-state", at: "t", data: [] });
+		h.latest().remoteClose(1006);
+		h.runTimers();
+		h.latest().open();
+		h.latest().sent.length = 0;
+
+		const late: unknown[] = [];
+		h.client.subscribe("agent-state", { onSnapshot: (event) => late.push(event) });
+		expect(late).toHaveLength(0);
+		expect(h.latest().ops()).toContain("subscribe");
+	});
+
+	/**
+	 * A half-open socket — a slept laptop, a proxy idle timeout — never fires `onclose`, so without
+	 * a watchdog the screen freezes on stale data while still calling itself live.
+	 */
+	it("closes a silent socket so the reconnect path runs", () => {
+		const h = harness();
+		h.client.subscribe("registrations", {});
+		h.latest().open();
+		h.runTimersOfDelay(50_000);
+		expect(h.sockets[0]?.closed).toBe(true);
+	});
+
+	/** Every frame RESETS the watchdog rather than stacking another one behind it. */
+	it("arms exactly one watchdog however many frames arrive", () => {
+		const h = harness();
+		h.client.subscribe("registrations", {});
+		h.latest().open();
+		h.latest().deliver({ op: "pong" });
+		h.latest().deliver({ op: "pong" });
+		expect(h.timersOfDelay(50_000)).toBe(1);
+	});
+
+	/** A closed socket has nothing to watch; a timer left armed would close its successor. */
+	it("disarms the watchdog once the socket is gone", () => {
+		const h = harness();
+		const release = h.client.subscribe("registrations", {});
+		h.latest().open();
+		release();
+		expect(h.timersOfDelay(50_000)).toBe(0);
+	});
+
+	/**
+	 * `connect()` is the escape hatch out of a loop the lazy socket created: a screen may not
+	 * subscribe until the `welcome` frame says what it may watch, and the welcome only arrives on an
+	 * open socket. A caller that wants the handshake without a lease must therefore be able to open
+	 * one, and the welcome must reach it — see `app/(app)/_context/live-context.tsx`.
+	 */
+	it("opens a socket and delivers the welcome for a caller that holds no lease", () => {
+		const h = harness();
+		const kinds: string[][] = [];
+		h.client.onWelcome((topics) => kinds.push([...topics]));
+		h.client.connect();
+		expect(h.sockets).toHaveLength(1);
+		h.latest().open();
+		expect(h.latest().ops()).toEqual([]);
+		h.latest().deliver({
+			op: "welcome",
+			orgId: "org",
+			topics: ["queue", "agent-state"],
+			heartbeatMs: 25_000,
+			at: "t",
+		});
+		expect(kinds).toEqual([["queue", "agent-state"]]);
+		expect(h.client.allowedTopicKinds).toEqual(["queue", "agent-state"]);
+	});
+
+	it("reuses the socket a lease-less connect opened when a lease is then taken", () => {
+		const h = harness();
+		h.client.connect();
+		h.latest().open();
+		h.client.subscribe("registrations", {});
+		expect(h.sockets).toHaveLength(1);
+		expect(h.latest().ops()).toEqual(["subscribe"]);
 	});
 
 	it("closes everything on destroy and does not reconnect afterwards", () => {

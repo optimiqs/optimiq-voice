@@ -3,7 +3,9 @@
 import { Badge } from "~/components/ui/badge";
 import { Spinner } from "~/components/ui/spinner";
 import {
+	attestationLevelLabel,
 	buildCallTree,
+	callerIdRightToUseLabel,
 	destinationTypeLabel,
 	dispositionLabel,
 	dispositionTone,
@@ -14,9 +16,10 @@ import {
 	hangupCauseTone,
 	recordingsForLeg,
 } from "~/lib/cdr/format";
+import { orderedCallAnswers } from "~/lib/cdr/queue-survey";
 import { useCdrCall } from "../../_hooks/use-cdr-queries";
 import { RecordingPlayer } from "../../recordings/_components/recording-player";
-import type { CallLegRow } from "~/lib/cdr/contracts";
+import type { CallLegRow, QueueSurveyCallAnswer } from "~/lib/cdr/contracts";
 
 /**
  * Every leg of one call, drawn as the tree it is.
@@ -73,6 +76,38 @@ export function CallDetail({
 					/>
 				))}
 			</ol>
+
+			<CallSurvey answers={call.data.survey} />
+		</div>
+	);
+}
+
+/**
+ * What the caller said about this call once the agent had gone.
+ *
+ * Renders NOTHING at all for a call with no answers, which is almost every call: a survey is asked
+ * only after an answered queue call on a queue that has one, and an empty "Survey" heading under
+ * every internal transfer would be noise on the screen people use to investigate a single call.
+ *
+ * The answers arrive on the call envelope, joined by the server from the PBX database by call id —
+ * there is no statement that can name both databases, which is why this is a field on the response
+ * rather than a second request the page would have to sequence.
+ */
+function CallSurvey({ answers }: { readonly answers: readonly QueueSurveyCallAnswer[] }) {
+	if (answers.length === 0) {
+		return null;
+	}
+	return (
+		<div className="flex flex-col gap-1 border-t border-border pt-3">
+			<p className="text-xs font-medium text-muted-foreground">Post-call survey</p>
+			<ol className="flex flex-col gap-1">
+				{orderedCallAnswers(answers).map((answer) => (
+					<li key={answer.questionId} className="flex items-baseline gap-2 text-xs">
+						<span className="text-muted-foreground">{answer.label}</span>
+						<span className="font-medium tabular-nums text-foreground">{answer.answer} / 5</span>
+					</li>
+				))}
+			</ol>
 		</div>
 	);
 }
@@ -119,6 +154,60 @@ function CallLegLine({
 				 * true thing in the pair.
 				 */}
 				<Detail label="Cause code" value={String(leg.hangupCauseCode)} />
+				{/*
+				 * The authorisation code that let this leg dial out, when one was demanded.
+				 *
+				 * `== null` and not a truthiness test: ordinal `0` is the FIRST code in a PIN set, and a
+				 * falsy check would hide the one leg most likely to be somebody's shared front-desk code.
+				 * It also covers the two absences at once — a leg where no code was demanded, and a leg
+				 * read through a projection that does not carry the columns yet. See `CallLegRow`.
+				 *
+				 * The label may legitimately be null while the ordinal is not: an entry in a PIN set need
+				 * not be named. "Authorised by code 3" is still the whole of what was recorded, and is
+				 * enough to find the entry in the set.
+				 */}
+				{leg.authPinOrdinal == null ? null : (
+					<Detail
+						label="Authorised by"
+						value={
+							leg.authPinLabel == null
+								? `code ${String(leg.authPinOrdinal)}`
+								: `code ${String(leg.authPinOrdinal)} (${leg.authPinLabel})`
+						}
+					/>
+				)}
+				{/*
+				 * STIR/SHAKEN, in two groups that must never read as one.
+				 *
+				 * The labels do the separating, because nothing else can: "Carrier claimed" and "We
+				 * attested" are the same letter from two different parties, and a `<dl>` that showed
+				 * both as "Attestation" would let somebody answer a traceback with the carrier's
+				 * opinion of an inbound call and believe they were quoting their own records.
+				 *
+				 * Every one is `== null` guarded, which covers the two absences at once — a leg where
+				 * nothing was signed, and a leg read through a projection that does not carry the
+				 * columns yet. See the field docs on `CallLegRow` for why they are optional.
+				 *
+				 * The levels are written as letter AND words: the letter is what the paperwork says,
+				 * and the words are the only part a person reading a dispute can act on.
+				 */}
+				{leg.sipAttestation == null ? null : (
+					<Detail label="Carrier claimed" value={attestationLevelLabel(leg.sipAttestation)} />
+				)}
+				{leg.sipVerstat == null ? null : (
+					<Detail label="Carrier verification" value={leg.sipVerstat} />
+				)}
+				{leg.sipOrigId == null ? null : <Detail label="Originating ID" value={leg.sipOrigId} />}
+				{leg.expectedAttestation == null ? null : (
+					<Detail label="We attested" value={attestationLevelLabel(leg.expectedAttestation)} />
+				)}
+				{leg.callerIdRightToUse == null ? null : (
+					<Detail label="On the basis of" value={callerIdRightToUseLabel(leg.callerIdRightToUse)} />
+				)}
+				{leg.trunkRef == null ? null : <Detail label="Trunk" value={leg.trunkRef} />}
+				{leg.signalingAddress == null ? null : (
+					<Detail label="Signalling from" value={leg.signalingAddress} />
+				)}
 			</dl>
 
 			{recordings.length > 0 ? (

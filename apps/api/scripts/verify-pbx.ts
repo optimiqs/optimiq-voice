@@ -1175,6 +1175,130 @@ async function main(): Promise<void> {
 			String(data(simulateQueue).destinationType),
 		);
 
+		// --- 6g. paging groups ----------------------------------------------------------------------
+		console.log("\n6g. paging groups, their members and the *81 that pins one");
+		const pagingGroup = await clientA("POST", "/api/v1/paging-groups", {
+			name: "Warehouse",
+			extensionNumber: "8100",
+			duplex: false,
+			timeoutSeconds: 20,
+		});
+		const pagingGroupId = id(pagingGroup);
+		check("create paging group -> 201", pagingGroup.status === 201, `status ${pagingGroup.status}`);
+
+		const pagingTrio = await clientA("POST", "/api/v1/paging-groups", {
+			name: "Nowhere",
+			timeoutDestinationType: "voicemail",
+			timeoutDestinationRef: mailboxId,
+		});
+		check(
+			"a paging group refuses a timeout destination — a page ends when the pager hangs up",
+			pagingTrio.status === 400,
+			`status ${pagingTrio.status}`,
+		);
+
+		const pagingMemberA = await clientA("POST", `/api/v1/paging-groups/${pagingGroupId}/members`, {
+			extensionId: extensionAId,
+			ordinal: 0,
+		});
+		check(
+			"add a paging member -> 201",
+			pagingMemberA.status === 201,
+			`status ${pagingMemberA.status}`,
+		);
+		const pagingMemberB = await clientA("POST", `/api/v1/paging-groups/${pagingGroupId}/members`, {
+			extensionId: extensionBId,
+			ordinal: 1,
+		});
+		check(
+			"a second handset joins at the next position",
+			pagingMemberB.status === 201,
+			`status ${pagingMemberB.status}`,
+		);
+		const duplicateMember = await clientA(
+			"POST",
+			`/api/v1/paging-groups/${pagingGroupId}/members`,
+			{ extensionId: extensionAId, ordinal: 2 },
+		);
+		check(
+			"the same desk cannot be paged twice by one announcement",
+			duplicateMember.status === 409,
+			`status ${duplicateMember.status}`,
+		);
+
+		const pagingMembers = await clientA("GET", `/api/v1/paging-groups/${pagingGroupId}/members`);
+		const pagingMemberIds = rows(pagingMembers).map((row) => String(row.id));
+		check(
+			"the member list returns both, in fan-out order",
+			pagingMemberIds.length === 2 && rows(pagingMembers)[0]?.ordinal === 0,
+			`${pagingMemberIds.length} row(s)`,
+		);
+		const pagingReorder = await clientA(
+			"PUT",
+			`/api/v1/paging-groups/${pagingGroupId}/members/reorder`,
+			{ ids: [...pagingMemberIds].reverse() },
+		);
+		check(
+			"reorder rewrites the fan-out order in one transaction",
+			pagingReorder.status === 200 &&
+				rows(pagingReorder)
+					.map((row) => String(row.id))
+					.join(",") === [...pagingMemberIds].reverse().join(","),
+			`status ${pagingReorder.status}`,
+		);
+
+		const pagingOption = await clientA("POST", `/api/v1/ivr-menus/${ivrId}/options`, {
+			ordinal: 6,
+			matchValue: "6",
+			label: "Warehouse page",
+			destinationType: "paging-group",
+			destinationRef: pagingGroupId,
+		});
+		check(
+			"an IVR option may send a caller into an announcement",
+			pagingOption.status === 201,
+			`status ${pagingOption.status}`,
+		);
+
+		const pagingCode = await clientA("POST", "/api/v1/feature-codes", {
+			code: "*81",
+			action: "paging",
+			params: { groupId: pagingGroupId },
+		});
+		check(
+			"a paging code may pin a group — the second parameter the compiler reads",
+			pagingCode.status === 201,
+			`status ${pagingCode.status}`,
+		);
+		const intercomParam = await clientA("POST", "/api/v1/feature-codes", {
+			code: "*80",
+			action: "intercom",
+			params: { groupId: pagingGroupId },
+		});
+		check(
+			"intercom takes no stored target — its argument is dialled after the code",
+			intercomParam.status === 400,
+			`status ${intercomParam.status}`,
+		);
+
+		const deleteBusyGroup = await clientA("DELETE", `/api/v1/paging-groups/${pagingGroupId}`);
+		check(
+			"deleting a group a feature code pins is 409, naming the JSONB path no foreign key covers",
+			deleteBusyGroup.status === 409 &&
+				references(deleteBusyGroup).some((entry) => entry.field === "params.groupId"),
+			`status ${deleteBusyGroup.status} ${JSON.stringify(references(deleteBusyGroup))}`,
+		);
+
+		const crossPagingMembers = await clientB(
+			"GET",
+			`/api/v1/paging-groups/${pagingGroupId}/members`,
+		);
+		check(
+			"B cannot list A's paging members",
+			crossPagingMembers.status === 404,
+			`status ${crossPagingMembers.status}`,
+		);
+
 		// --- 7. referenced deletes ------------------------------------------------------------------
 		console.log("\n7. deletes that would leave a dangling pointer");
 		const deleteRingGroup = await clientA("DELETE", `/api/v1/ring-groups/${ringGroupId}`);

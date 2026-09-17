@@ -14,6 +14,8 @@ import {
 	sql,
 } from "@optimiq-voice/cdr-db";
 import { decodeCdrCursor } from "./cdr-cursor";
+import { ownPartyFilter } from "./cdr-self-scope";
+import type { OwnedParties } from "./cdr-self-scope";
 import type { CdrListQuery, RecordingListQuery, ResolvedTimeRange } from "./cdr.dto";
 import type { CdrDatabaseTransaction, SQL } from "@optimiq-voice/cdr-db";
 
@@ -60,6 +62,18 @@ const LEG_LIST_COLUMNS = {
 	disposition: callLegs.disposition,
 	recordingKey: callLegs.recordingKey,
 	transcriptionStatus: callLegs.transcriptionStatus,
+	// On the LIST and not only the detail, unlike the PIN: "which of these calls was attested" is a
+	// question asked ACROSS a page of calls — a screening review scans for the failures — where
+	// "who authorised this one" is asked about a call somebody already opened. Three narrow columns
+	// on a page of 25 is not the `raw` blob the list exists to keep out.
+	sipAttestation: callLegs.sipAttestation,
+	sipVerstat: callLegs.sipVerstat,
+	sipOrigId: callLegs.sipOrigId,
+	// And ours, on the same argument and with more force. The three above are what a CARRIER said
+	// about a call that arrived; these two are what this platform DECIDED about a call it sent, and
+	// "which of our outbound calls went out as C" is the screening review, not a footnote to one.
+	expectedAttestation: callLegs.expectedAttestation,
+	callerIdRightToUse: callLegs.callerIdRightToUse,
 } as const;
 
 /** The detail view adds the media-quality block and the passthrough jsonb. */
@@ -79,6 +93,16 @@ const LEG_DETAIL_COLUMNS = {
 	mos: callLegs.mos,
 	jitterMs: callLegs.jitterMs,
 	packetLossPct: callLegs.packetLossPct,
+	// The outbound PIN that authorised this leg, ordinal and label only — the digits stop at the
+	// walker. Denormalised (there is no `pin_set` in this database to join), so the label is the
+	// name as it stood when the call was placed and a later rename does not rewrite history.
+	authPinOrdinal: callLegs.authPinOrdinal,
+	authPinLabel: callLegs.authPinLabel,
+	// Detail and not list, unlike the attestation pair above: a trunk id and a peer address are what
+	// somebody answering a traceback needs about ONE call they have already found, and neither is a
+	// value anybody scans a page for.
+	trunkRef: callLegs.trunkRef,
+	signalingAddress: callLegs.signalingAddress,
 	raw: callLegs.raw,
 	createdAt: callLegs.createdAt,
 } as const;
@@ -180,8 +204,15 @@ export async function listCallLegs(
 	transaction: CdrDatabaseTransaction,
 	query: CdrListQuery,
 	range: ResolvedTimeRange,
+	owned?: OwnedParties,
 ): Promise<LegPage> {
 	const filters = legFilters(query, range);
+	if (owned !== undefined) {
+		// `cdr.read.own`. Additive, and it survives every other filter — an `extension` query
+		// parameter naming somebody else's number now intersects with this to nothing rather than
+		// reaching their calls.
+		filters.push(ownPartyFilter(owned));
+	}
 	if (query.cursor !== undefined) {
 		const cursor = decodeCdrCursor(query.cursor);
 		filters.push(keysetBefore(cursor.startedAt, cursor.id));
@@ -207,9 +238,16 @@ export async function listCallLegs(
 export async function getCallLeg(
 	transaction: CdrDatabaseTransaction,
 	id: string,
-	options: { readonly startedAt?: Date; readonly range: ResolvedTimeRange },
+	options: {
+		readonly startedAt?: Date;
+		readonly range: ResolvedTimeRange;
+		readonly owned?: OwnedParties;
+	},
 ): Promise<CallLegDetailRow | undefined> {
 	const filters: SQL[] = [eq(callLegs.id, id) as SQL];
+	if (options.owned !== undefined) {
+		filters.push(ownPartyFilter(options.owned));
+	}
 	if (options.startedAt === undefined) {
 		filters.push(gte(callLegs.startedAt, options.range.from) as SQL);
 		filters.push(lte(callLegs.startedAt, options.range.to) as SQL);

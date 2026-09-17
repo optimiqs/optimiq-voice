@@ -8,34 +8,25 @@ import (
 	"net/netip"
 	"sync"
 	"time"
+
+	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 )
 
-// ErrClosed is returned by Allocate after the manager has begun draining.
-//
-// Distinct from ErrPortsExhausted: exhaustion means "try again later or try another instance",
-// shutting down means "this instance is going away, do not retry here". The engine routes those
-// two refusals differently.
+// ErrClosed is returned by Allocate after the manager has begun draining. Distinct from
+// ErrPortsExhausted, which means "retry"; this one means "do not retry here".
 var ErrClosed = errors.New("rtp: the session manager is shutting down")
 
-// ErrUnknownSession is returned by the commands that address an existing session.
-//
-// Distinct from every other failure because the engine's recovery is different: exhaustion means
-// "retry", shutting down means "retry elsewhere", and this one means "your picture of this call is
-// wrong". The control surface turns it into `unknown_session`, and the session directory is what
-// lets the engine tell that from "the session is on my neighbour".
+// ErrUnknownSession is returned by the commands that address an existing session. The control
+// surface turns it into `unknown_session`: the caller's picture of the call is wrong.
 var ErrUnknownSession = errors.New("rtp: no such session on this instance")
 
-// ErrCodecMismatch is returned when two sessions cannot be bridged because their answers settled
-// on different G.711 variants.
+// ErrCodecMismatch is an alias kept for callers that predate transcoding.
 //
-// This is the design doc §7 rule enforced at the one place it becomes visible: v1 is PASSTHROUGH,
-// so relaying µ-law bytes to a leg expecting A-law would deliver audible noise. Refusing is the
-// correct answer and Asterisk keeps serving that call — resampling here is what rung 7 is for.
-var ErrCodecMismatch = errors.New("rtp: the two sessions negotiated different codecs, and v1 does not transcode")
+// Deprecated: a codec mismatch is now translated. Branch on ErrCannotTranscode.
+var ErrCodecMismatch = ErrCannotTranscode
 
-// Descriptor is what a caller needs to tell a far end where to send its media. It is the reply
-// body of an allocate, expressed in the packet path's own vocabulary so the control package can
-// translate it to the wire without reaching into a Session.
+// Descriptor is what a caller needs to tell a far end where to send its media: the reply body of an
+// allocate, so the control package never reaches into a Session.
 type Descriptor struct {
 	SessionID                 string
 	Address                   netip.Addr
@@ -44,28 +35,36 @@ type Descriptor struct {
 	SSRC                      uint32
 	Mode                      Mode
 	AudioPayloadType          uint8
+	Format                    audio.Format
 	TelephoneEventPayloadType uint8
 }
 
 // AllocateOptions is everything the control surface has decided about a new session.
-//
-// A struct rather than a parameter list because it has grown past the point where a reader at a
-// call site can tell which string is which, and because the next rung adds fields to it rather than
-// arguments to every caller.
 type AllocateOptions struct {
+	Transport PacketTransport
+	// SRTP is the negotiated SDES context for a SIP leg, or nil for plain RTP.
+	SRTP *SRTPContext
 	// SessionID is caller-assigned and required. See the note on Allocate.
 	SessionID string
-	// OrgID, CallID and LegID travel to the session directory and the lifecycle events. mediad
-	// does not route on any of them.
+	// OrgID, CallID and LegID travel to the session directory and the lifecycle events; mediad
+	// routes on none of them.
 	OrgID  string
 	CallID string
 	LegID  string
-	// AudioPayloadType is the G.711 type the SDP answer settled on.
+	// AudioPayloadType is the audio payload type the SDP answer settled on.
 	AudioPayloadType uint8
+	// Format is the codec that payload type carries; a number alone does not name one (Opus is
+	// dynamic).
+	Format audio.Format
 	// TelephoneEventPayloadType is the RFC 4733 type the answer settled on, or 0 for none.
 	TelephoneEventPayloadType uint8
-	// Inactive puts the session in ModeInactive — a leg that is ringing but not yet talking.
+	// Inactive raises both direction gates at bind time — a leg that is ringing but not yet talking.
+	// The gates are the source of truth; Session.Mode is derived from them.
 	Inactive bool
+	// MuteIn and MuteOut are the media-plane half of a non-sendrecv answer direction. They arrive on
+	// the allocate so the gate is up before the first packet after a renegotiation.
+	MuteIn  bool
+	MuteOut bool
 }
 
 // EndReason is why a session stopped existing. The values match the wire contract's
@@ -84,38 +83,25 @@ const (
 	EndReasonDrained EndReason = "drained"
 )
 
-// Lifecycle is how the packet path tells the outside world a session changed state.
-//
-// An interface, and one the Manager calls SYNCHRONOUSLY but from a goroutine it owns, so that the
-// packet path never blocks on a NATS publish or a KV write. The control package supplies the real
-// implementation; tests supply a recorder; a Manager with none is a Manager that just does not
-// announce anything, which is what every packet-path unit test wants.
+// Lifecycle is how the packet path tells the outside world a session changed state. The Manager
+// calls it synchronously but from a goroutine it owns, so the packet path never blocks on a publish.
+// A Manager with no Lifecycle simply announces nothing.
 type Lifecycle interface {
 	// SessionEnded is called exactly once per session, after its sockets are closed.
 	SessionEnded(session SessionSummary, reason EndReason)
 	// RTPTimedOut is called before the SessionEnded that follows it, and only for that reason.
 	RTPTimedOut(session SessionSummary, silentFor time.Duration)
-	// PlaybackFinished is called exactly once per started playback, however it ended.
-	//
-	// Including when the SESSION ended under it, which is why the summary is passed rather than
-	// looked up: by the time this runs the session may already be closed and out of the map. On
-	// that path the ordering against SessionEnded is not guaranteed and does not need to be — both
-	// carry the session id, and a consumer asking "did the prompt play" is reading `playedMs`, not
-	// inferring it from arrival order.
+	// PlaybackFinished is called exactly once per started playback, however it ended — including
+	// when the SESSION ended under it, which is why the summary is passed rather than looked up.
+	// Its ordering against SessionEnded is NOT guaranteed.
 	PlaybackFinished(session SessionSummary, playback PlaybackSummary)
-	// DtmfReceived is called once per detected KEYPRESS, never once per RFC 4733 packet.
-	//
-	// It fires whether or not the session is bridged — a leg collecting a PIN has no peer — and it
-	// does not stop the packet being relayed to one that does. Called from the session's read
-	// goroutine, so an implementation must not block on anything slower than a channel send.
+	// DtmfReceived is called once per detected KEYPRESS, never once per RFC 4733 packet, and
+	// whether or not the session is bridged. Called from the session's read goroutine, so an
+	// implementation MUST NOT block on anything slower than a channel send.
 	DtmfReceived(session SessionSummary, digit DtmfDigit)
-	// RecordingFinished is called exactly once per started recording, after the file is on disk.
-	//
-	// Unlike PlaybackFinished, the ordering here IS guaranteed: when a session ends under a live
-	// recording this runs BEFORE the SessionEnded that follows it, because the engine tears the leg
-	// down on `session.ended` and a consumer that had already moved on would never learn the file
-	// existed. It is also announced only after the WAV has been finalised and renamed, since the
-	// whole point of the event is that the bytes are safe to read.
+	// RecordingFinished is called exactly once per started recording, after the file is finalised
+	// and renamed. Unlike PlaybackFinished its ordering IS guaranteed: it runs BEFORE the
+	// SessionEnded that follows, since consumers tear the leg down on that event.
 	RecordingFinished(session SessionSummary, recording RecordingSummary)
 }
 
@@ -130,13 +116,14 @@ type SessionSummary struct {
 	Stats      Stats
 	Duration   time.Duration
 	RemoteAddr string
+	// Quality is the RTCP view of the leg: jitter measured here, and loss, jitter and round-trip
+	// time as the far end reported them. It is on the summary only; the wire contract has no field
+	// for it yet.
+	Quality QualityStats
 }
 
 // Manager owns every live session: it allocates ports, runs each session's read loop, reaps idle
-// ones, and drains them all on shutdown.
-//
-// It is the only thing in mediad that knows how many calls are up, which makes it the natural
-// place for the capacity refusal and for the shutdown barrier.
+// ones, and drains them all on shutdown. It is the only thing that knows how many calls are up.
 type Manager struct {
 	allocator *Allocator
 	public    netip.Addr
@@ -147,8 +134,7 @@ type Manager struct {
 
 	// rtpTimeout is the "audio stopped" window. Distinct from idleAfter — see ReapIdle.
 	rtpTimeout time.Duration
-	// echoDiagnostic makes a freshly allocated session echo instead of relay. Off in production;
-	// design doc open question 5.
+	// echoDiagnostic makes a freshly allocated session echo instead of relay. Off in production.
 	echoDiagnostic bool
 	lifecycle      Lifecycle
 	// ticker is handed to every session it creates. See ManagerOptions.Ticker.
@@ -156,27 +142,39 @@ type Manager struct {
 	// dtmfMaxDigit bounds one detected digit on every session it creates.
 	dtmfMaxDigit time.Duration
 
+	// negotiating owns the SDP/crypto exchange state per session id. Its lock is taken OUTSIDE mu.
+	negotiating negotiations
+
 	mu       sync.Mutex
 	sessions map[string]*Session
-	// bridges maps a caller-assigned bridge id to the two sessions relaying under it.
-	//
-	// Held HERE rather than on the sessions, even though each session already points at its peer,
-	// because unbridge addresses a bridge by id and a session pair cannot be looked up from one. The
-	// peer pointers are the packet path's view; this is the control surface's.
+	// bridges maps a caller-assigned bridge id to the two sessions relaying under it. The peer
+	// pointers are the packet path's view of the same fact; this one is addressable by id.
 	bridges map[string][2]string
-	// playbacks maps a playback reference to the session playing it.
-	//
-	// Held HERE and not only on the session because `rpc.media.v1.stop-playback` carries a
-	// reference and NOTHING ELSE — `MediaPort.stopPlayback(playbackRef)` has no channel id to give
-	// — so without this index a stop would have to scan every live session on the instance.
+	// playbacks maps a playback reference to the session playing it, because `stop-playback` carries
+	// a reference and nothing else.
 	playbacks map[string]string
-	// recordings maps a recording reference to the session being recorded, for the same reason
-	// `playbacks` exists: `rpc.media.v1.stop-recording` carries a reference and nothing else.
+	// recordings maps a recording reference to the session being recorded, for the same reason.
 	recordings map[string]string
-	closed     bool
+	// conferences maps a room id to the mix running under it. Deliberately separate from `bridges`:
+	// collapsing the two would put a jitter buffer and a codec round trip on every two-party call.
+	conferences map[string]*Conference
+	// taps maps a tap id to the room it joined, because `untap-session` carries a tap id only.
+	taps map[string]tapRecord
+
+	// The reverse indexes. Membership and removal are asked on nearly every command, and answering
+	// them by scanning bridges, rooms and taps made one call's control path cost grow with every
+	// unrelated call on the box. Each is written only where its forward map is written, under m.mu.
+	bridgeBySession     map[string]string
+	conferenceBySession map[string]string
+	// tapsBySession and tapsByConference serve the two tap removals that carry no tap id: a
+	// supervisor's own session leaving, and a room being destroyed under it.
+	tapsBySession    map[string]map[string]struct{}
+	tapsByConference map[string]map[string]struct{}
+
+	closed bool
 
 	// running tracks each session's read goroutine so Drain can wait for the packet path to stop
-	// before the process exits, rather than exiting with sockets still being read.
+	// before the process exits.
 	running sync.WaitGroup
 }
 
@@ -230,6 +228,13 @@ func NewManager(opts ManagerOptions) (*Manager, error) {
 		bridges:        make(map[string][2]string),
 		playbacks:      make(map[string]string),
 		recordings:     make(map[string]string),
+		conferences:    make(map[string]*Conference),
+		taps:           make(map[string]tapRecord),
+
+		bridgeBySession:     make(map[string]string),
+		conferenceBySession: make(map[string]string),
+		tapsBySession:       make(map[string]map[string]struct{}),
+		tapsByConference:    make(map[string]map[string]struct{}),
 	}
 	if manager.rtpTimeout <= 0 {
 		manager.rtpTimeout = opts.IdleAfter
@@ -245,18 +250,10 @@ func NewManager(opts ManagerOptions) (*Manager, error) {
 
 // Allocate creates a session, starts its read loop and returns its descriptor.
 //
-// # Idempotent by session id
-//
-// An allocate for an id that already has a session returns THAT session, and does not open a
-// second port. This is not a convenience: the control surface is NATS request-reply over an
-// unreliable transport, so the engine's retry after a timeout is indistinguishable at this layer
-// from a fresh request. Without idempotency every timed-out allocate would leak a port and the
-// engine would hold a descriptor pointing at the wrong one. With it, a retry is free and the reply
-// the engine finally receives is the truth.
-//
-// The mode of an existing session is NOT changed by a repeat allocate: a retry must not mutate a
-// live call. A genuine mode change is a separate operation, and arrives with the capability that
-// needs it.
+// IDEMPOTENT by session id: an allocate for an id that already has a session returns that session
+// and opens no second port, because a retry over request-reply is indistinguishable from a fresh
+// request here. A repeat allocate does NOT change an existing session's mode — a retry must not
+// mutate a live call.
 func (m *Manager) Allocate(opts AllocateOptions) (Descriptor, error) {
 	sessionID := opts.SessionID
 	if sessionID == "" {
@@ -279,25 +276,33 @@ func (m *Manager) Allocate(opts AllocateOptions) (Descriptor, error) {
 	}
 	if existing, ok := m.sessions[sessionID]; ok {
 		m.mu.Unlock()
+		if (existing.transport == nil) != (opts.Transport == nil) {
+			return Descriptor{}, errors.New("rtp: a live session cannot change its transport")
+		}
 		return m.describe(existing), nil
 	}
 	m.mu.Unlock()
 
-	// Bind OUTSIDE the lock: net.ListenUDP is a syscall, and holding the map's mutex across it
-	// would serialise every call setup in the process behind the slowest bind.
+	// Bind OUTSIDE the lock: holding the map's mutex across a syscall would serialise every call
+	// setup behind the slowest bind.
 	ports, err := m.allocator.Allocate()
 	if err != nil {
 		return Descriptor{}, err
 	}
 
 	session, err := NewSession(Options{
+		Transport:                 opts.Transport,
+		SRTP:                      opts.SRTP,
 		ID:                        sessionID,
+		MuteIn:                    opts.MuteIn,
+		MuteOut:                   opts.MuteOut,
 		Ports:                     ports,
 		Mode:                      mode,
 		OrgID:                     opts.OrgID,
 		CallID:                    opts.CallID,
 		LegID:                     opts.LegID,
 		AudioPayloadType:          audioPT,
+		Format:                    opts.Format,
 		TelephoneEventPayloadType: opts.TelephoneEventPayloadType,
 		Logger:                    m.log,
 		Ticker:                    m.ticker,
@@ -310,9 +315,8 @@ func (m *Manager) Allocate(opts AllocateOptions) (Descriptor, error) {
 	}
 
 	m.mu.Lock()
-	// Re-check both invariants: between the unlock above and here, a concurrent allocate for the
-	// same id may have won, and Drain may have started. Losing either race must release the port
-	// just taken rather than leak it.
+	// Re-check both invariants: a concurrent allocate may have won and Drain may have started.
+	// Losing either race must release the port just taken rather than leak it.
 	if m.closed {
 		m.mu.Unlock()
 		_ = session.Close()
@@ -321,16 +325,29 @@ func (m *Manager) Allocate(opts AllocateOptions) (Descriptor, error) {
 	if existing, ok := m.sessions[sessionID]; ok {
 		m.mu.Unlock()
 		_ = session.Close()
+		if (existing.transport == nil) != (opts.Transport == nil) {
+			return Descriptor{}, errors.New("rtp: a live session cannot change its transport")
+		}
 		return m.describe(existing), nil
 	}
 	m.sessions[sessionID] = session
 	m.mu.Unlock()
+	// A session id bound afresh must not inherit the negotiation of the call before it.
+	m.negotiating.forget(sessionID)
 
 	m.running.Add(1)
 	go func() {
 		defer m.running.Done()
 		if err := session.Run(context.Background()); err != nil {
 			m.log.Error("session read loop stopped", "sessionId", sessionID, "error", err)
+		}
+	}()
+
+	m.running.Add(1)
+	go func() {
+		defer m.running.Done()
+		if err := session.RunRTCP(context.Background()); err != nil {
+			m.log.Debug("session RTCP loop stopped", "sessionId", sessionID, "error", err)
 		}
 	}()
 
@@ -344,21 +361,82 @@ func (m *Manager) Allocate(opts AllocateOptions) (Descriptor, error) {
 	return m.describe(session), nil
 }
 
-// Release tears a session down. It reports whether there was one to tear down, so the caller can
-// tell "released" from "already gone" — the engine retries a release, and a retry answering
-// "released: false" is the honest answer rather than an error.
+// ApplyDirection re-points a live session's suppression gates after a renegotiation. Idempotent: it
+// SETS both flags rather than toggling them.
+//
+// The gates are the ONLY record of the negotiated direction, so a session allocated `inactive`
+// resumes relaying here without a second mode transition to keep in step. See Session.Mode.
+//
+// It does NOT touch the HOLD flag — a renegotiation answering `sendrecv` must not take a held
+// caller off hold.
+func (m *Manager) ApplyDirection(sessionID string, muteIn, muteOut bool) error {
+	session, err := m.liveSession(sessionID)
+	if err != nil {
+		return err
+	}
+	if (session.mutedIn.Load() || session.mutedOut.Load()) && !muteIn && !muteOut {
+		session.rtpGraceUntil.Store(m.now().Add(m.rtpTimeout).UnixMilli())
+	}
+	session.mutedIn.Store(muteIn)
+	if session.mutedOut.Swap(muteOut) && !muteOut {
+		// The leg is about to hear a clock it has not been following, as at the end of a prompt.
+		session.markNextForward.Store(true)
+	}
+	return nil
+}
+
+// SettleAnswer re-points a live session's negotiated codec once the callee's SDP answer arrives: a
+// B-leg is originated without an offer, so its port is bound before the codec is known.
+//
+// It returns the session's updated descriptor, or ErrUnknownSession when the id names nothing here.
+func (m *Manager) SettleAnswer(
+	sessionID string,
+	format audio.Format,
+	audioPT, telephoneEventPT uint8,
+) (Descriptor, error) {
+	session, err := m.liveSession(sessionID)
+	if err != nil {
+		return Descriptor{}, err
+	}
+	session.settleCodec(format, audioPT, telephoneEventPT)
+	m.log.Info("session codec settled",
+		"sessionId", sessionID,
+		"audioPayloadType", audioPT,
+		"telephoneEventPayloadType", telephoneEventPT)
+	return m.describe(session), nil
+}
+
+// SeedRemote pre-fills a live session's far end from the address its negotiated SDP advertised, so
+// the leg can be sent to before it has spoken — the early-media case, where the caller stays silent
+// until the 200 and a learn-only remote would drop the announcement. Advisory: the first packet to
+// arrive still latches over it (RFC 4961). An unknown id is ErrUnknownSession.
+func (m *Manager) SeedRemote(sessionID string, addr netip.AddrPort) error {
+	session, err := m.liveSession(sessionID)
+	if err != nil {
+		return err
+	}
+	session.SeedRemote(addr)
+	return nil
+}
+
+// Release tears a session down, reporting whether there was one to tear down so a retried release
+// can answer false rather than error.
 func (m *Manager) Release(sessionID string) bool {
 	m.mu.Lock()
 	session, ok := m.sessions[sessionID]
+	var emptied *Conference
 	if ok {
 		delete(m.sessions, sessionID)
-		// Releasing one half of a bridge tears the whole relay down. The other leg stays ALIVE and
-		// simply stops having a peer, which is the correct shape of "one party hung up": the
-		// survivor is still allocated, and the engine decides whether it hears a prompt, gets
-		// re-bridged somewhere else, or is released in turn.
+		// Releasing one half of a bridge tears the relay down; the other leg stays ALIVE and simply
+		// stops having a peer.
 		m.unbridgeSessionLocked(sessionID)
+		// The room survives unless this was its last seat; what must not survive either way is a
+		// seat pointing at a closed socket.
+		_, emptied, _ = m.leaveConferenceLocked(sessionID)
 	}
 	m.mu.Unlock()
+
+	m.stopEmptied(emptied)
 
 	if !ok {
 		return false
@@ -370,20 +448,12 @@ func (m *Manager) Release(sessionID string) bool {
 
 // closeAndAnnounce shuts a session down and tells the Lifecycle, in that order.
 //
-// The summary is taken BEFORE the close so the counters and the latched far end are the session's
-// final state rather than a zeroed struct, and the announcement happens after so a consumer that
-// reacts by asking about the session gets the truth.
-//
-// A live RECORDING is finalised in between, and the order is a contract rather than tidiness: the
-// engine tears the leg down on `session.ended`, so a `recording.finished` published after it would
-// arrive to a consumer that has already written the CDR and moved on — and the file, which exists
-// and is perfectly good, would never be archived. Waiting is bounded by a flush and a rename.
+// The summary is taken BEFORE the close, so it holds the session's final counters and latched far
+// end. A live recording is finalised in BETWEEN: consumers tear the leg down on `session.ended`, so
+// a `recording.finished` published after it would never be acted on.
 func (m *Manager) closeAndAnnounce(session *Session, reason EndReason) {
-	// A digit still open when the leg went away, surfaced before anything else is said about the
-	// session. It is the backstop for a far end that began a tone and stopped sending entirely: the
-	// arrival-driven cutoff never fires because nothing arrives, and the engine tears the leg down on
-	// `session.ended`, so a keypress announced after it would reach a consumer that had already
-	// finished with the call.
+	// A digit still open when the leg went away, surfaced before anything else about the session:
+	// the arrival-driven cutoff never fires for a far end that stopped sending entirely.
 	session.FlushDtmf()
 
 	summary := session.Summary()
@@ -398,14 +468,12 @@ func (m *Manager) closeAndAnnounce(session *Session, reason EndReason) {
 	if m.lifecycle != nil {
 		m.lifecycle.SessionEnded(summary, reason)
 	}
+	// The negotiation dies with the session it belongs to; every end path passes through here.
+	m.negotiating.forget(session.ID)
 }
 
-// awaitRecording waits for a recorder to finalise its file, then announces it.
-//
-// Bounded, because a drain that hung on a stuck filesystem would turn one lost recording into a
-// process that never exits. The deadline is generous next to what finalising costs — a buffer
-// flush, a header patch, an fsync and a rename — so hitting it means the disk is gone, which is
-// worth a WARN and is not worth blocking a shutdown for.
+// awaitRecording waits for a recorder to finalise its file, then announces it. Bounded, so a drain
+// on a stuck filesystem cannot turn one lost recording into a process that never exits.
 func (m *Manager) awaitRecording(session SessionSummary, recording *Recording) {
 	select {
 	case <-recording.Done():
@@ -419,11 +487,8 @@ func (m *Manager) awaitRecording(session SessionSummary, recording *Recording) {
 // recordingFinaliseTimeout bounds the wait above. See awaitRecording.
 const recordingFinaliseTimeout = 5 * time.Second
 
-// announceDtmf hands one detected keypress to the Lifecycle.
-//
-// Deliberately trivial, and deliberately not indexed by anything: unlike a playback or a recording,
-// a digit has no reference and nothing can be done to it after the fact. It is a fact about a leg,
-// so it needs the leg's summary and nothing else.
+// announceDtmf hands one detected keypress to the Lifecycle. Unindexed: a digit has no reference
+// and nothing can be done to it after the fact.
 func (m *Manager) announceDtmf(session *Session, digit DtmfDigit) {
 	if m.lifecycle == nil {
 		return
@@ -431,12 +496,9 @@ func (m *Manager) announceDtmf(session *Session, digit DtmfDigit) {
 	m.lifecycle.DtmfReceived(session.Summary(), digit)
 }
 
-// announceRecording cleans the reference index and tells the Lifecycle, exactly once.
-//
-// Two paths reach a finished recording — the watcher goroutine StartRecording spawns, and a session
-// teardown that had to wait for it — and a `recording.finished` published twice would file two rows
-// for one file. The Once on the recording itself is what makes them idempotent with respect to each
-// other without either having to know the other exists.
+// announceRecording cleans the reference index and tells the Lifecycle, exactly once. Two paths
+// reach a finished recording — the watcher goroutine and a session teardown that waited for it —
+// and the Once on the recording is what keeps them from announcing it twice.
 func (m *Manager) announceRecording(session SessionSummary, recording *Recording) {
 	recording.announceOnce.Do(func() {
 		m.mu.Lock()
@@ -457,22 +519,13 @@ func (m *Manager) announceRecording(session SessionSummary, recording *Recording
 	})
 }
 
-// Bridge starts a bidirectional relay between two sessions.
+// Bridge starts a bidirectional relay between two sessions: each forwards what it receives out of
+// the OTHER's socket, with no decode, mix or jitter buffer.
 //
-// # What a bridge IS here
-//
-// Two pointers. Each session forwards what it receives out of the OTHER's socket, to the other's
-// latched far end — no decode, no mix, no jitter buffer, and therefore no added latency and no
-// audio-quality argument to have against Asterisk. RFC 4733 DTMF rides through it for free, because
-// a telephone-event payload is just bytes to a relay.
-//
-// # Idempotent, and re-pointable
-//
-// Bridging the same id to the same pair again is a no-op that answers success, for the same reason
-// allocate is idempotent: the engine's retry after a timeout is indistinguishable from a fresh
-// request at this layer. Bridging a session that is ALREADY in another bridge moves it — that is an
-// attended transfer, and refusing it would mean the engine had to unbridge first and the caller
-// would hear a gap in between.
+// Idempotent, and re-pointable: bridging the same pair again succeeds, and bridging a session that
+// is already in another bridge MOVES it, which is what an attended transfer needs. Re-using a bridge
+// id for a DIFFERENT pair moves the id too — the pair it named is disconnected, not left relaying
+// with nothing able to address it.
 func (m *Manager) Bridge(bridgeID string, first, second string) error {
 	switch {
 	case bridgeID == "":
@@ -480,10 +533,17 @@ func (m *Manager) Bridge(bridgeID string, first, second string) error {
 	case first == "" || second == "":
 		return errors.New("rtp: a bridge needs two session ids")
 	case first == second:
-		// A session relaying to itself is an echo with extra steps, and the only way to ask for one
-		// is a bug in the caller — most likely the same leg added to a bridge twice.
 		return errors.New("rtp: cannot bridge a session to itself")
 	}
+
+	// Registered before the unlock defer so it runs after it: Stop closes a channel the mix loop
+	// selects on, and that loop takes the room lock.
+	var emptied []*Conference
+	defer func() {
+		for _, conference := range emptied {
+			m.stopEmptied(conference)
+		}
+	}()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -499,29 +559,41 @@ func (m *Manager) Bridge(bridgeID string, first, second string) error {
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrUnknownSession, second)
 	}
-	if a.AudioPayloadType() != b.AudioPayloadType() {
-		return fmt.Errorf("%w: %s answered %d, %s answered %d",
-			ErrCodecMismatch, first, a.AudioPayloadType(), second, b.AudioPayloadType())
+
+	// Legs that agreed relay byte for byte; legs that differ get a translation installed on each
+	// direction. The only bridge still refused is one whose codec this build cannot decode.
+	transcoders, err := prepareTranscoders(a, b)
+	if err != nil {
+		return err
 	}
 
-	// Detach both from whatever they were in, so a re-bridge cannot leave a stale pointer behind
-	// pushing audio at a party that is no longer in the conversation.
+	// Detach three things first, so a re-bridge cannot leave a stale pointer pushing audio at a
+	// party that is no longer in the conversation: whatever this ID was bound to, and whatever each
+	// incoming session was in. The first is not implied by the second — re-using an id for a
+	// different pair would otherwise leave the old pair relaying with nothing indexing them.
+	if previous, bound := m.bridges[bridgeID]; bound {
+		m.detachLocked(bridgeID, previous)
+	}
 	m.unbridgeSessionLocked(first)
 	m.unbridgeSessionLocked(second)
+	for _, id := range []string{first, second} {
+		if _, left, ok := m.leaveConferenceLocked(id); ok && left != nil {
+			emptied = append(emptied, left)
+		}
+	}
 
+	transcoders.install(a, b)
 	a.SetPeer(b)
 	b.SetPeer(a)
 	m.bridges[bridgeID] = [2]string{first, second}
+	m.bridgeBySession[first] = bridgeID
+	m.bridgeBySession[second] = bridgeID
 
 	m.log.Info("sessions bridged", "bridgeId", bridgeID, "sessionIds", []string{first, second})
 	return nil
 }
 
-// Unbridge stops a relay and leaves both sessions alive.
-//
-// Reports whether there was a relay to stop, so the caller can tell "unbridged" from "already
-// gone" — the engine retries an unbridge, and a retry answering false is the honest answer rather
-// than an error.
+// Unbridge stops a relay and leaves both sessions alive, reporting whether there was one to stop.
 func (m *Manager) Unbridge(bridgeID string) ([]string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -537,33 +609,32 @@ func (m *Manager) Unbridge(bridgeID string) ([]string, bool) {
 
 // unbridgeSessionLocked removes whatever bridge a session is in. Caller holds m.mu.
 func (m *Manager) unbridgeSessionLocked(sessionID string) {
-	for bridgeID, pair := range m.bridges {
-		if pair[0] == sessionID || pair[1] == sessionID {
-			m.detachLocked(bridgeID, pair)
-			return
-		}
+	bridgeID, ok := m.bridgeBySession[sessionID]
+	if !ok {
+		return
 	}
+	m.detachLocked(bridgeID, m.bridges[bridgeID])
 }
 
 // detachLocked clears both peer pointers and forgets the bridge. Caller holds m.mu.
 func (m *Manager) detachLocked(bridgeID string, pair [2]string) {
 	for _, id := range pair {
+		if bound, ok := m.bridgeBySession[id]; ok && bound == bridgeID {
+			delete(m.bridgeBySession, id)
+		}
 		if session, ok := m.sessions[id]; ok {
 			session.SetPeer(nil)
+			// The translation goes with the bridge: leaving it installed would carry stale codec
+			// state into whatever the leg is bridged to next.
+			clearTranscoders(session)
 		}
 	}
 	delete(m.bridges, bridgeID)
 }
 
-// StartPlayback plays a decoded clip towards one session's far end.
-//
-// It returns when the prompt is RUNNING, not when it has finished — see Session.StartPlayback for
-// why, and Playback for what replacing the peer's audio does and does not interrupt.
-//
-// The reference is indexed here so a later `stop-playback`, which carries nothing but the
-// reference, can find the session without scanning. The index is cleaned by the watcher below,
-// however the playback ended, so a completed prompt does not leave a reference behind that a late
-// stop would match against a session that has since started a different one.
+// StartPlayback plays a decoded clip towards one session's far end. It returns when the prompt is
+// RUNNING, not when it has finished. The reference is indexed so a later `stop-playback` can find
+// the session without scanning; the watcher below cleans the entry however the playback ended.
 func (m *Manager) StartPlayback(sessionID string, opts PlaybackOptions) error {
 	m.mu.Lock()
 	if m.closed {
@@ -577,15 +648,24 @@ func (m *Manager) StartPlayback(sessionID string, opts PlaybackOptions) error {
 	}
 	m.mu.Unlock()
 
-	// Started OUTSIDE the lock: it spawns a goroutine and touches the socket, and holding the map's
-	// mutex across that would serialise every prompt on the instance behind the slowest one.
+	// Started OUTSIDE the lock: it spawns a goroutine and touches the socket.
 	playback, err := session.StartPlayback(opts)
 	if err != nil {
 		return err
 	}
 
+	m.trackPlayback(sessionID, session, opts.Ref, playback)
+
+	m.log.Info("playback started",
+		"sessionId", sessionID, "playbackRef", opts.Ref, "frames", len(opts.Frames))
+	return nil
+}
+
+// trackPlayback indexes a running playback by reference and watches it to the end. Every playback
+// the instance starts goes through here, hold music included.
+func (m *Manager) trackPlayback(sessionID string, session *Session, ref string, playback *Playback) {
 	m.mu.Lock()
-	m.playbacks[opts.Ref] = sessionID
+	m.playbacks[ref] = sessionID
 	m.mu.Unlock()
 
 	m.running.Add(1)
@@ -594,11 +674,11 @@ func (m *Manager) StartPlayback(sessionID string, opts PlaybackOptions) error {
 		<-playback.Done()
 
 		m.mu.Lock()
-		// Only if it is still OURS: a superseding playback with the same reference would otherwise
-		// have its index entry deleted by the one it replaced.
-		if owner, ok := m.playbacks[opts.Ref]; ok && owner == sessionID &&
+		// Only if it is still ours: a superseding playback with the same reference would otherwise
+		// have its entry deleted by the one it replaced.
+		if owner, ok := m.playbacks[ref]; ok && owner == sessionID &&
 			session.ActivePlayback() == nil {
-			delete(m.playbacks, opts.Ref)
+			delete(m.playbacks, ref)
 		}
 		m.mu.Unlock()
 
@@ -612,17 +692,10 @@ func (m *Manager) StartPlayback(sessionID string, opts PlaybackOptions) error {
 			m.lifecycle.PlaybackFinished(session.Summary(), summary)
 		}
 	}()
-
-	m.log.Info("playback started",
-		"sessionId", sessionID, "playbackRef", opts.Ref, "frames", len(opts.Frames))
-	return nil
 }
 
-// StopPlayback interrupts a playback by reference and reports the session it was on.
-//
-// Answering `false` for a reference nothing is playing is a SUCCESS at the wire, not an error: a
-// caller who lets a menu run to the end and then presses a digit produces exactly this on every
-// call, because `gather` stops its prompt whatever ended the collection.
+// StopPlayback interrupts a playback by reference and reports the session it was on. A false for a
+// reference nothing is playing is a success at the wire, not an error.
 func (m *Manager) StopPlayback(ref string) (string, bool) {
 	m.mu.Lock()
 	sessionID, ok := m.playbacks[ref]
@@ -638,15 +711,9 @@ func (m *Manager) StopPlayback(ref string) (string, bool) {
 	return sessionID, session.StopPlayback(ref)
 }
 
-// SendDtmf generates a digit string towards one session's far end. Rung 3.
-//
-// It returns when injection is RUNNING, not when the last digit is on the wire — see
-// Session.SendDtmf for why that mirrors ARI, and DtmfInjection for what taking the outbound stream
-// does and does not interrupt.
-//
-// There is no index here, unlike playbacks and recordings, because there is nothing to look a digit
-// string up BY: `MediaPort.sendDtmf` hands back no reference and there is no `stop-dtmf` to key on.
-// A string is bounded by construction and ends on its own.
+// SendDtmf generates a digit string towards one session's far end. It returns when injection is
+// RUNNING, not when the last digit is on the wire. There is no index, unlike playbacks and
+// recordings: a digit string has no reference and ends on its own.
 func (m *Manager) SendDtmf(sessionID string, opts DtmfOptions) error {
 	m.mu.Lock()
 	if m.closed {
@@ -660,8 +727,7 @@ func (m *Manager) SendDtmf(sessionID string, opts DtmfOptions) error {
 		return fmt.Errorf("%w: %s", ErrUnknownSession, sessionID)
 	}
 
-	// Started OUTSIDE the lock: it spawns a goroutine and touches the socket, and holding the map's
-	// mutex across that would serialise every digit on the instance behind the slowest one.
+	// Started OUTSIDE the lock: it spawns a goroutine and touches the socket.
 	injection, err := session.SendDtmf(opts)
 	if err != nil {
 		return err
@@ -680,11 +746,8 @@ func (m *Manager) SendDtmf(sessionID string, opts DtmfOptions) error {
 	return nil
 }
 
-// StartRecording writes one session's audio to a file. Rung 4.
-//
-// It returns once the file exists and its header is written. The reference is indexed here so a
-// later `stop-recording`, which carries nothing but the reference, can find the session without
-// scanning — the same reason the playback index exists, and cleaned by the same shape of watcher.
+// StartRecording writes one session's audio to a file, returning once the file exists and its
+// header is written. The reference is indexed as a playback's is, and cleaned by the same watcher.
 func (m *Manager) StartRecording(sessionID string, opts RecordingOptions) error {
 	m.mu.Lock()
 	if m.closed {
@@ -715,8 +778,7 @@ func (m *Manager) StartRecording(sessionID string, opts RecordingOptions) error 
 	go func() {
 		defer m.running.Done()
 		<-recording.Done()
-		// The teardown path may already have announced this one, having waited for exactly the
-		// channel above. announceRecording is idempotent for that reason.
+		// The teardown path may already have announced this one; announceRecording is idempotent.
 		m.announceRecording(session.Summary(), recording)
 	}()
 
@@ -726,11 +788,8 @@ func (m *Manager) StartRecording(sessionID string, opts RecordingOptions) error 
 	return nil
 }
 
-// StopRecording finalises a recording by reference and reports the session it was on.
-//
-// Answering `false` for a reference nothing is recording is a SUCCESS at the wire, not an error: a
-// recording that hit its duration limit, or whose leg hung up, has already finalised itself by the
-// time the engine's teardown gets around to stopping it.
+// StopRecording finalises a recording by reference and reports the session it was on. A false for a
+// reference nothing is recording is a success at the wire: it may already have finalised itself.
 func (m *Manager) StopRecording(ref string) (string, bool) {
 	m.mu.Lock()
 	sessionID, ok := m.recordings[ref]
@@ -744,6 +803,25 @@ func (m *Manager) StopRecording(ref string) (string, bool) {
 		return sessionID, false
 	}
 	return sessionID, session.StopRecording(ref)
+}
+
+// PauseRecording pauses or resumes a recording by reference WITHOUT ending its file, reporting the
+// session it is on, whether there was one to act on, and the paused state after. A false for a
+// reference nothing is recording is a success at the wire, exactly as StopRecording's is.
+func (m *Manager) PauseRecording(ref string, paused bool) (string, bool, bool) {
+	m.mu.Lock()
+	sessionID, ok := m.recordings[ref]
+	var session *Session
+	if ok {
+		session = m.sessions[sessionID]
+	}
+	m.mu.Unlock()
+
+	if session == nil {
+		return sessionID, false, false
+	}
+	applied, state := session.PauseRecording(ref, paused)
+	return sessionID, applied, state
 }
 
 // RecordingSessionOf reports which session holds a recording reference, if any.
@@ -766,12 +844,8 @@ func (m *Manager) TelephoneEventPayloadType(sessionID string) (uint8, bool) {
 	return session.TelephoneEventPayloadType(), true
 }
 
-// SessionTenancy reports the org and call a session was allocated for.
-//
-// The control surface's one other question about a leg, answered as VALUES for the same reason
-// AudioPayloadType is: a recording's path is derived from the tenant and the call, both of which
-// arrived on the allocate and live on the session, and handing the handler a live *Session so it
-// could read two strings would put the packet path's internals inside a NATS callback.
+// SessionTenancy reports the org and call a session was allocated for, as values rather than by
+// handing the caller a live *Session.
 func (m *Manager) SessionTenancy(sessionID string) (orgID, callID string, ok bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -794,12 +868,8 @@ func (m *Manager) PlaybackSessionOf(ref string) (string, bool) {
 func (m *Manager) BridgeOf(sessionID string) (string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for bridgeID, pair := range m.bridges {
-		if pair[0] == sessionID || pair[1] == sessionID {
-			return bridgeID, true
-		}
-	}
-	return "", false
+	bridgeID, ok := m.bridgeBySession[sessionID]
+	return bridgeID, ok
 }
 
 // Get returns a live session by id.
@@ -810,10 +880,7 @@ func (m *Manager) Get(sessionID string) (*Session, bool) {
 	return session, ok
 }
 
-// AudioPayloadType reports the G.711 type a live session answered with.
-//
-// The control surface's one question about a leg, answered as a value rather than by handing it the
-// session — see the note on control.Sessions.
+// AudioPayloadType reports the audio payload type a live session answered with.
 func (m *Manager) AudioPayloadType(sessionID string) (uint8, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -834,6 +901,15 @@ func (m *Manager) Len() int {
 // Capacity is how many sessions the port range can hold.
 func (m *Manager) Capacity() int { return m.allocator.Capacity() }
 
+// newTicker builds a pacing clock for anything this Manager owns that runs on one (the conference
+// mixer), so a test can step a room frame by frame.
+func (m *Manager) newTicker(interval time.Duration) (<-chan time.Time, func()) {
+	if m.ticker != nil {
+		return m.ticker(interval)
+	}
+	return systemTicker(interval)
+}
+
 func (m *Manager) describe(session *Session) Descriptor {
 	return Descriptor{
 		SessionID:                 session.ID,
@@ -843,30 +919,17 @@ func (m *Manager) describe(session *Session) Descriptor {
 		SSRC:                      session.SSRC,
 		Mode:                      session.Mode(),
 		AudioPayloadType:          session.AudioPayloadType(),
+		Format:                    session.Format(),
 		TelephoneEventPayloadType: session.TelephoneEventPayloadType(),
 	}
 }
 
 // ReapIdle closes sessions that have gone quiet and returns how many it closed.
 //
-// # Two different silences, and why they are not one check
-//
-// A session that RECEIVED audio and then stopped is an RTP TIMEOUT: a call that is still up as far
-// as the signalling plane is concerned, and whose two parties can no longer hear each other. A NAT
-// binding expired, a network dropped, an endpoint crashed without sending BYE. It is a media
-// failure, the engine wants to know about it while the call is notionally live, and it is
-// announced as `session.rtp-timeout` followed by a `session.ended` carrying that reason.
-//
-// A session that NEVER received a packet and simply aged out is a LEAK: the engine allocated it and
-// then stopped knowing about it — it crashed mid-call, or a release was never sent, or the far end
-// never answered the INVITE. Nothing failed in the media path, because nothing ever happened in it.
-// It is announced as `idle-reaped`, and it exists to stop a leaked port from being permanent
-// capacity loss until a restart.
-//
-// Reporting them as one event would mean a consumer counting media failures counted every abandoned
-// call setup as one.
-//
-// Exported so a test can run it without waiting for a ticker.
+// Two silences, reported as two reasons. A session that RECEIVED audio and then stopped is an RTP
+// TIMEOUT: a media failure on a call the signalling plane still believes is up. A session that NEVER
+// received a packet is a LEAK: nothing failed, the engine simply stopped knowing about it. One event
+// for both would make every abandoned call setup count as a media failure.
 func (m *Manager) ReapIdle() int {
 	if m.idleAfter <= 0 && m.rtpTimeout <= 0 {
 		return 0
@@ -881,12 +944,26 @@ func (m *Manager) ReapIdle() int {
 
 	m.mu.Lock()
 	var stale []expiry
+	var emptied []*Conference
 	for id, session := range m.sessions {
 		idle := session.Idle(now)
-		heardSomething := session.Stats().LastPacketUnixMs != 0
+		heardSomething := session.lastPacket.Load() != 0
+		// A leg that has never received a packet but is putting its peer's audio on the wire is a
+		// caller listening to early media: the far end plays and the caller sends nothing until the
+		// 200. Counting it as idle would reap the announcement out from under them at the backstop.
+		if !heardSomething {
+			if sent := session.lastWrite.Load(); sent != 0 {
+				idle = min(idle, now.Sub(time.UnixMilli(sent)))
+			}
+		}
+		// Held, muted and just-resumed sessions are EXPECTED to be silent, so they are exempt from
+		// the RTP timeout — but only from that one. A leg that has never received a packet is a leak
+		// whatever its direction, so the idle backstop below still applies to it.
+		gatedSilence := session.held.Load() || session.mutedIn.Load() || session.mutedOut.Load() ||
+			now.UnixMilli() < session.rtpGraceUntil.Load()
 
 		switch {
-		case heardSomething && m.rtpTimeout > 0 && idle > m.rtpTimeout:
+		case heardSomething && !gatedSilence && m.rtpTimeout > 0 && idle > m.rtpTimeout:
 			stale = append(stale, expiry{session, EndReasonRTPTimeout, idle})
 		case !heardSomething && m.idleAfter > 0 && idle > m.idleAfter:
 			stale = append(stale, expiry{session, EndReasonIdleReaped, idle})
@@ -895,8 +972,15 @@ func (m *Manager) ReapIdle() int {
 		}
 		delete(m.sessions, id)
 		m.unbridgeSessionLocked(id)
+		if _, left, ok := m.leaveConferenceLocked(id); ok && left != nil {
+			emptied = append(emptied, left)
+		}
 	}
 	m.mu.Unlock()
+
+	for _, conference := range emptied {
+		m.stopEmptied(conference)
+	}
 
 	for _, entry := range stale {
 		if entry.reason == EndReasonRTPTimeout {
@@ -925,9 +1009,8 @@ func (m *Manager) RunReaper(ctx context.Context) error {
 		<-ctx.Done()
 		return ctx.Err()
 	}
-	// Check several times per window, so a session is reaped near its deadline rather than up to a
-	// whole window late. Driven by the SHORTER of the two windows, because a tick sized for the
-	// longer one would make the shorter deadline meaningless.
+	// Several checks per window, driven by the SHORTER of the two, so a session is reaped near its
+	// deadline rather than up to a whole window late.
 	interval := window / 4
 	if interval < time.Second {
 		interval = time.Second
@@ -949,18 +1032,10 @@ func (m *Manager) RunReaper(ctx context.Context) error {
 
 // Drain refuses new allocations, closes every live session and waits for the read loops to stop.
 //
-// # Why sessions are closed rather than waited out
-//
-// A media server cannot drain the way an HTTP server does. There is no "last request" to finish:
-// an RTP session ends when a call ends, and a call can last hours. Waiting would mean a deploy
-// blocks on the longest conversation on the box.
-//
-// So v0 closes them, and the honest description of that is "calls on this instance lose audio at
-// shutdown". Making it graceful is a real requirement and a real design problem — it means moving
-// sessions to another instance, which needs a session directory in NATS KV and a signalling
-// re-INVITE — and it is called out as open question 3 in plans/mediad-design.md §10 rather than
-// pretended away here. What Drain does guarantee is that the process does not exit with sockets
-// still being read, so a restart finds its ports free.
+// Sessions are CLOSED rather than waited out: an RTP session ends when its call does, so waiting
+// would block a deploy on the longest conversation on the box. Calls on this instance therefore lose
+// audio at shutdown. What Drain guarantees is that the process does not exit with sockets still
+// being read, so a restart finds its ports free.
 func (m *Manager) Drain(ctx context.Context) error {
 	m.mu.Lock()
 	if m.closed {
@@ -974,14 +1049,28 @@ func (m *Manager) Drain(ctx context.Context) error {
 		delete(m.sessions, id)
 	}
 	m.bridges = make(map[string][2]string)
+	m.bridgeBySession = make(map[string]string)
+	m.conferenceBySession = make(map[string]string)
+	rooms := make([]*Conference, 0, len(m.conferences))
+	for id, conference := range m.conferences {
+		rooms = append(rooms, conference)
+		delete(m.conferences, id)
+	}
+	m.taps = make(map[string]tapRecord)
+	m.tapsBySession = make(map[string]map[string]struct{})
+	m.tapsByConference = make(map[string]map[string]struct{})
 	m.mu.Unlock()
+
+	// The mix loops stop BEFORE the sessions close, so no tick can find a member whose socket has
+	// already gone.
+	for _, conference := range rooms {
+		conference.Stop()
+	}
 
 	if len(live) > 0 {
 		m.log.Warn("draining live sessions; media on these calls stops now", "count", len(live))
 	}
-	for _, session := range live {
-		m.closeAndAnnounce(session, EndReasonDrained)
-	}
+	m.closeAllAndAnnounce(ctx, live)
 
 	stopped := make(chan struct{})
 	go func() {
@@ -994,5 +1083,59 @@ func (m *Manager) Drain(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("rtp: draining %d sessions: %w", len(live), ctx.Err())
+	}
+}
+
+// drainCloseWorkers bounds how many sessions a drain closes at once. See closeAllAndAnnounce.
+const drainCloseWorkers = 16
+
+// closeAllAndAnnounce closes a drained instance's sessions, in parallel and under the drain's
+// deadline. A bounded pool, because closeAndAnnounce waits up to recordingFinaliseTimeout per
+// recorder and the work is a filesystem flush.
+//
+// When the deadline lands mid-drain the remaining sessions still get their sockets closed, without
+// the announce: a port handed back late beats a port the exiting process never released.
+func (m *Manager) closeAllAndAnnounce(ctx context.Context, live []*Session) {
+	if len(live) == 0 {
+		return
+	}
+	workers := min(drainCloseWorkers, len(live))
+
+	work := make(chan *Session)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			for session := range work {
+				m.closeAndAnnounce(session, EndReasonDrained)
+			}
+		})
+	}
+
+	go func() {
+		defer close(work)
+		for index, session := range live {
+			select {
+			case work <- session:
+			case <-ctx.Done():
+				m.log.Warn("the drain deadline landed mid-close; closing the rest without announcing",
+					"remaining", len(live)-index)
+				for _, remaining := range live[index:] {
+					if err := remaining.Close(); err != nil {
+						m.log.Warn("closing a session", "sessionId", remaining.ID, "error", err)
+					}
+				}
+				return
+			}
+		}
+	}()
+
+	closed := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-ctx.Done():
 	}
 }

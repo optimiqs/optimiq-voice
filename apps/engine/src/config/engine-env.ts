@@ -59,12 +59,22 @@ const port = (fallback: number) => z.coerce.number().int().min(1).max(65_535).de
 const durationMs = (fallback: number, max: number) =>
 	z.coerce.number().int().min(0).max(max).default(fallback);
 
+/** The single-instance placeholder identity. Named so the production refusal can point at it. */
+const DEFAULT_ENGINE_INSTANCE_ID = "engine";
+
 const engineEnvObjectSchema = z.object({
 	NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
 
 	/** HTTP port for `/healthz`. The engine serves no product API. */
 	ENGINE_PORT: port(4010),
 	ENGINE_HOST: z.string().min(1).default("0.0.0.0"),
+	/**
+	 * `host:port` for the PRIVATE Prometheus listener, or empty to turn it off.
+	 *
+	 * A socket of its own rather than a route on `ENGINE_PORT`, and loopback by default, for the
+	 * reasons in `health/metrics-server.ts`. `9200` is `apps/api`'s; this is the next one.
+	 */
+	ENGINE_METRICS_ADDR: z.string().default("127.0.0.1:9201"),
 
 	// ---- Asterisk ARI --------------------------------------------------------------------
 	ARI_URL: requiredUrl.default("http://localhost:8088"),
@@ -172,6 +182,18 @@ const engineEnvObjectSchema = z.object({
 	 * an INVITE and a ringing phone, so slow is the same as broken.
 	 */
 	ENGINE_ROUTING_RPC_TIMEOUT_MS: durationMs(2_000, 30_000),
+
+	/**
+	 * How often the routing-cache watch is checked against the bucket it claims to be following.
+	 *
+	 * A `kv.watch()` can stop delivering while every signal says it is healthy — see
+	 * `RoutingArtifactSource` for the flow-control mechanism — so the watch is polled rather than
+	 * trusted. Two consecutive probes seeing the bucket ahead of the watch re-establish it, which
+	 * makes the worst-case staleness twice this. Configurable because the trade is deployment
+	 * shaped: the cost is one `STREAM.INFO` per interval, the benefit is a shorter window in which
+	 * calls walk a plan the tenant has already replaced.
+	 */
+	ENGINE_ROUTING_WATCH_PROBE_MS: durationMs(15_000, 300_000),
 
 	/**
 	 * How an extension NUMBER becomes a dialable endpoint. `{number}` is substituted.
@@ -301,8 +323,12 @@ const engineEnvObjectSchema = z.object({
 	 * Defaulted rather than required because an operator who does not set it should still get a
 	 * working single-instance deployment. `main.ts` fills it from the container's hostname when the
 	 * variable is unset, which is unique per replica under every orchestrator worth the name.
+	 *
+	 * The default is refused in production by the `superRefine` below: outside a container runtime
+	 * nothing fills it in, and the literal `"engine"` on two replicas is not a degraded state but
+	 * the one this variable exists to prevent — each of them adopting the other's channel leases.
 	 */
-	ENGINE_INSTANCE_ID: z.string().min(1).max(128).default("engine"),
+	ENGINE_INSTANCE_ID: z.string().min(1).max(128).default(DEFAULT_ENGINE_INSTANCE_ID),
 
 	/**
 	 * How often this process pushes its claims' expiry forward.
@@ -346,6 +372,62 @@ const engineEnvObjectSchema = z.object({
 	 * than the deadline means the instance is sick rather than busy.
 	 */
 	ENGINE_MEDIAD_RPC_TIMEOUT_MS: z.coerce.number().int().min(100).max(10_000).default(500),
+
+	/**
+	 * How many arriving INVITEs this instance admits AT ONCE.
+	 *
+	 * Admission is not CPU work — it is a tenant attribution, a ceiling check and a `channels`
+	 * compare-and-set, and every one of those is a NATS round trip the loop spends waiting on.
+	 * Answering them one at a time therefore does not protect anything; it just makes the hundredth
+	 * caller in a burst wait for the ninety-nine round trips in front of them. Measured on the local
+	 * stack: 50 simultaneous INVITEs admitted strictly serially at ~14 ms each spread the last
+	 * admission 700 ms after the first, with the engine's event loop 95 % IDLE the whole time.
+	 *
+	 * It stays BOUNDED rather than becoming unbounded concurrency, because the rate on this path is
+	 * chosen by whoever is calling in. A ceiling is what keeps a flood queued in the broker — where
+	 * it is visible, and where an unanswered request times out at the edge as a `503` the carrier can
+	 * fail over — instead of accumulating half-admitted calls in this process's heap.
+	 */
+	ENGINE_SIP_INVITE_CONCURRENCY: z.coerce.number().int().min(1).max(256).default(32),
+
+	/**
+	 * How long an admitted leg may produce NOTHING — no ringing, no progress, no answer — before the
+	 * engine ends it itself.
+	 *
+	 * ## The hole this closes
+	 *
+	 * `ENGINE_MAX_CALL_DURATION_SECONDS` is armed when a leg is ANSWERED, so it covers the call that
+	 * never hangs up and not the call that never starts. A routing walk that hangs — a dial waiting
+	 * on a signal the media plane will never emit, a queue session whose timer was lost — leaves an
+	 * admitted leg with no timer of any kind on it, and it stays in `activeChannels` until the
+	 * four-hour ceiling that was never armed. Measured on this platform at 2 walks in 200.
+	 *
+	 * ## Why 32 seconds
+	 *
+	 * RFC 3261 Timer B: 64×T1 is when the CALLER's own INVITE client transaction gives up. A leg
+	 * that has not produced even a `180` by then is one whose caller has already stopped waiting, so
+	 * nothing is taken away by ending it — and everything a legitimate long wait needs (a queue, an
+	 * IVR menu, a ring group) has produced a provisional response long before, which DISARMS this.
+	 * It bounds the pre-response phase only; it is not a call-duration limit and cannot cut a
+	 * conversation, a queue wait or a menu.
+	 *
+	 * `0` disables it, for a deployment that would rather leak a channel than risk a cut.
+	 */
+	ENGINE_SETUP_TIMEOUT_SECONDS: z.coerce.number().int().min(0).max(600).default(32),
+
+	/**
+	 * Whether the private health listener also serves `/debug/profile`, a V8 CPU sampling profile.
+	 *
+	 * OFF by default and never routed from a public port: the listener this mounts on is the same
+	 * one `/healthz` uses, which a deployment exposes only to its orchestrator. It is here because
+	 * the engine is the one process on the platform whose ceiling is a single thread, and the only
+	 * honest way to find what that thread is doing under a real call storm is to sample it while
+	 * the storm runs — `--cpu-prof` requires planning the restart before the incident.
+	 */
+	ENGINE_PROFILING: z
+		.string()
+		.optional()
+		.transform((value) => value === "true" || value === "1"),
 });
 
 export const engineEnvSchema = engineEnvObjectSchema.superRefine((env, context) => {
@@ -354,6 +436,16 @@ export const engineEnvSchema = engineEnvObjectSchema.superRefine((env, context) 
 			code: "custom",
 			path: ["ARI_PASSWORD"],
 			message: "is required when ENGINE_MEDIA_DRIVER=ari",
+		});
+	}
+	if (env.NODE_ENV === "production" && env.ENGINE_INSTANCE_ID === DEFAULT_ENGINE_INSTANCE_ID) {
+		context.addIssue({
+			code: "custom",
+			path: ["ENGINE_INSTANCE_ID"],
+			message:
+				`must not be the default "${DEFAULT_ENGINE_INSTANCE_ID}" in production: two replicas ` +
+				"sharing an instance id each adopt the other's channel leases. Set ENGINE_INSTANCE_ID, " +
+				"or HOSTNAME, to something unique per process",
 		});
 	}
 });

@@ -4,6 +4,9 @@ import { TelnyxApiError, TelnyxResponseShapeError, TelnyxTransportError } from "
 import { type FakeTelnyxServer, startFakeTelnyxServer } from "./fake";
 import { availableNumbersQuery } from "./resources/available-numbers";
 import { assertTelnyxPassword, assertTelnyxUserName } from "./resources/credential-connections";
+import { isTelnyxFaxEvent, TelnyxFaxRequestError } from "./resources/faxes";
+import { TelnyxCnamFormatError } from "./resources/phone-numbers";
+import { asFaxWebhook, parseTelnyxWebhookEvent } from "./webhooks/events";
 
 /**
  * The client, exercised end to end against the in-package fake.
@@ -379,6 +382,174 @@ describe("outboundVoiceProfiles", () => {
 	});
 });
 
+describe("faxes", () => {
+	it("queues a send and returns the fax with its carrier id, echoing our client_state", async () => {
+		const client = makeClient();
+		const fax = await client.faxes.send({
+			connectionId: "conn-1",
+			to: "+13125551111",
+			from: "+13125550000",
+			mediaUrl: "https://media.example/doc.pdf",
+			clientState: "fax-message-row-1",
+		});
+		expect(fax.direction).toBe("outbound");
+		expect(fax.status).toBe("queued");
+		expect(fax.client_state).toBe("fax-message-row-1");
+		expect(fax.id).toBeString();
+	});
+
+	it("answers 202 Accepted on send, not 200", async () => {
+		const client = makeClient();
+		server.state.requests.length = 0;
+		await client.faxes.send({
+			connectionId: "conn-1",
+			to: "+13125551111",
+			from: "+13125550000",
+			mediaUrl: "https://media.example/doc.pdf",
+			clientState: "row-2",
+		});
+		// One request only: a queued send must never auto-retry (a second attempt is a second fax).
+		expect(server.state.requests).toHaveLength(1);
+		expect(server.state.requests[0]?.method).toBe("POST");
+		expect(server.state.requests[0]?.path).toBe("/faxes");
+	});
+
+	it("reads a fax back by id after sending it", async () => {
+		const client = makeClient();
+		const sent = await client.faxes.send({
+			connectionId: "conn-1",
+			to: "+13125551111",
+			from: "+13125550000",
+			mediaName: "stored-doc",
+			clientState: "row-3",
+		});
+		const read = await client.faxes.get(sent.id);
+		expect(read.id).toBe(sent.id);
+		expect(read.media_name).toBe("stored-doc");
+	});
+
+	it("refuses a send with neither media_url nor media_name before any round trip", async () => {
+		const client = makeClient();
+		server.state.requests.length = 0;
+		await expect(
+			client.faxes.send({
+				connectionId: "conn-1",
+				to: "+13125551111",
+				from: "+13125550000",
+				clientState: "row-4",
+			}),
+		).rejects.toThrow(TelnyxFaxRequestError);
+		expect(server.state.requests).toHaveLength(0);
+	});
+
+	it("refuses a send with both media_url and media_name before any round trip", async () => {
+		const client = makeClient();
+		server.state.requests.length = 0;
+		await expect(
+			client.faxes.send({
+				connectionId: "conn-1",
+				to: "+13125551111",
+				from: "+13125550000",
+				mediaUrl: "https://media.example/doc.pdf",
+				mediaName: "stored-doc",
+				clientState: "row-5",
+			}),
+		).rejects.toThrow(TelnyxFaxRequestError);
+		expect(server.state.requests).toHaveLength(0);
+	});
+
+	it("does not retry a send that fails, because a repeat could send a second fax", async () => {
+		const client = makeClient();
+		server.state.failNext(500);
+		server.state.requests.length = 0;
+		await expect(
+			client.faxes.send({
+				connectionId: "conn-1",
+				to: "+13125551111",
+				from: "+13125550000",
+				mediaUrl: "https://media.example/doc.pdf",
+				clientState: "row-6",
+			}),
+		).rejects.toThrow(TelnyxApiError);
+		expect(server.state.requests).toHaveLength(1);
+	});
+});
+
+describe("fax webhooks", () => {
+	function faxEnvelope(eventType: string, payload: Record<string, unknown>) {
+		return {
+			data: {
+				record_type: "event",
+				event_type: eventType,
+				id: "evt-1",
+				occurred_at: "2026-08-12T00:00:00.000Z",
+				payload,
+			},
+			meta: { attempt: 1, delivered_to: "https://example/webhooks/telnyx" },
+		};
+	}
+
+	it("recognizes every modelled fax event type and rejects an unmodelled one", () => {
+		expect(isTelnyxFaxEvent("fax.delivered")).toBe(true);
+		expect(isTelnyxFaxEvent("fax.received")).toBe(true);
+		expect(isTelnyxFaxEvent("fax.queued")).toBe(true);
+		expect(isTelnyxFaxEvent("fax.bogus")).toBe(false);
+		expect(isTelnyxFaxEvent("number_order.complete")).toBe(false);
+	});
+
+	it("narrows an outbound fax.delivered to the fax payload", () => {
+		const event = parseTelnyxWebhookEvent(
+			faxEnvelope("fax.delivered", {
+				fax_id: "fax-1",
+				direction: "outbound",
+				status: "delivered",
+				from: "+13125550000",
+				to: "+13125551111",
+				client_state: "row-7",
+				page_count: 2,
+			}),
+		);
+		expect(event).toBeDefined();
+		const fax = asFaxWebhook(event as never);
+		expect(fax?.eventType).toBe("fax.delivered");
+		expect(fax?.fax.fax_id).toBe("fax-1");
+		expect(fax?.fax.page_count).toBe(2);
+		expect(fax?.fax.client_state).toBe("row-7");
+	});
+
+	it("narrows an inbound fax.received carrying the rendered document url", () => {
+		const event = parseTelnyxWebhookEvent(
+			faxEnvelope("fax.received", {
+				fax_id: "fax-2",
+				direction: "inbound",
+				status: "received",
+				from: "+13125559999",
+				to: "+13125550000",
+				media_url: "https://media.telnyx/received.tiff",
+				page_count: 1,
+			}),
+		);
+		const fax = asFaxWebhook(event as never);
+		expect(fax?.eventType).toBe("fax.received");
+		expect(fax?.fax.direction).toBe("inbound");
+		expect(fax?.fax.media_url).toBe("https://media.telnyx/received.tiff");
+	});
+
+	it("returns undefined for a non-fax event, leaving it for another narrower", () => {
+		const event = parseTelnyxWebhookEvent(
+			faxEnvelope("number_order.complete", { id: "order-1", status: "success" }),
+		);
+		expect(asFaxWebhook(event as never)).toBeUndefined();
+	});
+
+	it("returns undefined for a fax event whose payload is missing fax_id", () => {
+		const event = parseTelnyxWebhookEvent(
+			faxEnvelope("fax.failed", { direction: "outbound", status: "failed" }),
+		);
+		expect(asFaxWebhook(event as never)).toBeUndefined();
+	});
+});
+
 describe("transport behaviour", () => {
 	it("retries a 429 and succeeds on the next attempt", async () => {
 		const client = makeClient();
@@ -492,5 +663,311 @@ describe("transport behaviour", () => {
 			customerReference: "no-key",
 		});
 		expect(server.state.requests[0]?.headers["idempotency-key"]).toBeUndefined();
+	});
+});
+
+/**
+ * The failure modes that used to escape the package's own error types.
+ *
+ * `fetch` resolves on HEADERS; the body streams afterwards under the same abort signal. A body that
+ * never finishes rejected outside the retry `try`, so it left `request()` as a raw `TypeError` —
+ * past `TelnyxTransportError`, unretried, and unreported to `onAttempt`.
+ */
+describe("transport — a body that fails mid-stream", () => {
+	function stallingBody(): Response {
+		return new Response(
+			new ReadableStream({
+				start(controller) {
+					controller.error(new TypeError("socket reset"));
+				},
+			}),
+			{ status: 200, headers: { "content-type": "application/json" } },
+		);
+	}
+
+	it("is a TelnyxTransportError, not a raw stream error", async () => {
+		const client = createTelnyxClient({
+			apiKey: "KEY",
+			baseUrl: server.baseUrl,
+			sleep: async () => {},
+			random: () => 0,
+			fetch: async () => stallingBody(),
+		});
+		await expect(client.availableNumbers.search({ countryCode: "US" })).rejects.toThrow(
+			TelnyxTransportError,
+		);
+	});
+
+	it("is retried and reported like any other transport failure", async () => {
+		const attempts: number[] = [];
+		const client = createTelnyxClient({
+			apiKey: "KEY",
+			baseUrl: server.baseUrl,
+			sleep: async () => {},
+			random: () => 0,
+			fetch: async () => stallingBody(),
+			onAttempt: (attempt) => attempts.push(attempt.attempt),
+		});
+		await expect(client.availableNumbers.search({ countryCode: "US" })).rejects.toThrow(
+			TelnyxTransportError,
+		);
+		expect(attempts).toEqual([0, 1, 2, 3]);
+	});
+});
+
+/**
+ * Creating a connection or a profile is not idempotent and Telnyx honours no `Idempotency-Key`
+ * here, so a 5xx raised AFTER the record was created must not become a retry: the retry gets a
+ * non-retryable 422 while a real record exists at the carrier.
+ */
+describe("creation calls are never auto-retried", () => {
+	function failOnce() {
+		let calls = 0;
+		return async () => {
+			calls += 1;
+			return new Response(JSON.stringify({ errors: [{ code: "10009" }] }), {
+				status: 500,
+				headers: { "content-type": "application/json" },
+			});
+		};
+	}
+
+	it("makes exactly one attempt at POST /credential_connections", async () => {
+		const attempts: number[] = [];
+		const client = createTelnyxClient({
+			apiKey: "KEY",
+			baseUrl: server.baseUrl,
+			sleep: async () => {},
+			random: () => 0,
+			fetch: failOnce(),
+			onAttempt: (attempt) => attempts.push(attempt.attempt),
+		});
+		await expect(
+			client.credentialConnections.create({
+				connectionName: "org",
+				userName: "orgabcd1234",
+				password: "correct-horse",
+			}),
+		).rejects.toThrow(TelnyxApiError);
+		expect(attempts).toEqual([0]);
+	});
+
+	it("makes exactly one attempt at POST /outbound_voice_profiles", async () => {
+		const attempts: number[] = [];
+		const client = createTelnyxClient({
+			apiKey: "KEY",
+			baseUrl: server.baseUrl,
+			sleep: async () => {},
+			random: () => 0,
+			fetch: failOnce(),
+			onAttempt: (attempt) => attempts.push(attempt.attempt),
+		});
+		await expect(client.outboundVoiceProfiles.create({ name: "org-0001" })).rejects.toThrow(
+			TelnyxApiError,
+		);
+		expect(attempts).toEqual([0]);
+	});
+});
+
+/**
+ * Porting and CNAM, against the same fake.
+ *
+ * `orderOne` is re-declared here rather than hoisted out of the `phoneNumbers` block: both copies
+ * are three lines, and lifting a helper to module scope so two `describe`s can share it is how a
+ * spec file acquires a private framework.
+ */
+async function ownOne(client: ReturnType<typeof makeClient>) {
+	const search = await client.availableNumbers.search({ countryCode: "US", limit: 1 });
+	const phoneNumber = search.data[0]?.phone_number ?? "";
+	await client.numberOrders.create({ phoneNumbers: [phoneNumber], customerReference: "cnam" });
+	const [owned] = await client.phoneNumbers.list({ phoneNumber });
+	return owned;
+}
+
+describe("portingOrders", () => {
+	/** The shape the whole module is built around. See its header. */
+	it("returns a LIST from the create, not a single order", async () => {
+		const client = makeClient();
+		const created = await client.portingOrders.create({
+			phoneNumbers: ["+12125550199"],
+			customerReference: "optimiq-port-1",
+		});
+		expect(Array.isArray(created)).toBe(true);
+		expect(created).toHaveLength(1);
+		expect(created[0]?.status).toBe("draft");
+		expect(created[0]?.support_key).toMatch(/^sk-/u);
+	});
+
+	/**
+	 * The reason the create returns an array at all: numbers spread across losing carriers become
+	 * several orders. A client that modelled this as one order would drop the second one silently,
+	 * and the numbers in it would simply never port.
+	 */
+	it("surfaces every order when the carrier splits the request", async () => {
+		const client = makeClient();
+		const created = await client.portingOrders.create({
+			phoneNumbers: ["+12125550199", "+442075550100"],
+			customerReference: "optimiq-port-2",
+		});
+		expect(created).toHaveLength(2);
+		expect(new Set(created.map((order) => order.id)).size).toBe(2);
+	});
+
+	it("reads one order back by id", async () => {
+		const client = makeClient();
+		const [created] = await client.portingOrders.create({
+			phoneNumbers: ["+12125550199"],
+			customerReference: "optimiq-port-3",
+		});
+		const read = await client.portingOrders.get(created?.id ?? "");
+		expect(read.id).toBe(created?.id ?? "");
+		expect(read.phone_numbers[0]?.phone_number).toBe("+12125550199");
+	});
+
+	it("lists with the page metadata rather than discarding it", async () => {
+		const client = makeClient();
+		await client.portingOrders.create({
+			phoneNumbers: ["+12125550199"],
+			customerReference: "optimiq-port-4",
+		});
+		const page = await client.portingOrders.list({ pageSize: 20 });
+		expect(page.data).toHaveLength(1);
+		expect(page.meta?.total_pages).toBe(1);
+	});
+
+	it("filters by status, so 'what is stuck' is one request", async () => {
+		const client = makeClient();
+		await client.portingOrders.create({
+			phoneNumbers: ["+12125550199"],
+			customerReference: "optimiq-port-5",
+		});
+		expect((await client.portingOrders.list({ status: "draft" })).data).toHaveLength(1);
+		expect((await client.portingOrders.list({ status: "ported" })).data).toHaveLength(0);
+	});
+
+	/** The stand-in for the idempotency Telnyx does not offer on this endpoint. */
+	it("reconciles by customer reference instead of retrying", async () => {
+		const client = makeClient();
+		await client.portingOrders.create({
+			phoneNumbers: ["+12125550199"],
+			customerReference: "optimiq-port-6",
+		});
+		expect(await client.portingOrders.findByCustomerReference("optimiq-port-6")).toHaveLength(1);
+		expect(await client.portingOrders.findByCustomerReference("nope")).toHaveLength(0);
+	});
+
+	/**
+	 * A port-in commits the organization to a bill and to a regulatory workflow a human unwinds by
+	 * hand. One attempt, then reconcile — never a second POST.
+	 */
+	it("makes exactly one attempt at POST /porting_orders", async () => {
+		const client = makeClient();
+		server.state.failNext(500).failNext(500);
+		let attempts = 0;
+		const counting = makeClient({
+			fetch: async (url: string, init: RequestInit) => {
+				attempts += 1;
+				return await fetch(url, init);
+			},
+		});
+		await expect(
+			counting.portingOrders.create({
+				phoneNumbers: ["+12125550199"],
+				customerReference: "optimiq-port-7",
+			}),
+		).rejects.toThrow(TelnyxApiError);
+		expect(attempts).toBe(1);
+		// The reconciliation read that follows such a failure is a GET and retries normally.
+		expect((await client.portingOrders.list()).data).toHaveLength(0);
+	});
+});
+
+describe("cnam listing", () => {
+	/**
+	 * The whole reason `getCnamListing` exists: neither endpoint answers the question on its own.
+	 */
+	it("merges the two halves Telnyx keeps on two different endpoints", async () => {
+		const client = makeClient();
+		const owned = await ownOne(client);
+		const listing = await client.phoneNumbers.updateCnamListing(owned?.id ?? "", {
+			enabled: true,
+			listingEnabled: true,
+			details: "OPTIMIQ VOICE",
+		});
+		expect(listing).toEqual({
+			enabled: true,
+			listingEnabled: true,
+			listingDetails: "OPTIMIQ VOICE",
+		});
+		expect(await client.phoneNumbers.getCnamListing(owned?.id ?? "")).toEqual(listing);
+	});
+
+	/**
+	 * The asymmetry, asserted from the other side: the flag the PATCH accepted is readable on the
+	 * parent number and absent from the voice GET. A client that trusted the voice GET would report
+	 * CNAM as off on every number that has it on.
+	 */
+	it("reads caller_id_name_enabled from the parent, never from the voice GET", async () => {
+		const client = makeClient();
+		const owned = await ownOne(client);
+		await client.phoneNumbers.updateCnamListing(owned?.id ?? "", { enabled: true });
+		const voice = await client.phoneNumbers.getVoiceSettings(owned?.id ?? "");
+		expect((voice as Record<string, unknown>).caller_id_name_enabled).toBeUndefined();
+		expect((await client.phoneNumbers.get(owned?.id ?? "")).caller_id_name_enabled).toBe(true);
+	});
+
+	it("defaults both flags off for a number that has never been configured", async () => {
+		const client = makeClient();
+		const owned = await ownOne(client);
+		expect(await client.phoneNumbers.getCnamListing(owned?.id ?? "")).toEqual({
+			enabled: false,
+			listingEnabled: false,
+			listingDetails: "",
+		});
+	});
+
+	it("leaves untouched halves alone across two partial updates", async () => {
+		const client = makeClient();
+		const owned = await ownOne(client);
+		await client.phoneNumbers.updateCnamListing(owned?.id ?? "", { details: "ACME LTD" });
+		const listing = await client.phoneNumbers.updateCnamListing(owned?.id ?? "", {
+			enabled: true,
+		});
+		expect(listing.listingDetails).toBe("ACME LTD");
+		expect(listing.enabled).toBe(true);
+	});
+
+	/**
+	 * Refused locally, before a round trip, because the carrier accepts it and truncates: the
+	 * failure would otherwise surface weeks later as "our calls show up wrong".
+	 */
+	it("refuses a CNAM string longer than the NANP field before any request", async () => {
+		const client = makeClient();
+		const owned = await ownOne(client);
+		const before = server.state.requests.length;
+		await expect(
+			client.phoneNumbers.updateCnamListing(owned?.id ?? "", {
+				details: "SIXTEEN CHARS!!!",
+			}),
+		).rejects.toThrow(TelnyxCnamFormatError);
+		expect(server.state.requests.length).toBe(before);
+	});
+
+	it("refuses a non-ASCII CNAM string the carrier database cannot carry", async () => {
+		const client = makeClient();
+		const owned = await ownOne(client);
+		await expect(
+			client.phoneNumbers.updateCnamListing(owned?.id ?? "", { details: "CAFÉ" }),
+		).rejects.toThrow(TelnyxCnamFormatError);
+	});
+
+	it("also writes the cnam_listing group through updateVoiceSettings", async () => {
+		const client = makeClient();
+		const owned = await ownOne(client);
+		const voice = await client.phoneNumbers.updateVoiceSettings(owned?.id ?? "", {
+			cnamListing: { cnamListingEnabled: true, cnamListingDetails: "SUPPORT" },
+		});
+		expect(voice.cnam_listing?.cnam_listing_enabled).toBe(true);
+		expect(voice.cnam_listing?.cnam_listing_details).toBe("SUPPORT");
 	});
 });

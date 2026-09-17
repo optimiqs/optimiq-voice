@@ -97,6 +97,7 @@ const REQUIRED_FIELDS: Record<string, readonly string[]> = {
 		"lockedUntil",
 	],
 	jwks: ["id", "publicKey", "privateKey", "createdAt", "expiresAt"],
+	rateLimit: ["id", "key", "count", "lastRequest"],
 };
 
 const EXPECTED_TABLE_NAMES: Record<string, string> = {
@@ -106,6 +107,7 @@ const EXPECTED_TABLE_NAMES: Record<string, string> = {
 	jwks: "jwks",
 	member: "member",
 	organization: "organization",
+	rateLimit: "rate_limit",
 	session: "session",
 	twoFactor: "two_factor",
 	user: "user",

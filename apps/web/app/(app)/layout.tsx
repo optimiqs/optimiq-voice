@@ -11,8 +11,11 @@ import { signInWithRedirect } from "~/lib/routes";
 import { NoOrganization } from "./_components/no-organization";
 import { PermissionDenied } from "./_components/require-permission";
 import { Sidebar } from "./_components/sidebar";
+import { SoftphoneWidget } from "./_components/softphone/softphone-widget";
+import { BrandingProvider } from "./_context/branding-context";
 import { LiveProvider } from "./_context/live-context";
 import { SessionProvider, useSessionOverviewQuery } from "./_context/session-context";
+import { SoftphoneProvider } from "./_context/softphone-context";
 
 /**
  * The authenticated shell.
@@ -89,14 +92,24 @@ function AuthenticatedShell({ children }: { children: ReactNode }) {
 	return (
 		<SessionProvider overview={session}>
 			<LiveProvider>
-				<div className="flex h-dvh overflow-hidden bg-canvas">
-					<Sidebar />
-					<main id="main" className="flex min-w-0 flex-1 flex-col overflow-y-auto">
-						<div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-8 py-8">
-							{allowed ? children : <PermissionDenied what="this page" />}
+				<BrandingProvider>
+					<SoftphoneProvider>
+						<div className="flex h-dvh overflow-hidden bg-canvas">
+							<Sidebar />
+							<main id="main" className="flex min-w-0 flex-1 flex-col overflow-y-auto">
+								<div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-8 py-8">
+									{allowed ? children : <PermissionDenied what="this page" />}
+								</div>
+							</main>
 						</div>
-					</main>
-				</div>
+						{/*
+						 * The docked softphone. Outside `<main>` so it floats over every page and a call
+						 * survives navigation; inside `SoftphoneProvider` so it shares the one UA. It hides
+						 * itself when the caller holds no extension.
+						 */}
+						<SoftphoneWidget />
+					</SoftphoneProvider>
+				</BrandingProvider>
 			</LiveProvider>
 		</SessionProvider>
 	);

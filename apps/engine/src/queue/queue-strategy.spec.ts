@@ -4,14 +4,21 @@ import { fakeAgent, fakeMembership } from "./queue-services.fake";
 import {
 	compareByIdle,
 	compareByTier,
+	effectiveSkillBars,
 	eligibleCandidates,
+	mergeSkillRequirements,
 	openLevels,
 	rotateAfter,
 	selectAgents,
 	shuffled,
 } from "./queue-strategy";
 import type { QueueCandidate } from "./queue-strategy";
-import type { AgentStateEntry, QueueMembership, QueueMembershipAgent } from "@optimiq-voice/events";
+import type {
+	AgentStateEntry,
+	QueueMembership,
+	QueueMembershipAgent,
+	QueueSkillRequirement,
+} from "@optimiq-voice/events";
 import type { QueueStrategy } from "@optimiq-voice/routing";
 
 /**
@@ -76,6 +83,7 @@ function select(input: {
 	readonly membership?: Partial<QueueMembership>;
 	readonly waitedMs?: number;
 	readonly excludedAgentIds?: ReadonlySet<string>;
+	readonly skillRequirements?: readonly QueueSkillRequirement[];
 	readonly roundRobinAfterAgentId?: string;
 	readonly random?: () => number;
 }) {
@@ -86,6 +94,9 @@ function select(input: {
 		waitedMs: input.waitedMs ?? 0,
 		now: NOW,
 		...(input.excludedAgentIds === undefined ? {} : { excludedAgentIds: input.excludedAgentIds }),
+		...(input.skillRequirements === undefined
+			? {}
+			: { skillRequirements: input.skillRequirements }),
 		...(input.roundRobinAfterAgentId === undefined
 			? {}
 			: { roundRobinAfterAgentId: input.roundRobinAfterAgentId }),
@@ -437,3 +448,157 @@ function candidate(agent: QueueMembershipAgent, idleMs: number): QueueCandidate 
 		idleMs,
 	};
 }
+
+// =================================================================================================
+// Skills
+// =================================================================================================
+
+/** Three agents in one tier, distinguished only by how much Spanish they have. */
+const SPANISH = [
+	fakeAgent("a", { position: 1, skills: [{ skill: "spanish", level: 4 }] }),
+	fakeAgent("b", { position: 2, skills: [{ skill: "spanish", level: 2 }] }),
+	fakeAgent("c", { position: 3 }),
+];
+
+function requirement(overrides: Partial<QueueSkillRequirement> = {}): QueueSkillRequirement {
+	return { skill: "spanish", minLevel: 3, relaxAfterSeconds: 0, ...overrides };
+}
+
+describe("skill requirements", () => {
+	it("keeps the agents who clear the bar and drops the ones who do not", () => {
+		const selection = select({
+			strategy: "ring-all",
+			agents: SPANISH,
+			membership: { tierRulesApply: false },
+			skillRequirements: [requirement()],
+		});
+		expect(ids(selection)).toEqual(["a"]);
+	});
+
+	it("treats an agent with no skills at all as level 0 rather than as unrestricted", () => {
+		const selection = select({
+			strategy: "ring-all",
+			agents: SPANISH,
+			membership: { tierRulesApply: false },
+			skillRequirements: [requirement({ minLevel: 1 })],
+		});
+		expect(ids(selection)).toEqual(["a", "b"]);
+	});
+
+	it("relaxes the bar one level per relaxAfterSeconds of waiting", () => {
+		const relaxing = [requirement({ minLevel: 4, relaxAfterSeconds: 30 })];
+		const at = (waitedMs: number): string[] =>
+			ids(
+				select({
+					strategy: "ring-all",
+					agents: SPANISH,
+					membership: { tierRulesApply: false },
+					skillRequirements: relaxing,
+					waitedMs,
+				}),
+			);
+		expect(at(0)).toEqual(["a"]);
+		// 29 s is not yet a step: the bar drops on the whole interval, not proportionally.
+		expect(at(29_000)).toEqual(["a"]);
+		// 60 s buys two levels, which is the moment `b` (level 2) clears a bar of 2.
+		expect(at(60_000)).toEqual(["a", "b"]);
+		// A bar that has relaxed to 0 excludes nobody, including the agent with no skills recorded.
+		expect(at(120_000)).toEqual(["a", "b", "c"]);
+	});
+
+	it("never relaxes a requirement whose relaxAfterSeconds is zero", () => {
+		const selection = select({
+			strategy: "ring-all",
+			agents: SPANISH,
+			membership: { tierRulesApply: false },
+			skillRequirements: [requirement({ minLevel: 4, relaxAfterSeconds: 0 })],
+			waitedMs: 3_600_000,
+		});
+		expect(ids(selection)).toEqual(["a"]);
+		expect(selection.skillBars).toEqual([{ skill: "spanish", minLevel: 4 }]);
+	});
+
+	it("filters before the comparator, so the survivors keep the order they would have had", () => {
+		const agents = [
+			fakeAgent("a", { level: 2, position: 1, skills: [{ skill: "spanish", level: 5 }] }),
+			fakeAgent("b", { level: 1, position: 9, skills: [{ skill: "spanish", level: 5 }] }),
+			fakeAgent("c", { level: 1, position: 1 }),
+		];
+		const selection = select({
+			strategy: "ring-all",
+			agents,
+			membership: { tierRulesApply: false },
+			skillRequirements: [requirement()],
+		});
+		// `c` is the top of the tier ladder and is gone on skills; the two who remain are still in
+		// (level, position) order rather than in roster order.
+		expect(ids(selection)).toEqual(["b", "a"]);
+	});
+
+	it("reports how many agents the skills alone removed, but only when nobody is left", () => {
+		const excluded = select({
+			strategy: "ring-all",
+			agents: SPANISH,
+			membership: { tierRulesApply: false },
+			skillRequirements: [requirement({ minLevel: 5 })],
+		});
+		expect(ids(excluded)).toEqual([]);
+		expect(excluded.skilledOut).toBe(3);
+
+		const served = select({
+			strategy: "ring-all",
+			agents: SPANISH,
+			membership: { tierRulesApply: false },
+			skillRequirements: [requirement()],
+		});
+		expect(served.skilledOut).toBe(0);
+	});
+
+	it("leaves a queue that asks for nothing exactly as it was", () => {
+		expect(
+			ids(select({ strategy: "ring-all", agents: SPANISH, membership: { tierRulesApply: false } })),
+		).toEqual(["a", "b", "c"]);
+	});
+});
+
+describe("merging the queue's requirements with the entrance's", () => {
+	it("takes the higher minLevel when both name the same skill", () => {
+		expect(
+			mergeSkillRequirements(
+				[{ skill: "spanish", minLevel: 3, relaxAfterSeconds: 30 }],
+				[{ skill: "spanish", minLevel: 4, relaxAfterSeconds: 0 }],
+			),
+		).toEqual([{ skill: "spanish", minLevel: 4, relaxAfterSeconds: 0 }]);
+	});
+
+	it("never lets an entrance LOWER the queue's own bar", () => {
+		expect(
+			mergeSkillRequirements(
+				[{ skill: "spanish", minLevel: 4, relaxAfterSeconds: 0 }],
+				[{ skill: "spanish", minLevel: 1, relaxAfterSeconds: 10 }],
+			),
+		).toEqual([{ skill: "spanish", minLevel: 4, relaxAfterSeconds: 0 }]);
+	});
+
+	it("keeps skills only one side names", () => {
+		expect(
+			mergeSkillRequirements(
+				[{ skill: "spanish", minLevel: 2, relaxAfterSeconds: 0 }],
+				[{ skill: "billing", minLevel: 3, relaxAfterSeconds: 0 }],
+			),
+		).toEqual([
+			{ skill: "spanish", minLevel: 2, relaxAfterSeconds: 0 },
+			{ skill: "billing", minLevel: 3, relaxAfterSeconds: 0 },
+		]);
+	});
+
+	it("is empty when neither side asks for anything", () => {
+		expect(mergeSkillRequirements(undefined, undefined)).toEqual([]);
+	});
+
+	it("floors a relaxed bar at zero rather than going negative", () => {
+		expect(
+			effectiveSkillBars([{ skill: "spanish", minLevel: 2, relaxAfterSeconds: 10 }], 600_000),
+		).toEqual([{ skill: "spanish", minLevel: 0 }]);
+	});
+});

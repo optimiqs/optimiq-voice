@@ -1,0 +1,1 @@
+ALTER TABLE "cdr_export_job" ADD CONSTRAINT "cdr_export_job_object_key_check" CHECK ("object_key" is null or "object_key" = 'exports/' || "organization_id" || '/' || "id" || '.csv');

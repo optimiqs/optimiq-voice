@@ -1,11 +1,13 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "~/components/ui/toast";
 import { ApiError } from "~/lib/api-client";
 import {
 	applyAgentSessionAction,
+	fetchAgentSession,
 	fetchMyAgentSession,
+	submitAgentDisposition,
 	type AgentSessionAction,
 	type AgentSessionView,
 } from "~/lib/live/agent-session";
@@ -32,7 +34,9 @@ import type { UseQueryResult } from "@tanstack/react-query";
  * acknowledged and the truth comes back through the socket and the invalidated query.
  */
 
-export function useMyAgentSession(): UseQueryResult<AgentSessionView | null> {
+export function useMyAgentSession(
+	options: { readonly pollMs?: number } = {},
+): UseQueryResult<AgentSessionView | null> {
 	const organizationId = useActiveOrganization()?.id ?? "";
 	// `queues.read` is the route's floor; without it the request is a guaranteed 403 and asking
 	// would put a red line in every agent's console for a feature they cannot use.
@@ -41,10 +45,50 @@ export function useMyAgentSession(): UseQueryResult<AgentSessionView | null> {
 		queryKey: queryKeys.myAgentSession(organizationId),
 		queryFn: fetchMyAgentSession,
 		enabled: organizationId.length > 0 && canRead,
+		// Off by default: the socket is what keeps this fresh. A caller passes an interval only for
+		// the case the socket cannot cover — a cold or unpermitted one — and then it is a poll of one
+		// row, not a second live channel.
+		...(options.pollMs === undefined ? {} : { refetchInterval: options.pollMs }),
 		// A 403 or a 404 here is an answer, not a transient failure: this user is not an agent, or
 		// may not ask. Retrying would be four requests to learn the same thing.
 		retry: false,
 	});
+}
+
+/**
+ * The live seats of named agents, over HTTP.
+ *
+ * The wallboard reads agent state off the `agent-state` socket; this is what it falls back to when
+ * that socket has not warmed up or the operator does not hold `queues.monitor` on it. The session
+ * endpoint carries the same call and disposition fields, so the supervise button appears either way.
+ *
+ * Deliberately driven by an explicit id list rather than the whole roster: this is one request per
+ * agent, and a wallboard watching forty seats must not turn a cold socket into forty polls. The
+ * caller passes only the agents whose persisted status says they are on a call.
+ */
+export function useAgentSessions(
+	agentIds: readonly string[],
+	options: { readonly pollMs?: number } = {},
+): Map<string, AgentSessionView> {
+	const organizationId = useActiveOrganization()?.id ?? "";
+	const canRead = useAnyPermission(["queues.read"]);
+	const enabled = organizationId.length > 0 && canRead;
+	const results = useQueries({
+		queries: agentIds.map((agentId) => ({
+			queryKey: queryKeys.agentSession(organizationId, agentId),
+			queryFn: async () => await fetchAgentSession(agentId),
+			enabled,
+			...(options.pollMs === undefined ? {} : { refetchInterval: options.pollMs }),
+			retry: false,
+		})),
+	});
+	const seats = new Map<string, AgentSessionView>();
+	for (const result of results) {
+		if (result.data !== undefined) {
+			seats.set(result.data.agentId, result.data);
+		}
+	}
+	return seats;
 }
 
 export interface AgentSessionMutation {
@@ -62,11 +106,7 @@ export function useAgentSessionAction(): AgentSessionMutation {
 	const organizationId = useActiveOrganization()?.id ?? "";
 
 	const mutation = useMutation({
-		mutationFn: async (input: {
-			agentId: string;
-			action: AgentSessionAction;
-			reason?: string;
-		}) =>
+		mutationFn: async (input: { agentId: string; action: AgentSessionAction; reason?: string }) =>
 			await applyAgentSessionAction(
 				input.agentId,
 				input.action,
@@ -99,6 +139,67 @@ export function useAgentSessionAction(): AgentSessionMutation {
 		isPending: mutation.isPending,
 		error: mutation.error,
 	};
+}
+
+export interface DispositionMutation {
+	readonly run: (input: {
+		readonly agentId: string;
+		readonly callId: string;
+		readonly code: string;
+	}) => void;
+	readonly isPending: boolean;
+	readonly error: unknown;
+}
+
+/**
+ * The wrap-up code for the call an agent is finishing.
+ *
+ * No invalidation, unlike the four availability actions, and the difference is what each write
+ * touches: those move `queue_agent.status`, which the roster table renders from the ROW. This one
+ * writes a `queue_call_disposition` nothing on screen reads and stamps `dispositionCode` on the live
+ * `agent-state` entry — which arrives over the socket a moment later and is what makes the panel
+ * acknowledge itself. Invalidating the agents list here would refetch a table for a value that is
+ * not in it.
+ *
+ * A failure is a toast rather than a field error: the only refusal an agent can act on is
+ * `QUEUE_DISPOSITION_NO_LIVE_CALL`, which means the wrap-up ended while they were choosing, and the
+ * honest thing to say is that the platform has already recorded `unset`.
+ */
+export function useSubmitDisposition(): DispositionMutation {
+	const mutation = useMutation({
+		mutationFn: async (input: { agentId: string; callId: string; code: string }) =>
+			await submitAgentDisposition(input.agentId, { callId: input.callId, code: input.code }),
+		onSuccess: (result) => {
+			toast.success(`Call closed as ${result.code}.`);
+		},
+		onError: (error) => {
+			toast.error(dispositionMessage(error));
+		},
+	});
+
+	return {
+		run: (input) => mutation.mutate(input),
+		isPending: mutation.isPending,
+		error: mutation.error,
+	};
+}
+
+/** A refused wrap-up code, in words the agent can act on — which is usually "it is too late". */
+export function dispositionMessage(error: unknown): string {
+	if (!(error instanceof ApiError)) {
+		return "The wrap-up code could not be recorded. Check your connection and try again.";
+	}
+	const body = error.body as { code?: string; message?: string } | null;
+	switch (body?.code) {
+		case "QUEUE_DISPOSITION_NO_LIVE_CALL":
+			return "The wrap-up window for that call has closed, so it was recorded without a code. You are back on the floor.";
+		case "QUEUE_DISPOSITION_CODE_UNKNOWN":
+			return body.message ?? "That code is not one this queue offers any more.";
+		case "QUEUE_AGENT_SESSION_FORBIDDEN":
+			return body.message ?? "You may not close out this agent's call.";
+		default:
+			return body?.message ?? `The wrap-up code could not be recorded (${String(error.status)}).`;
+	}
 }
 
 const MESSAGES: Record<AgentSessionAction, (name: string) => string> = {

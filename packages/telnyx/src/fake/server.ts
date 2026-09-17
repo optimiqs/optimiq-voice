@@ -1,10 +1,19 @@
 import { createServer, type Server } from "node:http";
 import {
+	type FakeAddress,
+	type FakeBrand,
+	type FakeCampaign,
 	type FakeConnection,
+	type FakeFax,
+	type FakeMessage,
+	type FakeMessagingProfile,
 	type FakeNumberInventoryEntry,
 	type FakeOrder,
+	type FakePhoneNumberCampaign,
+	type FakePortingOrder,
 	type FakeProfile,
 	FakeTelnyxState,
+	type FakeTollFreeVerification,
 } from "./state";
 import type { AddressInfo } from "node:net";
 
@@ -32,9 +41,21 @@ import type { AddressInfo } from "node:net";
  * `features` as objects, costs as strings, `POST /number_orders` returning 200 while
  * `POST /credential_connections` returns 201, `DELETE /phone_numbers/{id}` returning a body.
  *
- * Not faithful: rate limits (driven by an explicit queue instead), regulatory requirements,
- * porting, messaging, and the several hundred endpoints this platform does not call. A fake that
- * tried to be complete would be a second implementation to maintain and would still be wrong.
+ * Also faithful about the two porting shapes that are easy to assume wrong: `POST /porting_orders`
+ * answering with a **list** because Telnyx splits a request across losing carriers, and CNAM's two
+ * halves living on two different endpoints — the `caller_id_name_enabled` written on `…/voice` is
+ * read back from the parent number and NOT from the voice GET.
+ *
+ * Not faithful: rate limits (driven by an explicit queue instead), regulatory requirements, the
+ * porting DOCUMENT workflow (LOAs, end-user detail, drafts), and the several hundred
+ * endpoints this platform does not call.
+ *
+ * Messaging IS modelled, and for the same "rule that carries money" reason: a US local number may
+ * not send until it is on a messaging profile AND assigned to an ACTIVE 10DLC campaign, and a
+ * campaign under an unverified brand never reaches ACTIVE. Those three refusals are the whole
+ * point of the 10DLC surface, so the fake says no to each of them; `state.allowUnregisteredSend`
+ * opts a spec out when it is testing something else. A fake that tried to be complete would be a second
+ * implementation to maintain and would still be wrong.
  *
  * It is deliberately NOT authenticated beyond "there must be a bearer token" — asserting the exact
  * key would test that we can pass a string to ourselves.
@@ -122,6 +143,50 @@ function orderBody(order: FakeOrder, state: FakeTelnyxState) {
 	};
 }
 
+/** The first required postal field this body is missing, or `undefined` when it is complete. */
+function missingAddressField(body: Record<string, unknown>): string | undefined {
+	for (const field of [
+		"street_address",
+		"locality",
+		"administrative_area",
+		"postal_code",
+		"country_code",
+	]) {
+		const value = body[field];
+		if (typeof value !== "string" || value.length === 0) {
+			return field;
+		}
+	}
+	return undefined;
+}
+
+function addressBody(address: FakeAddress) {
+	return {
+		id: address.id,
+		record_type: "address",
+		street_address: address.streetAddress,
+		extended_address: address.extendedAddress ?? null,
+		locality: address.locality,
+		administrative_area: address.administrativeArea,
+		postal_code: address.postalCode,
+		country_code: address.countryCode,
+		customer_reference: address.customerReference ?? null,
+		address_book: true,
+		created_at: address.createdAt,
+		updated_at: address.createdAt,
+	};
+}
+
+function addressValidationBody(state: FakeTelnyxState) {
+	const answer = state.addressValidation;
+	return {
+		record_type: "address_validation",
+		result: answer.result,
+		suggested: answer.suggested ?? null,
+		errors: answer.errors.map((entry) => ({ code: entry.code, message: entry.message })),
+	};
+}
+
 function phoneNumberBody(entry: FakeNumberInventoryEntry, status = "active") {
 	return {
 		id: entry.ownedId,
@@ -136,8 +201,8 @@ function phoneNumberBody(entry: FakeNumberInventoryEntry, status = "active") {
 		emergency_enabled: false,
 		emergency_address_id: null,
 		call_forwarding_enabled: false,
-		cnam_listing_enabled: false,
-		caller_id_name_enabled: false,
+		cnam_listing_enabled: entry.cnamListingEnabled ?? false,
+		caller_id_name_enabled: entry.callerIdNameEnabled ?? false,
 		call_recording_enabled: false,
 		t38_fax_gateway_enabled: false,
 		phone_number_type: entry.phoneNumberType,
@@ -165,7 +230,10 @@ function voiceSettingsBody(entry: FakeNumberInventoryEntry) {
 			forwards_to: "",
 			forwarding_type: "always",
 		},
-		cnam_listing: { cnam_listing_enabled: false, cnam_listing_details: "" },
+		cnam_listing: {
+			cnam_listing_enabled: entry.cnamListingEnabled ?? false,
+			cnam_listing_details: entry.cnamListingDetails ?? "",
+		},
 		emergency: {
 			emergency_enabled: false,
 			emergency_address_id: "",
@@ -244,6 +312,249 @@ function profileBody(profile: FakeProfile) {
 		billing_group_id: null,
 		created_at: profile.createdAt,
 		updated_at: profile.createdAt,
+	};
+}
+
+function faxBody(fax: FakeFax) {
+	return {
+		id: fax.id,
+		record_type: "fax",
+		direction: fax.direction,
+		status: fax.status,
+		connection_id: fax.connectionId,
+		from: fax.from,
+		to: fax.to,
+		from_display_name: null,
+		quality: "normal",
+		media_url: fax.mediaUrl ?? null,
+		media_name: fax.mediaName ?? null,
+		// Telnyx echoes the source document back under original_media_url; store_media is off by
+		// default, so stored_media_url stays null until a delivered webhook fills it.
+		original_media_url: fax.mediaUrl ?? null,
+		stored_media_url: null,
+		page_count: null,
+		store_media: false,
+		t38_enabled: true,
+		monochrome: false,
+		webhook_url: null,
+		client_state: fax.clientState ?? null,
+		failure_reason: null,
+		call_duration_secs: null,
+		created_at: fax.createdAt,
+		updated_at: fax.createdAt,
+	};
+}
+
+function portingOrderBody(order: FakePortingOrder) {
+	return {
+		id: order.id,
+		record_type: "porting_order",
+		status: order.status,
+		customer_reference: order.customerReference,
+		support_key: order.supportKey,
+		phone_numbers_count: order.phoneNumbers.length,
+		activation_settings: {
+			foc_datetime_requested: null,
+			foc_datetime_actual: null,
+			fast_port_eligible: false,
+		},
+		misc: { type: "full", remaining_numbers_action: "keep" },
+		created_at: order.createdAt,
+		updated_at: order.createdAt,
+		phone_numbers: order.phoneNumbers.map((phoneNumber) => ({
+			id: randomIshId(phoneNumber),
+			record_type: "porting_phone_number",
+			phone_number: phoneNumber,
+			porting_order_status: order.status,
+			activation_status: "New",
+			phone_number_type: "landline",
+			portability_status: "confirmed",
+		})),
+	};
+}
+
+/** A stable per-number id, so two reads of one order do not disagree about it. */
+function randomIshId(phoneNumber: string): string {
+	return `pn-${phoneNumber.replace(/[^0-9]/gu, "")}`;
+}
+
+/** The path of the toll-free verification collection — snake_case, unlike its camelCase body. */
+const TOLL_FREE_PATH = "/messaging_tollfree/verification/requests";
+
+/** The PIN a triggered brand OTP always "sends". Fixed so a spec can complete the round trip. */
+export const FAKE_BRAND_OTP_PIN = "123456";
+
+/** North American toll-free NPAs, which are verified by aggregator rather than registered with TCR. */
+const TOLL_FREE_NPAS = new Set(["800", "833", "844", "855", "866", "877", "888"]);
+
+/**
+ * Whether a number is a US/Canada **local** (10-digit long code) number — the only kind the 10DLC
+ * gate applies to. Toll-free and non-NANP numbers take other compliance paths entirely.
+ */
+function isUsLocalNumber(phoneNumber: string): boolean {
+	if (!/^\+1[0-9]{10}$/u.test(phoneNumber)) {
+		return false;
+	}
+	return !TOLL_FREE_NPAS.has(phoneNumber.slice(2, 5));
+}
+
+function messagingProfileBody(profile: FakeMessagingProfile) {
+	return {
+		id: profile.id,
+		record_type: "messaging_profile",
+		name: profile.name,
+		enabled: profile.enabled,
+		webhook_url: profile.webhookUrl ?? null,
+		webhook_failover_url: profile.webhookFailoverUrl ?? null,
+		webhook_api_version: profile.webhookApiVersion,
+		whitelisted_destinations: profile.whitelistedDestinations,
+		number_pool_settings: null,
+		url_shortener_settings: null,
+		alpha_sender: null,
+		daily_spend_limit: null,
+		daily_spend_limit_enabled: false,
+		mms_fall_back_to_sms: false,
+		mms_transcoding: false,
+		v1_secret: null,
+		created_at: profile.createdAt,
+		updated_at: profile.createdAt,
+	};
+}
+
+function numberMessagingBody(entry: FakeNumberInventoryEntry) {
+	return {
+		id: entry.ownedId,
+		record_type: "messaging_settings",
+		phone_number: entry.phoneNumber,
+		messaging_profile_id: entry.messagingProfileId ?? null,
+		messaging_product: entry.messagingProfileId === undefined ? null : "P2P",
+		eligible_messaging_products: ["P2P", "A2P"],
+		features: { sms: { domestic_two_way: true }, mms: null },
+		type: entry.phoneNumberType,
+		country_code: entry.countryCode,
+		traffic_type: "A2P",
+		health: null,
+		created_at: new Date().toISOString(),
+		updated_at: new Date().toISOString(),
+	};
+}
+
+function messageBody(message: FakeMessage) {
+	return {
+		id: message.id,
+		record_type: "message",
+		direction: message.direction,
+		type: message.type,
+		// A string on an outbound message and an OBJECT on an inbound one. The client normalises
+		// both with `messageFromE164`; a fake that always sent a string would agree with a client
+		// that never handled the object.
+		from:
+			message.direction === "outbound"
+				? message.from
+				: { phone_number: message.from, carrier: "FakeCarrier", line_type: "Wireless" },
+		// The delivery status is HERE, per recipient, and nowhere else. There is deliberately no
+		// top-level `status` key on this body.
+		to: [
+			{
+				phone_number: message.to,
+				status: message.toStatus,
+				carrier: "FakeCarrier",
+				line_type: "Wireless",
+			},
+		],
+		text: message.text ?? null,
+		media: message.mediaUrls.map((url) => ({
+			url,
+			content_type: "image/jpeg",
+			sha256: null,
+			size: null,
+		})),
+		parts: 1,
+		encoding: "GSM-7",
+		cost: null,
+		errors: [],
+		messaging_profile_id: message.messagingProfileId ?? null,
+		organization_id: "fake-org",
+		received_at: message.createdAt,
+		sent_at: null,
+		completed_at: null,
+		valid_until: null,
+		webhook_url: null,
+		client_state: message.clientState ?? null,
+		tags: [],
+	};
+}
+
+function brandBody(brand: FakeBrand) {
+	return {
+		brandId: brand.brandId,
+		entityType: brand.entityType,
+		displayName: brand.displayName,
+		companyName: brand.displayName,
+		identityStatus: brand.identityStatus,
+		brandRelationship: "BASIC_ACCOUNT",
+		vertical: brand.vertical,
+		status: brand.status,
+		failureReasons: null,
+		cspId: "fake-csp",
+		country: brand.country,
+		email: brand.email,
+		website: null,
+		phone: null,
+		street: null,
+		city: null,
+		state: null,
+		postalCode: null,
+		mock: true,
+	};
+}
+
+function campaignBody(campaign: FakeCampaign) {
+	return {
+		campaignId: campaign.campaignId,
+		brandId: campaign.brandId,
+		status: campaign.status,
+		campaignStatus: campaign.status,
+		usecase: campaign.usecase,
+		description: campaign.description,
+		sample1: "Your appointment is confirmed.",
+		messageFlow: "Users opt in on the web form.",
+		helpMessage: "Reply STOP to unsubscribe.",
+		optinKeywords: "START",
+		optoutKeywords: "STOP",
+		helpKeywords: "HELP",
+		mnoMetadata: {},
+		tcrCampaignId: `C${campaign.campaignId.slice(0, 6).toUpperCase()}`,
+		failureReasons: null,
+		createdAt: campaign.createdAt,
+	};
+}
+
+function phoneNumberCampaignBody(assignment: FakePhoneNumberCampaign) {
+	return {
+		phoneNumber: assignment.phoneNumber,
+		campaignId: assignment.campaignId,
+		brandId: assignment.brandId,
+		tcrCampaignId: `C${assignment.campaignId.slice(0, 6).toUpperCase()}`,
+		assignmentStatus: assignment.assignmentStatus,
+	};
+}
+
+function tollFreeBody(verification: FakeTollFreeVerification) {
+	return {
+		id: verification.id,
+		verificationRequestId: verification.id,
+		verificationStatus: verification.verificationStatus,
+		businessName: verification.businessName,
+		phoneNumbers: verification.phoneNumbers.map((phoneNumber) => ({ phoneNumber })),
+		businessRegistrationNumber: verification.businessRegistrationNumber ?? null,
+		businessRegistrationType: verification.businessRegistrationType ?? null,
+		businessRegistrationCountry: verification.businessRegistrationCountry ?? null,
+		entityType: "PRIVATE_PROFIT",
+		reason: null,
+		rejectionReason: null,
+		createdAt: verification.createdAt,
+		updatedAt: verification.createdAt,
 	};
 }
 
@@ -368,6 +679,80 @@ function route(request: ParsedRequest, state: FakeTelnyxState): Reply {
 		return { status: 200, body: { data: orderBody(order, state) } };
 	}
 
+	// ---- porting orders --------------------------------------------------------------------
+	if (method === "POST" && path === "/porting_orders") {
+		const requested = Array.isArray(body.phone_numbers)
+			? (body.phone_numbers as unknown[]).filter(
+					(value): value is string => typeof value === "string",
+				)
+			: [];
+		if (requested.length === 0) {
+			return { status: 422, body: errorBody("10027", "Unprocessable Entity", "phone_numbers") };
+		}
+		const customerReference =
+			typeof body.customer_reference === "string" ? body.customer_reference : "";
+
+		/**
+		 * The split. Telnyx files one order per losing carrier, and the fake stands in for that by
+		 * splitting on country code — enough to make the list-shaped response REAL rather than a
+		 * one-element array a client could get away with mis-modelling as a single object.
+		 */
+		const groups = new Map<string, string[]>();
+		for (const phoneNumber of requested) {
+			const key = phoneNumber.slice(0, 2);
+			groups.set(key, [...(groups.get(key) ?? []), phoneNumber]);
+		}
+		const created: FakePortingOrder[] = [];
+		for (const numbers of groups.values()) {
+			const order: FakePortingOrder = {
+				id: state.newId(),
+				customerReference,
+				supportKey: `sk-${state.newId().slice(0, 8)}`,
+				// Telnyx files a port as a draft: it is not with the losing carrier until the documents
+				// are in. A fake that answered "in-process" would hide the one state a UI must surface.
+				status: "draft",
+				phoneNumbers: numbers,
+				createdAt: state.now(),
+			};
+			state.portingOrders.set(order.id, order);
+			created.push(order);
+		}
+		// 200, and a LIST envelope — see resources/porting-orders.ts.
+		return {
+			status: 200,
+			body: {
+				data: created.map(portingOrderBody),
+				meta: { total_results: created.length, page_number: 1, page_size: 20, total_pages: 1 },
+			},
+		};
+	}
+
+	if (method === "GET" && path === "/porting_orders") {
+		const status = query.get("filter[status]");
+		const reference = query.get("filter[customer_reference]");
+		const matches = [...state.portingOrders.values()].filter(
+			(order) =>
+				(status === null || order.status === status) &&
+				(reference === null || order.customerReference === reference),
+		);
+		return {
+			status: 200,
+			body: {
+				data: matches.map(portingOrderBody),
+				meta: { total_results: matches.length, page_number: 1, page_size: 20, total_pages: 1 },
+			},
+		};
+	}
+
+	const portingMatch = /^\/porting_orders\/([^/]+)$/u.exec(path);
+	if (method === "GET" && portingMatch) {
+		const order = state.portingOrders.get(decodeURIComponent(portingMatch[1] ?? ""));
+		if (order === undefined) {
+			return { status: 404, body: errorBody("10005", "Resource not found") };
+		}
+		return { status: 200, body: { data: portingOrderBody(order) } };
+	}
+
 	// ---- phone numbers ---------------------------------------------------------------------
 	if (method === "GET" && path === "/phone_numbers") {
 		const filter = query.get("filter[phone_number]");
@@ -389,6 +774,30 @@ function route(request: ParsedRequest, state: FakeTelnyxState): Reply {
 		const entry = state.findOwned(decodeURIComponent(voiceMatch[1] ?? ""));
 		if (entry === undefined) {
 			return { status: 404, body: errorBody("10005", "Resource not found") };
+		}
+		if (method === "PATCH") {
+			// Write-only here: accepted on the PATCH, stored on the number, and deliberately NOT
+			// echoed by voiceSettingsBody. A client that reads it back from this response is reading a
+			// field the real API does not send.
+			if (typeof body.caller_id_name_enabled === "boolean") {
+				entry.callerIdNameEnabled = body.caller_id_name_enabled;
+			}
+			const cnam = body.cnam_listing;
+			if (typeof cnam === "object" && cnam !== null) {
+				const group = cnam as Record<string, unknown>;
+				if (typeof group.cnam_listing_enabled === "boolean") {
+					entry.cnamListingEnabled = group.cnam_listing_enabled;
+				}
+				if (typeof group.cnam_listing_details === "string") {
+					if (group.cnam_listing_details.length > 15) {
+						return {
+							status: 422,
+							body: errorBody("10027", "Unprocessable Entity", "cnam_listing_details"),
+						};
+					}
+					entry.cnamListingDetails = group.cnam_listing_details;
+				}
+			}
 		}
 		return { status: 200, body: { data: voiceSettingsBody(entry) } };
 	}
@@ -598,6 +1007,602 @@ function route(request: ParsedRequest, state: FakeTelnyxState): Reply {
 		if (method === "DELETE") {
 			state.profiles.delete(profileId);
 			return { status: 200, body: { data: profileBody(profile) } };
+		}
+	}
+
+	// ---- addresses / E911 dispatchable locations --------------------------------------------
+	if (method === "POST" && path === "/addresses/actions/validate") {
+		const missing = missingAddressField(body);
+		if (missing !== undefined) {
+			return { status: 422, body: errorBody("10027", "Unprocessable Entity", missing) };
+		}
+		return { status: 200, body: { data: addressValidationBody(state) } };
+	}
+
+	if (method === "POST" && path === "/addresses") {
+		const missing = missingAddressField(body);
+		if (missing !== undefined) {
+			return { status: 422, body: errorBody("10027", "Unprocessable Entity", missing) };
+		}
+		// `validate_address` is the carrier's own "refuse the write unless it validates" flag, and
+		// the fake honours it — a create that returned an id for an address the validation endpoint
+		// calls unreal would let the API layer store a reference that means nothing.
+		if (body.validate_address === true && state.addressValidation.result !== "valid") {
+			const [first] = state.addressValidation.errors;
+			return {
+				status: 422,
+				body: errorBody(
+					first?.code ?? "10015",
+					"Address validation failed",
+					first?.message ?? "The address could not be validated.",
+				),
+			};
+		}
+		const address: FakeAddress = {
+			id: state.newId(),
+			streetAddress: String(body.street_address ?? ""),
+			...(typeof body.extended_address === "string"
+				? { extendedAddress: body.extended_address }
+				: {}),
+			locality: String(body.locality ?? ""),
+			administrativeArea: String(body.administrative_area ?? ""),
+			postalCode: String(body.postal_code ?? ""),
+			countryCode: String(body.country_code ?? ""),
+			...(typeof body.customer_reference === "string"
+				? { customerReference: body.customer_reference }
+				: {}),
+			createdAt: state.now(),
+		};
+		state.addresses.set(address.id, address);
+		return { status: 201, body: { data: addressBody(address) } };
+	}
+
+	if (method === "GET" && path === "/addresses") {
+		const reference = request.query.get("filter[customer_reference]");
+		const rows = [...state.addresses.values()].filter(
+			(entry) => reference === null || entry.customerReference === reference,
+		);
+		return {
+			status: 200,
+			body: {
+				data: rows.map((entry) => addressBody(entry)),
+				meta: { total_results: rows.length, page_number: 1, page_size: rows.length },
+			},
+		};
+	}
+
+	const addressMatch = /^\/addresses\/([^/]+)$/u.exec(path);
+	if (addressMatch) {
+		const addressId = decodeURIComponent(addressMatch[1] ?? "");
+		const address = state.addresses.get(addressId);
+		if (address === undefined) {
+			return { status: 404, body: errorBody("10005", "Resource not found") };
+		}
+		if (method === "GET") {
+			return { status: 200, body: { data: addressBody(address) } };
+		}
+		if (method === "DELETE") {
+			state.addresses.delete(addressId);
+			return { status: 200, body: { data: addressBody(address) } };
+		}
+	}
+
+	// ---- programmable fax ------------------------------------------------------------------
+	if (method === "POST" && path === "/faxes") {
+		const connectionId = typeof body.connection_id === "string" ? body.connection_id : "";
+		const to = typeof body.to === "string" ? body.to : "";
+		const from = typeof body.from === "string" ? body.from : "";
+		if (connectionId.length === 0) {
+			return { status: 422, body: errorBody("10027", "Unprocessable Entity", "connection_id") };
+		}
+		if (to.length === 0) {
+			return { status: 422, body: errorBody("10027", "Unprocessable Entity", "to") };
+		}
+		if (from.length === 0) {
+			return { status: 422, body: errorBody("10027", "Unprocessable Entity", "from") };
+		}
+		const mediaUrl = typeof body.media_url === "string" ? body.media_url : undefined;
+		const mediaName = typeof body.media_name === "string" ? body.media_name : undefined;
+		// Exactly one of the two, same rule the client enforces before the round trip.
+		if ((mediaUrl === undefined) === (mediaName === undefined)) {
+			return {
+				status: 422,
+				body: errorBody("10027", "Unprocessable Entity", "exactly one of media_url or media_name"),
+			};
+		}
+		const fax: FakeFax = {
+			id: state.newId(),
+			direction: "outbound",
+			// Queued, not sent — the delivery is asynchronous and reported over webhooks.
+			status: "queued",
+			connectionId,
+			to,
+			from,
+			...(mediaUrl === undefined ? {} : { mediaUrl }),
+			...(mediaName === undefined ? {} : { mediaName }),
+			...(typeof body.client_state === "string" ? { clientState: body.client_state } : {}),
+			createdAt: state.now(),
+		};
+		state.faxes.set(fax.id, fax);
+		// 202 Accepted — the one endpoint in this surface that answers 202. A client asserting 200
+		// would break here, which is the point.
+		return { status: 202, body: { data: faxBody(fax) } };
+	}
+
+	const faxMatch = /^\/faxes\/([^/]+)$/u.exec(path);
+	if (method === "GET" && faxMatch) {
+		const fax = state.faxes.get(decodeURIComponent(faxMatch[1] ?? ""));
+		if (fax === undefined) {
+			return { status: 404, body: errorBody("10005", "Resource not found") };
+		}
+		return { status: 200, body: { data: faxBody(fax) } };
+	}
+
+	// ---- messaging profiles ----------------------------------------------------------------
+	if (method === "POST" && path === "/messaging_profiles") {
+		const name = typeof body.name === "string" ? body.name : "";
+		if (name.length === 0) {
+			return { status: 422, body: errorBody("10027", "Unprocessable Entity", "name") };
+		}
+		const profile: FakeMessagingProfile = {
+			id: state.newId(),
+			name,
+			enabled: body.enabled !== false,
+			...(typeof body.webhook_url === "string" ? { webhookUrl: body.webhook_url } : {}),
+			...(typeof body.webhook_failover_url === "string"
+				? { webhookFailoverUrl: body.webhook_failover_url }
+				: {}),
+			// Echoed back exactly as sent, so a spec can prove the client pins "2" — a profile left
+			// on the "1" default delivers an envelope `webhooks/events.ts` rejects.
+			webhookApiVersion:
+				typeof body.webhook_api_version === "string" ? body.webhook_api_version : "1",
+			whitelistedDestinations: Array.isArray(body.whitelisted_destinations)
+				? (body.whitelisted_destinations as string[])
+				: ["US"],
+			createdAt: state.now(),
+		};
+		state.messagingProfiles.set(profile.id, profile);
+		return { status: 200, body: { data: messagingProfileBody(profile) } };
+	}
+
+	if (method === "GET" && path === "/messaging_profiles") {
+		const filter = query.get("filter[name]");
+		const matches = [...state.messagingProfiles.values()].filter(
+			(profile) => filter === null || profile.name.includes(filter),
+		);
+		return {
+			status: 200,
+			body: {
+				data: matches.map(messagingProfileBody),
+				meta: { total_results: matches.length, page_number: 1, page_size: 50, total_pages: 1 },
+			},
+		};
+	}
+
+	const messagingProfileNumbers = /^\/messaging_profiles\/([^/]+)\/phone_numbers$/u.exec(path);
+	if (method === "GET" && messagingProfileNumbers) {
+		const profileId = decodeURIComponent(messagingProfileNumbers[1] ?? "");
+		if (!state.messagingProfiles.has(profileId)) {
+			return { status: 404, body: errorBody("10005", "Resource not found") };
+		}
+		const attached = state.inventory.filter((entry) => entry.messagingProfileId === profileId);
+		return {
+			status: 200,
+			body: {
+				data: attached.map(numberMessagingBody),
+				meta: { total_results: attached.length, page_number: 1, page_size: 50, total_pages: 1 },
+			},
+		};
+	}
+
+	const messagingProfileMatch = /^\/messaging_profiles\/([^/]+)$/u.exec(path);
+	if (messagingProfileMatch) {
+		const profileId = decodeURIComponent(messagingProfileMatch[1] ?? "");
+		const profile = state.messagingProfiles.get(profileId);
+		if (profile === undefined) {
+			return { status: 404, body: errorBody("10005", "Resource not found") };
+		}
+		if (method === "GET") {
+			return { status: 200, body: { data: messagingProfileBody(profile) } };
+		}
+		if (method === "PATCH") {
+			if (typeof body.name === "string") {
+				profile.name = body.name;
+			}
+			if (typeof body.enabled === "boolean") {
+				profile.enabled = body.enabled;
+			}
+			if (typeof body.webhook_url === "string") {
+				profile.webhookUrl = body.webhook_url;
+			}
+			if (Array.isArray(body.whitelisted_destinations)) {
+				profile.whitelistedDestinations = body.whitelisted_destinations as string[];
+			}
+			return { status: 200, body: { data: messagingProfileBody(profile) } };
+		}
+		if (method === "DELETE") {
+			state.messagingProfiles.delete(profileId);
+			for (const entry of state.inventory) {
+				if (entry.messagingProfileId === profileId) {
+					delete entry.messagingProfileId;
+				}
+			}
+			return { status: 200, body: { data: messagingProfileBody(profile) } };
+		}
+	}
+
+	const numberMessagingMatch = /^\/phone_numbers\/([^/]+)\/messaging$/u.exec(path);
+	if (numberMessagingMatch && (method === "GET" || method === "PATCH")) {
+		const identifier = decodeURIComponent(numberMessagingMatch[1] ?? "");
+		/**
+		 * Addressable by the carrier's number id OR by the E.164 itself.
+		 *
+		 * The id is what a number ordered through this fake carries. The E.164 is what a HOSTED
+		 * number has — Telnyx Hosted SMS attaches messaging to a number the customer keeps at another
+		 * carrier for voice, and there is no order and therefore no id on this account for it. A fake
+		 * that only understood ordered numbers would make that whole class of number untestable, and
+		 * it is the class a PBX migrating a customer in actually has.
+		 */
+		let entry =
+			state.findOwned(identifier) ??
+			state.inventory.find((candidate) => candidate.phoneNumber === identifier);
+		if (entry === undefined && identifier.startsWith("+")) {
+			entry = {
+				phoneNumber: identifier,
+				countryCode: "US",
+				nationalDestinationCode: identifier.slice(2, 5),
+				phoneNumberType: "local",
+				available: false,
+				ownedId: state.newId(),
+			};
+			state.inventory.push(entry);
+		}
+		if (entry === undefined) {
+			return { status: 404, body: errorBody("10005", "Resource not found") };
+		}
+		if (method === "PATCH") {
+			const profileId = body.messaging_profile_id;
+			if (typeof profileId === "string") {
+				if (!state.messagingProfiles.has(profileId)) {
+					return {
+						status: 422,
+						body: errorBody("10027", "Unprocessable Entity", "messaging_profile_id"),
+					};
+				}
+				entry.messagingProfileId = profileId;
+			} else if (profileId === null) {
+				// `null` detaches. Distinguished from an absent key, which changes nothing.
+				delete entry.messagingProfileId;
+			}
+		}
+		return { status: 200, body: { data: numberMessagingBody(entry) } };
+	}
+
+	// ---- messages --------------------------------------------------------------------------
+	if (method === "POST" && path === "/messages") {
+		const from = typeof body.from === "string" ? body.from : "";
+		const to = typeof body.to === "string" ? body.to : "";
+		const text = typeof body.text === "string" ? body.text : undefined;
+		const mediaUrls = Array.isArray(body.media_urls)
+			? (body.media_urls as unknown[]).filter((v): v is string => typeof v === "string")
+			: [];
+		if (from.length === 0) {
+			return { status: 422, body: errorBody("10027", "Unprocessable Entity", "from") };
+		}
+		if (to.length === 0) {
+			return { status: 422, body: errorBody("10027", "Unprocessable Entity", "to") };
+		}
+		if ((text === undefined || text.length === 0) && mediaUrls.length === 0) {
+			return {
+				status: 422,
+				body: errorBody("10027", "Unprocessable Entity", "one of text or media_urls"),
+			};
+		}
+
+		/**
+		 * The 10DLC gate, and the reason this fake is worth having.
+		 *
+		 * US carriers do not error on unregistered A2P traffic from a local number — they filter it,
+		 * silently. Telnyx front-runs that with a 400, which is the behaviour our own pre-send block
+		 * exists to anticipate. A fake that accepted this send would make that block untestable, so
+		 * it refuses; `state.allowUnregisteredSend = true` is the escape hatch for specs about
+		 * something else.
+		 */
+		if (!state.allowUnregisteredSend && isUsLocalNumber(from)) {
+			const assignment = state.phoneNumberCampaigns.get(from);
+			const campaign =
+				assignment === undefined ? undefined : state.campaigns.get(assignment.campaignId);
+			if (campaign === undefined || campaign.status !== "ACTIVE") {
+				return {
+					status: 400,
+					body: errorBody(
+						"40320",
+						"Unregistered 10DLC traffic",
+						`${from} is not assigned to an ACTIVE 10DLC campaign`,
+					),
+				};
+			}
+		}
+
+		const message: FakeMessage = {
+			id: state.newId(),
+			direction: "outbound",
+			type: mediaUrls.length > 0 ? "MMS" : "SMS",
+			from,
+			to,
+			// `queued`, on the RECIPIENT and not at the top level: there is no top-level status on a
+			// Telnyx message, and a client that reads one is reading a field that does not exist.
+			toStatus: "queued",
+			...(text === undefined ? {} : { text }),
+			mediaUrls,
+			...(typeof body.messaging_profile_id === "string"
+				? { messagingProfileId: body.messaging_profile_id }
+				: {}),
+			...(typeof body.client_state === "string" ? { clientState: body.client_state } : {}),
+			createdAt: state.now(),
+		};
+		state.messages.set(message.id, message);
+		return { status: 200, body: { data: messageBody(message) } };
+	}
+
+	const messageMatch = /^\/messages\/([^/]+)$/u.exec(path);
+	if (method === "GET" && messageMatch) {
+		const message = state.messages.get(decodeURIComponent(messageMatch[1] ?? ""));
+		if (message === undefined) {
+			return { status: 404, body: errorBody("10005", "Resource not found") };
+		}
+		return { status: 200, body: { data: messageBody(message) } };
+	}
+
+	// ---- 10DLC (camelCase paths AND bodies — see resources/ten-dlc.ts) ----------------------
+	if (method === "POST" && path === "/10dlc/brand") {
+		const entityType = typeof body.entityType === "string" ? body.entityType : "";
+		const displayName = typeof body.displayName === "string" ? body.displayName : "";
+		if (displayName.length === 0) {
+			return { status: 400, body: errorBody("10027", "Unprocessable Entity", "displayName") };
+		}
+		if (entityType !== "SOLE_PROPRIETOR" && typeof body.ein !== "string") {
+			// TCR's rule: everyone but a sole proprietor has a tax id to vet against.
+			return { status: 400, body: errorBody("10027", "Unprocessable Entity", "ein") };
+		}
+		const brand: FakeBrand = {
+			brandId: state.newId(),
+			entityType,
+			displayName,
+			country: typeof body.country === "string" ? body.country : "US",
+			email: typeof body.email === "string" ? body.email : "",
+			vertical: typeof body.vertical === "string" ? body.vertical : "TECHNOLOGY",
+			// A sole proprietor starts UNVERIFIED and reaches VERIFIED only through the SMS OTP;
+			// everyone else is vetted by EIN and lands SELF_DECLARED straight away.
+			identityStatus: entityType === "SOLE_PROPRIETOR" ? "UNVERIFIED" : "SELF_DECLARED",
+			status: "OK",
+			createdAt: state.now(),
+		};
+		state.brands.set(brand.brandId, brand);
+		return { status: 200, body: { data: brandBody(brand) } };
+	}
+
+	if (method === "GET" && path === "/10dlc/brand") {
+		const brands = [...state.brands.values()];
+		return {
+			status: 200,
+			body: {
+				data: brands.map(brandBody),
+				meta: { total_results: brands.length, page_number: 1, page_size: 50, total_pages: 1 },
+			},
+		};
+	}
+
+	const brandOtpMatch = /^\/10dlc\/brand\/([^/]+)\/smsOtp$/u.exec(path);
+	if (brandOtpMatch && (method === "POST" || method === "PUT")) {
+		const brand = state.brands.get(decodeURIComponent(brandOtpMatch[1] ?? ""));
+		if (brand === undefined) {
+			return { status: 404, body: errorBody("10005", "Resource not found") };
+		}
+		if (method === "POST") {
+			// A fixed PIN, not a random one: the point of the fake is that a spec can complete the
+			// round trip, and a random PIN would only be assertable by reading it back out of state.
+			brand.otpPin = FAKE_BRAND_OTP_PIN;
+			return { status: 200, body: { data: brandBody(brand) } };
+		}
+		// The wire field is `otpPin`, not `pin` — see resources/ten-dlc.ts for the doc URL.
+		const submitted = typeof body.otpPin === "string" ? body.otpPin : "";
+		if (brand.otpPin === undefined) {
+			return { status: 400, body: errorBody("10027", "Unprocessable Entity", "no OTP was sent") };
+		}
+		if (submitted !== brand.otpPin) {
+			return { status: 400, body: errorBody("10027", "Unprocessable Entity", "otpPin") };
+		}
+		brand.identityStatus = "VERIFIED";
+		delete brand.otpPin;
+		return { status: 200, body: { data: brandBody(brand) } };
+	}
+
+	const brandMatch = /^\/10dlc\/brand\/([^/]+)$/u.exec(path);
+	if (brandMatch && (method === "GET" || method === "DELETE")) {
+		const brandId = decodeURIComponent(brandMatch[1] ?? "");
+		const brand = state.brands.get(brandId);
+		if (brand === undefined) {
+			return { status: 404, body: errorBody("10005", "Resource not found") };
+		}
+		if (method === "DELETE") {
+			state.brands.delete(brandId);
+		}
+		return { status: 200, body: { data: brandBody(brand) } };
+	}
+
+	if (method === "POST" && path === "/10dlc/campaignBuilder") {
+		const brandId = typeof body.brandId === "string" ? body.brandId : "";
+		const brand = state.brands.get(brandId);
+		if (brand === undefined) {
+			return { status: 400, body: errorBody("10027", "Unprocessable Entity", "brandId") };
+		}
+		const campaign: FakeCampaign = {
+			campaignId: state.newId(),
+			brandId,
+			usecase: typeof body.usecase === "string" ? body.usecase : "",
+			description: typeof body.description === "string" ? body.description : "",
+			// A campaign under an unverified brand does not reach ACTIVE, which is precisely the
+			// state that makes an assignment fail. Verifying the brand first is the whole sequence
+			// this fake exists to make testable.
+			status:
+				brand.identityStatus === "UNVERIFIED" || brand.identityStatus === "PENDING"
+					? "TCR_PENDING"
+					: "ACTIVE",
+			createdAt: state.now(),
+		};
+		state.campaigns.set(campaign.campaignId, campaign);
+		return { status: 200, body: { data: campaignBody(campaign) } };
+	}
+
+	if (method === "GET" && path === "/10dlc/campaign") {
+		const brandId = query.get("brandId");
+		const matches = [...state.campaigns.values()].filter(
+			(campaign) => brandId === null || campaign.brandId === brandId,
+		);
+		return {
+			status: 200,
+			body: {
+				data: matches.map(campaignBody),
+				meta: { total_results: matches.length, page_number: 1, page_size: 50, total_pages: 1 },
+			},
+		};
+	}
+
+	const campaignMatch = /^\/10dlc\/campaign\/([^/]+)$/u.exec(path);
+	if (method === "GET" && campaignMatch) {
+		const campaign = state.campaigns.get(decodeURIComponent(campaignMatch[1] ?? ""));
+		if (campaign === undefined) {
+			return { status: 404, body: errorBody("10005", "Resource not found") };
+		}
+		return { status: 200, body: { data: campaignBody(campaign) } };
+	}
+
+	if (method === "POST" && path === "/10dlc/phoneNumberCampaign") {
+		const phoneNumber = typeof body.phoneNumber === "string" ? body.phoneNumber : "";
+		const campaignId = typeof body.campaignId === "string" ? body.campaignId : "";
+		const campaign = state.campaigns.get(campaignId);
+		if (campaign === undefined) {
+			return { status: 400, body: errorBody("10027", "Unprocessable Entity", "campaignId") };
+		}
+		// Rule one: only an ACTIVE campaign accepts numbers. Assigning to a pending campaign would
+		// look like it worked and then filter every message sent from the number.
+		if (campaign.status !== "ACTIVE") {
+			return {
+				status: 400,
+				body: errorBody(
+					"10027",
+					"Unprocessable Entity",
+					`campaign ${campaignId} is ${campaign.status}, not ACTIVE`,
+				),
+			};
+		}
+		// Rule two: the number must already be on a messaging profile. Telnyx has nowhere to route
+		// the traffic otherwise, and this is the ordering mistake easiest to make.
+		const entry = state.inventory.find((candidate) => candidate.phoneNumber === phoneNumber);
+		if (entry === undefined || entry.messagingProfileId === undefined) {
+			return {
+				status: 400,
+				body: errorBody(
+					"10027",
+					"Unprocessable Entity",
+					`${phoneNumber} is not assigned to a messaging profile`,
+				),
+			};
+		}
+		const assignment: FakePhoneNumberCampaign = {
+			phoneNumber,
+			campaignId,
+			brandId: campaign.brandId,
+			assignmentStatus: "SUCCESS",
+		};
+		state.phoneNumberCampaigns.set(phoneNumber, assignment);
+		return { status: 200, body: { data: phoneNumberCampaignBody(assignment) } };
+	}
+
+	const phoneNumberCampaignMatch = /^\/10dlc\/phoneNumberCampaign\/([^/]+)$/u.exec(path);
+	if (method === "DELETE" && phoneNumberCampaignMatch) {
+		const phoneNumber = decodeURIComponent(phoneNumberCampaignMatch[1] ?? "");
+		if (!state.phoneNumberCampaigns.has(phoneNumber)) {
+			return { status: 404, body: errorBody("10005", "Resource not found") };
+		}
+		state.phoneNumberCampaigns.delete(phoneNumber);
+		// 204, empty. The client declares `allowEmptyBody` for exactly this.
+		return { status: 204, body: undefined };
+	}
+
+	// ---- toll-free verification (camelCase body, snake_case path) --------------------------
+	if (method === "POST" && path === TOLL_FREE_PATH) {
+		const businessName = typeof body.businessName === "string" ? body.businessName : "";
+		if (businessName.length === 0) {
+			return { status: 400, body: errorBody("10027", "Unprocessable Entity", "businessName") };
+		}
+		// The BRN trio, mandatory on every new submission since 17 Feb 2026. The fake enforces it so
+		// a client that stops sending it fails here rather than in review, days later.
+		for (const field of [
+			"businessRegistrationNumber",
+			"businessRegistrationType",
+			"businessRegistrationCountry",
+		]) {
+			if (typeof body[field] !== "string" || (body[field] as string).length === 0) {
+				return { status: 400, body: errorBody("10027", "Unprocessable Entity", field) };
+			}
+		}
+		if (!/^[A-Z]{2}$/u.test(body.businessRegistrationCountry as string)) {
+			return {
+				status: 400,
+				body: errorBody("10027", "Unprocessable Entity", "businessRegistrationCountry"),
+			};
+		}
+		const verification: FakeTollFreeVerification = {
+			id: state.newId(),
+			businessName,
+			verificationStatus: "In Progress",
+			businessRegistrationNumber: body.businessRegistrationNumber as string,
+			businessRegistrationType: body.businessRegistrationType as string,
+			businessRegistrationCountry: body.businessRegistrationCountry as string,
+			phoneNumbers: Array.isArray(body.phoneNumbers)
+				? (body.phoneNumbers as { phoneNumber?: string }[]).map((item) => item.phoneNumber ?? "")
+				: [],
+			createdAt: state.now(),
+		};
+		state.tollFreeVerifications.set(verification.id, verification);
+		return { status: 200, body: { data: tollFreeBody(verification) } };
+	}
+
+	if (method === "GET" && path === TOLL_FREE_PATH) {
+		const status = query.get("status");
+		const matches = [...state.tollFreeVerifications.values()].filter(
+			(entry) => status === null || entry.verificationStatus === status,
+		);
+		return {
+			status: 200,
+			body: {
+				data: matches.map(tollFreeBody),
+				meta: { total_results: matches.length, page_number: 1, page_size: 50, total_pages: 1 },
+			},
+		};
+	}
+
+	const tollFreeMatch = new RegExp(`^${TOLL_FREE_PATH}/([^/]+)$`, "u").exec(path);
+	if (tollFreeMatch) {
+		const verificationId = decodeURIComponent(tollFreeMatch[1] ?? "");
+		const verification = state.tollFreeVerifications.get(verificationId);
+		if (verification === undefined) {
+			return { status: 404, body: errorBody("10005", "Resource not found") };
+		}
+		if (method === "GET") {
+			return { status: 200, body: { data: tollFreeBody(verification) } };
+		}
+		if (method === "PATCH") {
+			if (typeof body.businessName === "string") {
+				verification.businessName = body.businessName;
+			}
+			return { status: 200, body: { data: tollFreeBody(verification) } };
+		}
+		if (method === "DELETE") {
+			state.tollFreeVerifications.delete(verificationId);
+			return { status: 204, body: undefined };
 		}
 	}
 

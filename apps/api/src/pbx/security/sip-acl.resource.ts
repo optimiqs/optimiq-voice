@@ -37,6 +37,19 @@ import type { PbxResource } from "../shared/pbx-resource";
  * same network in the same scope, which is what stops an allow and a deny for `203.0.113.0/24`
  * from both existing and the answer depending on `priority`. A second rule for the same network is
  * a 409, and the entry that is already there is the one to edit.
+ *
+ * `trunk_id` is deliberately outside that key — see the schema comment on the column. It narrows what
+ * a rule ATTRIBUTES, not which rule matches, so admitting the same network twice under two trunks
+ * would add an ambiguity the edge's key cannot represent and buy nothing.
+ *
+ * ## No `scalarReferences`, and no delete guard for the trunk binding
+ *
+ * `trunk_id` is `on delete cascade`, so deleting a trunk takes its entries with it and there is
+ * nothing to refuse. That is the opposite of what `TRUNK_RESOURCE` does for outbound routes, and the
+ * asymmetry is the point: a route outlives its trunk as a route with a broken leg somebody repairs,
+ * while an ACL entry for a carrier that no longer exists has nothing left to repair. The alternative
+ * — `set null` — would turn a rule scoped to one carrier into one for the whole organization, which
+ * is an access-control boundary widening as a side effect of an unrelated delete.
  */
 export const SIP_ACL_ENTRY_RESOURCE: PbxResource = {
 	kind: "sip-acl-entry",

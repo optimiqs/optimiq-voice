@@ -38,6 +38,16 @@ import type { QueueMembership } from "@optimiq-voice/events";
  * `phone_number`; `rebuild:queue-membership` backfills. Every log line here still names the bucket
  * so an empty queue in production says which projection to check.
  */
+/**
+ * How many rosters this process holds at once.
+ *
+ * The watch `remember`s every key the control plane writes, not only the queues this engine has
+ * distributed for, so an unbounded map grows to one roster per queue on the whole fleet. Eviction is
+ * least-recently-written: `Map` keeps insertion order and {@link QueueMembershipSource.remember}
+ * re-inserts.
+ */
+const CACHE_MAX_ENTRIES = 500;
+
 @Injectable()
 export class QueueMembershipSource
 	implements OnModuleInit, OnApplicationShutdown, QueueMembershipPort
@@ -161,7 +171,7 @@ export class QueueMembershipSource
 				this.misses += 1;
 				return undefined;
 			}
-			this.cache.set(key, membership);
+			this.remember(key, membership);
 			return membership;
 		} catch (error) {
 			this.misses += 1;
@@ -180,6 +190,19 @@ export class QueueMembershipSource
 	 * that names one organization sitting under another's key is a tenancy bug, and accepting it here
 	 * would ring one tenant's agents for another tenant's caller.
 	 */
+	/** Puts a roster into the memory cache, evicting the least recently written when full. */
+	private remember(key: string, membership: QueueMembership): void {
+		this.cache.delete(key);
+		this.cache.set(key, membership);
+		while (this.cache.size > CACHE_MAX_ENTRIES) {
+			const oldest = this.cache.keys().next();
+			if (oldest.done === true) {
+				break;
+			}
+			this.cache.delete(oldest.value);
+		}
+	}
+
 	private parse(value: Uint8Array, orgId: string, queueId: string): QueueMembership | undefined {
 		try {
 			const membership = queueMembershipSchema.parse(
@@ -267,7 +290,7 @@ export class QueueMembershipSource
 			this.invalidate(key);
 			return;
 		}
-		this.cache.set(key, membership);
+		this.remember(key, membership);
 		this.invalidations += 1;
 		this.logger.info(
 			{ orgId, queueId, agents: membership.agents.length, revision: membership.revision },

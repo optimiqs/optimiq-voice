@@ -15,11 +15,10 @@ import (
 // and never collides with a real media server on the host.
 var loopback = netip.MustParseAddr("127.0.0.1")
 
-// testRange picks a high, uncommon range so a developer running Asterisk (10000-20000) or a real
-// mediad (30000-30999) alongside the suite does not fight it for ports.
+// testRange sits below the macOS ephemeral range (49152+) so no stray process can take the ports.
 const (
-	testLow  = 51000
-	testHigh = 51009 // five pairs
+	testLow  = 39000
+	testHigh = 39009 // five pairs
 )
 
 func newAllocator(t *testing.T, low, high int) *rtp.Allocator {
@@ -38,10 +37,10 @@ func TestNewAllocatorRejectsBadRanges(t *testing.T) {
 		low, high int
 		want      string
 	}{
-		{"odd start", loopback, 51001, 51010, "even port"},
-		{"inverted", loopback, 51010, 51000, "empty"},
-		{"no room for a pair", loopback, 51000, 51000, "no RTP/RTCP pair"},
-		{"no bind address", netip.Addr{}, 51000, 51009, "bind address is required"},
+		{"odd start", loopback, 39001, 39010, "even port"},
+		{"inverted", loopback, 39010, 39000, "empty"},
+		{"no room for a pair", loopback, 39000, 39000, "no RTP/RTCP pair"},
+		{"no bind address", netip.Addr{}, 39000, 39009, "bind address is required"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -61,9 +60,7 @@ func TestCapacityIsPairsNotPorts(t *testing.T) {
 	}
 }
 
-// A pair is an EVEN RTP port with the odd RTCP port above it, and both are really bound — the
-// allocator binds rather than counts, so a port held by another process is skipped rather than
-// handed out.
+// A pair is an even RTP port with the odd RTCP port above it, and both are really bound.
 func TestAllocateBindsAnEvenPairInRange(t *testing.T) {
 	allocator := newAllocator(t, testLow, testHigh)
 
@@ -94,7 +91,7 @@ func TestAllocateNeverHandsOutTheSamePortTwice(t *testing.T) {
 	allocator := newAllocator(t, testLow, testHigh)
 
 	seen := make(map[int]bool)
-	for i := 0; i < allocator.Capacity(); i++ {
+	for i := range allocator.Capacity() {
 		pair, err := allocator.Allocate()
 		if err != nil {
 			t.Fatalf("Allocate #%d: %v", i, err)
@@ -113,7 +110,7 @@ func TestAllocateNeverHandsOutTheSamePortTwice(t *testing.T) {
 func TestAllocateReportsExhaustion(t *testing.T) {
 	allocator := newAllocator(t, testLow, testHigh)
 
-	for i := 0; i < allocator.Capacity(); i++ {
+	for i := range allocator.Capacity() {
 		pair, err := allocator.Allocate()
 		if err != nil {
 			t.Fatalf("Allocate #%d: %v", i, err)
@@ -125,8 +122,7 @@ func TestAllocateReportsExhaustion(t *testing.T) {
 	if err == nil {
 		t.Fatal("Allocate succeeded past the range's capacity")
 	}
-	// The control surface branches on this to answer `capacity` rather than `internal`: it is a
-	// load signal the engine can route around, not a fault.
+	// The control surface branches on this to answer `capacity` rather than `internal`.
 	if !errors.Is(err, rtp.ErrPortsExhausted) {
 		t.Errorf("error = %v, want it to wrap ErrPortsExhausted", err)
 	}
@@ -137,7 +133,7 @@ func TestClosedPortsAreReusable(t *testing.T) {
 
 	// Fill the range, then free one and prove the freed pair can be taken again.
 	pairs := make([]*rtp.PortPair, 0, allocator.Capacity())
-	for i := 0; i < allocator.Capacity(); i++ {
+	for i := range allocator.Capacity() {
 		pair, err := allocator.Allocate()
 		if err != nil {
 			t.Fatalf("Allocate #%d: %v", i, err)
@@ -168,9 +164,8 @@ func TestClosedPortsAreReusable(t *testing.T) {
 	}
 }
 
-// Round-robin, not lowest-free. A just-freed port must not go straight back out: the far end of the
-// call that ended is still sending for a few hundred milliseconds, and those packets would land on
-// the next call's socket.
+// Round-robin, not lowest-free: the far end of the call that just ended keeps sending for a few
+// hundred milliseconds, and those packets would land on the next call's socket.
 func TestAllocateCyclesTheRangeBeforeReusingAPort(t *testing.T) {
 	allocator := newAllocator(t, testLow, testHigh)
 
@@ -195,8 +190,8 @@ func TestAllocateCyclesTheRangeBeforeReusingAPort(t *testing.T) {
 	}
 }
 
-// Idempotent close. A session reaped by the idle sweeper and then released explicitly is the normal
-// shape of that race; releasing the port twice would hand one port to two callers.
+// Idempotent close: a session reaped and then released explicitly is the normal shape of that race,
+// and releasing the port twice would hand one port to two callers.
 func TestCloseIsIdempotent(t *testing.T) {
 	allocator := newAllocator(t, testLow, testHigh)
 
@@ -216,8 +211,7 @@ func TestCloseIsIdempotent(t *testing.T) {
 	}
 }
 
-// A port held by something else in the range — Asterisk during the cutover, or any stray process —
-// is skipped rather than fatal.
+// A port held by another process in the range is skipped rather than fatal.
 func TestAllocateSkipsPortsHeldOutsideTheProcess(t *testing.T) {
 	allocator := newAllocator(t, testLow, testHigh)
 
@@ -258,8 +252,7 @@ func TestAllocateSkipsAPairWhoseRTCPHalfIsHeld(t *testing.T) {
 	if pair.Port == testLow {
 		t.Errorf("allocated pair %d/%d but the RTCP half is held", pair.Port, pair.Port+1)
 	}
-	// The skipped RTP half must be free again: a half-bound pair that leaked its descriptor would
-	// still hold testLow.
+	// A half-bound pair that leaked its descriptor would still hold testLow.
 	probe, err := net.ListenUDP("udp", &net.UDPAddr{IP: loopback.AsSlice(), Port: testLow})
 	if err != nil {
 		t.Fatalf("port %d is still held; the skipped pair leaked its RTP socket: %v", testLow, err)
@@ -267,10 +260,9 @@ func TestAllocateSkipsAPairWhoseRTCPHalfIsHeld(t *testing.T) {
 	_ = probe.Close()
 }
 
-// Concurrent allocation must never double-issue a port. Call setup happens on many goroutines at
-// once, so this is the allocator's normal operating condition rather than an edge case.
+// Concurrent allocation must never double-issue a port; many goroutines is the normal condition.
 func TestConcurrentAllocateIssuesDistinctPorts(t *testing.T) {
-	const low, high = 52000, 52039 // 20 pairs
+	const low, high = 39100, 39139 // 20 pairs, below the ephemeral range like testLow/testHigh
 	allocator := newAllocator(t, low, high)
 
 	var (
@@ -279,10 +271,8 @@ func TestConcurrentAllocateIssuesDistinctPorts(t *testing.T) {
 		ports = make(map[int]int)
 		pairs []*rtp.PortPair
 	)
-	for i := 0; i < allocator.Capacity(); i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range allocator.Capacity() {
+		wg.Go(func() {
 			pair, err := allocator.Allocate()
 			if err != nil {
 				return
@@ -291,7 +281,7 @@ func TestConcurrentAllocateIssuesDistinctPorts(t *testing.T) {
 			defer mu.Unlock()
 			ports[pair.Port]++
 			pairs = append(pairs, pair)
-		}()
+		})
 	}
 	wg.Wait()
 	t.Cleanup(func() {

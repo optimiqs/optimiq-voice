@@ -39,6 +39,10 @@ export const DIAGNOSTIC_CODES = [
 	"ivr-cycle",
 	/** A ring group has no enabled destinations, so every call to it dead-ends. */
 	"empty-ring-group",
+	/** A paging group has no reachable members, so an announcement to it is heard by nobody. */
+	"empty-paging-group",
+	/** A shared line has no reachable appearances, so a call to it rings nobody. */
+	"empty-shared-line",
 	/** An outbound route's trunk list is empty after unknown/disabled trunks are dropped. */
 	"empty-trunk-list",
 	/** An outbound route names a trunk id that is not in the snapshot. */
@@ -57,10 +61,113 @@ export const DIAGNOSTIC_CODES = [
 	"missing-voicemail-box",
 	/** An entity names a music-on-hold class that is not in the snapshot, or is disabled. */
 	"dangling-moh-class",
+	/**
+	 * An entity names a prompt that is not in the snapshot, so the audio it asks for does not
+	 * exist.
+	 *
+	 * Warning rather than error, and the severity is the whole point of the code: an IVR whose
+	 * greeting prompt was deleted still routes — the caller hears nothing, presses nothing, and is
+	 * sent to the timeout branch. That is exactly the failure a compile-on-write diagnostic has to
+	 * name at the moment of the write, because the call it breaks looks like a caller who hung up.
+	 */
+	"dangling-prompt",
 	/** A voicemail greeting row belongs to a mailbox that is not in the snapshot. */
 	"dangling-voicemail-greeting",
 	/** A mailbox's `pinHash` is not in the format `voicemail-pin.ts` defines, so it is not enforced. */
 	"invalid-pin-hash",
+
+	// --- the T2 admin block ----------------------------------------------------------------------
+	/** A destination alias points at another alias, and the chain loops or is too deep to expand. */
+	"alias-cycle",
+	/** An audio stream's URL is not an `http(s)` URL a media server may be asked to open. */
+	"invalid-stream-url",
+	/** A phrase has no playable steps, or one of its steps names another phrase. */
+	"invalid-phrase",
+	/** A phrase step points at a prompt that is not in the snapshot. */
+	"dangling-phrase-step",
+	/** A translation rule's regex does not compile, or its replacement could emit non-dialable text. */
+	"invalid-translation-rule",
+	/** A route or trunk names a translation ruleset that is not in the snapshot, or is disabled. */
+	"dangling-translation-ruleset",
+	/** An outbound route names a PIN set that is not in the snapshot, is disabled, or has no code. */
+	"unusable-pin-set",
+	/** A speed-dial code is not dialable, or collides with a feature code or an internal number. */
+	"conflicting-speed-dial",
+	/** A directory would offer nobody: no extension has a recorded name to speak. */
+	"empty-directory",
+	/** Two people in a directory spell to the same digits, so a caller cannot tell them apart. */
+	"directory-name-collision",
+	/** An extension is absent from a directory because its mailbox has no recorded name. */
+	"directory-entry-skipped",
+
+	// --- the contact-centre block ---------------------------------------------------------------
+	/**
+	 * A `queue` destination carried a caller priority that is not a whole number in range.
+	 *
+	 * A warning and not an error, because the consequence is a caller who waits their turn — the
+	 * queue working normally — whereas refusing the compile would take every unrelated route in the
+	 * tenant down with it over one mistyped form field.
+	 */
+	"invalid-queue-priority",
+	/**
+	 * A `queue` destination carried skill requirements that are not a usable list of skill tags.
+	 *
+	 * A warning for the reason above, one step sharper: a dropped requirement costs a caller the
+	 * right agent, and a refused compile costs the tenant every route in the artifact. The entry is
+	 * dropped, named in the message, and the rest of the list still applies — so a queue that asks
+	 * for two skills and was handed one typo still asks for the other.
+	 */
+	"invalid-queue-skills",
+	/** A queue has an exit key and no exit destination, so pressing it hangs the caller up. */
+	"queue-exit-key-without-destination",
+	/**
+	 * A queue's virtual-hold offer cannot be taken as configured — the accept key is not a DTMF
+	 * digit, it is already the exit key, or there is neither a key nor a wait to announce it after.
+	 *
+	 * A warning: the queue still distributes calls exactly as it did, and the only thing lost is the
+	 * offer. Refusing the compile would take the tenant's whole dial plan down over one form field.
+	 */
+	"queue-callback-unusable",
+
+	// --- IVR direct dial ---------------------------------------------------------------------------
+	/**
+	 * A direct-dial menu's option shares a prefix with an extension number, so the two entries are
+	 * told apart only by whether the caller paused.
+	 *
+	 * A warning, and one an admin genuinely wants: the configuration WORKS — a caller who types
+	 * `1104` without stopping reaches the extension, and one who presses `1` and waits reaches the
+	 * option — but the second caller waits `interDigitTimeoutMs` before anything happens, and an
+	 * option whose value IS an extension number makes that extension unreachable by direct dial
+	 * altogether. Neither is visible from the form, and both look like a broken menu on the phone.
+	 */
+	"ivr-direct-dial-ambiguous",
+
+	// --- hot desking ------------------------------------------------------------------------------
+	/**
+	 * The tenant can log a handset IN and cannot log it back OUT — a `hotdesk-login` code with no
+	 * `hotdesk-logout` beside it.
+	 *
+	 * A warning rather than an error, because the sessions still EXPIRE: the sweeper restores every
+	 * home binding at `hot_desk_expires_at` whatever the catalogue says, so the consequence is an
+	 * agent who cannot hand the desk back before then, not a phone stuck forever. It is worth saying
+	 * out loud because nothing on the feature-code form suggests the two are a pair.
+	 */
+	"hotdesk-logout-missing",
+	/**
+	 * A direct-dial menu is enabled for an organization with no extension to dial, so the feature
+	 * can only ever send callers to the invalid branch.
+	 */
+	"ivr-direct-dial-empty",
+
+	// --- organization quotas ----------------------------------------------------------------------
+	/**
+	 * An organization limit is not a number the engine can enforce, so it was not applied.
+	 *
+	 * A warning and not an error, for the reason `invalid-queue-priority` is: the artifact is still
+	 * routable without the ceiling, and refusing the compile would take every call in the tenant down
+	 * to report a quota nobody is currently hitting.
+	 */
+	"invalid-org-limit",
 
 	// --- emergency dialing (Kari's Law / RAY BAUM'S Act) ----------------------------------------
 	/** A DID carries no `emergencyAddressId`, so it cannot serve as an ELIN for the organization. */
@@ -77,6 +184,15 @@ export const DIAGNOSTIC_CODES = [
 	// --- matching tables ------------------------------------------------------------------------
 	/** Two entities claim the same internal number (extension 200 and ring group 200). */
 	"duplicate-internal-number",
+	/**
+	 * A field that is a phone number could not be read as E.164, so it was compiled verbatim.
+	 *
+	 * A warning and not an error, for the reason `invalid-queue-priority` is: every table in this
+	 * package compares numbers as strings, so a non-canonical one still routes — it just only
+	 * matches a caller who presents it the same way. Refusing the compile would take a tenant's
+	 * whole dial plan down over one row a migration wrote before normalisation existed.
+	 */
+	"non-e164-number",
 	/** Two feature codes claim the same code, or one code is a prefix of another. */
 	"conflicting-feature-code",
 	/** Two inbound routes match exactly the same DID input; the lower-priority one never runs. */
@@ -121,6 +237,12 @@ export const DIAGNOSTIC_CODES = [
 	"time-condition-closed",
 	/** The dialed string matched the emergency table; every configurable gate was bypassed. */
 	"emergency-call",
+	/** A translation ruleset rewrote a number, or would have and was refused for over-running. */
+	"number-translated",
+	/** An outbound call was given a STIR/SHAKEN attestation level, and on what basis. */
+	"attestation-decided",
+	/** An outbound call was refused on compliance grounds — an unvouched caller id, or KYC. */
+	"attestation-refused",
 ] as const;
 
 export type DiagnosticCode = (typeof DIAGNOSTIC_CODES)[number];

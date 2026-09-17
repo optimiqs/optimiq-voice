@@ -5,23 +5,31 @@ import {
 	hangupCauseForTransfer,
 	INITIAL_PARK_STATE,
 	INITIAL_TRANSFER_STATE,
+	supportsMediaBug,
 	supportsRecording,
 } from "@optimiq-voice/telephony";
+import { playbackSignalKey } from "../media/playback-signals";
 import { legSignalKey, recordingSignalKey } from "../routing/call-signals";
 import { parkSlotFor } from "../routing/park-registry";
 import { parkHandoffRefusal } from "./park-handoff";
-import type { MediaPort } from "../media/media-port";
+import type { MediaPort, TapHandle, TapSide } from "../media/media-port";
+import type { PlaybackSignalBus } from "../media/playback-signals";
 import type { CallSignalBus, LegSignal } from "../routing/call-signals";
 import type { ParkedCall, ParkRegistry, ParkResult } from "../routing/park-registry";
 import type { ParkHandoffClient } from "./park-handoff";
+import type { ConsentParty, ResolvedRecordingConsent } from "./recording-consent";
 import type {
 	CallEvent,
+	LegSide,
 	ParkEndReason,
 	ParkHandoffRefusalReason,
 	ParkHandoffRequest,
 	ParkHandoffResponse,
 	PickupKind,
+	TapEndReason,
+	TapMode,
 } from "@optimiq-voice/events";
+import type { RecordingConsentRecord } from "@optimiq-voice/routing";
 import type {
 	CallState,
 	ChannelFlag,
@@ -101,6 +109,14 @@ export interface ControlledLeg {
 	readonly callerIdName?: string;
 	/** What this leg was dialled to reach. How a directed pickup finds a ringing phone. */
 	readonly destinationNumber?: string;
+	/**
+	 * Which side of the call this leg is: `b` when the engine originated it, `a` when it arrived.
+	 *
+	 * The distinction decides which field carries the identity of the PERSON on this leg:
+	 * `destinationNumber` on an originated leg — `callerIdNumber` there is the party that started
+	 * the call, not the extension the leg reaches — and `callerIdNumber` on one that arrived.
+	 */
+	readonly side: LegSide;
 	/** Guarded state move. Returns whether the machine actually moved. */
 	moveTo(state: ChannelState): boolean;
 	/** Guarded user-visible state move, for the value a BLF subscriber renders. */
@@ -130,6 +146,81 @@ export interface PickupCandidate {
 	readonly callerLeg: ControlledLeg;
 	/** When the phone started ringing, so the longest-waiting call is taken first. */
 	readonly ringingSinceMs: number;
+}
+
+/**
+ * A live conversation a supervisor may join, and the one fact the media plane needs about it.
+ *
+ * `side` is the datum that makes `whisper` implementable at all: "speak to the agent" is only a
+ * direction on a channel once you know whether this channel IS the agent. See
+ * {@link import("../media/media-port").TapRequest.targetSide}.
+ */
+export interface SupervisionTarget {
+	/** The monitored extension's OWN leg — the one that gets tapped. */
+	readonly leg: ControlledLeg;
+	/** Which side of the conversation {@link leg} is: `b` on a call it received, `a` on one it placed. */
+	readonly side: "a" | "b";
+	/** When the leg was created, so the OLDEST match wins deterministically. */
+	readonly startedAtMs: number;
+}
+
+/**
+ * A shared line, as the compiled artifact describes it.
+ *
+ * The mid-call half's view of `SharedLinePlanNode` — deliberately narrower than the node, because
+ * everything the WALK needs (the strategy, the ring timeout, barge-in) is already spent by the time
+ * a line is seized.
+ */
+export interface SharedLine {
+	readonly sharedLineId: string;
+	/** How long a held appearance may sit before the line rings back. `0` means "never recall". */
+	readonly holdRecallTimeoutSeconds: number;
+	readonly appearances: readonly {
+		readonly appearanceIndex: number;
+		readonly extensionId: string;
+		readonly extensionNumber: string;
+	}[];
+}
+
+/**
+ * The shared-line registry, as the mid-call half consumes it.
+ *
+ * Structurally what `SharedLineRegistry` offers, declared here so this class depends on the five
+ * operations it performs rather than on the class — the same rule `PlanWalkerDependencies`'
+ * `SharedLinePort` follows one layer up, with the halves swapped: that port has seize and release
+ * and deliberately no hold, and this one has hold and recall and deliberately no seize.
+ */
+export interface SharedLineControlPort {
+	seizureForCall(
+		callId: string,
+	): { readonly sharedLineId: string; readonly value: SharedLineStateView } | undefined;
+	/** The seizure this instance holds on a line, or `undefined` when it does not hold it. */
+	held(orgId: string, sharedLineId: string): SharedLineStateView | undefined;
+	hold(orgId: string, sharedLineId: string): Promise<{ readonly kind: string }>;
+	resume(
+		orgId: string,
+		sharedLineId: string,
+		seizing?: {
+			readonly extensionId: string;
+			readonly appearanceIndex: number;
+			readonly callId: string;
+			readonly legId: string;
+		},
+	): Promise<{ readonly kind: string }>;
+	releaseOwn(orgId: string, sharedLineId: string): Promise<boolean>;
+	armRecall(orgId: string, sharedLineId: string, timeoutMs: number, onRecall: () => void): void;
+	cancelRecall(orgId: string, sharedLineId: string): void;
+}
+
+/** The fields of a seizure the mid-call half reads. A subset of `SharedLineState`. */
+export interface SharedLineStateView {
+	readonly orgId: string;
+	readonly sharedLineId: string;
+	readonly state: "seized" | "held";
+	readonly heldByExtensionId: string;
+	readonly heldByAppearanceIndex: number;
+	readonly callId: string;
+	readonly legId: string;
 }
 
 /** A park lot, as the compiled artifact describes it. */
@@ -175,6 +266,21 @@ export interface CallControlHost {
 	/** The leg with this media id, or `undefined` when this process is not handling it. */
 	legFor(mediaChannelId: string): ControlledLeg | undefined;
 	/**
+	 * The leg with this DOMAIN id, or `undefined` when this process is not handling it.
+	 *
+	 * The second lookup on this host, and the reason it exists rather than being folded into
+	 * {@link legFor}: the two take different keys and neither can be derived from the other without
+	 * a scan. Everything INSIDE the engine addresses a leg by its media-server channel id, because
+	 * that is what the media plane's events carry. Everything OUTSIDE it — a CDR row, a call event,
+	 * a webhook, and now a session-protocol `bridge` verb — addresses it by the domain leg id,
+	 * because a media channel id is an implementation detail of whichever driver is loaded and
+	 * changes if the call is re-created.
+	 *
+	 * So this is the seam an external application's leg reference lands on, and it is deliberately
+	 * the ONLY one: nothing above the engine is ever handed a media channel id to send back.
+	 */
+	legByLegId(legId: string): ControlledLeg | undefined;
+	/**
 	 * Phones currently being alerted for `extension`, longest-ringing first.
 	 *
 	 * Asynchronous because a GROUP pickup has to know the caller's pickup group, and that lives in
@@ -183,7 +289,52 @@ export interface CallControlHost {
 	 * receptionist answering the warehouse's call.
 	 */
 	ringingFor(leg: ControlledLeg, extension: string): Promise<readonly PickupCandidate[]>;
+	/**
+	 * Answered calls at `extension` that this engine is holding, OLDEST FIRST.
+	 *
+	 * Synchronous, unlike {@link ringingFor}, and the difference is not an inconsistency: a group
+	 * pickup has to know the caller's pickup group, which lives in the compiled artifact and is
+	 * fetched on a cache miss. "Which of my legs belongs to extension 1001?" is answered by the
+	 * channel registry alone, and making it a promise would advertise an await that never awaits
+	 * anything.
+	 *
+	 * The ORDER is the contract, not the implementation's convenience — see
+	 * {@link CallControl.monitor} for why oldest wins.
+	 */
+	activeCallsFor(leg: ControlledLeg, extension: string): readonly SupervisionTarget[];
 	publish(leg: ControlledLeg, type: CallEvent, data: Record<string, unknown>): Promise<void>;
+	/**
+	 * Records the recorder's state on the leg's own snapshot, and mirrors it.
+	 *
+	 * The ONLY thing that tells a surface outside this process that a call is being recorded. It
+	 * rides the `channels` snapshot rather than an event because the snapshot is already mirrored on
+	 * every change and already reaches the live topic a wallboard and the softphone read — where a
+	 * `channel.record.started` event, which this class also publishes, reaches the CDR writer and
+	 * nothing a browser is subscribed to.
+	 *
+	 * Fire-and-forget, and deliberately: a KV mirror that could not be written must not fail a pause
+	 * that the media plane has already applied. The consequence is a button that lags the recorder
+	 * until the next snapshot write, which is the right way round — the recorder is the truth.
+	 */
+	markRecording(
+		leg: ControlledLeg,
+		state: { readonly active: boolean; readonly paused: boolean },
+	): void;
+	/**
+	 * Files the consent verdict on the leg, so the CDR carries it whatever happens next.
+	 *
+	 * Called for EVERY outcome, and the one that matters most is `declined` — a call where the
+	 * tenant asked for a keypress and the caller refused starts no recording at all, publishes no
+	 * `channel.record.started`, and would otherwise leave no trace anywhere that it was ever asked.
+	 * "We asked and they said no" is the single most valuable row a compliance reviewer can find,
+	 * and it is the only one that has no recording to hang off.
+	 *
+	 * Synchronous and fire-and-forget for the reason {@link markRecording} is: the host writes it
+	 * onto the aggregate's channel variables, which are already mirrored on every change and already
+	 * read by the CDR builder — and a mirror that could not be written must not fail a consent gate
+	 * the caller has already answered.
+	 */
+	markConsent(leg: ControlledLeg, record: RecordingConsentRecord): void;
 	/** Resolves `destination` through the organization's artifact and walks the plan on this leg. */
 	route(leg: ControlledLeg, request: RouteRequest): Promise<RouteOutcome>;
 	/**
@@ -196,6 +347,15 @@ export interface CallControlHost {
 	parkLotFor(leg: ControlledLeg, lotRef?: string): Promise<ParkLot | undefined>;
 	/** The lot whose range contains this orbit. Ranges never overlap — the compiler refuses it. */
 	parkLotForSlot(leg: ControlledLeg, slot: number): Promise<ParkLot | undefined>;
+	/**
+	 * The shared line as the compiled artifact describes it.
+	 *
+	 * Asynchronous for the reason {@link parkLotFor} is: a shared line lives in the artifact, which
+	 * is fetched on a cache miss. The two things the mid-call half needs from it are the recall
+	 * timeout and the appearance NUMBERS — the seizure records an extension id, and a recall has to
+	 * ring a number.
+	 */
+	sharedLineFor(leg: ControlledLeg, sharedLineId: string): Promise<SharedLine | undefined>;
 }
 
 /** Deployment knobs. All have defaults; none is a product decision. */
@@ -204,7 +364,13 @@ export interface CallControlSettings {
 	readonly application: string;
 	/** Container on-demand recordings are written in. */
 	readonly recordingFormat: string;
-	/** How long to wait for a snoop channel to reach the application before giving up. */
+	/**
+	 * How long to wait for a snoop channel to reach the application before giving up.
+	 *
+	 * Shared by recording and by supervision, because on the ARI driver both materialise as the same
+	 * object — a snoop channel entering the engine's own Stasis application — and a deployment whose
+	 * media server is slow enough to miss one budget is slow enough to miss the other.
+	 */
 	readonly snoopTimeoutMs: number;
 	/** How long to wait for `RecordingFinished` after a stop before publishing anyway. */
 	readonly recordingStopTimeoutMs: number;
@@ -212,6 +378,94 @@ export interface CallControlSettings {
 	readonly defaultParkTimeoutSeconds: number;
 	/** Routing namespace a transfer destination is resolved in. */
 	readonly transferContext: string;
+	/**
+	 * How long the consent gate waits for the accept digit before treating the silence as a decline.
+	 *
+	 * Ten seconds, and the direction of the failure is the whole argument: a caller who is thinking,
+	 * or whose phone sends DTMF the media plane needs a moment to detect, must not be recorded
+	 * because a two-second budget expired. A caller who has walked away must not be recorded either.
+	 * Both of those are served by waiting a long-feeling time and then NOT recording.
+	 */
+	readonly consentKeypressTimeoutMs: number;
+	/**
+	 * What the gate plays when the tenant has named no prompt of their own.
+	 *
+	 * The seeded stem, not a spoken sentence chosen here: `system-media.ts` installs
+	 * `recording-consent` on every deployment exactly as it installs `vm-rec-name`, so a tenant who
+	 * turns the policy on without recording anything gets an announcement rather than silence — and
+	 * silence is the one outcome an announcement policy cannot be allowed to produce.
+	 */
+	readonly consentPrompt: string;
+	/**
+	 * How long the gate waits for a party's leg to be carrying media before it plays the prompt at it.
+	 *
+	 * A leg that has SIGNALLED an answer is not yet a leg that can hear anything: a WebRTC party's
+	 * ICE and DTLS finish after the `200 OK`, and a prompt played into that window is written to a
+	 * transport with no peer and dropped — `playedMs 0` — while the recording starts anyway. So the
+	 * gate waits for the evidence the engine actually has (the leg's own `active` call state, off
+	 * {@link CallControlHost.legFor} or the leg signal that announces it) before playing, and a party
+	 * that never produces it is left OUT of the record rather than credited with an announcement.
+	 *
+	 * Two seconds, and short deliberately: this budget is spent with two people already connected to
+	 * each other, so every millisecond of it is conversation happening before the recorder starts.
+	 * Two seconds covers a browser's handshake several times over; a party who needs longer than that
+	 * is a party the engine has no evidence about, and the honest answer there is to leave them out.
+	 *
+	 * NOTE what this can and cannot buy. `active` is a fact about SIGNALLING, not about a media path
+	 * being up, so readiness alone was measured on the running stack and found insufficient — the
+	 * wait returned in 0 ms and the prompt was still dropped. What closes the gap is
+	 * {@link consentPlaybackTimeoutMs}: the gate no longer trusts readiness, it waits for the media
+	 * plane's own account of what it delivered. Readiness is kept because it is still the cheapest
+	 * way to not play at a leg that is not there at all, and because a playback started before the
+	 * leg is answered is a playback the media plane may refuse outright.
+	 */
+	readonly consentPeerReadyTimeoutMs: number;
+	/**
+	 * How long the gate waits for the media plane to report what it DELIVERED of the prompt.
+	 *
+	 * This is the budget that replaced a fixed 1 500 ms sleep, and the difference is the whole point
+	 * of the mechanism. The sleep existed because {@link consentPeerReadyTimeoutMs} waits on a
+	 * SIGNALLING fact — a WebRTC party reports `active` on its `200 OK` and finishes ICE and DTLS
+	 * afterwards — so the prompt was played into a transport with no peer and the record still said
+	 * the party was announced to. `mediad` was publishing the contradiction on the same wire the
+	 * whole time (`playback.finished`, carrying `playedMs` and a reason); it was dropped at the
+	 * mapping. It is not dropped any more, so the gate waits for the DELIVERY instead of guessing at
+	 * how long one takes.
+	 *
+	 * A budget rather than an unbounded wait, because a media plane that dies mid-prompt must not
+	 * hold a recorded call open forever. Eight seconds: the seeded prompt is about one second and a
+	 * tenant's own may be several, so this is generous against the longest plausible announcement and
+	 * still bounded — and unlike the sleep it is not SPENT, it is a ceiling. The normal cost of the
+	 * gate is now however long the prompt actually takes, which is the honest price of announcing.
+	 *
+	 * A party whose playback never finishes inside it is left OUT of the record, on exactly the same
+	 * terms as a party whose leg never carried media: no evidence, no claim.
+	 *
+	 * It is a budget for the whole ATTEMPT at a party, retries included — see
+	 * {@link consentPlaybackRetryMs}.
+	 */
+	readonly consentPlaybackTimeoutMs: number;
+	/**
+	 * How long to wait after the media plane reports it delivered NOTHING before playing again.
+	 *
+	 * This is what replaced the fixed pre-play sleep, and the difference is not cosmetic. The sleep
+	 * ran on every announcing call, whether or not anything was wrong, and its length was a guess
+	 * about somebody else's network. A retry runs only when the media plane has SAID the far end got
+	 * nothing, and it stops the moment the media plane says otherwise — so an RTP endpoint, which
+	 * delivers on the first attempt, pays exactly zero, and a WebRTC party pays as long as its
+	 * handshake actually takes rather than as long as the slowest handshake anyone measured.
+	 *
+	 * A prompt is retried and not merely waited out because a playback aimed at a transport with no
+	 * peer is not queued anywhere: `mediad` decodes the frames, writes them, and they go nowhere.
+	 * There is nothing left to arrive late. The only way the party hears the disclosure is to play it
+	 * again once the path is up, and the media plane's own `playedMs` is what says when that is.
+	 *
+	 * 250 ms: short enough that the announcement lands promptly after the handshake completes, long
+	 * enough that a leg which is failing for a permanent reason is retried a bounded handful of times
+	 * inside {@link consentPlaybackTimeoutMs} rather than hammered. The whole loop is capped by that
+	 * budget, and a party still undelivered when it expires is left out of the record.
+	 */
+	readonly consentPlaybackRetryMs: number;
 }
 
 export const DEFAULT_CALL_CONTROL_SETTINGS: CallControlSettings = {
@@ -225,11 +479,26 @@ export const DEFAULT_CALL_CONTROL_SETTINGS: CallControlSettings = {
 	// `internal` and nothing else. A transfer destination that resolved in `outbound` would let any
 	// caller who reaches a phone with a transfer key dial anywhere on the tenant's account.
 	transferContext: "internal",
+	consentKeypressTimeoutMs: 10_000,
+	consentPrompt: "sound:recording-consent",
+	consentPeerReadyTimeoutMs: 2_000,
+	consentPlaybackTimeoutMs: 8_000,
+	consentPlaybackRetryMs: 250,
 };
 
 export interface CallControlDependencies {
 	readonly media: MediaPort;
 	readonly signals: CallSignalBus;
+	/**
+	 * Where a prompt's ENDING arrives — the consent gate's only reader, and the only one there is.
+	 *
+	 * Required, not optional, unlike the ports below it: a `CallControl` without it could still run
+	 * the consent gate, and would refuse every recording on an announce policy because no party could
+	 * ever be shown to have been announced to. That is a silently broken deployment rather than a
+	 * degraded one, and the orchestrator that constructs this class owns the bus, so there is nobody
+	 * who could legitimately omit it.
+	 */
+	readonly playbacks: PlaybackSignalBus;
 	readonly parks: ParkRegistry;
 	readonly host: CallControlHost;
 	/**
@@ -242,6 +511,16 @@ export interface CallControlDependencies {
 	 */
 	readonly parkHandoff?: ParkHandoffClient;
 	/**
+	 * The shared-line seizure registry, for the MID-CALL half of a shared line.
+	 *
+	 * The walk seizes the line when an appearance answers; everything after that — hold, retrieve
+	 * from another appearance, the hold recall, and the release when the call ends — happens here,
+	 * because it happens on events this class already owns. Optional, and its absence is a
+	 * deployment with shared lines that ring and bridge and do not light each other's keys, which is
+	 * exactly what every engine did before this wave.
+	 */
+	readonly sharedLines?: SharedLineControlPort;
+	/**
 	 * Where an attended transfer's cancel key is armed and disarmed.
 	 *
 	 * The mid-call feature runtime, in production. Optional so a spec about transfers needs no DTMF
@@ -249,6 +528,22 @@ export interface CallControlDependencies {
 	 */
 	readonly consultationKeys?: {
 		arm(mediaChannelId: string, digit: DtmfDigit): void;
+		disarm(mediaChannelId: string): void;
+	};
+	/**
+	 * Where a supervisor's mode keys — `4`/`5`/`6` — are armed and disarmed.
+	 *
+	 * The same seam as {@link consultationKeys}, one layer along, and armed and disarmed by the same
+	 * rule: HERE, at the moment the tap is opened and the moment it is taken down, rather than by
+	 * whoever called `monitor`. Three digits left armed on a leg whose tap has ended would swallow
+	 * them for the rest of that call, and the two places a tap ends (a hangup on either side, and an
+	 * escalation's own teardown) are inside this class.
+	 *
+	 * Optional so a spec about supervision needs no DTMF machinery, which is the rule every optional
+	 * dependency here follows.
+	 */
+	readonly supervisionKeys?: {
+		arm(mediaChannelId: string, escalate: (mode: TapMode) => Promise<void>): void;
 		disarm(mediaChannelId: string): void;
 	};
 	readonly settings?: Partial<CallControlSettings>;
@@ -279,6 +574,9 @@ const ok = (detail?: string): CallControlResult =>
 	detail === undefined ? { ok: true } : { ok: true, detail };
 const refuse = (reason: string): CallControlResult => ({ ok: false, reason });
 
+/** Nobody was announced to. Shared so a `not-required` record allocates nothing per call. */
+const NO_CONSENT_PARTIES: readonly ConsentParty[] = Object.freeze([]);
+
 export interface ParkOutcome {
 	readonly result: CallControlResult;
 	/** The orbit the call landed in, when it landed in one. */
@@ -291,6 +589,14 @@ export interface RecordingOutcome {
 	readonly recordingId?: string;
 	/** Where the audio will be, in the object store's vocabulary. */
 	readonly objectKey?: string;
+	/**
+	 * What the consent gate decided, when one ran.
+	 *
+	 * Present on a REFUSAL too, and that is the point: a decline is reported with no `recordingId`
+	 * and no `objectKey`, because there is no recording — but there is very much a fact, and a
+	 * caller that only read `result.ok` would throw it away.
+	 */
+	readonly consent?: RecordingConsentRecord;
 }
 
 // -------------------------------------------------------------------------------------------
@@ -349,11 +655,95 @@ export interface PickupRequest {
 	readonly extension: string;
 }
 
+export interface MonitorRequest {
+	/** The extension whose conversation is being joined. */
+	readonly extension: string;
+	/** Where the supervisor starts. `eavesdrop` from `*0`; the mode keys move it afterwards. */
+	readonly mode: TapMode;
+	/**
+	 * The handset that dialled `*0`, as the SIP edge authenticated it.
+	 *
+	 * For the EVENTS only. The gate that decided this handset may listen ran in the plan walker,
+	 * before this method was reachable — see {@link import("../routing/plan-walker").PlanWalker} —
+	 * and nothing here re-derives authority from this string.
+	 */
+	readonly supervisorExtension: string;
+}
+
+/**
+ * One destination a `dial` verb should try, in order.
+ *
+ * Deliberately just a destination and a context — NOT an endpoint, a trunk or a dial string. The
+ * verb re-enters ROUTING for each entry, which is what makes an application's `dial` obey the same
+ * outbound rules, the same caller-id policy and the same toll gates a handset does. An application
+ * that could name a trunk directly would be a way to dial internationally from a tenant that has
+ * international calling switched off, and the whole reason `*69` was built on `route` rather than
+ * on `originate` was to avoid exactly that.
+ */
+export interface DialLegTarget {
+	readonly destination: string;
+	/** `internal` first then `outbound` when omitted — the same walk `*69` performs. */
+	readonly context?: "internal" | "outbound";
+}
+
+export interface DialLegRequest {
+	readonly targets: readonly DialLegTarget[];
+	/**
+	 * Causes that allow the dial to move on to the next target.
+	 *
+	 * Empty or absent means STOP at the first failure, never "try everything": retrying a
+	 * `CALL_REJECTED` down a list is how a toll-fraud loop is written by accident. The same rule
+	 * `DialVerb.continueOnCauses` states in `packages/telephony`.
+	 */
+	readonly continueOnCauses?: readonly HangupCause[];
+}
+
+export interface DialLegOutcome {
+	readonly result: CallControlResult;
+	/** Which entry of `targets` answered, when one did. */
+	readonly answeredTargetIndex?: number;
+	/** The cause of the last attempt that did not connect. */
+	readonly cause?: HangupCause;
+	/** Whether the leg is now bridged to the target and no longer this application's to talk to. */
+	readonly bridged: boolean;
+	readonly notes: readonly string[];
+}
+
+/** Join this leg to another one this engine is holding, addressed by DOMAIN leg id. */
+export interface BridgeLegRequest {
+	readonly peerLegId: string;
+}
+
+export interface BridgeLegOutcome {
+	readonly result: CallControlResult;
+	/** The bridge both legs are now in. Present exactly when the result is `ok`. */
+	readonly bridgeId?: string;
+}
+
 export interface StartRecordingRequest {
 	readonly maxDurationMs?: number;
 	readonly silenceStopMs?: number;
 	readonly beep?: boolean;
 	readonly format?: string;
+	/**
+	 * The consent this call owes, resolved from the artifact by whoever fetched it.
+	 *
+	 * Absent means "no gate", and absent behaves EXACTLY as every release before the gate existed:
+	 * no prompt, no wait, no record, and the recording starts. That is not a loophole, it is the
+	 * compatibility contract — a caller that has no artifact (a spec, an old code path, a verb
+	 * executor that has not been taught about consent yet) must not be able to accidentally block
+	 * recording on a tenant who never configured any of this.
+	 */
+	readonly consent?: ResolvedRecordingConsent;
+	/**
+	 * Silence this recording while digits are being pressed — the PCI rule.
+	 *
+	 * Carried on the START rather than being asked for again at each digit, because the answer comes
+	 * from the artifact and the DTMF handler is on the media socket's callback path where fetching
+	 * one per keypress would put a cache miss between a caller's card number and the pause that is
+	 * supposed to hide it. {@link CallControl.recordingFor} reports it back.
+	 */
+	readonly autoPauseOnDtmf?: boolean;
 }
 
 /** The surface the verb executor and the plan walker call. `CallControl` is its only implementation. */
@@ -361,13 +751,25 @@ export interface CallControlPort {
 	hold(leg: ControlledLeg, request?: HoldRequest): Promise<CallControlResult>;
 	unhold(leg: ControlledLeg): Promise<CallControlResult>;
 	park(leg: ControlledLeg, request?: ParkRequest): Promise<ParkOutcome>;
+	/** Parks the party on the OTHER side of this leg, recording this leg as the parker. */
+	parkPeer(leg: ControlledLeg, request?: ParkRequest): Promise<ParkOutcome>;
 	unpark(leg: ControlledLeg, request?: UnparkRequest): Promise<CallControlResult>;
 	transfer(leg: ControlledLeg, request: TransferRequest): Promise<CallControlResult>;
 	completeTransfer(leg: ControlledLeg): Promise<CallControlResult>;
+	completeAttendedRefer(
+		transferor: ControlledLeg,
+		consultation: ControlledLeg,
+		destination: string,
+	): Promise<CallControlResult>;
 	cancelTransfer(leg: ControlledLeg): Promise<CallControlResult>;
 	pickup(leg: ControlledLeg, request: PickupRequest): Promise<CallControlResult>;
+	monitor(leg: ControlledLeg, request: MonitorRequest): Promise<CallControlResult>;
 	startRecording(leg: ControlledLeg, request?: StartRecordingRequest): Promise<RecordingOutcome>;
 	stopRecording(leg: ControlledLeg): Promise<CallControlResult>;
+	pauseRecording(leg: ControlledLeg, paused: boolean): Promise<CallControlResult>;
+	dial(leg: ControlledLeg, request: DialLegRequest): Promise<DialLegOutcome>;
+	bridge(leg: ControlledLeg, request: BridgeLegRequest): Promise<BridgeLegOutcome>;
+	unbridge(leg: ControlledLeg): Promise<CallControlResult>;
 	/** Whether an attended transfer initiated by this leg is waiting to be completed. */
 	hasPendingTransfer(mediaChannelId: string): boolean;
 	/** Told by the orchestrator when a leg goes away, so held music, slots and taps are released. */
@@ -409,17 +811,96 @@ interface Consultation {
 }
 
 /** A live tap writing one leg's conversation to the recording store. */
+interface RecordingCompletion {
+	readonly durationMs: number;
+	readonly bytes?: number;
+	readonly reason: "completed" | "cancelled" | "failed";
+	/** PCI pause intervals, as the media plane reported them against the file's own timeline. */
+	readonly pauses?: readonly { readonly startMs: number; readonly endMs: number }[];
+}
+
 interface RecordingSession {
 	readonly recordingId: string;
+	/** Whether the capture is currently silenced. See {@link CallControl.pauseRecording}. */
+	paused: boolean;
 	readonly objectKey: string;
-	readonly snoopChannelId: string;
+	readonly snoopChannelId?: string;
 	readonly format: string;
 	readonly startedAtMs: number;
+	/** The resolved PCI rule for this recording. See {@link StartRecordingRequest.autoPauseOnDtmf}. */
+	readonly autoPauseOnDtmf: boolean;
+	readonly completion: { result?: RecordingCompletion };
+	readonly stopWatching: () => void;
 }
 
 /** A parked call and the timer that will ring it back. */
 interface ParkTimer {
 	readonly cancel: () => void;
+}
+
+/**
+ * A supervisor listening to somebody else's conversation.
+ *
+ * Keyed by the SUPERVISOR's media channel id throughout, because that is the leg this runtime was
+ * given and the leg whose death ends the tap. Everything about the monitored side is captured here
+ * rather than looked up again on teardown: by the time a `target-ended` teardown runs, the monitored
+ * aggregate is on its way out of the registry, and a session that had to re-resolve it would publish
+ * `call.tap.ended` for some taps and not others depending on who won a race.
+ */
+interface TapSession {
+	readonly tapId: string;
+	handle: TapHandle;
+	readonly supervisorLeg: ControlledLeg;
+	readonly supervisorExtension: string;
+	/** The monitored leg. Live getters, so a teardown reads its current state. */
+	readonly targetLeg: ControlledLeg;
+	readonly targetExtension: string;
+	readonly targetSide: "a" | "b";
+	mode: TapMode;
+	readonly startedAtMs: number;
+	/** Drops the watcher on the monitored leg, so a torn-down tap stops listening for its death. */
+	stopWatching: () => void;
+}
+
+/**
+ * The three supervision features, as two arguments to one media primitive.
+ *
+ * Exported and pure because this table IS the feature. Everything around it — minting ids, waiting
+ * for the tap to enter the application, publishing — is plumbing that would look the same for any
+ * mode, and this is the part where getting a value backwards puts a supervisor's coaching into the
+ * CUSTOMER's ear. A spec pins it directly rather than inferring it from a tap request three awaits
+ * deep in a harness.
+ *
+ * ```text
+ * eavesdrop   hear both, speak to nobody          silent monitoring
+ * whisper     hear both, speak to the MONITORED   coaching; the other party hears nothing
+ * barge       hear both, speak to both            a third person in the conversation
+ * ```
+ *
+ * `monitoredSide` is the side the SUPERVISED EXTENSION is on — `b` on a call it received, `a` on one
+ * it placed — and it appears here for one reason: whisper is the only mode whose answer depends on
+ * it, and "coach the agent" is a statement about a PARTY. Passing `hear`/`speakTo` down as sides
+ * rather than as directions is what keeps that translation in the media adapter, where the
+ * `in`/`out` inversion is documented once instead of being re-derived per feature.
+ *
+ * `hear` is `both` in all three because there is no product for a supervisor who hears half a
+ * conversation. It is written out rather than hoisted so the table reads as a table.
+ */
+export function tapSidesFor(
+	mode: TapMode,
+	monitoredSide: "a" | "b",
+): { readonly hear: TapSide; readonly speakTo: TapSide } {
+	switch (mode) {
+		case "eavesdrop": {
+			return { hear: "both", speakTo: "none" };
+		}
+		case "whisper": {
+			return { hear: "both", speakTo: monitoredSide };
+		}
+		case "barge": {
+			return { hear: "both", speakTo: "both" };
+		}
+	}
 }
 
 /**
@@ -480,6 +961,21 @@ function parkRefusal(claim: Exclude<ParkResult, { kind: "parked" }>): string {
 	}
 }
 
+/**
+ * The number of the PERSON on a leg.
+ *
+ * Not `callerIdNumber` unconditionally: on a leg the engine originated that field still carries the
+ * party who started the call, so an extension reached by an originated leg would be identified as
+ * whoever dialled it. `destinationNumber` is what that leg was dialled to reach, which is the
+ * extension itself. See {@link ControlledLeg.side}.
+ */
+function numberOf(leg: ControlledLeg | undefined): string | undefined {
+	if (leg === undefined) {
+		return undefined;
+	}
+	return leg.side === "b" ? leg.destinationNumber : leg.callerIdNumber;
+}
+
 export class CallControl implements CallControlPort {
 	private readonly settings: CallControlSettings;
 	private readonly newId: () => string;
@@ -490,6 +986,8 @@ export class CallControl implements CallControlPort {
 	private readonly holds = new Map<string, HeldLeg>();
 	private readonly consultations = new Map<string, Consultation>();
 	private readonly recordings = new Map<string, RecordingSession>();
+	/** Live taps, keyed by the SUPERVISOR's media channel id. See {@link TapSession}. */
+	private readonly taps = new Map<string, TapSession>();
 	private readonly parkTimers = new Map<string, ParkTimer>();
 	/** `parkStates` and `transferStates` exist to make the machines' guards real, not decorative. */
 	private readonly parkStates = new Map<string, ParkState>();
@@ -508,9 +1006,21 @@ export class CallControl implements CallControlPort {
 			});
 	}
 
-	/** Legs this process is holding, parking, consulting on or recording. `/healthz` reads it. */
+	/** Legs this process is holding, parking, consulting on, recording or monitoring. `/healthz` reads it. */
 	get activeOperationCount(): number {
-		return this.holds.size + this.consultations.size + this.recordings.size + this.parkTimers.size;
+		return (
+			this.holds.size +
+			this.consultations.size +
+			this.recordings.size +
+			this.parkTimers.size +
+			this.taps.size
+		);
+	}
+
+	/** The tap this leg is running, if any. Read by the specs and by the escalation keys. */
+	tapFor(mediaChannelId: string): { readonly tapId: string; readonly mode: TapMode } | undefined {
+		const session = this.taps.get(mediaChannelId);
+		return session === undefined ? undefined : { tapId: session.tapId, mode: session.mode };
 	}
 
 	hasPendingTransfer(mediaChannelId: string): boolean {
@@ -522,10 +1032,26 @@ export class CallControl implements CallControlPort {
 		return this.holds.has(mediaChannelId);
 	}
 
-	/** The recording running on this leg, if any. Read by the record-toggle feature code. */
-	recordingFor(mediaChannelId: string): { readonly recordingId: string } | undefined {
+	/**
+	 * The recording running on this leg, if any. Read by the record-toggle feature code, and by the
+	 * PBX recording control — which needs `paused` too, because it answers a caller that is drawing
+	 * a pause/resume button from the reply.
+	 */
+	recordingFor(mediaChannelId: string):
+		| {
+				readonly recordingId: string;
+				readonly paused: boolean;
+				readonly autoPauseOnDtmf: boolean;
+		  }
+		| undefined {
 		const session = this.recordings.get(mediaChannelId);
-		return session === undefined ? undefined : { recordingId: session.recordingId };
+		return session === undefined
+			? undefined
+			: {
+					recordingId: session.recordingId,
+					paused: session.paused,
+					autoPauseOnDtmf: session.autoPauseOnDtmf,
+				};
 	}
 
 	// -------------------------------------------------------------------------------------------
@@ -665,6 +1191,11 @@ export class CallControl implements CallControlPort {
 	 * is usually gone. So the parker's NUMBER is stored, not their leg, and the timeout re-routes
 	 * the parked call to it through the ordinary routing path — which rings their phone exactly as
 	 * a new call would, including their forwarding rules and their voicemail.
+	 *
+	 * Which number that is depends on which side the parker's leg is — see {@link numberOf}. When
+	 * the leg carries no such number the field is left OFF rather than filled with the other side's
+	 * identity, which would route the parked caller back to the number they are already on; the
+	 * timeout then re-parks them (see {@link CallControl.returnParkedCall}) instead of dropping them.
 	 */
 	async park(leg: ControlledLeg, request: ParkRequest = {}): Promise<ParkOutcome> {
 		const refusal = this.refuseIfUnusable(leg, "park");
@@ -693,6 +1224,7 @@ export class CallControl implements CallControlPort {
 		}
 
 		const parker = request.parkedBy ?? this.peerOf(leg);
+		const parkerNumber = numberOf(parker);
 		const mohClass = request.musicOnHold ?? lot.mohClass;
 		let state: ParkState = INITIAL_PARK_STATE;
 		const claim = await this.deps.parks.park(
@@ -704,7 +1236,7 @@ export class CallControl implements CallControlPort {
 				callId: leg.callId,
 				organizationId: leg.organizationId,
 				...(parker?.legId === undefined ? {} : { parkedByLegId: parker.legId }),
-				...(parker?.callerIdNumber === undefined ? {} : { parkedByNumber: parker.callerIdNumber }),
+				...(parkerNumber === undefined ? {} : { parkedByNumber: parkerNumber }),
 				parkedAtMs: this.now(),
 				...(mohClass === undefined ? {} : { mohClass }),
 			},
@@ -758,6 +1290,48 @@ export class CallControl implements CallControlPort {
 		});
 
 		return { result: ok(), slot: claim.entry.slot, parkLotId: lot.parkLotId };
+	}
+
+	/**
+	 * Parks the OTHER party — what a phone means by the park feature code.
+	 *
+	 * `park` takes the leg that goes INTO the orbit; the person who pressed `*5` stays on their
+	 * phone and expects the far end to be the one put away, and to be the one rung back when the
+	 * timeout fires. Passing the presser's own leg to `park` inverts both halves at once: the
+	 * presser ends up in the lot listening to music, and `parkedByNumber` records the party who is
+	 * already parked, so the recall routes the parked caller at themselves and drops them.
+	 *
+	 * So the seam is here, in one place, rather than at every caller: resolve the peer, park that,
+	 * and name the presser as the parker explicitly.
+	 *
+	 * ## And then the presser's own leg is ENDED, which is the half that was missing
+	 *
+	 * Parking is the phone equivalent of putting the handset down: the far end goes into the orbit
+	 * and the person who pressed `*5` is off the call. Leaving their leg up looks harmless — they
+	 * hear silence and hang up a second later — but it is what broke the recall. The timeout re-routes
+	 * the parked caller at the PARKER'S NUMBER through the ordinary routing path, and that path found
+	 * the parker's extension still occupied by the leg they parked from, fell through the ladder, and
+	 * filed the parked caller in the parker's own voicemail. Every recall, both orientations.
+	 *
+	 * `NORMAL_CLEARING`, because that is what it is: a party who finished with the call deliberately.
+	 * `markHangup` first for the reason {@link CallControl.completeTransfer} does it — the CDR cause
+	 * is first-wins, and the teardown that follows would otherwise supply a generic one.
+	 *
+	 * Only on a park that actually took. A refusal leaves both legs exactly as they were, which is
+	 * what lets the phone report "that lot is full" to somebody who is still on the call.
+	 */
+	async parkPeer(leg: ControlledLeg, request: ParkRequest = {}): Promise<ParkOutcome> {
+		const peer = this.peerOf(leg);
+		if (peer === undefined) {
+			return { result: refuse("this leg has nobody on the other side to park") };
+		}
+		const outcome = await this.park(peer, { ...request, parkedBy: leg });
+		if (!outcome.result.ok) {
+			return outcome;
+		}
+		leg.markHangup("NORMAL_CLEARING");
+		await this.hangupQuietly(leg.mediaChannelId, "NORMAL_CLEARING");
+		return outcome;
 	}
 
 	/**
@@ -1407,6 +1981,145 @@ export class CallControl implements CallControlPort {
 		return ok(`transferred to ${consultation.destination}`);
 	}
 
+	/**
+	 * Finishes an attended transfer the PHONE brokered: two calls this engine holds are joined into
+	 * one, and the party who owns both of them is released from each.
+	 *
+	 * ## Why this is not {@link completeTransfer}
+	 *
+	 * `completeTransfer` finishes a consultation THIS class started, so it has a `Consultation`
+	 * record naming the transferee and the destination, and the target is a B-leg of the
+	 * transferor's own call. A softphone with a second line does none of that: it places an ordinary
+	 * second call, talks on it, and then sends a `REFER` with `Replaces` (RFC 5589 §7) naming that
+	 * consultation dialog. Both halves are real calls of this engine's own — which is exactly what
+	 * makes the join possible — but there is no consultation record to complete, and inventing one
+	 * to reuse the other method would mean fabricating the state it is supposed to be evidence of.
+	 *
+	 * So the two arguments are the transferor's TWO legs: the one the REFER arrived in, and the one
+	 * `Replaces` named. Their peers — the transferee and the target — are the pair that survives.
+	 *
+	 * ## Order, and what a failure leaves behind
+	 *
+	 * The transferee moves into the CONSULTATION's bridge, exactly as `completeTransfer` does and for
+	 * the same reason: the person who agreed to take the call hears no gap. Nothing is hung up until
+	 * that has succeeded, so every failure path here leaves both original calls up and talking and
+	 * returns a named reason — a transfer key that fails visibly is recoverable, and a transfer that
+	 * tore a bridge down before it knew the join would work is not.
+	 *
+	 * ## The CDR
+	 *
+	 * Both surviving legs keep their own `callId`; what links them is the bridge-peer pointer, set in
+	 * both directions here so that whichever of them dies first names the other on its record, plus
+	 * `call.transferred` naming all three parties. `destination` is the `Refer-To` user the phone
+	 * asked for, which is what the event means by it — the engine dials nothing here, so there is no
+	 * other string that would be true. Re-keying one call's legs onto the other's id was
+	 * the alternative and is not available from this layer: the id is on the KV snapshot and on every
+	 * event both calls have already published, and a record that disagreed with its own event stream
+	 * is worse than two records that are each true.
+	 */
+	async completeAttendedRefer(
+		transferor: ControlledLeg,
+		consultation: ControlledLeg,
+		destination: string,
+	): Promise<CallControlResult> {
+		for (const leg of [transferor, consultation]) {
+			const refusal = this.refuseIfUnusable(leg, "an attended transfer");
+			if (refusal !== undefined) {
+				return refusal;
+			}
+		}
+		if (transferor.mediaChannelId === consultation.mediaChannelId) {
+			return refuse("the Replaces named the very dialog the REFER arrived in");
+		}
+		if (this.consultations.has(transferor.mediaChannelId)) {
+			return refuse("this leg already has a transfer in progress");
+		}
+
+		const transferee = this.peerOf(transferor);
+		if (transferee === undefined || transferee.isTearingDown) {
+			return refuse("the transferor is not bridged to anybody, so there is nobody to hand over");
+		}
+		const target = this.peerOf(consultation);
+		if (target === undefined || target.isTearingDown) {
+			return refuse("the consultation is not connected to anybody, so there is nobody to hand to");
+		}
+		const targetBridgeId = consultation.bridgeId;
+		if (targetBridgeId === undefined) {
+			return refuse("the consultation is not in a bridge, so there is nothing to join");
+		}
+		if (transferee.mediaChannelId === target.mediaChannelId) {
+			// Both dialogs lead back to the same person: the phone consulted the party it is holding.
+			// Joining them would bridge a leg to itself and take the call down.
+			return refuse("both dialogs name the same party, so there is nothing to join");
+		}
+
+		// The join is committed here and nowhere earlier: everything above this line is a check that
+		// leaves both calls exactly as it found them, and `completing` means the decision is made.
+		assertTransferTransition(INITIAL_TRANSFER_STATE, "completing");
+
+		const transfereeBridgeId = transferee.bridgeId;
+		this.holds.delete(transferee.mediaChannelId);
+		try {
+			await this.deps.media.stopMusicOnHold(transferee.mediaChannelId);
+		} catch {
+			// Stopping music that is not playing is a no-op. A softphone-brokered consultation
+			// usually leaves the transferee held at the PHONE, where this class never started any.
+		}
+		try {
+			if (transfereeBridgeId !== undefined && transfereeBridgeId !== targetBridgeId) {
+				await this.deps.media.removeFromBridge(transfereeBridgeId, [transferee.mediaChannelId]);
+			}
+			await this.deps.media.addToBridge(targetBridgeId, [transferee.mediaChannelId]);
+		} catch (error) {
+			assertTransferTransition("completing", "failed");
+			// Put them back where they were. The transferor is still up and still bridged, so a
+			// transferee returned to that bridge is the original call, unbroken.
+			if (transfereeBridgeId !== undefined && transfereeBridgeId !== targetBridgeId) {
+				try {
+					await this.deps.media.addToBridge(transfereeBridgeId, [transferee.mediaChannelId]);
+				} catch (restoreError) {
+					this.log("a refused attended transfer could not restore the original bridge", {
+						transfereeMediaChannelId: transferee.mediaChannelId,
+						err: String(restoreError),
+					});
+				}
+			}
+			return refuse(`the transferee could not be joined to the target: ${String(error)}`);
+		}
+
+		transferee.removeFlag("hold");
+		transferee.setBridge(targetBridgeId);
+		transferee.moveTo("exchanging-media");
+		transferee.moveCallStateTo("active");
+		// Both directions, while both legs are up — the rule every other bridge in this file follows.
+		transferee.setBridgePeer(target.legId);
+		target.setBridgePeer(transferee.legId);
+
+		// Cleared before either transferor leg is hung up, and this is the load-bearing part: the
+		// orchestrator's `endBridgePeer` would otherwise follow each hangup straight into the call
+		// that was just handed over and end it.
+		for (const leg of [transferor, consultation]) {
+			leg.addFlag("attended-transfer");
+			leg.setBridgePeer(undefined);
+			leg.setBridge(undefined);
+			leg.markHangup(hangupCauseForTransfer("attended"));
+		}
+		for (const leg of [transferor, consultation]) {
+			await this.hangupQuietly(leg.mediaChannelId, hangupCauseForTransfer("attended"));
+		}
+
+		assertTransferTransition("completing", "completed");
+
+		await this.publishQuietly(transferee, "call.transferred", {
+			legId: transferee.legId,
+			kind: "attended" satisfies TransferKind,
+			destination,
+			transferorLegId: transferor.legId,
+			targetLegId: target.legId,
+		});
+		return ok(`transferred to ${destination}`);
+	}
+
 	/** Abandons an attended transfer and puts the transferee back with the transferor. */
 	async cancelTransfer(leg: ControlledLeg): Promise<CallControlResult> {
 		const consultation = this.consultations.get(leg.mediaChannelId);
@@ -1450,8 +2163,12 @@ export class CallControl implements CallControlPort {
 			return refuse(`the transferee could not be held for the transfer: ${held.reason}`);
 		}
 		// Cleared BEFORE the transferor is hung up: `endBridgePeer` would otherwise follow the
-		// transferor's teardown straight into the call it just handed over.
+		// transferor's teardown straight into the call it just handed over, and the walk that built
+		// the bridge watches the transferor's leg — `onPeerEnded` hangs the transferee up unless the
+		// bridge pointer it compares against is gone by then. `hold` keeps the bridge id in its own
+		// record, so the unhold path is unaffected.
 		transferee.setBridgePeer(undefined);
+		transferee.setBridge(undefined);
 		transferor.setBridgePeer(undefined);
 		transferee.addFlag("transfer");
 		transferee.moveTo("routing");
@@ -1520,6 +2237,9 @@ export class CallControl implements CallControlPort {
 		}
 
 		transferee.setBridgePeer(undefined);
+		// Same seam as `completeBlindTransfer`: the walk that bridged this leg watches the leg that
+		// is going away, and its `onPeerEnded` compares against this pointer before ending us.
+		transferee.setBridge(undefined);
 		transferee.addFlag("transfer");
 		transferee.moveTo("routing");
 
@@ -1645,6 +2365,13 @@ export class CallControl implements CallControlPort {
 		const bridgeId = this.newId();
 		try {
 			await this.deps.media.answer(leg.mediaChannelId);
+			// The caller is RINGING, which on a split media plane means they have no session yet:
+			// `answer` is what allocates one. Bridging them without it refused `unknown_session` and
+			// the picker heard the refusal announcement while the caller kept hearing ringback.
+			// Answering is also what a pickup means for the caller — their call has been taken.
+			if (!candidate.callerLeg.isAnswered) {
+				await this.deps.media.answer(candidate.callerLeg.mediaChannelId);
+			}
 			await this.deps.media.createBridge({
 				bridgeId,
 				name: `pickup-${candidate.callerLeg.callId}`,
@@ -1678,6 +2405,362 @@ export class CallControl implements CallControlPort {
 			mode: "media",
 		});
 		return ok(`picked up the call ringing at ${extension}`);
+	}
+
+	// -------------------------------------------------------------------------------------------
+	// Supervision
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * Joins this leg to a conversation it is not part of — `*0`, and eavesdrop/whisper/barge.
+	 *
+	 * ## What this method is NOT responsible for
+	 *
+	 * Authorization. The gate ran in the plan walker, before `*0` could reach this seam, and it ran
+	 * there deliberately so that a future caller cannot get a tap by skipping it — see
+	 * {@link import("../routing/plan-walker").SupervisorAuthzPort}. Nothing below re-derives
+	 * authority from {@link MonitorRequest.supervisorExtension}; that string is event data.
+	 *
+	 * ## The media plane has to be holding samples
+	 *
+	 * A tap reads DECODED audio, so it is only possible on a bridge whose mode decodes — `media` and
+	 * nothing else ({@link import("@optimiq-voice/telephony").supportsMediaBug}). Checked here,
+	 * against the driver's declared {@link MediaPort.bridgeMode}, rather than inferred from whatever
+	 * a relay-only plane returns when asked to snoop, for the reason
+	 * {@link CallControl.startRecording} gives at length: "this media plane cannot do it" is a
+	 * deployment fact and "the media server refused" is an incident, and only one is worth paging
+	 * about.
+	 *
+	 * ## Finding the call, and why the OLDEST one wins
+	 *
+	 * The registry is scanned for an answered, live, un-detached leg in the same organization whose
+	 * `destinationNumber` or `callerIdNumber` is the target extension — a phone that was CALLED and a
+	 * phone that CALLED, which are the two ways an extension is on a call. A busy extension routinely
+	 * has more than one (a held call and an active one), so a rule is needed, and oldest is the one
+	 * that is both deterministic across instances and most likely right: somebody asking to listen to
+	 * extension 1001 means the conversation that has been going on, not the one that started while
+	 * they were dialling the code.
+	 *
+	 * **The registry is per engine instance, and that is a real limitation, not a rounding error.**
+	 * `*0` today reaches a call THIS process is holding and no other. In a cluster, a supervisor
+	 * whose own leg landed on instance B cannot monitor a call instance A is carrying, and what they
+	 * hear is the "nobody is on a call" announcement — indistinguishable, by design, from a denial.
+	 * The cross-instance answer already exists in outline: `apps/engine/src/presence/presence.service.ts`
+	 * maintains the `channels` KV bucket indexed per extension, which is exactly the index this scan
+	 * is a local copy of. Making `*0` cluster-wide means reading that bucket to find the OWNING
+	 * instance and then handing the request to it over an RPC, the way
+	 * `apps/engine/src/calls/park-handoff.ts` already hands a park retrieval across instances. That
+	 * is deliberately NOT built here: a supervision handoff needs the tap to be created next to the
+	 * monitored leg's media and the supervisor's leg to be bridged to it across two media servers,
+	 * which is a media-plane question rather than a routing one.
+	 *
+	 * ## The tap is watched before it exists
+	 *
+	 * On the ARI driver the tap materialises as a snoop channel entering the engine's own Stasis
+	 * application, and it gets there BEFORE the HTTP response returns. A channel the orchestrator has
+	 * never heard of is filed as a new inbound call, so the signal key is watched first — the same
+	 * rule, and the same mechanism, that makes {@link CallControl.startRecording} and every
+	 * originated B-leg safe.
+	 *
+	 * ## Never throws
+	 *
+	 * Every path returns a {@link CallControlResult}. The walker turns a refusal into an
+	 * announcement, and a supervisor who dialled `*0` and got silence would assume they were
+	 * listening — which is the one failure mode this feature must not have.
+	 */
+	async monitor(leg: ControlledLeg, request: MonitorRequest): Promise<CallControlResult> {
+		if (leg.isTearingDown) {
+			return refuse("the leg is tearing down, so it cannot be used for monitoring");
+		}
+		if (!this.deps.media.supportsSupervision && !supportsMediaBug(this.deps.media.bridgeMode)) {
+			return refuse(
+				`this media plane bridges in ${this.deps.media.bridgeMode} mode, which never decodes the audio, so a call on it cannot be monitored`,
+			);
+		}
+		if (this.taps.has(leg.mediaChannelId)) {
+			return refuse("this leg is already monitoring a call");
+		}
+
+		const extension = request.extension.trim();
+		if (extension === "") {
+			return refuse("monitoring needs the extension whose call is being joined");
+		}
+
+		const target = this.deps.host
+			.activeCallsFor(leg, extension)
+			.find((candidate) => !candidate.leg.isTearingDown);
+		if (target === undefined) {
+			return refuse(`nobody at extension ${extension} is on a call this engine is handling`);
+		}
+
+		// `*0` is dialled from an idle handset, so the supervisor's leg has not answered — the walker
+		// deliberately did not answer it, exactly as it does not answer before a pickup, so that a
+		// request that finds nothing has not started billing anybody. Answered here, at the moment
+		// there is something to connect them to.
+		try {
+			await this.deps.media.answer(leg.mediaChannelId);
+		} catch (error) {
+			return refuse(`the supervisor's leg could not be answered: ${String(error)}`);
+		}
+
+		const opened = await this.openTap(leg, target, extension, request.mode);
+		if (!opened.ok) {
+			return refuse(opened.reason);
+		}
+
+		const session: TapSession = {
+			tapId: opened.tapId,
+			handle: opened.handle,
+			supervisorLeg: leg,
+			supervisorExtension: request.supervisorExtension,
+			targetLeg: target.leg,
+			targetExtension: extension,
+			targetSide: target.side,
+			mode: request.mode,
+			startedAtMs: this.now(),
+			stopWatching: () => undefined,
+		};
+		this.taps.set(leg.mediaChannelId, session);
+		this.armTapTeardown(session);
+
+		leg.setBridge(session.handle.bridgeId);
+		leg.moveTo("exchanging-media");
+		// No `setBridgePeer`: the thing on the other side of this bridge is a TAP, which has no domain
+		// leg id and no CDR, and writing the monitored party's id there would make the supervisor's
+		// record claim a bridge that the monitored party's record does not agree exists.
+
+		await this.publishTapStarted(session);
+		return ok(`monitoring extension ${extension} in ${request.mode} mode`);
+	}
+
+	/**
+	 * Moves a live tap to another mode — the `4`/`5`/`6` keys.
+	 *
+	 * ## Why it re-taps instead of adjusting the one that is running
+	 *
+	 * Because the driver cannot adjust it. On ARI a tap IS a snoop channel, and `spy` and `whisper`
+	 * are arguments to `POST /channels/{id}/snoop` — properties fixed when the channel is created.
+	 * There is no `PUT` and no `snoop/{id}` resource to modify: `packages/media-ari`'s channel
+	 * surface exposes `snoop` and nothing that would change one, because Asterisk offers nothing that
+	 * would. So an escalation is a new tap, and the old one is stopped first so the supervisor is
+	 * never briefly in two bridges hearing the same conversation twice.
+	 *
+	 * ## Two events, in this order
+	 *
+	 * `call.tap.ended{reason:"escalated"}` and then `call.tap.started{previousMode}`. Not one
+	 * `changed` event, because the pair is what makes a compliance timeline reconstructable: each
+	 * interval a call was monitored is bounded by its own start and end with the mode that applied
+	 * during it, and a single mutation event would leave a reader integrating a mode change over an
+	 * interval that has no end. `previousMode` is what distinguishes the second `started` from a
+	 * fresh one.
+	 *
+	 * A failed re-tap leaves NO tap: the old one is already gone, the new one did not open, and the
+	 * supervisor is dropped rather than left in a bridge with nothing in it. `failed` is the end
+	 * reason, and the leg is hung up because a supervisor holding a silent line believes they are
+	 * still listening.
+	 */
+	async escalate(mediaChannelId: string, mode: TapMode): Promise<CallControlResult> {
+		const session = this.taps.get(mediaChannelId);
+		if (session === undefined) {
+			return refuse("this leg is not monitoring a call");
+		}
+		if (session.mode === mode) {
+			// Pressing the key you are already on is not an error and must not cost a re-tap: tearing
+			// the audio down and building it back would put a gap in the supervisor's ear for nothing.
+			return ok(`already monitoring in ${mode} mode`);
+		}
+		if (session.targetLeg.isTearingDown || session.supervisorLeg.isTearingDown) {
+			return refuse("the call being monitored is going away");
+		}
+
+		const previousMode = session.mode;
+		await this.stopTapQuietly(session.handle);
+		await this.publishTapEnded(session, "escalated");
+
+		const opened = await this.openTap(
+			session.supervisorLeg,
+			{ leg: session.targetLeg, side: session.targetSide, startedAtMs: session.startedAtMs },
+			session.targetExtension,
+			mode,
+		);
+		if (!opened.ok) {
+			session.stopWatching();
+			this.taps.delete(mediaChannelId);
+			this.deps.supervisionKeys?.disarm(mediaChannelId);
+			await this.publishTapEnded(session, "failed");
+			await this.hangupQuietly(mediaChannelId, "NORMAL_TEMPORARY_FAILURE");
+			return refuse(opened.reason);
+		}
+
+		session.handle = opened.handle;
+		session.mode = mode;
+		session.supervisorLeg.setBridge(session.handle.bridgeId);
+		await this.publishTapStarted(session, previousMode);
+		return ok(`monitoring extension ${session.targetExtension} in ${mode} mode`);
+	}
+
+	/**
+	 * Creates one tap and waits for it to reach the application.
+	 *
+	 * Shared by {@link monitor} and {@link escalate} because an escalation is literally a second
+	 * tap, and two copies of "mint three ids, subscribe, tap, wait, clean up on failure" is two
+	 * places for the subscribe-before-tap ordering to be got wrong.
+	 */
+	private async openTap(
+		leg: ControlledLeg,
+		target: SupervisionTarget,
+		extension: string,
+		mode: TapMode,
+	): Promise<
+		| { readonly ok: true; readonly tapId: string; readonly handle: TapHandle }
+		| { readonly ok: false; readonly reason: string }
+	> {
+		const tapId = this.newId();
+		const tapChannelId = this.newId();
+		const bridgeId = this.newId();
+		const sides = tapSidesFor(mode, target.side);
+
+		// BEFORE the tap is asked for. See the method note on `monitor`.
+		const entered = this.awaitLegEntered(tapChannelId, this.settings.snoopTimeoutMs);
+		let handle: TapHandle;
+		try {
+			handle = await this.deps.media.tap({
+				tapId,
+				targetChannelId: target.leg.mediaChannelId,
+				targetSide: target.side,
+				supervisorChannelId: leg.mediaChannelId,
+				tapChannelId,
+				bridgeId,
+				application: this.settings.application,
+				hear: sides.hear,
+				speakTo: sides.speakTo,
+				mode,
+			});
+		} catch (error) {
+			entered.cancel();
+			return {
+				ok: false,
+				reason: `the media plane refused a tap on extension ${extension}: ${String(error)}`,
+			};
+		}
+
+		// A native media tap uses the supervisor's existing session. Only a newly created
+		// snoop channel needs to enter the application's signaling lifecycle.
+		if (handle.tapChannelId === leg.mediaChannelId) {
+			entered.cancel();
+		} else if (!(await entered.promise)) {
+			// Quietly, and both halves: `stopTap` takes the bridge down and the hangup takes the
+			// channel with it, and neither may touch the conversation that was being listened to.
+			await this.stopTapQuietly(handle);
+			await this.hangupQuietly(tapChannelId, "NORMAL_TEMPORARY_FAILURE");
+			return { ok: false, reason: "the tap never reached the engine's application" };
+		}
+
+		return { ok: true, tapId, handle };
+	}
+
+	/**
+	 * Wires a tap's two possible endings, and arms the mode keys.
+	 *
+	 * The two endings are NOT symmetrical, which is the whole reason this is written out:
+	 *
+	 * - The MONITORED call ends → the tap is dead anyway (the snoop dies with the channel it was
+	 *   spying on) and the supervisor is left holding a line with nothing on it. They are hung up.
+	 * - The SUPERVISOR hangs up → the monitored call carries on. Nothing about their leg going away
+	 *   may reach the other conversation, which is the invariant {@link MediaPort.stopTap} states
+	 *   and which this method exists to make true. The supervisor's own teardown arrives through
+	 *   {@link onLegEnded}, not through a watcher here.
+	 */
+	private armTapTeardown(session: TapSession): void {
+		this.deps.supervisionKeys?.arm(session.supervisorLeg.mediaChannelId, async (mode) => {
+			await this.escalate(session.supervisorLeg.mediaChannelId, mode);
+		});
+
+		const unwatch = this.deps.signals.watch(
+			legSignalKey(session.targetLeg.mediaChannelId),
+			(signal) => {
+				if ((signal as LegSignal).kind !== "ended") {
+					return;
+				}
+				unwatch();
+				void this.endTap(session, "target-ended", true);
+			},
+		);
+		session.stopWatching = unwatch;
+	}
+
+	/**
+	 * Takes a tap down and publishes the fact.
+	 *
+	 * `call.tap.ended` is published BEFORE the media teardown, which is the opposite of the order
+	 * every other operation here uses, and the reason is the `target-ended` case: the monitored leg
+	 * is being destroyed at this instant and the aggregate that names its call is on its way out of
+	 * the registry, so an event published after two awaited media round trips would be published for
+	 * a call the publisher can no longer identify. A compliance report that silently loses the END of
+	 * some monitored intervals is worse than one whose last event precedes its last packet by a
+	 * millisecond. Stopping the tap afterwards is safe by construction — it never touches the
+	 * monitored conversation.
+	 */
+	private async endTap(
+		session: TapSession,
+		reason: TapEndReason,
+		hangUpSupervisor: boolean,
+	): Promise<void> {
+		if (this.taps.get(session.supervisorLeg.mediaChannelId) !== session) {
+			return;
+		}
+		this.taps.delete(session.supervisorLeg.mediaChannelId);
+		session.stopWatching();
+		this.deps.supervisionKeys?.disarm(session.supervisorLeg.mediaChannelId);
+
+		await this.publishTapEnded(session, reason);
+		await this.stopTapQuietly(session.handle);
+		if (hangUpSupervisor && !session.supervisorLeg.isTearingDown) {
+			await this.hangupQuietly(session.supervisorLeg.mediaChannelId, "NORMAL_CLEARING");
+		}
+	}
+
+	/**
+	 * `call.tap.started`, on the MONITORED call.
+	 *
+	 * The event belongs to the call being listened to, not to the supervisor's — that is what the
+	 * contract says and it is the only choice that makes the feature auditable: "was this
+	 * conversation monitored, and by whom?" is a question asked of a call id somebody has in front of
+	 * them, and answering it from the supervisor's call id would mean scanning every tap ever opened.
+	 * `supervisorCallId` carries the other direction so the two can be joined without a scan.
+	 */
+	private async publishTapStarted(session: TapSession, previousMode?: TapMode): Promise<void> {
+		await this.publishQuietly(session.targetLeg, "call.tap.started", {
+			// The SUPERVISOR's leg, on the monitored call's envelope. Deliberately: the tap channel
+			// has no leg id, and the field names the party doing the listening.
+			legId: session.supervisorLeg.legId,
+			mode: session.mode,
+			supervisorExtension: session.supervisorExtension,
+			targetExtension: session.targetExtension,
+			targetLegId: session.targetLeg.legId,
+			supervisorCallId: session.supervisorLeg.callId,
+			...(previousMode === undefined ? {} : { previousMode }),
+		});
+	}
+
+	private async publishTapEnded(session: TapSession, reason: TapEndReason): Promise<void> {
+		await this.publishQuietly(session.targetLeg, "call.tap.ended", {
+			legId: session.supervisorLeg.legId,
+			mode: session.mode,
+			supervisorExtension: session.supervisorExtension,
+			targetExtension: session.targetExtension,
+			reason,
+			durationMs: Math.max(0, this.now() - session.startedAtMs),
+		});
+	}
+
+	/** Idempotent by contract; a tap that is already gone is not a failure. See {@link MediaPort.stopTap}. */
+	private async stopTapQuietly(handle: TapHandle): Promise<void> {
+		try {
+			await this.deps.media.stopTap(handle);
+		} catch (error) {
+			this.log("failed to stop a tap", { tapId: handle.tapId, err: String(error) });
+		}
 	}
 
 	// -------------------------------------------------------------------------------------------
@@ -1716,6 +2799,32 @@ export class CallControl implements CallControlPort {
 	 * failures need different answers from an operator ("this media plane cannot record" is a
 	 * deployment fact, "the media server refused a tap" is an incident) and only one of them is
 	 * worth paging about.
+	 *
+	 * ## The consent gate runs BEFORE any of this, and its refusal is not an error
+	 *
+	 * {@link StartRecordingRequest.consent} — when it is supplied at all — is answered before a tap
+	 * or a snoop channel exists, because a tap that exists is a recorder that has already heard
+	 * something. `none` is the pass-through: outcome `not-required`, and the rest of the method runs
+	 * exactly as it did before any of this was written. `announce` plays the prompt to each party the
+	 * resolution named and proceeds. `announce-and-require-keypress` plays it and then waits on the
+	 * recorded leg's own signal key for the accept digit.
+	 *
+	 * A decline — an explicit decline digit, or the timeout, which is the same answer given more
+	 * slowly — starts NO recording and returns a refusal that names it. The consent record is
+	 * returned and filed on the leg anyway, through {@link CallControlHost.markConsent}, because a
+	 * call that was asked and said no is a fact somebody will need and the recording that would
+	 * normally have carried it does not exist.
+	 *
+	 * ## A playback that fails must not become a silent recording
+	 *
+	 * The announcement is best-effort PER PARTY: a media plane that will not play to the peer still
+	 * announced to the party in front of it, and refusing the whole recording over the second failure
+	 * would take a legitimate recorded call away over a media error. But if NOBODY heard it, the
+	 * outcome is a refusal. Downgrading a total playback failure to "recorded, announcement
+	 * attempted" is precisely the bug this gate exists to prevent — it would produce recordings that
+	 * a compliance report calls announced and that no human being was ever told about. So the
+	 * outcome is `announced` only when at least one party heard the prompt, and a call where none
+	 * did is refused with the media failure named.
 	 */
 	async startRecording(
 		leg: ControlledLeg,
@@ -1725,7 +2834,8 @@ export class CallControl implements CallControlPort {
 		if (refusal !== undefined) {
 			return { result: refusal };
 		}
-		if (!supportsRecording(this.deps.media.bridgeMode)) {
+		const recordConversation = this.deps.media.recordConversation?.bind(this.deps.media);
+		if (recordConversation === undefined && !supportsRecording(this.deps.media.bridgeMode)) {
 			return {
 				result: refuse(
 					`this media plane bridges in ${this.deps.media.bridgeMode} mode, which never decodes the audio, so a call on it cannot be recorded`,
@@ -1736,31 +2846,57 @@ export class CallControl implements CallControlPort {
 			return { result: refuse("this leg is already being recorded") };
 		}
 
+		let consentRecord: RecordingConsentRecord | undefined;
+		if (request.consent !== undefined) {
+			const gate = await this.runConsentGate(leg, request.consent);
+			consentRecord = gate.record;
+			this.deps.host.markConsent(leg, gate.record);
+			if (gate.refusal !== undefined) {
+				return { result: refuse(gate.refusal), consent: gate.record };
+			}
+		}
+
 		const recordingId = this.newId();
 		const format = request.format ?? this.settings.recordingFormat;
 		const objectKey = `${leg.organizationId}/${leg.callId}/${recordingId}.${format}`;
-		const snoopChannelId = this.newId();
+		let snoopChannelId: string | undefined;
 
-		const entered = this.awaitLegEntered(snoopChannelId, this.settings.snoopTimeoutMs);
-		try {
-			await this.deps.media.snoop({
-				channelId: leg.mediaChannelId,
-				snoopChannelId,
-				application: this.settings.application,
-				spy: "both",
-			});
-		} catch (error) {
-			entered.cancel();
-			return { result: refuse(`the media server refused a tap on this leg: ${String(error)}`) };
+		if (recordConversation === undefined) {
+			snoopChannelId = this.newId();
+			const entered = this.awaitLegEntered(snoopChannelId, this.settings.snoopTimeoutMs);
+			try {
+				await this.deps.media.snoop({
+					channelId: leg.mediaChannelId,
+					snoopChannelId,
+					application: this.settings.application,
+					spy: "both",
+				});
+			} catch (error) {
+				entered.cancel();
+				return { result: refuse(`the media server refused a tap on this leg: ${String(error)}`) };
+			}
+
+			if (!(await entered.promise)) {
+				await this.hangupQuietly(snoopChannelId, "NORMAL_TEMPORARY_FAILURE");
+				return { result: refuse("the tap never reached the engine's application") };
+			}
 		}
 
-		if (!(await entered.promise)) {
-			await this.hangupQuietly(snoopChannelId, "NORMAL_TEMPORARY_FAILURE");
-			return { result: refuse("the tap never reached the engine's application") };
-		}
-
+		const completion: { result?: RecordingCompletion } = {};
+		const stopWatching = this.deps.signals.watch(recordingSignalKey(recordingId), (signal) => {
+			if (signal.kind === "recording-finished") {
+				completion.result = {
+					durationMs: signal.durationMs,
+					reason: "completed",
+					...(signal.bytes === undefined ? {} : { bytes: signal.bytes }),
+					...(signal.pauses === undefined ? {} : { pauses: signal.pauses }),
+				};
+			} else if (signal.kind === "recording-failed") {
+				completion.result = { durationMs: 0, reason: "failed" };
+			}
+		});
 		try {
-			await this.deps.media.record(snoopChannelId, {
+			const recordingRequest = {
 				name: recordingId,
 				format,
 				...(request.maxDurationMs === undefined
@@ -1770,29 +2906,526 @@ export class CallControl implements CallControlPort {
 					? {}
 					: { maxSilenceSeconds: Math.ceil(request.silenceStopMs / MILLIS_PER_SECOND) }),
 				...(request.beep === undefined ? {} : { beep: request.beep }),
-				terminateOn: "none",
-			});
+				terminateOn: "none" as const,
+			};
+			if (recordConversation !== undefined) {
+				await recordConversation(leg.mediaChannelId, recordingRequest);
+			} else if (snoopChannelId !== undefined) {
+				await this.deps.media.record(snoopChannelId, recordingRequest);
+			}
 		} catch (error) {
-			await this.hangupQuietly(snoopChannelId, "NORMAL_TEMPORARY_FAILURE");
+			if (snoopChannelId !== undefined)
+				await this.hangupQuietly(snoopChannelId, "NORMAL_TEMPORARY_FAILURE");
+			stopWatching();
 			return { result: refuse(`the recording could not be started: ${String(error)}`) };
 		}
 
 		this.recordings.set(leg.mediaChannelId, {
+			completion,
+			stopWatching,
 			recordingId,
+			paused: false,
 			objectKey,
 			snoopChannelId,
 			format,
 			startedAtMs: this.now(),
+			autoPauseOnDtmf: request.autoPauseOnDtmf ?? false,
 		});
 
+		this.deps.host.markRecording(leg, { active: true, paused: false });
 		await this.publishQuietly(leg, "channel.record.started", {
 			legId: leg.legId,
 			recordingId,
 			objectKey,
 			kind: "call",
 			stereo: false,
+			...(consentRecord === undefined ? {} : { consent: consentRecord }),
 		});
-		return { result: ok(), recordingId, objectKey };
+		return {
+			result: ok(),
+			recordingId,
+			objectKey,
+			...(consentRecord === undefined ? {} : { consent: consentRecord }),
+		};
+	}
+
+	/**
+	 * Asks the parties, and answers whether the recording may start.
+	 *
+	 * The three policies are three shapes of the same sequence and are written as one method rather
+	 * than three, because the announcement is common to two of them and the RECORD is common to all
+	 * three: whatever happens, exactly one {@link RecordingConsentRecord} comes out, stamped once,
+	 * naming the parties the prompt was actually PLAYED at rather than the parties it was owed to.
+	 * `outcome: "announced"` therefore means "the media plane reported that it played audio to this
+	 * party" — the media plane's own `playedMs`, greater than zero — and never "this person heard
+	 * it", which nothing can establish (see {@link CallControl.announceConsent}). `refusal`
+	 * present means the caller must not record; its absence means it may.
+	 */
+	private async runConsentGate(
+		leg: ControlledLeg,
+		consent: ResolvedRecordingConsent,
+	): Promise<{ readonly record: RecordingConsentRecord; readonly refusal?: string }> {
+		const stamp = (
+			outcome: RecordingConsentRecord["outcome"],
+			method: RecordingConsentRecord["method"],
+			parties: readonly ConsentParty[],
+		): RecordingConsentRecord => ({
+			outcome,
+			method,
+			policy: consent.policy,
+			at: new Date(this.now()).toISOString(),
+			parties,
+			...(consent.regions.length === 0 ? {} : { regions: consent.regions }),
+			...(consent.promptId === undefined ? {} : { promptId: consent.promptId }),
+		});
+
+		if (consent.policy === "none") {
+			return { record: stamp("not-required", "none", NO_CONSENT_PARTIES) };
+		}
+
+		const keypress = consent.policy === "announce-and-require-keypress";
+		const method = keypress ? "keypress" : "announcement";
+		const heard = await this.announceConsent(leg, consent);
+		if (heard.length === 0) {
+			// Nobody was told. See the argument on `startRecording`: this is the one media failure
+			// that has to stop the recording rather than be logged past.
+			return {
+				record: stamp("declined", method, heard),
+				refusal:
+					"the consent announcement could not be played to any party, so this call was not recorded",
+			};
+		}
+		if (!keypress) {
+			return { record: stamp("announced", "announcement", heard) };
+		}
+
+		const pressed = await this.awaitConsentDigit(
+			leg.mediaChannelId,
+			consent,
+			this.settings.consentKeypressTimeoutMs,
+		);
+		if (pressed === consent.acceptDigit) {
+			return { record: stamp("accepted", "keypress", heard) };
+		}
+		return {
+			record: stamp("declined", "keypress", heard),
+			refusal:
+				pressed === undefined
+					? `no consent digit was pressed within ${String(this.settings.consentKeypressTimeoutMs)}ms, so this call was not recorded`
+					: "the party declined to be recorded, so this call was not recorded",
+		};
+	}
+
+	/**
+	 * Plays the consent prompt at every party it is owed to. Returns the ones it was DELIVERED to.
+	 *
+	 * ## What the returned parties mean — read this before reading the consent record
+	 *
+	 * A party in this list is a party whose media plane reported that it PLAYED AUDIO to that party:
+	 * `mediad` publishes `playback.finished` with `playedMs`, the count of milliseconds it actually
+	 * wrote to that leg's transport, and a party is counted only when that number is greater than
+	 * zero. That is a materially stronger claim than the one this method used to make. It used to
+	 * count a party when `MediaPort.play` RESOLVED, and `play` resolves on acceptance — so a WebRTC
+	 * party still finishing ICE and DTLS was written into a compliance record as announced to while
+	 * the media plane was logging `playedMs 0` and `WebRTC media is not connected` on the very same
+	 * prompt. That was measured on the running stack, not imagined.
+	 *
+	 * What it STILL cannot mean, and the documentation says so in the same words: that a human
+	 * listened. Audio left the machine and reached the far end's transport. Nobody can prove a person
+	 * was in the room, was not on mute at their end, or understood the language the prompt is in —
+	 * no telephony platform can, and a record that implied it would be lying about something
+	 * unfalsifiable. `announced` means the media plane delivered audio to that party. See
+	 * `docs/recording-compliance.md`.
+	 *
+	 * ## The two waits, and why neither is a sleep
+	 *
+	 * **Readiness first.** A leg that has not signalled an answer cannot be played at — the media
+	 * plane may refuse the playback outright — so each party's `active` call state is required, read
+	 * off {@link CallControlHost.legFor} and, when it has not arrived, waited for on the leg's signal
+	 * key, bounded by {@link CallControlSettings.consentPeerReadyTimeoutMs}. Both parties are waited
+	 * for AT ONCE, so a bridged pair costs one budget between them rather than two in series.
+	 *
+	 * **Then delivery.** Readiness is a SIGNALLING fact and is not enough on its own; this is where a
+	 * fixed 1 500 ms sleep used to sit, guessing at how long a browser's handshake takes because the
+	 * engine had no way to know when the prompt had actually played. It has one now. The gate
+	 * subscribes to the playback's own reference BEFORE issuing the play — a prompt can finish before
+	 * the command's reply is unwrapped, and a watcher registered afterwards would miss it — and then
+	 * waits for the media plane's account, bounded by
+	 * {@link CallControlSettings.consentPlaybackTimeoutMs}. The gate's cost is therefore the length of
+	 * the prompt, not a constant; a deployment whose parties are all RTP endpoints stops paying the
+	 * old sleep entirely.
+	 *
+	 * Every way a party can fail — no addressable channel, never answered, `play` threw, the playback
+	 * never finished, or it finished having delivered nothing — leaves that party OUT of `parties`
+	 * rather than credited. No party at all refuses the recording, which is the contract
+	 * {@link CallControl.runConsentGate} already held and still holds.
+	 *
+	 * The peer is addressed by its MEDIA channel id and not by walking back through the registry,
+	 * because the far end of an outbound recorded call is exactly the party the announcement exists
+	 * for and it is reachable here with no lookup at all. A `callee` the engine cannot address —
+	 * the recorded leg is not bridged yet, which is what a recording started by the walk before the
+	 * dial looks like — is left out of `parties` rather than reported as told.
+	 */
+	private async announceConsent(
+		leg: ControlledLeg,
+		consent: ResolvedRecordingConsent,
+	): Promise<readonly ConsentParty[]> {
+		const media = consent.promptMedia ?? this.settings.consentPrompt;
+
+		const ready = (
+			await Promise.all(
+				consent.parties.map(async (party) => {
+					const channelId = party === "caller" ? leg.mediaChannelId : leg.peerMediaChannelId;
+					if (channelId === undefined) {
+						return undefined;
+					}
+					if (!(await this.awaitMediaReady(channelId, this.settings.consentPeerReadyTimeoutMs))) {
+						this.log("a consent announcement was not played: the party's leg never carried media", {
+							mediaChannelId: channelId,
+							party,
+							timeoutMs: this.settings.consentPeerReadyTimeoutMs,
+						});
+						return undefined;
+					}
+					return { party, channelId };
+				}),
+			)
+		).filter((entry) => entry !== undefined);
+
+		// Played and awaited CONCURRENTLY, which matters more than it did when this was fire-and-
+		// forget: the parties now wait for the prompt to end, and doing that in series would play at
+		// the second party a whole prompt after the first on a call two people are already on.
+		// ONE budget for the whole announcement, on a real timer rather than on `now()`: the injected
+		// clock is a constant in a spec, and a loop that measured its own elapsed time with it would
+		// never terminate. The budget is raced by every party and cancelled once they have all settled.
+		const budget = this.playbackBudget(this.settings.consentPlaybackTimeoutMs);
+		const delivered = await Promise.all(
+			ready.map(async ({ party, channelId }) => {
+				let attempts = 0;
+				for (;;) {
+					attempts += 1;
+					const playbackRef = this.newId();
+					// Subscribed BEFORE the play, never after: a short prompt on a fast local transport
+					// can finish before the command's reply is unwrapped, and a waiter registered then
+					// would wait out the whole budget for a signal that had already been emitted.
+					const finished = this.awaitPlaybackDelivery(
+						playbackRef,
+						this.settings.consentPlaybackTimeoutMs,
+					);
+					let outcome: Awaited<typeof finished.result> | "budget-expired";
+					try {
+						await this.deps.media.play(channelId, { media: [media], playbackRef });
+						outcome = await Promise.race([finished.result, budget.expiry]);
+					} catch (error) {
+						finished.cancel();
+						// A refused command is not retried: `play` throwing is the media plane declining
+						// this prompt on this leg — an unknown session, an unresolvable media ref — and
+						// none of those become true again by asking a second time. A DELIVERED ZERO is
+						// the opposite: everything worked and the transport was not there yet.
+						this.log("failed to play a consent announcement", {
+							mediaChannelId: channelId,
+							party,
+							err: String(error),
+						});
+						return undefined;
+					}
+					if (outcome === "budget-expired") {
+						finished.cancel();
+					} else if (outcome.deliveredMedia) {
+						if (attempts > 1) {
+							this.log("a consent announcement was delivered after the media path came up", {
+								mediaChannelId: channelId,
+								party,
+								attempts,
+								...(outcome.playedMs === undefined ? {} : { playedMs: outcome.playedMs }),
+							});
+						}
+						return party;
+					}
+					if (outcome === "budget-expired" || budget.expired) {
+						this.log("a consent announcement was played but the media plane delivered no audio", {
+							mediaChannelId: channelId,
+							party,
+							attempts,
+							timeoutMs: this.settings.consentPlaybackTimeoutMs,
+							...(outcome === "budget-expired"
+								? { reason: "the announcement budget expired" }
+								: {
+										...(outcome.playedMs === undefined ? {} : { playedMs: outcome.playedMs }),
+										...(outcome.reason === undefined ? {} : { reason: outcome.reason }),
+									}),
+						});
+						return undefined;
+					}
+					// Retried, not waited out: a playback written into a transport with no peer is not
+					// queued anywhere and nothing is going to arrive late. The only way this party hears
+					// the disclosure is to play it again once the path is up.
+					await Promise.race([this.settle(this.settings.consentPlaybackRetryMs), budget.expiry]);
+					if (budget.expired) {
+						this.log("a consent announcement was played but the media plane delivered no audio", {
+							mediaChannelId: channelId,
+							party,
+							attempts,
+							timeoutMs: this.settings.consentPlaybackTimeoutMs,
+							reason: "the announcement budget expired between attempts",
+						});
+						return undefined;
+					}
+				}
+			}),
+		);
+		budget.cancel();
+		return delivered.filter((party) => party !== undefined);
+	}
+
+	/**
+	 * The whole announcement's ceiling, as a promise that resolves once rather than a clock to read.
+	 *
+	 * `expiry` never rejects and is safe to race any number of times; `expired` is the same fact for
+	 * a caller that has already settled and only wants to know why. `cancel` drops the timer when
+	 * every party is done, so an announcement that succeeds immediately leaves nothing pending.
+	 */
+	private playbackBudget(timeoutMs: number): {
+		readonly expiry: Promise<"budget-expired">;
+		readonly expired: boolean;
+		readonly cancel: () => void;
+	} {
+		let expired = false;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const expiry = new Promise<"budget-expired">((resolve) => {
+			timer = setTimeout(() => {
+				expired = true;
+				resolve("budget-expired");
+			}, timeoutMs);
+			timer.unref?.();
+		});
+		return {
+			expiry,
+			get expired() {
+				return expired;
+			},
+			cancel: () => {
+				if (timer !== undefined) {
+					clearTimeout(timer);
+					timer = undefined;
+				}
+			},
+		};
+	}
+
+	/** The gap between a delivered-nothing report and the next attempt. Unref'd: it never holds exit. */
+	private settle(ms: number): Promise<void> {
+		return new Promise<void>((resolve) => {
+			const timer = setTimeout(resolve, ms);
+			timer.unref?.();
+		});
+	}
+
+	/**
+	 * What the media plane says it delivered of one playback, waiting a bounded time for it.
+	 *
+	 * Returns the promise AND its cancel, rather than just the promise, because the caller has to
+	 * subscribe before it plays and then has a path — the play itself throwing — on which no signal
+	 * will ever arrive. Without the cancel that path would hold a watcher and a timer for the length
+	 * of the budget on a playback that never started.
+	 *
+	 * `deliveredMedia` is the whole judgement, and it is deliberately not `playedMs > 0` on its own.
+	 * A driver that measures delivery (`mediad`) reports a number and `0` means the far end got
+	 * nothing — that is the failure this rung exists to catch. A driver that CANNOT measure it
+	 * (Asterisk's `PlaybackFinished` carries a state and no duration) reports no number, and there
+	 * the strongest available evidence is that the playback ended without failing. Treating a missing
+	 * measurement as a zero would refuse every announcement on an ARI deployment.
+	 *
+	 * The watcher and the timer are torn down by whichever settles first, on EVERY exit — delivered,
+	 * delivered nothing, budget expired, cancelled — for the reason {@link awaitConsentDigit} gives:
+	 * this runs on every recorded call, and a watcher left behind would be a listener on a dead
+	 * playback's key for the life of the process.
+	 */
+	private awaitPlaybackDelivery(
+		playbackRef: string,
+		timeoutMs: number,
+	): {
+		readonly result: Promise<{
+			readonly deliveredMedia: boolean;
+			readonly playedMs?: number;
+			readonly reason?: string;
+		}>;
+		readonly cancel: () => void;
+	} {
+		let cancel = (): void => undefined;
+		const result = new Promise<{
+			readonly deliveredMedia: boolean;
+			readonly playedMs?: number;
+			readonly reason?: string;
+		}>((resolve) => {
+			let unwatch = (): void => undefined;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const done = (value: {
+				readonly deliveredMedia: boolean;
+				readonly playedMs?: number;
+				readonly reason?: string;
+			}): void => {
+				if (timer !== undefined) {
+					clearTimeout(timer);
+					timer = undefined;
+				}
+				unwatch();
+				resolve(value);
+			};
+			cancel = () => {
+				done({ deliveredMedia: false, reason: "the playback was never started" });
+			};
+			unwatch = this.deps.playbacks.watch(playbackSignalKey(playbackRef), (signal) => {
+				done({
+					deliveredMedia:
+						signal.playedMs === undefined
+							? signal.reason !== "error" && signal.reason !== "failed"
+							: signal.playedMs > 0,
+					...(signal.playedMs === undefined ? {} : { playedMs: signal.playedMs }),
+					reason: signal.reason,
+				});
+			});
+			timer = setTimeout(() => {
+				done({ deliveredMedia: false, reason: "the playback never finished" });
+			}, timeoutMs);
+			timer.unref?.();
+		});
+		return {
+			result,
+			cancel: () => {
+				cancel();
+			},
+		};
+	}
+
+	/**
+	 * Whether this leg is answered, waiting a bounded time for it if it is not yet.
+	 *
+	 * The same promise-and-cancel shape as {@link awaitConsentDigit} and for the same reason: the
+	 * watcher and the timer are torn down by whichever settles first, on EVERY exit — already
+	 * answered, answered while waiting, hung up while waiting, budget expired — so a gate that runs
+	 * on every recorded call cannot leave a listener behind on a dead leg's key.
+	 *
+	 * A leg the host does not know is not treated as a failure on the spot: the signal bus is keyed
+	 * by media channel id and works for a leg no registry entry exists for yet, so the wait runs and
+	 * the budget is what ends it.
+	 */
+	private awaitMediaReady(mediaChannelId: string, timeoutMs: number): Promise<boolean> {
+		if (this.deps.host.legFor(mediaChannelId)?.isAnswered === true) {
+			return Promise.resolve(true);
+		}
+		return new Promise<boolean>((resolve) => {
+			let unwatch = (): void => undefined;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const done = (value: boolean): void => {
+				if (timer !== undefined) {
+					clearTimeout(timer);
+					timer = undefined;
+				}
+				unwatch();
+				resolve(value);
+			};
+			unwatch = this.deps.signals.watch(legSignalKey(mediaChannelId), (signal) => {
+				const legSignal = signal as LegSignal;
+				if (legSignal.kind === "answered") {
+					done(true);
+					return;
+				}
+				if (legSignal.kind === "ended") {
+					done(false);
+				}
+			});
+			timer = setTimeout(() => {
+				done(false);
+			}, timeoutMs);
+			timer.unref?.();
+		});
+	}
+
+	/**
+	 * The accept or decline digit off the recorded leg, or `undefined` when the budget ran out.
+	 *
+	 * The same promise-and-cancel shape as {@link awaitLegEntered}, and for the same reason: the
+	 * watcher and the timer are both torn down by whichever settles first, so no exit path — accept,
+	 * decline, hangup, timeout — leaves either behind. A dangling watcher here would be a listener
+	 * on a dead leg's key for the life of the process, and every recorded call would add one.
+	 *
+	 * Digits that are neither the accept nor the decline are IGNORED rather than treated as a
+	 * decline: a caller who is still holding a menu's `#` from two seconds ago has not answered this
+	 * question, and the timeout is what covers a caller who never answers it. An `ended` is a hangup
+	 * mid-question, which settles as no answer — there is nobody left to record either way.
+	 */
+	private awaitConsentDigit(
+		mediaChannelId: string,
+		consent: ResolvedRecordingConsent,
+		timeoutMs: number,
+	): Promise<string | undefined> {
+		return new Promise<string | undefined>((resolve) => {
+			let unwatch = (): void => undefined;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const done = (value: string | undefined): void => {
+				if (timer !== undefined) {
+					clearTimeout(timer);
+					timer = undefined;
+				}
+				unwatch();
+				resolve(value);
+			};
+			unwatch = this.deps.signals.watch(legSignalKey(mediaChannelId), (signal) => {
+				const legSignal = signal as LegSignal;
+				if (legSignal.kind === "ended") {
+					done(undefined);
+					return;
+				}
+				if (legSignal.kind !== "dtmf") {
+					return;
+				}
+				if (legSignal.digit === consent.acceptDigit || legSignal.digit === consent.declineDigit) {
+					done(legSignal.digit);
+				}
+			});
+			timer = setTimeout(() => {
+				done(undefined);
+			}, timeoutMs);
+			timer.unref?.();
+		});
+	}
+
+	/**
+	 * Pauses or resumes the recording running on this leg WITHOUT ending its file. PCI.
+	 *
+	 * The card-number case: the caller reads a PAN, the agent pauses, and what lands in the object
+	 * is silence at the offset the number was spoken. One artifact, one `objectKey`, one CDR row —
+	 * which is what a stop-and-start cannot give, because a stop publishes `channel.record.stopped`
+	 * for half the call and the rest gets a different key.
+	 *
+	 * Idempotent, and deliberately so at THIS layer too: an agent who hits the pause feature code
+	 * twice because the first press was not acknowledged must not open a second interval, and one
+	 * who resumes a recording that was never paused must not close one that never opened.
+	 *
+	 * The intervals are not tracked here. They ride the media plane's own recording-finished event,
+	 * because only the process that wrote the audio knows where in the file the silence landed.
+	 */
+	async pauseRecording(leg: ControlledLeg, paused: boolean): Promise<CallControlResult> {
+		const session = this.recordings.get(leg.mediaChannelId);
+		if (session === undefined) {
+			return refuse("this leg is not being recorded");
+		}
+		if (session.paused === paused) {
+			return ok(session.recordingId);
+		}
+		try {
+			await this.deps.media.pauseRecording(session.recordingId, paused);
+		} catch (error) {
+			// The state is NOT flipped on a refusal: a runtime that believed a pause it never got is
+			// one that tells an agent the card number is safe while it is being written to disk.
+			return refuse(
+				`the media plane cannot ${paused ? "pause" : "resume"} a recording: ${String(error)}`,
+			);
+		}
+		session.paused = paused;
+		this.deps.host.markRecording(leg, { active: true, paused });
+		return ok(session.recordingId);
 	}
 
 	/**
@@ -1810,12 +3443,13 @@ export class CallControl implements CallControlPort {
 		}
 		this.recordings.delete(leg.mediaChannelId);
 
-		const finished = this.awaitRecordingFinished(
-			session.recordingId,
-			this.settings.recordingStopTimeoutMs,
-		);
+		const finished =
+			session.completion.result === undefined
+				? this.awaitRecordingFinished(session.recordingId, this.settings.recordingStopTimeoutMs)
+				: { promise: Promise.resolve(session.completion.result), cancel: () => undefined };
 		try {
-			await this.deps.media.stopRecording(session.recordingId);
+			if (session.completion.result === undefined)
+				await this.deps.media.stopRecording(session.recordingId);
 		} catch (error) {
 			finished.cancel();
 			this.log("the media server refused to stop a recording", {
@@ -1824,17 +3458,277 @@ export class CallControl implements CallControlPort {
 			});
 		}
 		const outcome = await finished.promise;
-		await this.hangupQuietly(session.snoopChannelId, "NORMAL_CLEARING");
+		session.stopWatching();
+		this.deps.host.markRecording(leg, { active: false, paused: false });
+		if (session.snoopChannelId !== undefined)
+			await this.hangupQuietly(session.snoopChannelId, "NORMAL_CLEARING");
 
 		await this.publishQuietly(leg, "channel.record.stopped", {
 			legId: leg.legId,
 			recordingId: session.recordingId,
 			objectKey: session.objectKey,
+			...(outcome.bytes === undefined ? {} : { bytes: outcome.bytes }),
+			// The gap in the audio is deliberate, and this is the only place that says so: the CDR
+			// row is what a compliance reviewer reads, not the media plane's own event stream.
+			...(outcome.pauses === undefined || outcome.pauses.length === 0
+				? {}
+				: { pauses: outcome.pauses.map((pause) => ({ ...pause })) }),
 			durationMs:
 				outcome.durationMs > 0 ? outcome.durationMs : Math.max(0, this.now() - session.startedAtMs),
 			reason: outcome.reason,
 		});
 		return ok(session.recordingId);
+	}
+
+	// -------------------------------------------------------------------------------------------
+	// Dial and bridge — the session protocol's leg surface
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * Originates towards each target in turn and connects the first that answers.
+	 *
+	 * ## Why this goes through routing and does not originate
+	 *
+	 * Every target is resolved by {@link CallControlHost.route}, which is the same path `*69` takes
+	 * and the same path an inbound call takes. That means an application's `dial` gets, for free and
+	 * without being able to opt out of them: the organization's outbound routes, its caller-id
+	 * policy, its trunk selection and capacity limits, its call-block list and its emergency
+	 * handling. The verb executor could have called `MediaPort.originate` directly and skipped all
+	 * of it — which is precisely why it does not. An integration is the least trusted caller on this
+	 * platform and the one most likely to be holding a leaked API key, and a dial that bypassed the
+	 * toll gate would make the session protocol the cheapest way to defraud a tenant.
+	 *
+	 * The cost is that this is SEQUENTIAL, one target at a time. Ring-all with lose-race semantics
+	 * and CDR-correct losers lives in the plan walker, which owns origination; a second originator
+	 * here would be a second, subtly different one. `simultaneous` is refused at the verb, by name,
+	 * rather than silently downgraded — see the verb executor.
+	 *
+	 * ## `continueOnCauses` is the only thing that moves to the next target
+	 *
+	 * A target that connects ends the dial. A target that fails ends it too, UNLESS its cause is in
+	 * the list the application supplied. Absent means "stop", never "keep going": a list that
+	 * defaulted to retrying would turn one `CALL_REJECTED` into sixteen attempts down somebody
+	 * else's number range.
+	 */
+	async dial(leg: ControlledLeg, request: DialLegRequest): Promise<DialLegOutcome> {
+		const notes: string[] = [];
+		if (leg.isTearingDown) {
+			return {
+				result: refuse("the leg is tearing down, so it cannot be used for dial"),
+				bridged: false,
+				notes,
+			};
+		}
+		if (request.targets.length === 0) {
+			return { result: refuse("a dial needs at least one target"), bridged: false, notes };
+		}
+
+		const continueOn = new Set<HangupCause>(request.continueOnCauses ?? []);
+		let lastCause: HangupCause | undefined;
+
+		for (const [index, target] of request.targets.entries()) {
+			// `internal` then `outbound` when the application did not say, which is the walk `*69`
+			// performs: an extension number is not a PSTN number, and trying the toll-bearing context
+			// first would put every internal dial through the outbound rules.
+			const contexts: readonly ("internal" | "outbound")[] =
+				target.context === undefined ? ["internal", "outbound"] : [target.context];
+
+			let outcome: RouteOutcome | undefined;
+			for (const context of contexts) {
+				outcome = await this.deps.host.route(leg, { destination: target.destination, context });
+				notes.push(...outcome.notes);
+				if (outcome.status !== "unresolved") {
+					break;
+				}
+			}
+			if (outcome === undefined || outcome.status === "unresolved") {
+				notes.push(`nothing matched ${target.destination}`);
+				// An unresolved destination is not a hangup cause, so it does not consult
+				// `continueOnCauses` — there was no attempt to continue FROM. The list is about calls
+				// that were placed and failed, and a number that does not route was never placed.
+				continue;
+			}
+			if (outcome.status === "bridged") {
+				return {
+					result: ok(`dialled ${target.destination}`),
+					answeredTargetIndex: index,
+					bridged: true,
+					notes,
+				};
+			}
+			if (outcome.status === "aborted") {
+				// The A-leg went away underneath the dial. There is nobody left to try for.
+				return { result: refuse("the leg went away during the dial"), bridged: false, notes };
+			}
+			lastCause = outcome.cause;
+			if (outcome.cause === undefined || !continueOn.has(outcome.cause)) {
+				return {
+					result: refuse(`${target.destination} did not answer: ${outcome.cause ?? "unknown"}`),
+					bridged: false,
+					...(lastCause === undefined ? {} : { cause: lastCause }),
+					notes,
+				};
+			}
+			notes.push(`${target.destination} failed with ${outcome.cause}; continuing`);
+		}
+
+		return {
+			result: refuse("no target answered"),
+			bridged: false,
+			...(lastCause === undefined ? {} : { cause: lastCause }),
+			notes,
+		};
+	}
+
+	/**
+	 * Joins this leg to another this engine is holding — the `uuid_bridge` equivalent.
+	 *
+	 * ## The tenancy check is the first thing here and is not optional
+	 *
+	 * The peer is named by an application, over a socket, as an opaque string. Everything else in
+	 * this class receives a leg the engine looked up for itself; this is the one operation whose
+	 * TARGET is caller-supplied, which makes it the one place a cross-tenant bridge could be built
+	 * by asking for it. Two legs in different organizations sharing a media bridge is two customers
+	 * on one another's calls, so the organization comparison happens before any media command and
+	 * the refusal deliberately does not distinguish "not yours" from "does not exist" — an
+	 * application that could tell the two apart could enumerate another tenant's live legs.
+	 *
+	 * ## Reuse the peer's bridge when it has one; create one when neither does
+	 *
+	 * Joining an existing bridge rather than building a second is what makes `bridge` work on a leg
+	 * that is already in a conversation — the application is adding this leg to that call, which is
+	 * what an operator means by it. Both legs are pulled out of any OTHER bridge first, because a
+	 * channel in two bridges is a media loop.
+	 *
+	 * ## An unanswered member is ANSWERED, not refused
+	 *
+	 * A leg that has not answered has no media session on a split plane, so adding it to a bridge is
+	 * refused `unknown_session` one layer down. Refusing it up here instead was tidier and wrong: the
+	 * operations that arrive with a ringing leg are exactly the ones where bridging IS the answer — a
+	 * shared line retrieved from a second appearance above all — and every one of them was told "the
+	 * leg has not answered, so it cannot be used for bridge". {@link CallControl.pickup} and
+	 * {@link CallControl.monitor} already answer inline for this reason; doing it here is why they
+	 * are the only two places that ever had to.
+	 */
+	async bridge(leg: ControlledLeg, request: BridgeLegRequest): Promise<BridgeLegOutcome> {
+		if (leg.isTearingDown) {
+			return { result: refuse("the leg is tearing down, so it cannot be used for bridge") };
+		}
+		const peer = this.deps.host.legByLegId(request.peerLegId);
+		if (peer === undefined || peer.organizationId !== leg.organizationId) {
+			return { result: refuse(`no leg ${request.peerLegId} on this engine`) };
+		}
+		if (peer.legId === leg.legId) {
+			return { result: refuse("a leg cannot be bridged to itself") };
+		}
+		if (peer.isTearingDown) {
+			return {
+				result: refuse(
+					`leg ${peer.legId} is not usable: the leg is tearing down, so it cannot be used for bridge`,
+				),
+			};
+		}
+		for (const member of [leg, peer]) {
+			if (member.isAnswered) {
+				continue;
+			}
+			try {
+				await this.deps.media.answer(member.mediaChannelId);
+			} catch (error) {
+				return { result: refuse(`leg ${member.legId} could not be answered: ${String(error)}`) };
+			}
+		}
+		if (this.holds.has(leg.mediaChannelId) || this.holds.has(peer.mediaChannelId)) {
+			// Bridging a held leg would put a live conversation on top of hold music, and would leave
+			// the hold record pointing at a bridge that no longer exists. `unhold` first.
+			return { result: refuse("one of the legs is on hold; release it before bridging") };
+		}
+
+		const existing = peer.bridgeId;
+		const bridgeId = existing ?? this.newId();
+		try {
+			if (existing === undefined) {
+				await this.deps.media.createBridge({ bridgeId, name: `session-${leg.callId}` });
+			}
+			for (const member of [leg, peer]) {
+				const held = member.bridgeId;
+				if (held !== undefined && held !== bridgeId) {
+					await this.deps.media.removeFromBridge(held, [member.mediaChannelId]);
+				}
+			}
+			const joining = [
+				leg.mediaChannelId,
+				...(existing === undefined ? [peer.mediaChannelId] : []),
+			];
+			await this.deps.media.addToBridge(bridgeId, joining);
+		} catch (error) {
+			return { result: refuse(`the legs could not be bridged: ${String(error)}`) };
+		}
+
+		leg.setBridge(bridgeId);
+		peer.setBridge(bridgeId);
+		leg.moveTo("exchanging-media");
+		peer.moveTo("exchanging-media");
+		// Both directions, while both legs are up: each CDR carries the other's id whichever dies
+		// first. The same rule every other bridge in this file follows.
+		leg.setBridgePeer(peer.legId);
+		peer.setBridgePeer(leg.legId);
+
+		await this.publishQuietly(leg, "channel.bridged", {
+			legId: leg.legId,
+			peerLegId: peer.legId,
+			bridgeId,
+			mode: this.deps.media.bridgeMode,
+		});
+		return { result: ok(`bridged to ${peer.legId}`), bridgeId };
+	}
+
+	/**
+	 * Takes the leg out of its bridge WITHOUT hanging anything up.
+	 *
+	 * The distinction from `hangup` is the whole verb: after this the application still has the leg
+	 * and can play to it, gather from it or dial somewhere else with it, and the far end is still up
+	 * and is somebody else's problem. Nobody is hung up here, ever — a `bridge` that tore its peer
+	 * down would make "put this caller back in the IVR" impossible to express.
+	 *
+	 * The bridge itself is destroyed when this leg was one of two in it, because a mixing bridge with
+	 * one member is a resource on the media server that nothing will ever come back for. A bridge
+	 * with a third member (a conference, a tap) is left alone.
+	 */
+	async unbridge(leg: ControlledLeg): Promise<CallControlResult> {
+		const bridgeId = leg.bridgeId;
+		if (bridgeId === undefined) {
+			return refuse("the leg is not in a bridge");
+		}
+		// Resolved BEFORE the pointers are cleared: `peerOf` reads `leg.peerMediaChannelId`, and after
+		// `setBridgePeer(undefined)` there is nothing left to resolve.
+		const peer = this.peerOf(leg);
+		try {
+			await this.deps.media.removeFromBridge(bridgeId, [leg.mediaChannelId]);
+		} catch (error) {
+			return refuse(`the leg could not be taken out of its bridge: ${String(error)}`);
+		}
+
+		leg.setBridge(undefined);
+		leg.setBridgePeer(undefined);
+		if (peer !== undefined && peer.bridgeId === bridgeId) {
+			peer.setBridgePeer(undefined);
+		}
+
+		if (peer !== undefined) {
+			// `channel.unbridged` REQUIRES a peer id — the event's whole content is which two legs
+			// stopped hearing each other, and one of them is not that. A leg leaving a bridge whose
+			// other member this instance cannot name (it was reaped, or it is a tap) is therefore not
+			// published rather than published with a hole in it; the leg's own lifecycle events still
+			// say everything a consumer needs about the leg.
+			await this.publishQuietly(leg, "channel.unbridged", {
+				legId: leg.legId,
+				peerLegId: peer.legId,
+				bridgeId,
+				reason: "session-unbridge",
+			});
+		}
+		return ok(`left bridge ${bridgeId}`);
 	}
 
 	// -------------------------------------------------------------------------------------------
@@ -1851,8 +3745,24 @@ export class CallControl implements CallControlPort {
 	async onLegEnded(mediaChannelId: string): Promise<void> {
 		const leg = this.deps.host.legFor(mediaChannelId);
 
-		if (this.recordings.has(mediaChannelId) && leg !== undefined) {
-			await this.stopRecording(leg);
+		if (this.recordings.has(mediaChannelId)) {
+			if (leg === undefined) {
+				// No leg means no `record.stopped` can be published — but the session and its signal
+				// watcher still have to go, or `activeOperationCount` (which `/healthz` reads) never
+				// drops and the `CallSignalBus` keeps a watcher on a channel that no longer exists.
+				this.recordings.get(mediaChannelId)?.stopWatching();
+				this.recordings.delete(mediaChannelId);
+			} else {
+				await this.stopRecording(leg);
+			}
+		}
+
+		// The SUPERVISOR hung up. The monitored conversation carries on — that is the invariant
+		// `MediaPort.stopTap` states — so nothing here touches the other legs, and the supervisor is
+		// not hung up again by the teardown that is already ending them.
+		const tap = this.taps.get(mediaChannelId);
+		if (tap !== undefined) {
+			await this.endTap(tap, "supervisor-ended", false);
 		}
 
 		// A transferor who hangs up mid-consultation IS the completion signal. This is the classic
@@ -1900,10 +3810,15 @@ export class CallControl implements CallControlPort {
 		for (const timer of this.parkTimers.values()) {
 			timer.cancel();
 		}
+		for (const tap of this.taps.values()) {
+			tap.stopWatching();
+		}
 		this.consultations.clear();
 		this.parkTimers.clear();
 		this.holds.clear();
+		for (const recording of this.recordings.values()) recording.stopWatching();
 		this.recordings.clear();
+		this.taps.clear();
 		this.parkStates.clear();
 	}
 
@@ -1988,6 +3903,308 @@ export class CallControl implements CallControlPort {
 		}
 	}
 
+	// -------------------------------------------------------------------------------------------
+	// Shared lines, mid-call
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * A phone on a shared line pressed hold, or released it.
+	 *
+	 * ## Why this is not the same event as {@link hold}
+	 *
+	 * `hold` is an APPLICATION holding a leg. This is a desk phone re-INVITEing with `sendonly`, and
+	 * the orchestrator's `onPhoneHold` is where it lands. The two produce the same media outcome and
+	 * completely different bookkeeping: the phone's hold is the one that has to reach the OTHER
+	 * appearances, because the point of a shared line is that pressing hold on one key lights it on
+	 * every other phone that shares the line.
+	 *
+	 * ## The KV write IS the publication
+	 *
+	 * There is no separate lamp event to send. The seizure lives in the shared claim bucket that
+	 * every engine instance and every BLF fan-out already watches, so moving it from `seized` to
+	 * `held` is what the other appearances see. A single-instance deployment with no bucket keeps the
+	 * same state locally and reaches the same code on retrieval.
+	 *
+	 * ## Recall is armed here and nowhere else
+	 *
+	 * The line's `hold_recall_timeout_seconds` starts when the key is pressed, so it is armed here
+	 * and cancelled the moment the line is picked back up — by this appearance or by another one.
+	 *
+	 * `leg` is the leg the media event was about: the APPEARANCE that pressed the key, whose peer is
+	 * the caller now listening to music. Best-effort throughout — a line whose lamp did not update is
+	 * a worse shared line and a much better outcome than an exception on the event socket.
+	 */
+	async onSharedLineHold(leg: ControlledLeg, held: boolean): Promise<void> {
+		const lines = this.deps.sharedLines;
+		if (lines === undefined) {
+			return;
+		}
+		// The seizure is filed under the CALLER's call, which is the one that survives a retrieve.
+		// An appearance that retrieved the line dialled in as a call of its own, so its own call id
+		// matches nothing and the party on the other side of the bridge is the one to ask about.
+		const seizure =
+			lines.seizureForCall(leg.callId) ?? lines.seizureForCall(this.peerOf(leg)?.callId ?? "");
+		if (seizure === undefined) {
+			return;
+		}
+
+		if (!held) {
+			// Cancelled BEFORE the resume: a recall that fired between the two would ring the line back
+			// at a phone that is already talking on it.
+			lines.cancelRecall(leg.organizationId, seizure.sharedLineId);
+			const resumed = await lines.resume(leg.organizationId, seizure.sharedLineId);
+			if (resumed.kind !== "held") {
+				this.log("a shared line could not be taken off hold", {
+					sharedLineId: seizure.sharedLineId,
+					callId: leg.callId,
+					reason: resumed.kind,
+				});
+			}
+			return;
+		}
+
+		const outcome = await lines.hold(leg.organizationId, seizure.sharedLineId);
+		if (outcome.kind !== "held") {
+			this.log("a shared line could not be moved to held; the other appearances will not light", {
+				sharedLineId: seizure.sharedLineId,
+				callId: leg.callId,
+				reason: outcome.kind,
+			});
+			return;
+		}
+
+		const line = await this.deps.host.sharedLineFor(leg, seizure.sharedLineId);
+		const timeoutMs = Math.max(0, line?.holdRecallTimeoutSeconds ?? 0) * MILLIS_PER_SECOND;
+		// `armRecall` treats `<= 0` as "never", which is the tenant's own choice for a line with no
+		// recall timeout and is why no deployment default is substituted here.
+		lines.armRecall(leg.organizationId, seizure.sharedLineId, timeoutMs, () => {
+			void this.recallSharedLine(leg.organizationId, seizure.sharedLineId);
+		});
+	}
+
+	/**
+	 * Another appearance picked up the held line.
+	 *
+	 * This is the operation a shared line exists for and the one a ring group cannot express: the
+	 * caller is on hold at appearance 1, somebody presses the same lit key on appearance 2, and the
+	 * SAME conversation continues on the second phone. Nothing is re-dialled and nobody is rung.
+	 *
+	 * Modelled on {@link unpark}, and the differences are the interesting part:
+	 *
+	 * - the held party is addressed by DOMAIN leg id, because that is what the seizure records; a
+	 *   media channel id would not survive the call being re-created;
+	 * - the seizure is not released and re-taken but RE-POINTED, so the line never passes through a
+	 *   free state a third appearance could seize in between;
+	 * - a line held by ANOTHER instance is refused honestly rather than half-retrieved, exactly as a
+	 *   foreign park orbit is when no handoff transport is wired. The caller stays where they are.
+	 *
+	 * ## The retrieving leg has NOT answered, and demanding that it had is what broke this
+	 *
+	 * A second appearance retrieves by DIALLING the line, so this runs from the walker's
+	 * `shared-line` node on a leg that is still ringing — the walk deliberately does not answer
+	 * before it knows there is something to connect the caller to. {@link refuseIfUnusable}'s
+	 * `isAnswered` check therefore refused every retrieve there has ever been, with "the leg has not
+	 * answered, so it cannot be used for shared-line retrieve", and the walk fell through to its
+	 * timeout branch. So only the teardown half of that guard applies here, and the leg is answered
+	 * by {@link CallControl.bridge} at the moment there IS something to connect it to — the same
+	 * shape, and for the same reason, as {@link CallControl.pickup} and {@link CallControl.monitor}.
+	 */
+	async retrieveSharedLine(
+		leg: ControlledLeg,
+		request: { readonly sharedLineId: string },
+	): Promise<CallControlResult> {
+		if (leg.isTearingDown) {
+			return refuse("the leg is tearing down, so it cannot be used for shared-line retrieve");
+		}
+		const lines = this.deps.sharedLines;
+		if (lines === undefined) {
+			return refuse("this engine has no shared-line registry");
+		}
+		const line = await this.deps.host.sharedLineFor(leg, request.sharedLineId);
+		if (line === undefined) {
+			return refuse(`shared line ${request.sharedLineId} is not in this organization's artifact`);
+		}
+		// The retrieving leg DIALLED the line, so what it was dialled to reach is the line's number
+		// and not the appearance's — the person on it is `numberOf`. Matching on
+		// `destinationNumber` never found an appearance, and the fallback below then left the lamp
+		// naming the appearance that had put the call on hold.
+		const retrievingNumber = numberOf(leg);
+		const appearance = line.appearances.find(
+			(candidate) => candidate.extensionNumber === retrievingNumber,
+		);
+		const heldState = lines.held(leg.organizationId, request.sharedLineId);
+		if (heldState === undefined) {
+			return refuse(`shared line ${request.sharedLineId} is not held on this engine`);
+		}
+		if (heldState.state !== "held") {
+			return refuse(`shared line ${request.sharedLineId} is in use, not on hold`);
+		}
+		const heldParty = this.deps.host.legByLegId(heldState.legId);
+		if (heldParty === undefined || heldParty.isTearingDown) {
+			// The caller hung up between the lamp lighting and this key being pressed. Free the line
+			// rather than leaving every appearance showing a call nobody is on.
+			await lines.releaseOwn(leg.organizationId, request.sharedLineId);
+			return refuse(`the call on shared line ${request.sharedLineId} has already gone`);
+		}
+
+		lines.cancelRecall(leg.organizationId, request.sharedLineId);
+		try {
+			await this.deps.media.stopMusicOnHold(heldParty.mediaChannelId);
+		} catch {
+			// Stopping music that is not playing is a no-op everywhere it matters.
+		}
+		// The phone-pressed hold never went through `this.holds`, but a soft hold on the same leg
+		// would have; clearing it keeps `bridge`'s "one of the legs is on hold" guard honest.
+		this.holds.delete(heldParty.mediaChannelId);
+		heldParty.removeFlag("hold");
+
+		const bridged = await this.bridge(leg, { peerLegId: heldParty.legId });
+		if (!bridged.result.ok) {
+			// Put them back on hold rather than stranding them in silence: the line is still held and
+			// the appearance that had it can still take it back.
+			await this.deps.media.startMusicOnHold(heldParty.mediaChannelId).catch(() => undefined);
+			heldParty.addFlag("hold");
+			return bridged.result;
+		}
+
+		heldParty.moveCallStateTo("unheld");
+		heldParty.moveCallStateTo("active");
+
+		const resumed = await lines.resume(leg.organizationId, request.sharedLineId, {
+			extensionId: appearance?.extensionId ?? heldState.heldByExtensionId,
+			appearanceIndex: appearance?.appearanceIndex ?? heldState.heldByAppearanceIndex,
+			callId: heldParty.callId,
+			legId: heldParty.legId,
+		});
+		if (resumed.kind !== "held") {
+			this.log("a retrieved shared line could not be re-pointed at the retrieving appearance", {
+				sharedLineId: request.sharedLineId,
+				reason: resumed.kind,
+			});
+		}
+		return ok(`retrieved shared line ${request.sharedLineId}`);
+	}
+
+	/**
+	 * The call on a shared line ended: the appearance is freed.
+	 *
+	 * Called from the orchestrator's teardown for every leg, and a no-op for the overwhelming
+	 * majority of them that are not on a shared line. A seizure that outlived its call is a line
+	 * every appearance sees as busy and nobody is on, which is the one failure mode of a shared line
+	 * that a person cannot work around.
+	 *
+	 * The leg is compared, not just the call: a shared-line call has at least two legs, and the
+	 * appearance's leg going away is a blind transfer or a recall re-ring, not the end of the call.
+	 * The line is freed when the leg the seizure NAMES ends — the party who is actually on it.
+	 */
+	async releaseSharedLine(organizationId: string, callId: string, legId: string): Promise<void> {
+		const lines = this.deps.sharedLines;
+		if (lines === undefined) {
+			return;
+		}
+		const seizure = lines.seizureForCall(callId);
+		if (seizure === undefined || seizure.value.legId !== legId) {
+			return;
+		}
+		lines.cancelRecall(organizationId, seizure.sharedLineId);
+		await lines.releaseOwn(organizationId, seizure.sharedLineId);
+	}
+
+	/**
+	 * The hold timeout elapsed: the line rings back at the appearance that put it there.
+	 *
+	 * Through the ordinary routing path rather than by re-bridging that appearance's old leg, for
+	 * the reason {@link returnParkedCall} gives — the leg is usually gone, and routing to the NUMBER
+	 * rings the phone as a new call would, with its forwarding and its voicemail behind it.
+	 *
+	 * The seizure is deliberately NOT released first. A recall that freed the line would let a third
+	 * appearance seize it while the caller is mid-recall, and the caller would then be on a line
+	 * somebody else owns.
+	 *
+	 * ## The appearance's OWN leg is ended first, which is what made the recall reachable
+	 *
+	 * A shared-line hold is a desk phone re-INVITEing `sendonly` — nothing tears its dialog down, so
+	 * the appearance that pressed hold is still in this call when the timer fires. Routing the caller
+	 * at that appearance's extension therefore dialled a number this very call was occupying, the
+	 * ladder fell through, and the recall ended `hangup` (or, on the identical park path, in the
+	 * holder's own voicemail). The call is on the LINE and not on that phone by the time a recall
+	 * fires, so the phone's leg is released and the recall reaches an idle extension. The bridge peer
+	 * link is cut FIRST, for the reason `park` cuts it: `endBridgePeer` would otherwise follow the
+	 * appearance's teardown straight into the caller it is recalling.
+	 */
+	private async recallSharedLine(organizationId: string, sharedLineId: string): Promise<void> {
+		const lines = this.deps.sharedLines;
+		if (lines === undefined) {
+			return;
+		}
+		const heldState = lines.held(organizationId, sharedLineId);
+		if (heldState === undefined || heldState.state !== "held") {
+			return;
+		}
+		const heldParty = this.deps.host.legByLegId(heldState.legId);
+		if (heldParty === undefined || heldParty.isTearingDown) {
+			await lines.releaseOwn(organizationId, sharedLineId);
+			return;
+		}
+		const line = await this.deps.host.sharedLineFor(heldParty, sharedLineId);
+		const seizing = line?.appearances.find(
+			(candidate) => candidate.appearanceIndex === heldState.heldByAppearanceIndex,
+		);
+		if (seizing === undefined) {
+			// No number to ring back. The caller stays on hold rather than being hung up: the
+			// appearance that holds the line can still take them back.
+			this.log("a shared line timed out on hold with no appearance to recall to", {
+				sharedLineId,
+				appearanceIndex: heldState.heldByAppearanceIndex,
+			});
+			return;
+		}
+
+		try {
+			await this.deps.media.stopMusicOnHold(heldParty.mediaChannelId);
+		} catch {
+			// Stopping music that is not playing is a no-op everywhere it matters.
+		}
+		this.holds.delete(heldParty.mediaChannelId);
+		heldParty.removeFlag("hold");
+
+		const holder = this.peerOf(heldParty);
+		if (holder !== undefined && !holder.isTearingDown) {
+			// The BRIDGE as well as the peer pointer, and both before the hangup. `park` clears both
+			// for the same reason: the walk that built this bridge is still watching the other side
+			// of it, and its `onPeerEnded` hangs its own leg up — the caller this recall is about to
+			// dial for — unless the leg has visibly left the bridge first.
+			heldParty.setBridge(undefined);
+			heldParty.setBridgePeer(undefined);
+			holder.setBridgePeer(undefined);
+			holder.markHangup("NORMAL_CLEARING");
+			await this.hangupQuietly(holder.mediaChannelId, "NORMAL_CLEARING");
+		}
+		heldParty.moveTo("routing");
+
+		const outcome = await this.routeTransferee(
+			heldParty,
+			seizing.extensionNumber,
+			this.settings.transferContext,
+		);
+		if (outcome.status !== "bridged") {
+			this.log("a shared line's hold recall did not reach the appearance that held it", {
+				sharedLineId,
+				extensionNumber: seizing.extensionNumber,
+				status: outcome.status,
+			});
+			return;
+		}
+		// The recall built a NEW leg to the appearance, so the seizure now points at a leg that has
+		// gone. Re-point it at the caller's leg, which is the one that survived both sides of this.
+		await lines.resume(organizationId, sharedLineId, {
+			extensionId: seizing.extensionId,
+			appearanceIndex: seizing.appearanceIndex,
+			callId: heldParty.callId,
+			legId: heldParty.legId,
+		});
+	}
+
 	private transitionPark(mediaChannelId: string, to: ParkState): void {
 		const from = this.parkStates.get(mediaChannelId);
 		if (from === undefined) {
@@ -2069,13 +4286,10 @@ export class CallControl implements CallControlPort {
 		name: string,
 		timeoutMs: number,
 	): {
-		readonly promise: Promise<{
-			readonly durationMs: number;
-			readonly reason: "completed" | "cancelled" | "failed";
-		}>;
+		readonly promise: Promise<RecordingCompletion>;
 		readonly cancel: () => void;
 	} {
-		type Outcome = { durationMs: number; reason: "completed" | "cancelled" | "failed" };
+		type Outcome = RecordingCompletion;
 		let unwatch = (): void => undefined;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		let settle: (value: Outcome) => void = () => undefined;
@@ -2092,7 +4306,12 @@ export class CallControl implements CallControlPort {
 			settle = done;
 			unwatch = this.deps.signals.watch(recordingSignalKey(name), (signal) => {
 				if (signal.kind === "recording-finished") {
-					done({ durationMs: signal.durationMs, reason: "completed" });
+					done({
+						durationMs: signal.durationMs,
+						reason: "completed",
+						...(signal.bytes === undefined ? {} : { bytes: signal.bytes }),
+						...(signal.pauses === undefined ? {} : { pauses: signal.pauses }),
+					});
 				} else if (signal.kind === "recording-failed") {
 					done({ durationMs: 0, reason: "failed" });
 				}

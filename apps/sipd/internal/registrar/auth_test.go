@@ -6,14 +6,62 @@ import (
 	"testing"
 	"time"
 
+	"github.com/emiago/sipgo/sip"
 	"github.com/icholy/digest"
 )
 
-// Digest authentication unit tests.
-//
-// The answers under test are computed by github.com/icholy/digest — an independent CLIENT-side
-// implementation of RFC 2617 — so a bug in the verifier below cannot cancel out against a matching
-// bug in a hand-written expectation.
+func TestAccountRealmNoncesAndDigestURIsAreIsolated(t *testing.T) {
+	base := newTestAuthenticator(t, time.Minute)
+	request := sip.NewRequest(sip.INVITE, sip.Uri{Scheme: "sip", User: "1002", Host: "outside.example"})
+	request.AppendHeader(&sip.FromHeader{Address: sip.Uri{Scheme: "sip", User: authUser, Host: "tenant-b.example"}})
+	account := base.ForRequest(request)
+	if account.Realm() != "tenant-b.example" || base.Realm() != authRealm {
+		t.Fatal("realm dispatch used the destination or mutated shared authentication state")
+	}
+	challenge, err := account.Challenge(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := answer(t, challenge, "INVITE", request.Recipient.String(), authPassword)
+	ha1 := md5hex(authUser + ":tenant-b.example:" + authPassword)
+	if err := account.VerifyRequest(request, auth, ha1); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.CheckNonce(auth.Nonce); !errors.Is(err, ErrNonceInvalid) {
+		t.Fatal("a nonce from another organization's realm was accepted")
+	}
+	request.Recipient.User = "expensive-destination"
+	if err := account.VerifyRequest(request, auth, ha1); !errors.Is(err, ErrBadResponse) {
+		t.Fatal("an authenticated request could be retargeted without recomputing the digest")
+	}
+}
+
+// The deployment realm stands in ONLY when a request names no domain — "no tenant matched" — and
+// never in place of a domain the request did name.
+func TestTheDeploymentRealmIsOnlyTheNoTenantMatchedDefault(t *testing.T) {
+	base := newTestAuthenticator(t, time.Minute)
+
+	nameless := sip.NewRequest(sip.REGISTER, sip.Uri{Scheme: "sip", Host: authRealm})
+	if got := RequestRealm(nameless); got != "" {
+		t.Fatalf("RequestRealm = %q, want empty for a request that names no domain", got)
+	}
+	if base.ForRequest(nameless).Realm() != authRealm {
+		t.Fatal("a request naming no domain should be challenged with the deployment realm")
+	}
+
+	named := sip.NewRequest(sip.REGISTER, sip.Uri{Scheme: "sip", Host: authRealm})
+	named.AppendHeader(&sip.ToHeader{Address: sip.Uri{Scheme: "sip", User: authUser, Host: "Tenant-B.Example"}})
+	if got := RequestRealm(named); got != "tenant-b.example" {
+		t.Fatalf("RequestRealm = %q, want the To host lowercased", got)
+	}
+	if got := base.ForRequest(named).Realm(); got != "tenant-b.example" {
+		t.Fatalf("realm = %q: the deployment default displaced the tenant's own domain", got)
+	}
+}
+
+// Digest authentication unit tests. The answers are computed by github.com/icholy/digest — an
+// independent client-side implementation of RFC 2617 — so a bug in the verifier cannot cancel out
+// against a matching bug in a hand-written expectation.
 
 const (
 	authRealm    = "acme.example.com"
@@ -191,7 +239,7 @@ func TestVerifyRejectsTheThingsThatMatter(t *testing.T) {
 }
 
 func TestNoncesFromAnotherFleetAreRejected(t *testing.T) {
-	// The stateless nonce is only trustworthy because the MAC is keyed. A nonce minted with a
+	// The stateless nonce is trustworthy only because the MAC is keyed: a nonce minted with a
 	// different secret must not verify, or any host could challenge on our behalf.
 	ours := newTestAuthenticator(t, time.Minute)
 	theirs, err := NewAuthenticator(authRealm, []byte("a-different-secret"), time.Minute)
@@ -295,5 +343,107 @@ func TestNewAuthenticatorRejectsBadInput(t *testing.T) {
 	}
 	if len(generated.secret) != 32 {
 		t.Errorf("generated secret is %d bytes, want 32", len(generated.secret))
+	}
+}
+
+func answerCount(t *testing.T, challenge string, method, uri, password string, count int) Authorization {
+	t.Helper()
+	parsed, err := digest.ParseChallenge(challenge)
+	if err != nil {
+		t.Fatalf("a real client cannot parse our challenge: %v", err)
+	}
+	credential, err := digest.Digest(parsed, digest.Options{
+		Method:   method,
+		URI:      uri,
+		Username: authUser,
+		Password: password,
+		Count:    count,
+		Cnonce:   "0a4f113b",
+	})
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	authorization, err := ParseAuthorization(credential.String())
+	if err != nil {
+		t.Fatalf("ParseAuthorization: %v", err)
+	}
+	return authorization
+}
+
+// The digest does not cover the Contact, so a replayed Authorization is not "the same device
+// re-binding the same contact" — it is whatever REGISTER the replayer wraps it in. The nonce count
+// is what makes one answer usable exactly once.
+func TestAnAnswerCannotBeUsedTwiceWithTheSameNonceCount(t *testing.T) {
+	authenticator := newTestAuthenticator(t, time.Minute)
+	challenge, err := authenticator.Challenge(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := answerCount(t, challenge, "REGISTER", "sip:"+authRealm, authPassword, 1)
+	if err := authenticator.Verify("REGISTER", first, ha1()); err != nil {
+		t.Fatalf("the first use must be accepted: %v", err)
+	}
+	if err := authenticator.Verify("REGISTER", first, ha1()); !errors.Is(err, ErrNonceReplayed) {
+		t.Fatalf("err = %v, want ErrNonceReplayed", err)
+	}
+	// stale=true, so the honest device retries without prompting a human.
+	if err := authenticator.Verify("REGISTER", first, ha1()); !errors.Is(err, ErrNonceStale) {
+		t.Errorf("a replay must present as stale, not as a bad password: %v", err)
+	}
+	// The legitimate re-REGISTER — same nonce, next count — still works: counting, not burning.
+	next := answerCount(t, challenge, "REGISTER", "sip:"+authRealm, authPassword, 2)
+	if err := authenticator.Verify("REGISTER", next, ha1()); err != nil {
+		t.Fatalf("an incremented nonce count must be accepted: %v", err)
+	}
+	// And a count already passed cannot be reused, in either direction.
+	if err := authenticator.Verify("REGISTER", next, ha1()); !errors.Is(err, ErrNonceReplayed) {
+		t.Errorf("err = %v, want ErrNonceReplayed", err)
+	}
+}
+
+// A wrong password must not burn the nonce count the honest device is about to use, or an attacker
+// could lock a phone out of its own registration by guessing at it.
+func TestAFailedAnswerDoesNotConsumeTheNonceCount(t *testing.T) {
+	authenticator := newTestAuthenticator(t, time.Minute)
+	challenge, err := authenticator.Challenge(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := answerCount(t, challenge, "REGISTER", "sip:"+authRealm, "wrong", 1)
+	if err := authenticator.Verify("REGISTER", wrong, ha1()); !errors.Is(err, ErrBadResponse) {
+		t.Fatalf("err = %v, want ErrBadResponse", err)
+	}
+	good := answerCount(t, challenge, "REGISTER", "sip:"+authRealm, authPassword, 1)
+	if err := authenticator.Verify("REGISTER", good, ha1()); err != nil {
+		t.Fatalf("the genuine answer at the same count must still be accepted: %v", err)
+	}
+}
+
+// The challenge offers qop="auth" and only that. Falling back to the RFC 2069 form for an answer
+// naming no qop is a client-chosen downgrade carrying neither cnonce nor nonce count, so it cannot
+// be replay-guarded.
+func TestAQOPlessAnswerIsRefusedAgainstAQOPChallenge(t *testing.T) {
+	authenticator := newTestAuthenticator(t, time.Minute)
+	value, err := authenticator.Challenge(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	challenge, err := digest.ParseChallenge(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uri := "sip:" + authRealm
+	legacy := Authorization{
+		Username:  authUser,
+		Realm:     authRealm,
+		Nonce:     challenge.Nonce,
+		URI:       uri,
+		Algorithm: "MD5",
+		// The RFC 2069 response, which is arithmetically correct and must still be refused.
+		Response: md5hex(ha1() + ":" + challenge.Nonce + ":" + md5hex("REGISTER:"+uri)),
+	}
+	if err := authenticator.Verify("REGISTER", legacy, ha1()); !errors.Is(err, ErrQOPUnsupported) {
+		t.Fatalf("err = %v, want ErrQOPUnsupported", err)
 	}
 }

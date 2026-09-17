@@ -1,14 +1,14 @@
 // Package events publishes sipd's registration transitions onto the NATS backbone.
 //
-// Every envelope is built by packages/events-go, so the subject, the payload shape and the
-// aorHash-derived-from-aor invariant are the same ones the TypeScript services enforce. This
-// package adds only the transport: a JetStream publish with the envelope id as Nats-Msg-Id, which
-// is what makes a retried publish idempotent inside the REGISTRATIONS stream's duplicate window.
+// Envelopes are built by packages/events-go; this package adds only the transport. Every publish
+// carries the envelope id as Nats-Msg-Id, so a retry is collapsed by the REGISTRATIONS stream's
+// duplicate window instead of being counted twice.
 package events
 
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -16,13 +16,11 @@ import (
 )
 
 // Publisher emits registration events.
-//
-// One method per event rather than a generic one: the three payloads are distinct types, and a
-// caller that has to name the type it is publishing cannot publish the wrong one by accident.
 type Publisher interface {
 	Registered(ctx context.Context, envelope contract.Envelope[contract.RegistrationRegisteredData]) error
 	Unregistered(ctx context.Context, envelope contract.Envelope[contract.RegistrationUnregisteredData]) error
 	Expired(ctx context.Context, envelope contract.Envelope[contract.RegistrationExpiredData]) error
+	AuthFailed(ctx context.Context, envelope contract.Envelope[contract.RegistrationAuthFailedData]) error
 }
 
 // JetStreamPublisher publishes into the REGISTRATIONS stream.
@@ -32,44 +30,54 @@ type JetStreamPublisher struct {
 
 var _ Publisher = (*JetStreamPublisher)(nil)
 
-// NewJetStreamPublisher wraps an established JetStream context.
-//
-// It does NOT create the REGISTRATIONS stream. Stream provisioning is `ensureStreams` in
-// packages/events, run once by the control plane; a data-plane edge that created its own streams
-// could silently bring one up with the wrong retention and lose events nobody notices.
+// NewJetStreamPublisher wraps an established JetStream context. It does not create the
+// REGISTRATIONS stream; provisioning is the control plane's `ensureStreams`.
 func NewJetStreamPublisher(js jetstream.JetStream) *JetStreamPublisher {
 	return &JetStreamPublisher{js: js}
 }
 
 // Registered publishes a `registered` event.
 func (p *JetStreamPublisher) Registered(
-	ctx context.Context,
+	_ context.Context,
 	envelope contract.Envelope[contract.RegistrationRegisteredData],
 ) error {
-	return publish(ctx, p.js, envelope)
+	return publish(p.js, envelope)
 }
 
 // Unregistered publishes an `unregistered` event.
 func (p *JetStreamPublisher) Unregistered(
-	ctx context.Context,
+	_ context.Context,
 	envelope contract.Envelope[contract.RegistrationUnregisteredData],
 ) error {
-	return publish(ctx, p.js, envelope)
+	return publish(p.js, envelope)
 }
 
 // Expired publishes an `expired` event.
 func (p *JetStreamPublisher) Expired(
-	ctx context.Context,
+	_ context.Context,
 	envelope contract.Envelope[contract.RegistrationExpiredData],
 ) error {
-	return publish(ctx, p.js, envelope)
+	return publish(p.js, envelope)
 }
 
-func publish[T any](
-	ctx context.Context,
-	js jetstream.JetStream,
-	envelope contract.Envelope[T],
+// AuthFailed publishes an `auth-failed` event.
+func (p *JetStreamPublisher) AuthFailed(
+	_ context.Context,
+	envelope contract.Envelope[contract.RegistrationAuthFailedData],
 ) error {
+	return publish(p.js, envelope)
+}
+
+// publish enqueues one envelope asynchronously.
+//
+// Asynchronous because the caller is a SIP handler that has not yet answered the device, and the
+// caller has never acted on a publish error beyond logging it. Waiting for the PubAck therefore put
+// a broker round trip inside every REGISTER for information nobody used. Delivery is unchanged: the
+// message is written on the same connection with the same Nats-Msg-Id, so the stream still
+// de-duplicates a retry, and a failed ack is reported through the JetStream context's
+// WithPublishAsyncErrHandler rather than through this return. Shutdown waits for the outstanding
+// acks (cmd/sipd), so a drain does not drop what a synchronous publish would have delivered.
+func publish[T any](js jetstream.JetStream, envelope contract.Envelope[T]) error {
 	if err := contract.CheckSubject(envelope.Subject, envelope); err != nil {
 		return fmt.Errorf("events: refusing to publish an inconsistent envelope: %w", err)
 	}
@@ -77,22 +85,19 @@ func publish[T any](
 	if err != nil {
 		return fmt.Errorf("events: encoding %s: %w", envelope.Type, err)
 	}
-	// WithMsgID sets Nats-Msg-Id. The envelope id is a UUID v7 generated once per transition, so a
-	// publish retried after a timeout is collapsed by the stream rather than double-counted by the
-	// anti-fraud consumer.
-	if _, err := js.Publish(ctx, envelope.Subject, payload, jetstream.WithMsgID(envelope.ID)); err != nil {
+	if _, err := js.PublishAsync(envelope.Subject, payload, jetstream.WithMsgID(envelope.ID)); err != nil {
 		return fmt.Errorf("events: publishing %s on %s: %w", envelope.Type, envelope.Subject, err)
 	}
 	return nil
 }
 
-// RecordingPublisher captures envelopes in memory instead of publishing them. It backs the unit
-// tests and the `--dry-run` style local mode.
+// RecordingPublisher captures envelopes in memory instead of publishing them.
 type RecordingPublisher struct {
 	mu           sync.Mutex
 	registered   []contract.Envelope[contract.RegistrationRegisteredData]
 	unregistered []contract.Envelope[contract.RegistrationUnregisteredData]
 	expired      []contract.Envelope[contract.RegistrationExpiredData]
+	authFailed   []contract.Envelope[contract.RegistrationAuthFailedData]
 }
 
 var _ Publisher = (*RecordingPublisher)(nil)
@@ -133,23 +138,41 @@ func (p *RecordingPublisher) Expired(
 	return nil
 }
 
-// Registered returns a copy of the recorded `registered` events.
+// AuthFailed implements Publisher.
+func (p *RecordingPublisher) AuthFailed(
+	_ context.Context,
+	envelope contract.Envelope[contract.RegistrationAuthFailedData],
+) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.authFailed = append(p.authFailed, envelope)
+	return nil
+}
+
+// RegisteredEvents returns a copy of the recorded `registered` events.
 func (p *RecordingPublisher) RegisteredEvents() []contract.Envelope[contract.RegistrationRegisteredData] {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]contract.Envelope[contract.RegistrationRegisteredData](nil), p.registered...)
+	return slices.Clone(p.registered)
 }
 
 // UnregisteredEvents returns a copy of the recorded `unregistered` events.
 func (p *RecordingPublisher) UnregisteredEvents() []contract.Envelope[contract.RegistrationUnregisteredData] {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]contract.Envelope[contract.RegistrationUnregisteredData](nil), p.unregistered...)
+	return slices.Clone(p.unregistered)
 }
 
 // ExpiredEvents returns a copy of the recorded `expired` events.
 func (p *RecordingPublisher) ExpiredEvents() []contract.Envelope[contract.RegistrationExpiredData] {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]contract.Envelope[contract.RegistrationExpiredData](nil), p.expired...)
+	return slices.Clone(p.expired)
+}
+
+// AuthFailedEvents returns a copy of the recorded `auth-failed` events.
+func (p *RecordingPublisher) AuthFailedEvents() []contract.Envelope[contract.RegistrationAuthFailedData] {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.authFailed)
 }

@@ -2,25 +2,14 @@
 // actually uses: RFC 4235 `dialog` (the busy-lamp key) and RFC 3842 `message-summary` (the voicemail
 // lamp).
 //
-// # What this closes
-//
-// Every provisioning template in apps/api already writes BLF keys onto handsets — Yealink
-// `linekey.N.type = 16`, Snom `blf sip:200@<domain>;user=phone`, Poly `attendant.resourceList` — and
-// apps/api already publishes `voicemail.evt.v1.…mwi.updated` whenever a mailbox's counts move. Until
-// now sipd answered every SUBSCRIBE with 501, so the keys were provisioned and dark and the MWI
-// events had no consumer. This package is the half that was missing on the wire; apps/engine's
-// presence publisher is the half that was missing in the bucket.
-//
-// # What it deliberately does not do
-//
-// No `presence` (RFC 3856 / pidf+xml) and no eventlist (RFC 4662 BLF-List). The first is a different
-// thing wearing the same word — human availability, not dialog state — and no template subscribes to
-// it. The second is a bandwidth optimisation for phones with many keys, and it needs a resource-list
-// server that does not exist yet. Both are answered 489 with an honest `Allow-Events`, which is what
-// makes a phone fall back to per-key subscriptions rather than sit silent.
+// It serves no `presence` (RFC 3856 / pidf+xml) — that is human availability, not dialog state —
+// and no eventlist (RFC 4662 BLF-List), which needs a resource-list server this platform lacks.
+// Both are answered 489 with an honest `Allow-Events`, so a phone falls back to per-key
+// subscriptions rather than sitting silent.
 package subscribe
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -28,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/emiago/sipgo"
@@ -41,7 +31,7 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/sipd/internal/registrar"
 )
 
-// SIP statuses this handler emits. Bare integers at a call site are how a 403 becomes a 423.
+// SIP statuses this handler emits.
 const (
 	statusOK               = 200
 	statusBadRequest       = 400
@@ -51,15 +41,13 @@ const (
 	statusIntervalTooBrief = 423
 	statusServerError      = 500
 	statusBadEvent         = 489
+	statusUnavailable      = 503
 )
 
 // ExpiryPolicy clamps the interval a subscriber asks for.
 //
-// Separate from the registrar's ExpiryPolicy even though the shape is the same, because the two
-// answer different questions and want different numbers. A registration's interval decides how long
-// a phone stays routable; a subscription's decides how long a lamp can be wrong after this instance
-// dies (see the Table doc comment). The default here is deliberately much shorter than a
-// registration's.
+// Separate from the registrar's identically shaped policy and deliberately much shorter: this
+// interval bounds how long a lamp can be wrong after the instance holding it dies.
 type ExpiryPolicy struct {
 	Min     time.Duration
 	Max     time.Duration
@@ -109,11 +97,8 @@ type Notifier interface {
 	Notify(ctx context.Context, req *sip.Request) error
 }
 
-// ClientNotifier sends notifications through a sipgo client transaction.
-//
-// A transaction rather than a bare write, for the same reason internal/transfer uses one: NOTIFY is
-// a non-INVITE request, and the transaction layer owns the T1 retransmission timer that covers a
-// notification lost on UDP — the exact case that leaves a lamp wrong.
+// ClientNotifier sends notifications through a sipgo client transaction rather than a bare write:
+// the transaction layer owns the T1 retransmission timer covering a NOTIFY lost on UDP.
 type ClientNotifier struct {
 	client *sipgo.Client
 }
@@ -160,12 +145,14 @@ func (DiscardNotifier) Notify(context.Context, *sip.Request) error { return nil 
 type Options struct {
 	// Realm is the digest realm. It must match the Authenticator's.
 	Realm string
-	// Auth runs the digest exchange. The SAME authenticator the registrar and the transfer handler
-	// use: a second one with its own secret would mint nonces the others reject, and the symptom
-	// would be a phone that can register but whose BLF keys never light.
+	// Auth runs the digest exchange. It MUST be the same authenticator the registrar and transfer
+	// handler use: a second one with its own secret would mint nonces the others reject.
 	Auth *registrar.Authenticator
 	// Credentials resolves the account behind the subscriber's AOR.
 	Credentials credentials.Store
+	// Lockout throttles credential guessing. It must be the same instance the registrar holds, or a
+	// spray that used SUBSCRIBE would get a budget of its own. Nil disables it.
+	Lockout *registrar.Lockout
 	// Bindings is the location service. Read to confirm the subscriber is registered HERE, never
 	// written — a SUBSCRIBE changes no binding.
 	Bindings kv.Store
@@ -192,36 +179,32 @@ type Options struct {
 	NotifyTimeout time.Duration
 	// SweepInterval is how often Run looks for lapsed subscriptions.
 	SweepInterval time.Duration
+	// NotifyConcurrency bounds how many NOTIFY client transactions are in flight at once. Zero takes
+	// defaultNotifyConcurrency.
+	NotifyConcurrency int
 	// Now is injectable so expiry behaviour is testable without sleeping.
 	Now func() time.Time
 	// NewTag mints the To tag for the 200. Injectable so a test can assert the exact NOTIFY headers.
 	NewTag func() string
 }
 
-// Handler answers SUBSCRIBE and drives the notifications that follow.
+// Handler answers SUBSCRIBE and drives the notifications that follow. Nothing reaches the table
+// until, in this order:
 //
-// # What it checks before anything reaches the table
-//
-//  1. The event package is one this edge serves. Checked FIRST, before the digest, and that order is
-//     deliberate: `Allow-Events` is a constant this edge already advertises on every OPTIONS and
-//     every 200, so answering 489 to an anonymous SUBSCRIBE leaks nothing — and challenging a phone
-//     for a package we will never serve produces an authentication loop that some handsets run
-//     forever.
-//  2. The SUBSCRIBE answers a digest challenge this fleet minted, with a password only the account
-//     holder has.
-//  3. The authenticated account is the one in the `From` header. Without this any valid account on
-//     the realm could subscribe as somebody else — the same hole the registrar's AOR check and the
-//     transfer handler's From check close.
-//  4. That account has a LIVE binding in this deployment. A credential that verifies but has no
-//     registration is a phone that is not on this network right now.
-//  5. The watched resource is in the subscriber's own realm, and — for `message-summary` — is the
-//     subscriber's OWN account. That last one is not symmetry, it is the only real confidentiality
-//     boundary in this file: an extension's dialog state is visible to every colleague by design
-//     (that is what a BLF wall IS), and its message counts are not.
+//  1. the event package is one this edge serves — checked BEFORE the digest, because `Allow-Events`
+//     is already advertised publicly and challenging for a package we never serve loops some
+//     handsets forever;
+//  2. the digest verifies against a nonce this fleet minted;
+//  3. the authenticated account is the one in the `From` header;
+//  4. that account has a live binding in this deployment;
+//  5. the watched resource is in the subscriber's own realm and — for `message-summary` — is the
+//     subscriber's OWN account. That is the confidentiality boundary here: dialog state is visible
+//     to every colleague by design, message counts are not.
 type Handler struct {
 	realm    string
 	auth     *registrar.Authenticator
 	creds    credentials.Store
+	digest   *registrar.DigestGate
 	bindings kv.Store
 	presence presence.Store
 	mwi      mwi.Source
@@ -243,6 +226,14 @@ type Handler struct {
 	// Wait can drain them at shutdown rather than leaving a phone with an accepted subscription it
 	// was never told the state of.
 	notifications sync.WaitGroup
+	// slots bounds how many NOTIFY client transactions this handler holds open at once; the INVITE
+	// path shares the same sipgo client. A saturated fan-out DROPS rather than queues: RFC 4235
+	// versioning makes a skipped intermediate notification safe.
+	slots chan struct{}
+	// concurrency is the capacity of slots, kept so the shed log and the shutdown pool can name it.
+	concurrency int
+	// dropped counts notifications shed by a saturated fan-out, so the shedding is visible.
+	dropped atomic.Int64
 }
 
 // New validates the options and builds a Handler.
@@ -271,6 +262,7 @@ func New(opts Options) (*Handler, error) {
 
 	handler := &Handler{
 		realm:         opts.Realm,
+		digest:        registrar.NewDigestGate(opts.Auth, opts.Credentials, opts.Lockout),
 		auth:          opts.Auth,
 		creds:         opts.Credentials,
 		bindings:      opts.Bindings,
@@ -288,6 +280,7 @@ func New(opts Options) (*Handler, error) {
 		now:           opts.Now,
 		newTag:        opts.NewTag,
 		table:         NewTable(),
+		concurrency:   cmp.Or(opts.NotifyConcurrency, defaultNotifyConcurrency),
 	}
 	if handler.notifier == nil {
 		handler.notifier = DiscardNotifier{}
@@ -316,15 +309,15 @@ func New(opts Options) (*Handler, error) {
 	if handler.newTag == nil {
 		handler.newTag = func() string { return sip.GenerateTagN(16) }
 	}
+	handler.slots = make(chan struct{}, handler.concurrency)
 	return handler, nil
 }
 
 // Subscriptions returns how many subscriptions this instance holds.
 func (h *Handler) Subscriptions() int { return h.table.Len() }
 
-// ---------------------------------------------------------------------------------------------
-// SUBSCRIBE
-// ---------------------------------------------------------------------------------------------
+// Dropped returns how many notifications a saturated fan-out has shed since boot.
+func (h *Handler) Dropped() int64 { return h.dropped.Load() }
 
 // HandleSubscribe implements RFC 6665 §4.2 for this edge.
 func (h *Handler) HandleSubscribe(req *sip.Request, tx sip.ServerTransaction) {
@@ -337,9 +330,8 @@ func (h *Handler) HandleSubscribe(req *sip.Request, tx sip.ServerTransaction) {
 
 	event, eventID, ok := parseEvent(headerValue(req, "Event"))
 	if !ok || !Supported(event) {
-		// 489 and NOT 501. 501 says "this element does not implement the method", which is now false
-		// and would stop a phone trying a package we do serve; 489 says "not that package, here is
-		// the list", which is the answer a handset can act on.
+		// 489 and not 501: 501 would stop a phone trying a package we do serve, while 489 plus
+		// `Allow-Events` is an answer a handset can act on.
 		log.Info("refusing an unsupported event package", "event", string(event))
 		h.respondWithAllowEvents(tx, req, statusBadEvent, "Bad Event")
 		return
@@ -433,10 +425,8 @@ func (h *Handler) HandleSubscribe(req *sip.Request, tx sip.ServerTransaction) {
 
 	res := sip.NewResponseFromRequest(req, statusOK, "OK", nil)
 	if inDialogTag == "" {
-		// sipgo mints a tag of its own when the request carried none, and does not say which. The
-		// NOTIFY's From tag must be the SAME string the phone saw on the 200 — a phone that cannot
-		// match the tags silently drops every notification, so the lamp never moves and the failure
-		// looks exactly like presence not being wired up at all.
+		// The NOTIFY's From tag must be the same string the phone saw on the 200; sipgo would
+		// otherwise mint one of its own and every notification would be dropped silently.
 		if to := res.To(); to != nil {
 			to.Params.Remove("tag")
 			to.Params.Add("tag", subscription.LocalTag)
@@ -461,18 +451,15 @@ func (h *Handler) HandleSubscribe(req *sip.Request, tx sip.ServerTransaction) {
 	// a subscription. After the 200 and off the transaction, because it is a new transaction in the
 	// other direction and holding the SUBSCRIBE open across a KV read would put a broker round trip
 	// inside a phone's retransmission timer.
-	h.notifications.Add(1)
-	go func() {
-		defer h.notifications.Done()
+	h.notifications.Go(func() {
 		h.notifyCurrent(subscription, log)
-	}()
+	})
 }
 
 // unsubscribe answers `Expires: 0` — the phone asking to stop watching.
 //
-// The 200 goes out first and the final NOTIFY follows, per RFC 6665 §4.2.2: a subscription is not
-// gone until its notifier says so, and a phone that got a 200 with no terminal notification keeps
-// the subscription in its own table until it times out.
+// The 200 goes out first and the final NOTIFY follows (RFC 6665 §4.2.2): a subscription is not gone
+// until its notifier says so.
 func (h *Handler) unsubscribe(req *sip.Request, tx sip.ServerTransaction, candidate *Subscription, log *slog.Logger) {
 	subscription, found := h.table.Remove(candidate.Key())
 	if !found {
@@ -498,11 +485,9 @@ func (h *Handler) unsubscribe(req *sip.Request, tx sip.ServerTransaction, candid
 	if !found {
 		return
 	}
-	h.notifications.Add(1)
-	go func() {
-		defer h.notifications.Done()
+	h.notifications.Go(func() {
 		h.notifyState(subscription, StateTerminatedClient, log)
-	}()
+	})
 }
 
 // build assembles the subscription record from the request. It does NOT insert it.
@@ -546,9 +531,8 @@ func (h *Handler) build(
 
 // resourceOf decides what a SUBSCRIBE is asking to watch, and whether it may.
 //
-// The resource is the To address, not the Request-URI: they are the same on a fresh SUBSCRIBE, and
-// on a REFRESH the Request-URI is this edge's own Contact while the To still names the extension.
-// Reading the Request-URI would make every refresh look like a subscription to `optimiq-sipd`.
+// The resource is the To address, not the Request-URI: on a refresh the Request-URI is this edge's
+// own Contact while the To still names the extension.
 func (h *Handler) resourceOf(
 	req *sip.Request,
 	event EventPackage,
@@ -565,18 +549,16 @@ func (h *Handler) resourceOf(
 		log.Info("rejecting a SUBSCRIBE with no usable To address")
 		return "", "", false
 	}
-	// Cross-realm watching is refused rather than resolved. This edge serves one realm and its
-	// presence bucket is scoped by the org the CREDENTIAL named; accepting a To in another domain
-	// would silently read the subscriber's own tenant under a name that says otherwise.
-	if !strings.EqualFold(to.Address.Host, h.realm) {
+	// Cross-realm watching is refused rather than resolved: the presence bucket is scoped by the org
+	// the CREDENTIAL named, so a To in another domain would read the subscriber's own tenant.
+	if !strings.EqualFold(to.Address.Host, h.auth.ForRequest(req).Realm()) {
 		log.Warn("rejecting a SUBSCRIBE for another realm", "watchedRealm", to.Address.Host)
 		return "", "", false
 	}
 
 	if event == EventMessageSummary && user != credential.Username {
-		// THE confidentiality boundary in this file. Dialog state is public within a tenant by
-		// design — a BLF wall is exactly that — but message counts are not, and a phone that could
-		// subscribe to `message-summary` for any extension could watch a colleague's mailbox fill up.
+		// The confidentiality boundary in this file: dialog state is public within a tenant by design,
+		// but message counts are not.
 		log.Warn("rejecting a message-summary subscription to somebody else's mailbox",
 			"watched", user, "authenticatedAs", credential.Username)
 		return "", "", false
@@ -585,10 +567,6 @@ func (h *Handler) resourceOf(
 	return user, aor, true
 }
 
-// ---------------------------------------------------------------------------------------------
-// notification
-// ---------------------------------------------------------------------------------------------
-
 // notifyCurrent sends the full-state notification a fresh or refreshed subscription is owed.
 func (h *Handler) notifyCurrent(subscription *Subscription, log *slog.Logger) {
 	ctx, cancel := context.WithTimeout(h.baseCtx, h.notifyTimeout)
@@ -596,9 +574,8 @@ func (h *Handler) notifyCurrent(subscription *Subscription, log *slog.Logger) {
 
 	body, contentType, err := h.currentBody(ctx, subscription)
 	if err != nil {
-		// A presence read that failed is not a reason to tell a phone its colleague is idle. Better
-		// no notification at all: the subscription stays active, and the next state change — or the
-		// next refresh — carries the truth.
+		// A failed presence read is not a reason to tell a phone its colleague is idle. The
+		// subscription stays active and the next change or refresh carries the truth.
 		log.Error("cannot compose the initial notification", "error", err)
 		return
 	}
@@ -663,41 +640,82 @@ func (h *Handler) deliver(
 	}
 }
 
-// dispatch sends one NOTIFY OFF the caller's goroutine.
+// defaultNotifyConcurrency is how many NOTIFY client transactions may be in flight at once, both
+// for the change fan-out and for the shutdown deactivation sweep.
 //
-// The fan-out cannot be sequential. A NOTIFY is a client transaction, so an unreachable phone holds
-// its send for the full notify timeout, and one desk phone that somebody unplugged would stall every
-// other lamp in the deployment behind it — on a busy queue, for as long as it stays unplugged.
+// The bound is per NOTIFY, not per change, and that is what sizes it: one busy extension with N
+// busy-lamp watchers costs N transactions for a SINGLE state transition. A BLF wall of five hundred
+// keys over a handful of watched extensions therefore needs hundreds of slots to deliver one change,
+// and the load rig measures the consequence directly — at 32 slots, 500 watchers over 5 extensions
+// see two thirds of their notifications shed at 50 changes/s, and the same fraction at 200.
+// Five hundred and twelve delivers all of them at both rates while still bounding an unreachable
+// fleet to 512 transactions held for one notify timeout.
+const defaultNotifyConcurrency = 512
+
+// dispatch sends one NOTIFY OFF the caller's goroutine: a NOTIFY is a client transaction, so one
+// unreachable phone would otherwise stall every other lamp for the full notify timeout.
 //
-// Concurrency is safe here for a specific reason rather than by luck: the body's `version` attribute
-// is allocated by the CALLER, in order, before the goroutine starts. If two notifications for one
-// subscription race and arrive out of order, RFC 4235 §3.3 has the watcher keep the higher version
-// and discard the older — which is exactly the newest state. The ordering guarantee lives in the
-// body, so the transport does not need one.
+// Concurrency is safe because the body's `version` attribute is allocated by the CALLER, in order,
+// before the goroutine starts: RFC 4235 §3.3 has a watcher keep the higher version, so the ordering
+// guarantee lives in the body rather than the transport.
 //
 // Tracked on the same WaitGroup as the acceptance notifications, so Wait drains these too.
 func (h *Handler) dispatch(
+	batch *notifyBatch,
 	subscription *Subscription,
 	body []byte,
 	contentType string,
 	state SubscriptionState,
 ) {
-	h.notifications.Add(1)
+	select {
+	case h.slots <- struct{}{}:
+	default:
+		// Shed, and say so. The watcher is not left stale: the next change for this subscription
+		// carries a higher version and RFC 4235 §3.3 has the watcher keep that one.
+		if dropped := h.dropped.Add(1); dropped%100 == 1 {
+			h.log.Warn("shedding notifications: the fan-out is saturated",
+				"resource", subscription.Resource, "dropped", dropped, "limit", h.concurrency)
+		}
+		return
+	}
+	batch.pending.Add(1)
+	h.notifications.Go(func() {
+		defer batch.pending.Done()
+		defer func() { <-h.slots }()
+		h.deliver(batch.ctx, subscription, body, contentType, state, h.log)
+	})
+}
+
+// notifyBatch is the deadline every notification derived from ONE state change shares.
+//
+// One context per change rather than one per watcher: they start and are abandoned together, and a
+// child of the long-lived base context holds a lock on it for its whole life — measured at a quarter
+// of all mutex delay at 200 changes/s over 500 watchers.
+type notifyBatch struct {
+	ctx     context.Context
+	cancel  context.CancelFunc
+	pending sync.WaitGroup
+}
+
+func (h *Handler) newBatch() *notifyBatch {
+	ctx, cancel := context.WithTimeout(h.baseCtx, h.notifyTimeout)
+	return &notifyBatch{ctx: ctx, cancel: cancel}
+}
+
+// close releases the batch's context once the last notification in it has finished. Called for
+// effect and not waited on, because the fan-out must not block the loop that reads the changes.
+func (b *notifyBatch) close() {
 	go func() {
-		defer h.notifications.Done()
-		ctx, cancel := context.WithTimeout(h.baseCtx, h.notifyTimeout)
-		defer cancel()
-		h.deliver(ctx, subscription, body, contentType, state, h.log)
+		b.pending.Wait()
+		b.cancel()
 	}()
 }
 
-// BuildNotify assembles one NOTIFY for a subscription.
+// BuildNotify assembles one NOTIFY for a subscription. It is a pure function of the subscription
+// and the body.
 //
-// A pure function of the subscription and the body, so every header this edge puts on the wire is
-// asserted in a unit test rather than observed on a capture. Note what it does NOT do: it never
-// interpolates a device-supplied string into a header value it has not round-tripped through a
-// parser — the Call-ID is the one echo, and it is placed as a typed header rather than concatenated,
-// which is the CRLF-injection case sipgo's SECURITY note is about.
+// It never interpolates a device-supplied string into a header value: the Call-ID is the one echo
+// and it is placed as a typed header rather than concatenated (CRLF injection).
 func BuildNotify(
 	subscription *Subscription,
 	body []byte,
@@ -732,6 +750,8 @@ func BuildNotify(
 	req.AppendHeader(cseq)
 	req.AppendHeader(sip.NewHeader("Event", event))
 	req.AppendHeader(sip.NewHeader("Subscription-State", state.String()))
+	// TODO(SLA): stamp the Call-Info appearance-index here once Subscription carries an appearance
+	// index resolved from the WATCHED resource's binding at accept time.
 	req.AppendHeader(&sip.ContactHeader{Address: contact})
 	if server != "" {
 		req.AppendHeader(sip.NewHeader("User-Agent", server))
@@ -751,15 +771,10 @@ func BuildNotify(
 	return req
 }
 
-// ---------------------------------------------------------------------------------------------
-// the fan-out
-// ---------------------------------------------------------------------------------------------
-
 // Run watches both sources and expires lapsed subscriptions until the context is cancelled.
 //
 // One goroutine over both channels plus a ticker, rather than three: every branch mutates the same
-// table, and a single loop is what makes "a change arrived while a sweep was removing the
-// subscription" impossible to get wrong.
+// table, so a single loop removes the change-during-sweep race by construction.
 func (h *Handler) Run(ctx context.Context) error {
 	changes, err := h.presence.Watch(ctx)
 	if err != nil {
@@ -813,6 +828,8 @@ func (h *Handler) OnPresence(change presence.Change) {
 	}
 
 	now := h.now()
+	batch := h.newBatch()
+	defer batch.close()
 	for _, subscription := range watchers {
 		body, err := dialogInfoBody(
 			subscription.Entity, subscription.Resource, device, subscription.NextVersion())
@@ -821,16 +838,15 @@ func (h *Handler) OnPresence(change presence.Change) {
 				"resource", subscription.Resource, "error", err)
 			continue
 		}
-		h.dispatch(subscription, body, dialogInfoContentType,
+		h.dispatch(batch, subscription, body, dialogInfoContentType,
 			activeState(subscription.RemainingSeconds(now)))
 	}
 }
 
 // OnMWI notifies every subscriber whose mailbox counts moved.
 //
-// The match is on the ACCOUNT rather than on a resource key, because the event names a mailbox and a
-// subscription names a SIP user, and the contract's `extensionNumber` — the field that would join
-// them — is optional and currently never set. See mwi.Update.MatchesAccount.
+// The match is on the ACCOUNT rather than a resource key: the event names a mailbox, a subscription
+// names a SIP user, and the joining `extensionNumber` is optional. See mwi.Update.MatchesAccount.
 func (h *Handler) OnMWI(update mwi.Update) {
 	candidates := map[string]struct{}{}
 	if update.Extension != "" {
@@ -841,6 +857,8 @@ func (h *Handler) OnMWI(update mwi.Update) {
 	}
 
 	now := h.now()
+	batch := h.newBatch()
+	defer batch.close()
 	notified := map[string]struct{}{}
 	for user := range candidates {
 		for _, subscription := range h.table.Watchers(EventMessageSummary, update.OrgID, user) {
@@ -851,7 +869,7 @@ func (h *Handler) OnMWI(update mwi.Update) {
 				continue
 			}
 			notified[key] = struct{}{}
-			h.dispatch(subscription,
+			h.dispatch(batch, subscription,
 				messageSummaryBody(subscription.Entity, update.Counts), messageSummaryContentType,
 				activeState(subscription.RemainingSeconds(now)))
 		}
@@ -862,11 +880,13 @@ func (h *Handler) OnMWI(update mwi.Update) {
 // removed. Exported so tests can drive it directly instead of waiting for a tick.
 func (h *Handler) Sweep(context.Context) int {
 	lapsed := h.table.TakeExpired(h.now())
+	batch := h.newBatch()
+	defer batch.close()
 	for _, subscription := range lapsed {
 		// RFC 6665 §4.1.2.4: the notifier SHOULD send a terminal notification when a subscription
 		// expires. Without it a phone that missed its own refresh window sits believing it is still
 		// subscribed, and the lamp stops moving with nothing to tell it why.
-		h.dispatch(subscription, nil, contentTypeFor(subscription.Event), StateTerminatedTimeout)
+		h.dispatch(batch, subscription, nil, contentTypeFor(subscription.Event), StateTerminatedTimeout)
 	}
 	if len(lapsed) > 0 {
 		h.log.Info("expired lapsed subscriptions",
@@ -880,18 +900,42 @@ func (h *Handler) Sweep(context.Context) int {
 // of every lamp this instance was serving.
 func (h *Handler) Shutdown(ctx context.Context) int {
 	drained := h.table.Drain()
-	// Sent inline rather than through dispatch, and with the caller's context: this runs AFTER the
-	// base context is cancelled, so a dispatched notification would be abandoned before it left the
-	// process — which is the one case where a lost notification costs a fleet-wide lamp freeze
-	// rather than one stale key.
+	// Sent on the caller's context rather than through dispatch: this runs AFTER the base context is
+	// cancelled, so a dispatched notification would be abandoned before it left the process.
+	//
+	// Bounded-parallel rather than sequential: Notify blocks until its client transaction settles,
+	// and the whole loop shares one shutdown deadline, so a few dead phones would otherwise consume
+	// it and freeze every other lamp in the fleet.
+	workers := min(h.concurrency, len(drained))
+	queue := make(chan *Subscription)
+	var group sync.WaitGroup
+	for range workers {
+		group.Go(func() {
+			for subscription := range queue {
+				req := BuildNotify(subscription, nil, contentTypeFor(subscription.Event),
+					StateTerminatedDeactivated, h.contact, h.server)
+				if err := h.notifier.Notify(ctx, req); err != nil {
+					h.log.Warn("cannot deactivate a subscription on shutdown",
+						"resource", subscription.Resource, "error", err)
+				}
+			}
+		})
+	}
 	for _, subscription := range drained {
-		req := BuildNotify(subscription, nil, contentTypeFor(subscription.Event),
-			StateTerminatedDeactivated, h.contact, h.server)
-		if err := h.notifier.Notify(ctx, req); err != nil {
-			h.log.Warn("cannot deactivate a subscription on shutdown",
-				"resource", subscription.Resource, "error", err)
+		select {
+		case queue <- subscription:
+		case <-ctx.Done():
+			// The shutdown deadline passed. Stop feeding rather than blocking on a worker that is
+			// itself waiting on a transaction nobody will answer.
+			close(queue)
+			group.Wait()
+			h.log.Warn("the shutdown deadline passed before every subscription was deactivated",
+				"subscriptions", len(drained))
+			return len(drained)
 		}
 	}
+	close(queue)
+	group.Wait()
 	if len(drained) > 0 {
 		h.log.Info("deactivated subscriptions on shutdown", "count", len(drained))
 	}
@@ -914,15 +958,10 @@ func (h *Handler) Wait(timeout time.Duration) bool {
 	}
 }
 
-// ---------------------------------------------------------------------------------------------
-// authorization
-// ---------------------------------------------------------------------------------------------
-
-// authorize runs the digest exchange for a SUBSCRIBE. It answers the transaction itself on every
-// failure path and reports whether the caller should continue.
+// authorize runs the shared digest pipeline for a SUBSCRIBE and answers the transaction on every
+// failure path, reporting whether the caller should continue.
 //
-// The status choices mirror the registrar's and the transfer handler's, for the same reasons: 401
-// for "no credentials" and "stale nonce" because the device can retry, 403 for everything else
+// 401 for "no credentials" and "stale nonce" because the device can retry; 403 for everything else,
 // because re-challenging a wrong password produces a loop some handsets run forever.
 func (h *Handler) authorize(
 	ctx context.Context,
@@ -931,69 +970,46 @@ func (h *Handler) authorize(
 	fromUser string,
 	log *slog.Logger,
 ) (credentials.Credential, bool) {
-	auth, err := registrar.ParseAuthorization(headerValue(req, "Authorization"))
-	if err != nil {
-		if errors.Is(err, registrar.ErrNoAuthorization) {
-			h.challenge(req, tx, false, log)
-			return credentials.Credential{}, false
-		}
-		log.Info("rejecting a malformed Authorization header", "error", err)
-		h.respond(tx, req, statusBadRequest, "Bad Request")
-		return credentials.Credential{}, false
-	}
-
-	if auth.Realm != h.realm {
-		log.Info("re-challenging a credential for another realm", "offeredRealm", auth.Realm)
+	// An account may only subscribe AS ITSELF: otherwise any valid account on the realm could send a
+	// SUBSCRIBE carrying somebody else's From, which for `message-summary` is another's mailbox.
+	result := h.digest.Authenticate(ctx, req, fromUser, "")
+	switch result.Outcome {
+	case registrar.DigestAccepted:
+		return result.Credential, true
+	case registrar.DigestChallenge:
 		h.challenge(req, tx, false, log)
-		return credentials.Credential{}, false
-	}
-	if err := h.auth.CheckNonce(auth.Nonce); err != nil {
-		h.challenge(req, tx, errors.Is(err, registrar.ErrNonceStale), log)
-		return credentials.Credential{}, false
-	}
-
-	// An account may only subscribe AS ITSELF. Without this any valid account on the realm could
-	// send a SUBSCRIBE carrying somebody else's From and have this edge attribute the subscription
-	// to them — which for `message-summary` is somebody else's mailbox.
-	if auth.Username != fromUser {
-		log.Warn("rejecting a SUBSCRIBE sent as somebody else", "authenticatedAs", auth.Username)
+	case registrar.DigestStale:
+		h.challenge(req, tx, true, log)
+	case registrar.DigestMalformed:
+		log.Info("rejecting a malformed Authorization header", "error", result.Err)
+		h.respond(tx, req, statusBadRequest, "Bad Request")
+	case registrar.DigestWrongIdentity:
+		log.Warn("rejecting a SUBSCRIBE sent as somebody else", "authenticatedAs", result.Auth.Username)
 		h.respond(tx, req, statusForbidden, "Forbidden")
-		return credentials.Credential{}, false
-	}
-
-	credential, err := h.creds.Lookup(ctx, h.realm, auth.Username)
-	if err != nil {
-		switch {
-		case errors.Is(err, credentials.ErrNotFound):
-			log.Info("rejecting an unknown account", "username", auth.Username)
-		case errors.Is(err, credentials.ErrDisabled):
-			log.Info("rejecting a disabled account", "username", auth.Username)
-		default:
-			log.Error("cannot look up the account", "username", auth.Username, "error", err)
-		}
+	case registrar.DigestThrottled:
+		log.Info("rejecting a SUBSCRIBE from a locked source",
+			"username", result.Auth.Username, "retryAfterSeconds", int(result.Refusal.RetryAfter.Seconds()))
 		h.respond(tx, req, statusForbidden, "Forbidden")
-		return credentials.Credential{}, false
-	}
-
-	// SUBSCRIBE, not REGISTER: HA2 is MD5(method:uri), so verifying with the wrong method name
-	// accepts nothing and would make every BLF key fail with a password error nobody could explain.
-	if err := h.auth.Verify(req.Method.String(), auth, credential.HA1); err != nil {
-		if errors.Is(err, registrar.ErrNonceStale) {
-			h.challenge(req, tx, true, log)
-			return credentials.Credential{}, false
-		}
-		log.Warn("rejecting a failed digest", "username", auth.Username, "reason", err)
+	case registrar.DigestUnknownAccount:
+		log.Info("rejecting an unknown account", "username", result.Auth.Username)
 		h.respond(tx, req, statusForbidden, "Forbidden")
-		return credentials.Credential{}, false
+	case registrar.DigestDisabled:
+		log.Info("rejecting a disabled account", "username", result.Auth.Username)
+		h.respond(tx, req, statusForbidden, "Forbidden")
+	case registrar.DigestBadPassword:
+		log.Warn("rejecting a failed digest", "username", result.Auth.Username, "reason", result.Err)
+		h.respond(tx, req, statusForbidden, "Forbidden")
+	case registrar.DigestBackendUnavailable:
+		log.Error("cannot look up the account", "username", result.Auth.Username, "error", result.Err)
+		h.respond(tx, req, statusUnavailable, "Service Unavailable")
 	}
-
-	return credential, true
+	return credentials.Credential{}, false
 }
 
 // isRegistered reports whether the subscriber has a live binding in this deployment.
 //
-// A read failure answers FALSE. Fail-closed, exactly as the transfer handler is: a location service
-// that cannot be consulted is not evidence that a phone is on the network.
+// A read failure answers FALSE: a location service that cannot be consulted is not evidence that a
+// phone is on the network.
 func (h *Handler) isRegistered(ctx context.Context, orgID, aor string, log *slog.Logger) bool {
 	aorHash, err := contract.AORSubjectToken(aor)
 	if err != nil {
@@ -1012,12 +1028,8 @@ func (h *Handler) isRegistered(ctx context.Context, orgID, aor string, log *slog
 	return !binding.Expired(h.now())
 }
 
-// ---------------------------------------------------------------------------------------------
-// responses
-// ---------------------------------------------------------------------------------------------
-
 func (h *Handler) challenge(req *sip.Request, tx sip.ServerTransaction, stale bool, log *slog.Logger) {
-	value, err := h.auth.Challenge(stale)
+	value, err := h.auth.ForRequest(req).Challenge(stale)
 	if err != nil {
 		log.Error("cannot mint a digest challenge", "error", err)
 		h.respond(tx, req, statusServerError, "Server Internal Error")

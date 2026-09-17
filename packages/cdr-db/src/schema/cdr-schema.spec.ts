@@ -4,6 +4,7 @@ import { CDR_PARTITION_KEYS, PARTITIONED_CDR_TABLES } from "../partitions";
 import { cdrTenantRlsPreflightPlan } from "../rls-preflight-plan";
 import { callEvents } from "./call-event-schema";
 import { callLegs } from "./call-leg-schema";
+import { CALL_DISPOSITIONS, QUEUE_OUTCOMES } from "./enums";
 import { cdrSchema } from "./index";
 import { cdrWriteQuarantine } from "./quarantine-schema";
 import { recordings } from "./recording-schema";
@@ -86,20 +87,44 @@ describe("partitioned CDR tables", () => {
 describe("call_legs", () => {
 	const config = getTableConfig(callLegs);
 
-	it("is the ~40-column trim of the FusionPBX 90-column CDR plus a jsonb tail", () => {
+	it("is the ~45-column trim of the FusionPBX 90-column CDR plus a jsonb tail", () => {
+		// The ceiling moves only when a column is added deliberately; the point of the band is that
+		// the 90-column original was never copied wholesale, not that the number is frozen.
 		expect(config.columns.length).toBeGreaterThanOrEqual(35);
-		expect(config.columns.length).toBeLessThanOrEqual(45);
+		expect(config.columns.length).toBeLessThanOrEqual(60);
 		expect(config.columns.find((column) => column.name === "raw")?.notNull).toBe(true);
 	});
 
 	it("carries the reporting indexes the CDR explorer queries by", () => {
-		expect(config.indexes.map((entry) => entry.config.name).sort()).toEqual([
-			"call_legs_call_idx",
-			"call_legs_organization_from_idx",
-			"call_legs_organization_started_idx",
-			"call_legs_organization_to_idx",
-			"call_legs_recording_idx",
-		]);
+		expect(config.indexes.map((entry) => entry.config.name).sort()).toEqual(
+			[
+				"call_legs_call_idx",
+				"call_legs_organization_from_idx",
+				"call_legs_organization_started_idx",
+				"call_legs_organization_to_idx",
+				"call_legs_queue_agent_idx",
+				"call_legs_queue_idx",
+				"call_legs_recording_idx",
+				"call_legs_related_call_idx",
+				// The three that deliberately do not lead with `organization_id`: a traceback is asked by
+				// a platform operator about a number, across every tenant at once. See the schema.
+				"call_legs_traceback_from_idx",
+				"call_legs_traceback_to_idx",
+				"call_legs_trunk_idx",
+			].sort(),
+		);
+	});
+
+	/**
+	 * Sparse on purpose. The column is null on every leg but a virtual-hold callback, so the index
+	 * is the size of the feature rather than of the ledger.
+	 */
+	it("indexes the cross-call link partially, because almost no leg carries one", () => {
+		const related = config.indexes.find(
+			(entry) => entry.config.name === "call_legs_related_call_idx",
+		);
+
+		expect(related?.config.where).toBeDefined();
 	});
 
 	it("indexes recordings partially so the retention sweep never scans answered-only legs", () => {
@@ -129,6 +154,8 @@ describe("call_legs", () => {
 			"call_legs_hangup_cause_check",
 			"call_legs_hangup_side_check",
 			"call_legs_leg_check",
+			"call_legs_queue_outcome_check",
+			"call_legs_queue_wait_check",
 			"call_legs_transcription_status_check",
 		]);
 	});
@@ -224,5 +251,105 @@ describe("recordings", () => {
 		expect(names).toContain("retention_until");
 		expect(names).toContain("deleted_at");
 		expect(names).toContain("updated_at");
+	});
+});
+
+/**
+ * The queue leg.
+ *
+ * `queue_ref` has existed since the baseline and was never written by anything; the three columns
+ * beside it are what turn "this call went to a queue" into a service level. What is asserted here is
+ * the half a report would get silently wrong: that every column is NULLABLE (a `queue_wait_ms` of 0
+ * on a direct extension call is a zero every average would then include), and that the index the
+ * stats query runs on is PARTIAL, so the rows it serves are not paid for on every insert by the
+ * majority of calls that never went near a queue.
+ */
+describe("the queue leg", () => {
+	const config = getTableConfig(callLegs);
+	const columns = new Map(config.columns.map((column) => [column.name, column]));
+
+	it("keeps every queue column nullable, because most legs never touched a queue", () => {
+		for (const name of ["queue_ref", "queue_wait_ms", "queue_outcome", "queue_agent_ref"]) {
+			expect(columns.get(name)?.notNull, name).toBe(false);
+			expect(columns.get(name)?.hasDefault, name).toBe(false);
+		}
+	});
+
+	it("indexes the queue reporting path partially, so an unqueued call pays nothing for it", () => {
+		const index = config.indexes.find((entry) => entry.config.name === "call_legs_queue_idx");
+		expect(index).toBeDefined();
+		expect(index?.config.where).toBeDefined();
+		expect(index?.config.columns.map((column) => (column as { name?: string }).name)).toEqual([
+			"organization_id",
+			"queue_ref",
+			"started_at",
+		]);
+	});
+
+	/**
+	 * A queue verdict is not a leg disposition. A caller the queue timed out into a voicemail box has
+	 * a leg that ends `answered`, and an SLA built on the disposition would report a queue nobody
+	 * staffs as fully served.
+	 */
+	it("keeps the queue outcome vocabulary separate from the leg disposition", () => {
+		expect(QUEUE_OUTCOMES).toContain("exit-key");
+		expect(QUEUE_OUTCOMES).toContain("no-agents");
+		for (const outcome of QUEUE_OUTCOMES) {
+			if (outcome === "answered") {
+				continue;
+			}
+			expect(CALL_DISPOSITIONS as readonly string[]).not.toContain(outcome);
+		}
+	});
+});
+
+/**
+ * Recording consent.
+ *
+ * Two tables carry it and they carry it differently, which is the thing worth pinning: `recordings`
+ * takes the whole record as one `jsonb` because it is read with the object it describes, and
+ * `call_legs` takes four flat columns because it is aggregated over. The second half is the sharper
+ * assertion — that those four columns have NO check constraints. `call_legs` is append-only and
+ * partitioned, so a rejected write is a call record that never existed; an outcome a newer engine
+ * knows and this schema does not must land on the row rather than fail it.
+ */
+describe("recording consent", () => {
+	const legConfig = getTableConfig(callLegs);
+	const legColumns = new Map(legConfig.columns.map((column) => [column.name, column]));
+	const recordingColumns = new Map(
+		getTableConfig(recordings).columns.map((column) => [column.name, column]),
+	);
+
+	const LEG_CONSENT_COLUMNS = [
+		"recording_consent",
+		"recording_consent_method",
+		"recording_consent_at",
+		"recording_consent_regions",
+	] as const;
+
+	it("keeps the recording's consent one nullable jsonb, the way `pauses` is", () => {
+		expect(recordingColumns.get("consent")?.notNull).toBe(false);
+		expect(recordingColumns.get("consent")?.hasDefault).toBe(false);
+		expect(recordingColumns.get("consent")?.getSQLType()).toBe("jsonb");
+	});
+
+	it("flattens the leg's consent into four nullable columns, because legs are aggregated", () => {
+		for (const name of LEG_CONSENT_COLUMNS) {
+			expect(legColumns.get(name), name).toBeDefined();
+			expect(legColumns.get(name)?.notNull, name).toBe(false);
+			expect(legColumns.get(name)?.hasDefault, name).toBe(false);
+		}
+		expect(legColumns.get("recording_consent_regions")?.getSQLType()).toBe("jsonb");
+	});
+
+	it("puts NO check on any of them, so an unknown future outcome reaches the row", () => {
+		const names = legConfig.checks.map((entry) => entry.name);
+
+		for (const column of LEG_CONSENT_COLUMNS) {
+			expect(
+				names.some((name) => name.includes(column)),
+				column,
+			).toBe(false);
+		}
 	});
 });

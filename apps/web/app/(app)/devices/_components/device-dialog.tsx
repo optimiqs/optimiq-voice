@@ -6,6 +6,7 @@ import { ResourceSelect } from "~/components/pbx/resource-select";
 import { NoticeBanner } from "~/components/pbx/warnings-banner";
 import { SelectField, SwitchField, TextareaField, TextField } from "~/components/ui/form-fields";
 import { useServerFieldErrors } from "~/lib/forms/server-errors";
+import { PBX_RESOURCES } from "~/lib/pbx/client";
 import { PROVISIONING_RESOURCES } from "~/lib/provisioning/client";
 import {
 	DEVICE_VENDORS,
@@ -47,6 +48,8 @@ function defaultsFor(device: DeviceRow | null): DeviceFormValues {
 		model: device?.model ?? "",
 		label: device?.label ?? "",
 		deviceProfileId: device?.deviceProfileId ?? "",
+		emergencyAddressId: device?.emergencyAddressId ?? "",
+		emergencyLocationDetail: device?.emergencyLocationDetail ?? "",
 		settings: settingsToText(device?.settings),
 		enabled: device?.enabled ?? true,
 	};
@@ -83,6 +86,8 @@ export function DeviceDialog({
 				model: parsed.model,
 				label: parsed.label,
 				deviceProfileId: parsed.deviceProfileId,
+				emergencyAddressId: parsed.emergencyAddressId,
+				emergencyLocationDetail: parsed.emergencyLocationDetail,
 				settings: parsed.settings,
 				enabled: parsed.enabled,
 			};
@@ -224,6 +229,40 @@ export function DeviceDialog({
 					}
 				/>
 			) : null}
+
+			<FormSection title="Dispatchable location" columns={1}>
+				<NoticeBanner
+					title="Where a 911 call from this phone is dispatched to"
+					description="Set this when two desks share an extension. Without it every phone on the extension reports the number's address, which sends a responder to the building rather than to the desk. Changing it needs the emergency address permission."
+				/>
+				<form.Field name="emergencyAddressId">
+					{(field) => (
+						<ResourceSelect
+							id={field.name}
+							label="Emergency address"
+							resource={PBX_RESOURCES.emergencyAddresses}
+							value={field.state.value}
+							onChange={(value) => field.handleChange(value)}
+							emptyLabel="Use the number's address"
+							description="The validated street address a responder is given. Managed under Numbers → Emergency addresses."
+							disabled={mutation.isPending}
+							error={server.errors.emergencyAddressId}
+						/>
+					)}
+				</form.Field>
+				<form.Field name="emergencyLocationDetail">
+					{(field) => (
+						<TextField
+							field={field}
+							label="Location detail"
+							placeholder="Floor 3, desk by the window"
+							description="The desk-level refinement, read out beside the address. On its own it is not a location — it refines whichever address applies."
+							disabled={mutation.isPending}
+							submitError={server.errors.emergencyLocationDetail}
+						/>
+					)}
+				</form.Field>
+			</FormSection>
 
 			<FormSection title="Configuration" columns={1}>
 				<form.Field name="deviceProfileId">

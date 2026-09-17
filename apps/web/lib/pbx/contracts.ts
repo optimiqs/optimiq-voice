@@ -73,6 +73,17 @@ export interface ValidationIssue {
 // Closed sets, mirrored from @optimiq-voice/pbx-db and @optimiq-voice/routing
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * Every destination a compiled route may point at, in the server's order.
+ *
+ * The four the T2 admin block added sit between `time-condition` and `external`, which is where
+ * `packages/pbx-db/src/destinations.ts` puts them — and the order is the order a select reads, so
+ * `contracts.spec.ts` compares these as arrays rather than as sets.
+ *
+ * `alias` is the odd member and is entity-backed like the rest. It compiles FLAT: an alias produces
+ * no plan node of its own, it resolves to whatever its target resolved to. That is why it may be
+ * chosen anywhere a destination may be, and why a picker needs to know nothing special about it.
+ */
 export const DESTINATION_TYPES = [
 	"extension",
 	"ivr",
@@ -81,7 +92,12 @@ export const DESTINATION_TYPES = [
 	"voicemail",
 	"conference",
 	"park",
+	"paging-group",
 	"time-condition",
+	"call-flow",
+	"stream",
+	"dial-by-name",
+	"alias",
 	"external",
 	"application",
 	"hangup",
@@ -103,14 +119,88 @@ export const DESTINATION_TYPE_KINDS: Readonly<Record<DestinationType, Destinatio
 	voicemail: "entity",
 	conference: "entity",
 	park: "entity",
+	"paging-group": "entity",
 	"time-condition": "entity",
+	"call-flow": "entity",
+	stream: "entity",
+	"dial-by-name": "entity",
+	alias: "entity",
 	external: "value",
 	application: "value",
 	hangup: "terminal",
 };
 
+/**
+ * The two positions of a call flow's switch. Mirrors `CALL_FLOW_MODES`.
+ *
+ * `day` is the default position of a fresh row, and neither name is a claim about the clock: a flow
+ * is in whichever mode somebody last put it in, and nothing moves it automatically. Which is the
+ * whole point — a time condition is the clock, and a call flow is the override that ignores it.
+ */
+export const CALL_FLOW_MODES = ["day", "night"] as const;
+export type CallFlowMode = (typeof CALL_FLOW_MODES)[number];
+
+/**
+ * Whether a time condition's clock is being obeyed, and if not, which way it is overruled.
+ *
+ * The names say what they DO rather than what they mean, and the server is explicit about why:
+ * plenty of conditions match on "out of hours" and route the match branch to voicemail, so
+ * `forced-open` / `forced-closed` would be a guess about somebody else's configuration. Any UI that
+ * renders these must resist the same temptation.
+ *
+ * The order is the RING the toggle endpoint walks when it is called with no target state —
+ * `auto → forced-match → forced-no-match → auto` — which is what pressing the star code does.
+ */
+export const TIME_CONDITION_OVERRIDES = ["auto", "forced-match", "forced-no-match"] as const;
+export type TimeConditionOverride = (typeof TIME_CONDITION_OVERRIDES)[number];
+
+/** Which part of a name a dial-by-name directory matches keypad digits against. */
+export const DIRECTORY_SEARCH_FIELDS = ["last-name", "first-name", "full-name"] as const;
+export type DirectorySearchField = (typeof DIRECTORY_SEARCH_FIELDS)[number];
+
+/**
+ * The four organization quotas, in the order the usage screen renders them.
+ *
+ * Mirrors `ORG_LIMIT_NAMES` in `apps/api/src/pbx/org-limits/org-limits.ts`. The list is also the
+ * `limit` value a `PBX_LIMIT_REACHED` 409 names, so a client can switch on it.
+ */
+export const ORG_LIMIT_NAMES = [
+	"maxExtensions",
+	"maxTrunks",
+	"maxConcurrentCalls",
+	"maxStorageMb",
+] as const;
+export type OrgLimitName = (typeof ORG_LIMIT_NAMES)[number];
+
+/** Whether an extension's outbound number is shown to the far end — CLIR. */
+export const CALLER_ID_PRESENTATIONS = ["allowed", "restricted"] as const;
+export type CallerIdPresentation = (typeof CALLER_ID_PRESENTATIONS)[number];
+
 export const RECORD_POLICIES = ["none", "inbound", "outbound", "all", "on-demand"] as const;
 export type RecordPolicy = (typeof RECORD_POLICIES)[number];
+
+/**
+ * What a tenant tells the parties to a recorded call before recording starts.
+ *
+ * Mirrors `RECORDING_CONSENT_POLICIES` in `@optimiq-voice/routing`, on the same terms as every
+ * other closed set here. It is ORTHOGONAL to {@link RECORD_POLICIES}: that decides whether a call
+ * is recorded at all, this decides what is said about it. `none` means "say nothing here" rather
+ * than "consent does not apply" — the organization's all-party region list can still upgrade a
+ * particular call to an announcement.
+ */
+export const RECORDING_CONSENT_POLICIES = [
+	"none",
+	"announce",
+	"announce-and-require-keypress",
+] as const;
+export type RecordingConsentPolicy = (typeof RECORDING_CONSENT_POLICIES)[number];
+
+/** How each policy reads on a form. Sentence case, because these are choices and not headings. */
+export const RECORDING_CONSENT_POLICY_LABELS: Record<RecordingConsentPolicy, string> = {
+	none: "Say nothing",
+	announce: "Play the disclosure",
+	"announce-and-require-keypress": "Play the disclosure and require a keypress",
+};
 
 export const TOLL_CLASSES = ["internal", "local", "national", "international", "premium"] as const;
 export type TollClass = (typeof TOLL_CLASSES)[number];
@@ -127,11 +217,60 @@ export type SipTransport = (typeof SIP_TRANSPORTS)[number];
 export const ROUTE_MATCH_KINDS = ["exact", "prefix", "regex", "any"] as const;
 export type RouteMatchKind = (typeof ROUTE_MATCH_KINDS)[number];
 
+/**
+ * Which side of a call a screening rule reads.
+ *
+ * `inbound` matches the CALLER's number, `outbound` matches the DIALED string, and `both` applies
+ * the rule to each in its own direction — which is how one row expresses "we do not talk to this
+ * number, in either direction". The three are not a display preference: the server's unique index
+ * is `(organization_id, direction, pattern)`, so the same pattern in two directions is two rows and
+ * `both` is a third, distinct one rather than a shorthand for the first two.
+ */
+export const CALL_BLOCK_DIRECTIONS = ["inbound", "outbound", "both"] as const;
+export type CallBlockDirection = (typeof CALL_BLOCK_DIRECTIONS)[number];
+
+/**
+ * What happens on a match.
+ *
+ * `allow` is NOT the absence of a rule — it is an entry that WINS over a `block` rule at the same
+ * specificity, which is the only way an allowlisted number escapes a broad prefix block. That makes
+ * it the dangerous member of this set rather than the harmless one, and it is why the API gives
+ * screening its own `call-block.write` instead of riding on `routes.write`: a grant that can write
+ * allow rules can quietly re-admit a caller the organization decided to exclude.
+ *
+ * `voicemail` carries no destination. The compiler sends the caller to the CALLEE's own mailbox —
+ * the box the dialed extension already owns — rather than to an arbitrary destination the rule
+ * picked, which is why `call_block_rule` has no destination trio and nothing in the picker points
+ * at one.
+ */
+export const CALL_BLOCK_ACTIONS = ["block", "allow", "reject", "voicemail"] as const;
+export type CallBlockAction = (typeof CALL_BLOCK_ACTIONS)[number];
+
+/**
+ * How `pattern` is read. Deliberately narrower than {@link ROUTE_MATCH_KINDS}, which also has
+ * `any`: a screening rule that matched everything would be a tenant-wide outage wearing a
+ * blocklist's name.
+ */
+export const CALL_BLOCK_MATCH_KINDS = ["exact", "prefix", "regex"] as const;
+export type CallBlockMatchKind = (typeof CALL_BLOCK_MATCH_KINDS)[number];
+
 export const IVR_OPTION_MATCH_KINDS = ["digit", "regex"] as const;
 export type IvrOptionMatchKind = (typeof IVR_OPTION_MATCH_KINDS)[number];
 
 export const RING_GROUP_STRATEGIES = ["simultaneous", "sequential"] as const;
 export type RingGroupStrategy = (typeof RING_GROUP_STRATEGIES)[number];
+
+/**
+ * How a shared line offers a call to its appearances. Mirrors `SHARED_LINE_STRATEGIES`.
+ *
+ * `simultaneous` lights and rings every appearance at once (the receptionist case); `sequential`
+ * walks them in ordinal order (the boss-then-assistant case). The same two words a ring group's
+ * strategy uses, and deliberately its OWN set: a shared line is not a ring group, and folding the
+ * two lists together is exactly the tidy-up the drift gate refuses — `contracts.spec.ts` compares
+ * each against its own server tuple.
+ */
+export const SHARED_LINE_STRATEGIES = ["simultaneous", "sequential"] as const;
+export type SharedLineStrategy = (typeof SHARED_LINE_STRATEGIES)[number];
 
 export const QUEUE_STRATEGIES = [
 	"longest-idle",
@@ -157,6 +296,62 @@ export type QueueAgentStatus = (typeof QUEUE_AGENT_STATUSES)[number];
 export const QUEUE_AGENT_CONTACT_KINDS = ["extension", "external"] as const;
 export type QueueAgentContactKind = (typeof QUEUE_AGENT_CONTACT_KINDS)[number];
 
+/**
+ * The caller-priority scale, mirroring `QUEUE_PRIORITY_MIN` / `QUEUE_PRIORITY_MAX` in
+ * `packages/pbx-db`.
+ *
+ * Higher dequeues first, and 0 means unprioritised — the direction every `mod_callcenter`
+ * deployment already assumes, which is why the mirror carries the bounds rather than the form
+ * inventing its own. The same range is what `queue.caller.joined` publishes on, so a wallboard
+ * never has to rescale between the configured default and the live entry.
+ */
+export const QUEUE_PRIORITY_MIN = 0;
+export const QUEUE_PRIORITY_MAX = 1000;
+
+/**
+ * The DTMF digits a phone can actually send, as one character.
+ *
+ * Mirrors the `queue_exit_key_shape_check` constraint and the DTO's regex. It is a CHARACTER SET
+ * rather than a free string because the engine compares the stored key against a `DtmfEvent.digit`
+ * with `===`: a row holding `"1 "` or a lower-case `d` is a queue whose exit key silently never
+ * fires, and the operator would have configured a feature that does nothing.
+ */
+export const QUEUE_EXIT_KEY_PATTERN = /^[0-9*#A-D]$/u;
+
+/**
+ * The skill scale, mirroring `QUEUE_SKILL_LEVEL_MIN` / `QUEUE_SKILL_LEVEL_MAX` in
+ * `packages/pbx-db`.
+ *
+ * One scale for both halves of the match: an agent's `level` and a queue's `minLevel` are compared
+ * with `>=`, so a form that offered 1-10 on one side and 1-5 on the other would be a requirement no
+ * agent can meet.
+ */
+export const QUEUE_SKILL_LEVEL_MIN = 1;
+export const QUEUE_SKILL_LEVEL_MAX = 5;
+
+/**
+ * A skill tag and a disposition code share one shape, and it is the DATABASE's.
+ *
+ * `queue_agent_skill_shape_check`, `queue_skill_requirement_shape_check` and
+ * `queue_disposition_code_shape_check` are the same regex, and the API lower-cases before checking
+ * it. Both values are compared with `===` on the call path — a seat's skills against a queue's
+ * requirements, a submitted code against the queue's vocabulary — so `Spanish` and `spanish` are not
+ * equivalent anywhere below this line, and a form that let one through would fragment the
+ * vocabulary rather than fail.
+ */
+export const QUEUE_TAG_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/u;
+
+/**
+ * The wrap-up code the engine's deadline records when the agent chose nothing.
+ *
+ * Reserved: the API refuses it as a tenant-defined code, because a report would otherwise fold
+ * "nobody answered the question" and "the agent picked the code called unset" into one row.
+ */
+export const QUEUE_DISPOSITION_UNSET = "unset";
+
+/** At most three questions, at positions 1 to 3. `queue_survey_question_position_range_check`. */
+export const QUEUE_SURVEY_MAX_QUESTIONS = 3;
+
 export const VOICEMAIL_EMAIL_MODES = ["none", "notify", "attach"] as const;
 export type VoicemailEmailMode = (typeof VOICEMAIL_EMAIL_MODES)[number];
 
@@ -181,6 +376,10 @@ export const FEATURE_CODE_ACTIONS = [
 	"agent-status",
 	"eavesdrop",
 	"transfer",
+	"hotdesk-login",
+	"hotdesk-logout",
+	"caller-id-presentation-restrict",
+	"caller-id-presentation-allow",
 ] as const;
 export type FeatureCodeAction = (typeof FEATURE_CODE_ACTIONS)[number];
 
@@ -197,6 +396,41 @@ export type RoutingContext = (typeof ROUTING_CONTEXTS)[number];
  */
 export const AUDIT_ACTOR_TYPES = ["user", "api-key", "service", "system"] as const;
 export type AuditActorType = (typeof AUDIT_ACTOR_TYPES)[number];
+
+/** What a matching ACL entry does. Mirrors `SIP_ACL_ACTIONS` in `@optimiq-voice/pbx-db`. */
+export const SIP_ACL_ACTIONS = ["allow", "deny"] as const;
+export type SipAclAction = (typeof SIP_ACL_ACTIONS)[number];
+
+/**
+ * Which surface an ACL entry guards, and the same four an auth-failure event is filed under.
+ *
+ * Not one list with a "everywhere" option: the server's unique index is
+ * `(organization_id, scope, network)`, so the same network in two scopes is two rows and a form
+ * that offered "all scopes" would be offering to write four rows behind one button. Keeping them
+ * apart is what the server calls the anti-toll-fraud boundary — `provisioning` is already read by
+ * the device provisioner, and widening a rule from it to `trunk` is a decision, not a checkbox.
+ */
+export const SIP_ACL_SCOPES = ["registration", "trunk", "provisioning", "api"] as const;
+export type SipAclScope = (typeof SIP_ACL_SCOPES)[number];
+
+/**
+ * Why an attempt was refused — the REASON, never the surface. The surface is the scope.
+ *
+ * `unknown-account` and `disabled-account` are deliberately separate and mean opposite things to
+ * whoever is reading the log: the first is somebody guessing, the second is a credential that
+ * outlived its authorisation. A screen that folded them together would hide the one an
+ * administrator can act on today.
+ */
+export const SIP_AUTH_EVENT_TYPES = [
+	"acl-denied",
+	"rate-limited",
+	"unknown-account",
+	"bad-credentials",
+	"token-invalid",
+	"token-expired",
+	"disabled-account",
+] as const;
+export type SipAuthEventType = (typeof SIP_AUTH_EVENT_TYPES)[number];
 
 // ---------------------------------------------------------------------------------------------
 // Rows
@@ -238,6 +472,7 @@ export interface ExtensionRow extends EntityRow {
 	readonly callerIdNumber: string | null;
 	readonly outboundCallerIdName: string | null;
 	readonly outboundCallerIdNumber: string | null;
+	readonly outboundCallerIdPresentation: CallerIdPresentation;
 	readonly emergencyCallerIdName: string | null;
 	readonly emergencyCallerIdNumber: string | null;
 	readonly voicemailEnabled: boolean;
@@ -256,6 +491,14 @@ export interface ExtensionRow extends EntityRow {
 		readonly targets: readonly FollowMeTarget[];
 	} | null;
 	readonly recordPolicy: RecordPolicy;
+	/**
+	 * Pause the recorder while this extension's caller is pressing keys, and resume once they stop.
+	 *
+	 * PCI DSS 4.0.1 prefers not capturing a card number to asking an agent to remember to pause, and
+	 * this is that preference as a column. It is a backstop under the manual pause rather than a
+	 * replacement for it, and it overrides the organization's setting for calls this extension takes.
+	 */
+	readonly recordAutoPauseOnDtmf: boolean;
 	readonly tollClass: TollClass;
 	/**
 	 * The `*8` pickup group this extension belongs to, or `null` for none.
@@ -269,6 +512,21 @@ export interface ExtensionRow extends EntityRow {
 	 * every form: leaving it blank is the behaviour a tenant had before groups existed.
 	 */
 	readonly pickupGroup: string | null;
+	/**
+	 * Screen EXTERNAL callers before this extension is rung.
+	 *
+	 * The caller records their name, the extension hears "call from <recording>" and presses a key
+	 * to accept; a rejected call takes the same branch an unanswered one would, so the caller meets
+	 * voicemail rather than a dead line. Internal callers are never screened — a colleague already
+	 * arrives with a name on the handset's display.
+	 *
+	 * `false` on a fresh row, because the feature lengthens every inbound call it touches. Note that
+	 * the column being on is not by itself enough: the engine's screening RUNTIME is behind a
+	 * deployment flag that ships off (`callScreeningEnabled` in `plan-walker.ts`), so an extension
+	 * with this set on a default deployment simply rings. The form says so rather than implying a
+	 * behaviour change nobody would observe.
+	 */
+	readonly callScreening: boolean;
 	readonly callTimeoutSeconds: number;
 	readonly maxRegistrations: number;
 	/**
@@ -297,6 +555,17 @@ export interface PhoneNumberRow extends EntityRow, DestinationTrio {
 	readonly label: string | null;
 	readonly callerIdNamePrefix: string | null;
 	readonly recordEnabled: boolean;
+	/**
+	 * What the parties to a call on this DID are told before recording starts, or `null` to inherit
+	 * the organization's setting.
+	 *
+	 * `null` is not `"none"`. Inheriting means this number follows whatever the organization decides
+	 * next; `"none"` is this number saying nothing whatever the organization decides. The two look
+	 * identical on a stock install and diverge the first time somebody turns disclosure on.
+	 */
+	readonly recordingConsentPolicy: RecordingConsentPolicy | null;
+	/** The prompt played as the disclosure. `null` uses the organization's, or the built-in one. */
+	readonly recordingConsentPromptId: string | null;
 	readonly emergencyAddressId: string | null;
 	readonly voiceEnabled: boolean;
 	readonly faxEnabled: boolean;
@@ -327,7 +596,39 @@ export interface TrunkRow extends EntityRow {
 	readonly codecPrefs: string | null;
 	readonly maxChannels: number | null;
 	readonly callerIdNumberOverride: string | null;
+	/**
+	 * The ruleset that normalises the caller id ARRIVING on this trunk, before anything reads it.
+	 *
+	 * One carrier presents `0044…`, the next presents `+44…`, and without a rewrite the tenant's
+	 * call-block list, their inbound routes and their CDR all have to know which trunk a call came in
+	 * on. Nothing composes with this — a trunk has no inline manipulation — so it runs first and
+	 * alone.
+	 *
+	 * Read-only in this app, and that is the API's shape rather than a decision here:
+	 * `createTrunkDto` is a `z.strictObject` and does not declare the column, so a form that sent it
+	 * would get a 400 naming the field. It arrives on every read because the compiler reads it, and
+	 * the trunk dialog renders it as a fact rather than as a control.
+	 */
+	readonly inboundTranslationRulesetId: string | null;
+	/**
+	 * The four columns the qualify loop writes, and the only ones on this row no request may set.
+	 *
+	 * `updateTrunkDto` excludes them deliberately — they are machine-written state, not tenant
+	 * configuration, and a PATCH that accepted them could forge a carrier outage — so a form must
+	 * never send one back. They arrive on every read because "when did this carrier last move, and
+	 * what did the media server actually say" is the first question asked of a trunk that is not
+	 * working.
+	 *
+	 * `statusChangedAt` is `null` on a trunk nothing has ever observed, which is a different fact
+	 * from `status: "unknown"` with a timestamp: the first means the pinger has not reported, the
+	 * second means it reported that it could not tell. `statusReason` is the media server's word
+	 * verbatim (`Reachable`, `Unreachable`) rather than this platform's five-member projection of
+	 * it, and `statusLatencyMs` is the qualify round trip when one was measured.
+	 */
 	readonly status: TrunkStatus;
+	readonly statusChangedAt: string | null;
+	readonly statusReason: string | null;
+	readonly statusLatencyMs: number | null;
 	readonly enabled: boolean;
 	/** Set once the trunk has been provisioned at the managed carrier; `null` for a BYO-SIP trunk. */
 	readonly carrierProvider: string | null;
@@ -347,6 +648,9 @@ export interface InboundRouteRow extends EntityRow, DestinationTrio {
 	readonly failoverDestinationData: DestinationData | null;
 	readonly timeConditionId: string | null;
 	readonly recordEnabled: boolean;
+	/** The same override {@link PhoneNumberRow.recordingConsentPolicy} carries, one level in. */
+	readonly recordingConsentPolicy: RecordingConsentPolicy | null;
+	readonly recordingConsentPromptId: string | null;
 	readonly enabled: boolean;
 }
 
@@ -366,6 +670,27 @@ export interface OutboundRouteRow extends EntityRow {
 	readonly tollClass: TollClass;
 	readonly trunkPriority: readonly TrunkPriorityEntry[];
 	readonly timeConditionId: string | null;
+	/**
+	 * The authorisation codes a caller must satisfy before any trunk is dialled. `null` is the
+	 * overwhelmingly common case and means no challenge.
+	 *
+	 * Read-only in this app for the same reason {@link TrunkRow.inboundTranslationRulesetId} is:
+	 * `createOutboundRouteDto` is a `z.strictObject` that does not declare the column. The route
+	 * dialog names the attached set rather than offering to change it — see the note there.
+	 */
+	readonly pinSetId: string | null;
+	/**
+	 * The shared rewrite applied to the dialled number, AFTER this route's own strip/prepend.
+	 *
+	 * The composition order is not arbitrary and the form says it: the inline pair
+	 * (`stripDigits` / `prependDigits`) turns what somebody's fingers did into the number they meant,
+	 * and the ruleset normalises that number for the wire. A ruleset that ran first would have to
+	 * know about every route's outside-line prefix, which is the coupling the shared layer exists to
+	 * remove. `applyRouteTranslation` in `packages/routing/src/resolve.ts` is the authority.
+	 *
+	 * Read-only in this app, as above.
+	 */
+	readonly translationRulesetId: string | null;
 	readonly failoverDestinationType: DestinationType | null;
 	readonly failoverDestinationRef: string | null;
 	readonly failoverDestinationData: DestinationData | null;
@@ -389,7 +714,268 @@ export interface TimeConditionRow extends EntityRow, DestinationTrio {
 	readonly nomatchDestinationType: DestinationType | null;
 	readonly nomatchDestinationRef: string | null;
 	readonly nomatchDestinationData: DestinationData | null;
+	/**
+	 * The manual override, and the one column on this row no `PATCH` may carry.
+	 *
+	 * `updateTimeConditionDto` does not declare it — it is a `z.strictObject`, so a form that sent it
+	 * would get a 400 naming the field — and it moves instead through
+	 * `POST /call-flows/time-conditions/:id/override`, guarded by `call-flows.toggle`. That is the
+	 * receptionist's grant rather than the administrator's, on the server's argument that forcing a
+	 * condition open and flipping a call flow to night are one act on two tables. See
+	 * {@link setTimeConditionOverride}.
+	 */
+	readonly override: TimeConditionOverride;
+	/**
+	 * The star code that cycles the override, and the key a BLF lamp watches.
+	 *
+	 * WRITABLE, and by the ordinary `PATCH` rather than by the override endpoint beside it — which is
+	 * the split worth reading twice, because the two look like one subject.
+	 * `createTimeConditionDto`/`updateTimeConditionDto` declare it (`overrideFeatureCode:
+	 * shortCode.nullish()`), so it rides `time-conditions.write`: choosing which digits a phone dials
+	 * is dial-plan configuration and is compiled — the code is screened against the feature-code
+	 * catalogue at compile time. PRESSING it is {@link setTimeConditionOverride}, guarded by
+	 * `call-flows.toggle`, which is the receptionist's grant.
+	 *
+	 * `null` clears it; blank is not a value the column takes.
+	 */
+	readonly overrideFeatureCode: string | null;
 	readonly enabled: boolean;
+}
+
+/**
+ * The day/night switch.
+ *
+ * Two REQUIRED destination trios, which is the only shape in this area that has one: every other
+ * secondary trio is a branch a tenant may leave unset, and a flow with one position is not a switch.
+ *
+ * `mode` is on the row and is NOT writable through `PATCH` — `createCallFlowDto` and
+ * `updateCallFlowDto` both omit it. It moves through `POST /call-flows/:id/toggle`, guarded by
+ * `call-flows.toggle`, which also writes the presence entry a busy-lamp key renders. A `PATCH` that
+ * set the column would put the daily action behind the administrator's grant and would leave every
+ * lamp in the building showing the old position.
+ */
+export interface CallFlowRow extends EntityRow, DestinationTrio {
+	readonly name: string;
+	readonly extensionNumber: string | null;
+	/** The star code that toggles it, and the key a BLF lamp is provisioned with. */
+	readonly featureCode: string | null;
+	readonly mode: CallFlowMode;
+	readonly nightDestinationType: DestinationType | null;
+	readonly nightDestinationRef: string | null;
+	readonly nightDestinationData: DestinationData | null;
+	readonly enabled: boolean;
+}
+
+/**
+ * A list of outbound authorisation codes.
+ *
+ * Nothing on this row is a secret and nothing on it ever will be: the codes live on the entries, are
+ * stored as scrypt digests, and are set through an endpoint that hashes them. `pinHash` is in
+ * `secretColumns` on the server's child resource, so it is stripped from every response and is
+ * absent from {@link PinSetEntryRow} — a row simply does not carry it and this type must not pretend
+ * otherwise.
+ */
+export interface PinSetRow extends EntityRow {
+	readonly name: string;
+	readonly description: string | null;
+	readonly promptId: string | null;
+	readonly failurePromptId: string | null;
+	readonly maxAttempts: number;
+	readonly digitTimeoutMs: number;
+	readonly enabled: boolean;
+}
+
+/**
+ * One authorisation code — its identity, never its digits.
+ *
+ * `label` and `ordinal` are what a call detail record names ("code 3, the night desk"), which is the
+ * whole of what upstream's plaintext column was needed for: "which of our codes placed this call" is
+ * answerable from an identity rather than from a secret. The ordinal is therefore a value an
+ * administrator chooses rather than a position a loader happened to return, which is why the
+ * collection has a reorder endpoint.
+ */
+export interface PinSetEntryRow extends EntityRow {
+	readonly pinSetId: string;
+	readonly ordinal: number;
+	readonly label: string | null;
+	readonly enabled: boolean;
+}
+
+/**
+ * A named, ordered list of rewrites several routes and trunks can point at.
+ *
+ * Guarded by `routes.*` rather than by a resource of its own: a ruleset is only meaningful attached
+ * to an outbound route or a trunk, and its power — deciding what digits reach which carrier — is the
+ * power `routes.write` already grants.
+ */
+export interface TranslationRulesetRow extends EntityRow {
+	readonly name: string;
+	readonly description: string | null;
+	readonly enabled: boolean;
+}
+
+/**
+ * One rewrite in a ruleset.
+ *
+ * A PIPELINE and not a first-match table: every enabled rule fires in `ordinal` order and each sees
+ * the previous one's output, so "strip the international prefix" before "add the plus" produces a
+ * number and the other way round produces nonsense. That is why the order has a reorder endpoint and
+ * why the editor never lets a rule be moved by editing its ordinal alone.
+ *
+ * Neither `matchPattern` nor `replacement` is validated beyond its length by the API, deliberately:
+ * `validateTranslationRule` in `@optimiq-voice/routing` runs inside the write transaction, and a
+ * second opinion in the browser would disagree with it on the first interesting input.
+ */
+export interface TranslationRuleRow extends EntityRow {
+	readonly translationRulesetId: string;
+	readonly ordinal: number;
+	readonly label: string | null;
+	readonly matchPattern: string;
+	/** May be empty — that is how a strip rule is written. */
+	readonly replacement: string;
+	readonly enabled: boolean;
+}
+
+/**
+ * A named shortcut an administrator points many routes at, so moving the target is one edit.
+ *
+ * FusionPBX's "Bridge" with the raw dial string removed: upstream a bridge is a FreeSWITCH dial
+ * STRING, which reaches a carrier with no route, no toll class and no call-block screen. This one
+ * names a destination trio instead, and the compiler expands it FLAT — an alias produces no plan
+ * node, it resolves to whatever its target resolved to, and a cycle is refused at depth 8.
+ */
+export interface DestinationAliasRow extends EntityRow, DestinationTrio {
+	readonly name: string;
+	readonly description: string | null;
+	readonly enabled: boolean;
+}
+
+/**
+ * A remote audio source usable as a destination.
+ *
+ * The fallback trio is REQUIRED, which is unusual for a secondary trio and is the point: remote-URL
+ * playback is the one capability here whose availability depends on the media driver, so a stream
+ * with nowhere to go is a call dropped in silence on any driver that cannot play it.
+ */
+export interface AudioStreamRow extends EntityRow {
+	readonly name: string;
+	readonly description: string | null;
+	/** `http(s)` only. The allow-list is a security check — a media server will open `file://`. */
+	readonly url: string;
+	readonly answerFirst: boolean;
+	/** Zero means "until the caller hangs up", which is what an always-on radio feed wants. */
+	readonly maxSeconds: number;
+	readonly fallbackDestinationType: DestinationType | null;
+	readonly fallbackDestinationRef: string | null;
+	readonly fallbackDestinationData: DestinationData | null;
+	readonly enabled: boolean;
+}
+
+/**
+ * A dial-by-name directory.
+ *
+ * There is no child collection: the entries are DERIVED from the organization's extensions at
+ * compile time. An extension whose mailbox has no recorded NAME greeting is skipped with a warning,
+ * because this platform has no text-to-speech and an entry whose name cannot be spoken cannot be
+ * offered.
+ */
+export interface DialByNameDirectoryRow extends EntityRow {
+	readonly name: string;
+	readonly extensionNumber: string | null;
+	readonly searchField: DirectorySearchField;
+	readonly minDigits: number;
+	readonly greetingPromptId: string | null;
+	readonly invalidPromptId: string | null;
+	readonly maxFailures: number;
+	readonly timeoutDestinationType: DestinationType | null;
+	readonly timeoutDestinationRef: string | null;
+	readonly timeoutDestinationData: DestinationData | null;
+	readonly enabled: boolean;
+}
+
+/**
+ * An organization-wide short code that points somewhere.
+ *
+ * Nothing points AT a speed dial — its `destinationType` on the server is `null` — so it never
+ * appears in the destination picker. Its own trio is required, and it is a trio rather than a
+ * number for the reason an alias refuses a dial string: a bare number would have to be dialled by
+ * something, with no route matched and no toll class applied.
+ */
+export interface SpeedDialRow extends EntityRow, DestinationTrio {
+	readonly code: string;
+	readonly label: string;
+	readonly enabled: boolean;
+}
+
+/**
+ * The organization's quotas. `GET|PUT /api/v1/org-limits` — a SINGLETON, not a collection.
+ *
+ * Every field is nullable and `null` means "no ceiling" rather than "reset to a default": unlimited
+ * IS the default and always has been, because this table arrived after tenants existed. An absent
+ * ROW is an empty set of limits, which is why the read can legitimately answer `{}`.
+ *
+ * The write is a `PUT` and the body is the COMPLETE set: a partial one would make "remove this
+ * limit" and "leave this limit alone" the same request.
+ */
+export interface OrgLimits {
+	readonly maxExtensions?: number | null;
+	readonly maxTrunks?: number | null;
+	readonly maxConcurrentCalls?: number | null;
+	readonly maxStorageMb?: number | null;
+}
+
+/** One line of the usage report: what is used, against what is allowed. */
+export interface OrgUsageEntry {
+	readonly limit: OrgLimitName;
+	readonly used: number;
+	/** `null` means no ceiling — the tenant is unlimited on this axis. */
+	readonly ceiling: number | null;
+	/**
+	 * `null` when there is no ceiling to divide by, AND when {@link measured} is false.
+	 *
+	 * The second case is newer and is the one a renderer gets wrong: `maxConcurrentCalls` used to
+	 * report `ratio: 0` beside a real ceiling, which drew a 0% bar — a confident statement that
+	 * nobody is on a call, made by a process that cannot see calls. It is `null` now, so a bar drawn
+	 * from it draws nothing.
+	 *
+	 * A fraction rather than a percentage, so a UI decides how to say it.
+	 */
+	readonly ratio: number | null;
+	/**
+	 * Whether `used` is a MEASUREMENT or a placeholder.
+	 *
+	 * Three of the four limits are a `select count(*)` in the API process and are true at the instant
+	 * they were read. `maxConcurrentCalls` is not: simultaneous calls are live state the engines hold,
+	 * and the control plane has no way to ask that does not enumerate every live leg on the platform
+	 * on every page load. Its `used` is therefore zero, and this flag is what stops a screen rendering
+	 * that zero as "nobody is on a call right now".
+	 *
+	 * This app branches on the FLAG rather than on `limit === "maxConcurrentCalls"`, which is what it
+	 * used to do: the server owns which lines it can count, and a hard-coded name here would be a
+	 * second copy of that decision that goes stale in the direction of claiming a number it does not
+	 * have.
+	 */
+	readonly measured: boolean;
+}
+
+/**
+ * `GET /api/v1/org-limits/usage`.
+ *
+ * Two of the four numbers are honest about being incomplete, and the screen has to say so rather
+ * than round them off:
+ *
+ * - `maxConcurrentCalls` always reports `used: 0`, `ratio: null` and `measured: false`. Simultaneous
+ *   calls are live state the engine holds; a number this endpoint invented would be wrong the moment
+ *   it was read. The ceiling is still reported, because that is the fact an administrator came for —
+ *   and it is now genuinely enforced, at admission, by the engine rather than by a form.
+ * - `maxStorageMb` counts `prompt` and `voicemail_message` rows only. RECORDINGS are excluded —
+ *   they live in the CDR database, a different connection and a different bounded context — so the
+ *   total is smaller than the tenant's real storage. Named as a gap rather than half-counted.
+ */
+export interface OrgUsageReport {
+	readonly entries: readonly OrgUsageEntry[];
+	/** Exact bytes, before the megabyte rounding the ceiling is compared against. */
+	readonly storageBytes: number;
 }
 
 export interface TimeConditionRuleRow extends EntityRow {
@@ -449,6 +1035,73 @@ export interface RingGroupRow extends EntityRow {
 	readonly enabled: boolean;
 }
 
+/**
+ * A paging group. No destination trio — a page does not continue anywhere: the pager speaks, the
+ * handsets auto-answer, and the announcement ends when the pager hangs up. `duplex: false` is a
+ * one-way announcement; `true` is talkback (fifty open microphones, which is why `false` is the
+ * server default and this mirror states it rather than assuming it).
+ */
+export interface PagingGroupRow extends EntityRow {
+	readonly name: string;
+	readonly extensionNumber: string | null;
+	readonly duplex: boolean;
+	readonly timeoutSeconds: number;
+	readonly enabled: boolean;
+}
+
+export interface PagingGroupMemberRow extends EntityRow {
+	readonly pagingGroupId: string;
+	readonly extensionId: string;
+	readonly ordinal: number;
+	readonly enabled: boolean;
+}
+
+/**
+ * A shared line (SLA / BLA) — one line that appears on several handsets and behaves as ONE seizable
+ * thing. No destination trio, and the absence is the design: a shared line never routes a call out.
+ * Its whole point is the state it keeps AFTER the answer — who holds it, whether it is on hold, when
+ * it recalls — which lives in a KV claim the engine arbitrates, not in a branch. `extensionNumber`
+ * is nullable for the reason a paging group's is: a line that is only a shared KEY across a boss and
+ * an assistant has no dialable number of its own.
+ */
+export interface SharedLineRow extends EntityRow {
+	readonly name: string;
+	readonly extensionNumber: string | null;
+	readonly strategy: SharedLineStrategy;
+	readonly ringTimeoutSeconds: number;
+	/**
+	 * How long a call held on the line may sit before it recalls every appearance. `0` disables
+	 * recall — the line holds indefinitely — which is a real value the column takes rather than
+	 * "unset", so the detail copy says "0 disables recall" rather than rendering a blank.
+	 */
+	readonly holdRecallTimeoutSeconds: number;
+	/**
+	 * Whether an idle appearance may join a call already up on the line (the boss/admin "barge").
+	 *
+	 * The flag is stored and COMPILED, but the live barge-in MEDIA join awaits the media plane — a
+	 * deferred seam named in the backend report — so the switch records intent rather than an effect
+	 * a call would observe today. The dialog says so instead of implying a behaviour that has not
+	 * landed.
+	 */
+	readonly bargeInEnabled: boolean;
+	readonly enabled: boolean;
+}
+
+/**
+ * One appearance — one extension's button on a shared line.
+ *
+ * `ordinal` is the APPEARANCE INDEX: the button position the phone lights and the number sipd stamps
+ * into the `Call-Info` header, not a loader's display order — which is why the collection has a
+ * reorder endpoint. `extensionId` is a plain foreign key rather than a destination, because only a
+ * registered endpoint can be given a button on the line; an external number cannot light a lamp.
+ */
+export interface SharedLineAppearanceRow extends EntityRow {
+	readonly sharedLineId: string;
+	readonly extensionId: string;
+	readonly ordinal: number;
+	readonly enabled: boolean;
+}
+
 export interface RingGroupMemberRow extends EntityRow, DestinationTrio {
 	readonly ringGroupId: string;
 	readonly ordinal: number;
@@ -465,9 +1118,39 @@ export interface QueueRow extends EntityRow {
 	readonly mohClassId: string | null;
 	readonly greetingPromptId: string | null;
 	readonly announcePromptId: string | null;
+	/**
+	 * Whisper-on-answer: played to the ANSWERING AGENT alone, before the caller is bridged in.
+	 *
+	 * The opposite side of the bridge from `greetingPromptId` and `announcePromptId`, which both
+	 * play to the caller. A caller who heard the agent's cue sheet ("call from Sales queue") would
+	 * be listening to the routing table, which is the whole reason this is a separate column.
+	 */
+	readonly agentWhisperPromptId: string | null;
 	readonly maxWaitSeconds: number;
 	readonly maxWaitNoAgentSeconds: number;
 	readonly wrapUpSeconds: number;
+	/**
+	 * Whether the console insists on a wrap-up code before the agent goes back on the floor.
+	 *
+	 * "Insists" and not "blocks", and the difference is the whole of what a console may do with it:
+	 * the engine's wrap-up deadline ends the after-call work regardless and records `unset`, so a UI
+	 * that refused to let the agent continue would be holding a form open over a state the platform
+	 * has already left. A queue with no {@link QueueDispositionCodeRow} ignores it entirely — there
+	 * is nothing to pick.
+	 */
+	readonly dispositionRequired: boolean;
+	/**
+	 * ONE unanswered offer benches the agent until a person resumes them.
+	 *
+	 * Off, the ceiling is `queue_agent.max_no_answer` and the engine's reason is `max-no-answer`.
+	 * On, a single ring-out is `rona` — the same `unavailable` status to distribution and a
+	 * different sentence to the supervisor, which is why the wallboard separates them.
+	 */
+	readonly ronaEnabled: boolean;
+	/** Whether the caller is offered the questions after the AGENT hangs up on an answered call. */
+	readonly surveyEnabled: boolean;
+	/** "Please stay on the line to rate this call." Played once, before the first question. */
+	readonly surveyIntroPromptId: string | null;
 	readonly announcePositionEnabled: boolean;
 	readonly announceFrequencySeconds: number;
 	readonly abandonedResumeAllowed: boolean;
@@ -475,7 +1158,51 @@ export interface QueueRow extends EntityRow {
 	readonly tierRulesApply: boolean;
 	readonly tierRuleWaitSeconds: number;
 	readonly tierRuleNoAgentNoWait: boolean;
-	readonly recordEnabled: boolean;
+	/**
+	 * When the engine records what this queue distributes — the same vocabulary an extension and a
+	 * trunk carry, which REPLACED a `recordEnabled` boolean no runtime honoured.
+	 *
+	 * A queued call is inbound from the queue's point of view whichever direction the leg that
+	 * reached the queue was travelling, so `inbound` and `all` both record here and `outbound` never
+	 * does. The recording begins at the ANSWER rather than at the join: hold music is not evidence of
+	 * anything, and recording it would put every abandoned call in the retention bucket.
+	 */
+	readonly recordPolicy: RecordPolicy;
+	/** The same keypad backstop {@link ExtensionRow.recordAutoPauseOnDtmf} carries, per queue. */
+	readonly recordAutoPauseOnDtmf: boolean;
+	/**
+	 * The single DTMF digit a WAITING caller may press to leave the line. `null` disables it.
+	 *
+	 * One character, because that is the whole feature: a caller four minutes into a hold is not
+	 * going to type a string, and a multi-digit code would need an inter-digit timeout running under
+	 * the music for the entire wait. Where they go is the `exit` trio below.
+	 */
+	readonly exitKey: string | null;
+	readonly exitDestinationType: DestinationType | null;
+	readonly exitDestinationRef: string | null;
+	readonly exitDestinationData: DestinationData | null;
+	/**
+	 * Virtual hold: a waiting caller keeps their place and the platform calls them back.
+	 *
+	 * `callbackKey` is the digit that accepts, on the same one-character terms as `exitKey` and for
+	 * the same reason. It may not be the exit key — one digit cannot mean two things, and the
+	 * compiler gives it to the exit key with a warning when a tenant sets both.
+	 */
+	readonly callbackEnabled: boolean;
+	readonly callbackKey: string | null;
+	/** Seconds of waiting after which the offer plays unprompted. 0 means only on the key. */
+	readonly callbackOfferAfterSeconds: number;
+	readonly callbackOfferPromptId: string | null;
+	readonly callbackConfirmPromptId: string | null;
+	readonly callbackMaxAttempts: number;
+	readonly callbackRetryDelaySeconds: number;
+	readonly callbackExpiresAfterSeconds: number;
+	/**
+	 * The priority every caller entering this queue starts with, unless the destination that sent
+	 * them overrode it — an IVR option saying "press 2 if you are a platinum customer" is exactly
+	 * that override. Higher dequeues first; see {@link QUEUE_PRIORITY_MIN}.
+	 */
+	readonly defaultPriority: number;
 	readonly timeoutDestinationType: DestinationType | null;
 	readonly timeoutDestinationRef: string | null;
 	readonly timeoutDestinationData: DestinationData | null;
@@ -510,6 +1237,78 @@ export interface QueueTierRow extends EntityRow {
 	readonly level: number;
 	/** Order within the level. */
 	readonly position: number;
+	/**
+	 * Played to the AGENT alone when a call distributed by THIS tier reaches them, in place of the
+	 * queue's `agentWhisperPromptId`. `null` clears it and the queue's whisper takes over again.
+	 *
+	 * On the tier rather than on the queue because it is a fact about the MEMBERSHIP: an escalation
+	 * cue for a level that is only reached after the one below it could not take the call. It is
+	 * therefore behind `queues.manage-agents` like everything else on a tier — whoever staffs the
+	 * levels is whoever knows what each level should be told.
+	 */
+	readonly announcePromptId: string | null;
+}
+
+/**
+ * One wrap-up code a queue offers: `sale`, `escalated`, `wrong-number`.
+ *
+ * A retired code is `enabled: false` rather than deleted — the history that points at it is what the
+ * vocabulary exists for. Deleting one is allowed and leaves the denormalised `code` on the calls it
+ * closed, so a report keeps its rows.
+ */
+export interface QueueDispositionCodeRow extends EntityRow {
+	readonly queueId: string;
+	/** Machine-readable and stable. Reports group by this; {@link label} is free to change. */
+	readonly code: string;
+	readonly label: string;
+	/** Order in the console's list. Lowest first; ties fall back to the code. */
+	readonly position: number;
+	readonly enabled: boolean;
+}
+
+/**
+ * One skill this queue's callers need, and how fast it stops insisting.
+ *
+ * `relaxAfterSeconds` is the seconds of waiting that buy a one-level drop in `minLevel`; `0` never
+ * relaxes and makes the requirement absolute, which is right for a regulated skill and wrong for a
+ * preference — which is why it is per requirement rather than a queue-wide switch.
+ */
+export interface QueueSkillRequirementRow extends EntityRow {
+	readonly queueId: string;
+	readonly skill: string;
+	readonly minLevel: number;
+	readonly relaxAfterSeconds: number;
+}
+
+/**
+ * One post-call survey question.
+ *
+ * `position` is the question's IDENTITY rather than a mere order: every report groups by it, so
+ * renumbering rows would re-file last month's answers under a different question. That is why there
+ * is no reorder here and why the position is typed.
+ */
+export interface QueueSurveyQuestionRow extends EntityRow {
+	readonly queueId: string;
+	/** 1 to {@link QUEUE_SURVEY_MAX_QUESTIONS}, unique within the queue. */
+	readonly position: number;
+	/** `null` leaves the question silent — the caller hears the digits prompt and nothing else. */
+	readonly promptId: string | null;
+	/** For the console and the report. The caller never hears it. */
+	readonly label: string;
+}
+
+/**
+ * One skill an AGENT has, and how good they are at it.
+ *
+ * Hung off the agent rather than off a tier because a skill is a property of the person: the same
+ * agent carries `spanish: 4` into every queue they staff, and a copy per membership would be a
+ * second value somebody has to keep in step.
+ */
+export interface QueueAgentSkillRow extends EntityRow {
+	readonly queueAgentId: string;
+	readonly skill: string;
+	/** {@link QUEUE_SKILL_LEVEL_MIN} to {@link QUEUE_SKILL_LEVEL_MAX}. */
+	readonly level: number;
 }
 
 /**
@@ -523,9 +1322,12 @@ export interface ConferenceRow extends EntityRow {
 	readonly name: string;
 	readonly roomNumber: string;
 	readonly maxMembers: number;
-	readonly recordEnabled: boolean;
+	readonly recordPolicy: RecordPolicy;
 	readonly mohClassId: string | null;
 	readonly announceJoinLeave: boolean;
+	/** Join/leave beeps — distinct from `announceJoinLeave`, which plays recorded names. */
+	readonly entryToneEnabled: boolean;
+	readonly exitToneEnabled: boolean;
 	readonly waitForModerator: boolean;
 	readonly enabled: boolean;
 }
@@ -570,6 +1372,44 @@ export interface FeatureCodeParamField {
 export type FeatureCodeParamFields = Readonly<
 	Record<FeatureCodeAction, readonly FeatureCodeParamField[]>
 >;
+
+/**
+ * One caller-screening rule.
+ *
+ * ## `pattern` is one loose string, and that is the server's decision rather than a shortcut
+ *
+ * The column holds an exact number, a prefix, or a regular expression, and which one it is is
+ * `matchKind`'s business. The API's DTO deliberately refuses to validate the string against the
+ * kind, because the function whose opinion decides whether a rule can be ENFORCED is
+ * `compilePattern` in `@optimiq-voice/routing`, and it runs inside the write transaction: an
+ * unusable pattern is a 422 naming `pattern` that rolls the insert back, and an unanchored regex is
+ * a warning that rides out in the mutation envelope. A second regex validator here would be a
+ * second opinion, and the two would disagree on the first interesting input — so
+ * `callBlockRuleFormSchema` bounds the LENGTH and lets the compiler refuse what will not compile.
+ *
+ * ## `hitCount` and `lastHitAt` are read-only, and are the point of the screen
+ *
+ * They are counters the enforcement side writes, absent from both DTOs — `z.strictObject` means a
+ * client that sends one gets a 400 naming the field rather than a silent drop, so nothing here may
+ * put them in a request body. They are NOT secret columns: "this rule has never matched anything"
+ * is the single most useful thing a screening list can say, and hiding it would leave a stale
+ * blocklist looking identical to a working one.
+ *
+ * `lastHitAt` is `null` on a rule that has never fired, which is exactly the `hitCount: 0` case and
+ * is rendered as such rather than as a missing date.
+ */
+export interface CallBlockRuleRow extends EntityRow {
+	readonly pattern: string;
+	readonly matchKind: CallBlockMatchKind;
+	readonly direction: CallBlockDirection;
+	readonly action: CallBlockAction;
+	readonly label: string | null;
+	/** Written by enforcement, never by a request. See the note above. */
+	readonly hitCount: number;
+	/** ISO-8601, or `null` on a rule that has never matched a call. */
+	readonly lastHitAt: string | null;
+	readonly enabled: boolean;
+}
 
 export interface VoicemailBoxRow extends EntityRow {
 	readonly mailboxNumber: string;
@@ -690,6 +1530,32 @@ export interface VoicemailMessageDeletion {
 	readonly mailbox: VoicemailMailboxSummary;
 }
 
+/**
+ * Which of the two things `POST …/messages/:id/forward` does.
+ *
+ * One verb with a mode rather than two endpoints, because they are the same operation: both file
+ * the audio and a row into another mailbox, and only `forward` then removes the original.
+ */
+export const VOICEMAIL_FORWARD_MODES = ["forward", "copy"] as const;
+export type VoicemailForwardMode = (typeof VOICEMAIL_FORWARD_MODES)[number];
+
+/**
+ * What a forward or a copy answers with.
+ *
+ * BOTH mailboxes' counts. A forward changes two lamps, and a screen handed only the destination's
+ * numbers would leave the badge on the box the user is looking at counting a message that has left
+ * it.
+ */
+export interface VoicemailForwardResult {
+	/** The copy, as it now sits in the target mailbox. */
+	readonly data: VoicemailMessageRow;
+	/** The TARGET box's counts after the operation. */
+	readonly mailbox: VoicemailMailboxSummary;
+	/** The SOURCE box's counts after the operation — unchanged on a copy. */
+	readonly source: VoicemailMailboxSummary;
+	readonly mode: VoicemailForwardMode;
+}
+
 /** A short-lived, anonymous URL an `<audio src>` can actually fetch. Minutes, not hours. */
 export interface VoicemailPlaybackLink {
 	readonly url: string;
@@ -705,8 +1571,21 @@ export interface VoicemailPlaybackLink {
 export const MOH_SOURCES = ["library", "stream"] as const;
 export type MohSource = (typeof MOH_SOURCES)[number];
 
-/** What a stored audio object is for. Mirrors `PROMPT_KINDS`. */
-export const PROMPT_KINDS = ["prompt", "moh", "greeting"] as const;
+/**
+ * What a stored audio object is for. Mirrors `PROMPT_KINDS`.
+ *
+ * `phrase` is the odd member and has no audio of its own: it is an ordered sequence of OTHER prompts
+ * played as one ("your call is number", "seven", "in the queue"), which is the only way to say a
+ * number aloud on a platform with no text-to-speech. It is a `prompt` row rather than a table of its
+ * own so that the eight `*_prompt_id` foreign keys already in the schema accept one for free — see
+ * `packages/pbx-db/src/schema/media-schema.ts`.
+ *
+ * The consequence for this app is {@link PromptRow.objectKey} being nullable, and the consequence
+ * for the media screen is a second surface rather than a second column: `PromptsController` still
+ * creates a library row only through a multipart UPLOAD, and `/api/v1/phrases` creates the sequence
+ * with an ordinary JSON body because a phrase owns no file. See {@link PhraseRow}.
+ */
+export const PROMPT_KINDS = ["prompt", "moh", "greeting", "phrase"] as const;
 export type PromptKind = (typeof PROMPT_KINDS)[number];
 
 /** The four greeting slots. Mirrors `VOICEMAIL_GREETING_KINDS`. */
@@ -745,12 +1624,88 @@ export interface PromptRow extends EntityRow {
 	 * `app/(app)/media/_components/moh-files-dialog.tsx`, which is the whole of its user interface.
 	 */
 	readonly mohClassId: string | null;
-	readonly objectKey: string;
+	/**
+	 * The stored object, or `null` for a `phrase`.
+	 *
+	 * The column became nullable when a phrase became a `prompt` row: a phrase names other rows'
+	 * audio and owns none, and `prompt_object_key_kind_check` is what keeps that from widening into
+	 * "a prompt with no file". Anything that renders or plays a key must therefore check the kind
+	 * first — `POST /prompts/:id/play-url` answers a phrase with an invalid-link error, because the
+	 * row is perfectly valid and what does not exist is a file to stream.
+	 */
+	readonly objectKey: string | null;
 	readonly contentType: string;
 	readonly durationMs: number | null;
 	readonly sizeBytes: number | null;
 	readonly checksum: string | null;
 	readonly language: string;
+}
+
+/**
+ * A phrase — an ordered sequence of prompts, played as one.
+ *
+ * ## It IS a {@link PromptRow}, and this interface says so rather than restating it
+ *
+ * `/api/v1/phrases` reads and writes the SAME `prompt` table with `kind = 'phrase'` and a null
+ * `object_key`; `PHRASE_RESOURCE` in `apps/api/src/pbx/phrases/phrases.resource.ts` is a second
+ * descriptor over one table, differing only in the discriminator the descriptor cannot express. So
+ * this extends `PromptRow` instead of copying eleven fields, and NARROWS the two that the
+ * discriminator decides: `kind` is always `"phrase"` and `objectKey` is always `null`.
+ *
+ * The narrowing is what makes it useful rather than an alias. A screen holding a `PhraseRow` never
+ * has to check the kind before deciding there is no audio to play — `POST /prompts/:id/play-url`
+ * answers a phrase with an invalid-link error, and that is not an error a phrase screen should be
+ * able to provoke by accident.
+ *
+ * ## What is NOT on it
+ *
+ * No `language` control and no `mohClassId` picker, matching the DTO: a phrase's language is
+ * whatever its steps' audio is, and an MOH file is a member of a class while a sequence is not a
+ * file. The columns are inherited because the row carries them; nothing in this app writes them.
+ *
+ * The STEPS are not here either — they are a child collection under `/phrases/:id/steps`, exactly as
+ * a ruleset's rules are, because the order is the sentence. See {@link PhraseStepRow}.
+ */
+export interface PhraseRow extends PromptRow {
+	readonly kind: "phrase";
+	readonly objectKey: null;
+}
+
+/**
+ * One step of a phrase: the audio it plays, and where in the sentence it plays.
+ *
+ * ## `promptId` may not name another phrase
+ *
+ * Nesting is refused — `phrases.service.ts` answers a step whose `promptId` is a `kind = 'phrase'`
+ * row with a `PBX_VALIDATION_FAILED` naming `promptId`, so the message lands on the picker the user
+ * just used, and the compiler refuses the same shape a second time for rows that arrive by any other
+ * route. The form therefore offers library prompts only; the server's refusal is the backstop, not
+ * the user interface.
+ *
+ * ## The reference into `prompt` is `on delete restrict`
+ *
+ * The only such column in the PBX schema. Deleting a prompt a phrase plays is a 409 whose referrers
+ * are `kind: "phrase"` and whose `id` is the PHRASE's — `idColumn: "phrase_id"` on
+ * `PROMPT_RESOURCE`, because a step has no screen and the phrase does. `referenceHref` in
+ * `./references.ts` is what turns that into a link, and `nameColumn` is `null` there, so the
+ * reference arrives with no name and renders as a short id.
+ *
+ * Cascading would have silently SHORTENED a phrase, which is the failure the restrict exists to
+ * prevent: "your call is number seven in the queue" quietly becoming "your call is number in the
+ * queue" is worse than a refused delete.
+ */
+export interface PhraseStepRow extends EntityRow {
+	readonly phraseId: string;
+	readonly promptId: string;
+	readonly ordinal: number;
+	/**
+	 * A step that is skipped rather than removed.
+	 *
+	 * `prompt` has no `enabled` column and a phrase therefore has no disabled state — it is the STEPS
+	 * that carry one, because half-building a sequence is a real state and half-deleting a file is
+	 * not. See the note on `PHRASE_RESOURCE`.
+	 */
+	readonly enabled: boolean;
 }
 
 export interface VoicemailGreetingRow extends EntityRow {
@@ -876,6 +1831,154 @@ export interface AuditLogQueryParams {
 }
 
 // ---------------------------------------------------------------------------------------------
+// SIP security: the network allowlist, and the attack log
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One CIDR access-control entry.
+ *
+ * `network` arrives NORMALISED by PostgreSQL's own `cidr` type, so a row that was written as
+ * `203.0.113.0/24` comes back as `203.0.113.0/24` and one written as a bare `198.51.100.7` comes
+ * back as `198.51.100.7/32`. That is why the form normalises before sending — see
+ * `lib/pbx/cidr.ts` — rather than letting the two spellings become two rows that collide on the
+ * unique index only after the database has widened them.
+ *
+ * There is no destination trio and nothing points at one of these, so a delete is never refused
+ * for a reference. It is also not a routing input: saving one recompiles nothing, and reaching the
+ * media server takes a generator run and a transport rebuild that this app does not perform.
+ */
+export interface SipAclEntryRow extends EntityRow {
+	readonly name: string | null;
+	readonly network: string;
+	readonly action: SipAclAction;
+	readonly scope: SipAclScope;
+	/** Lower wins. Ties are broken by the longer prefix. */
+	readonly priority: number;
+	readonly description: string | null;
+	readonly enabled: boolean;
+}
+
+/**
+ * One refused authentication attempt.
+ *
+ * Not an `EntityRow`: `sip_auth_event` is append-only in the database — the tenant role holds
+ * `SELECT, INSERT` and nothing else — so there is no `updatedAt` for it to carry and no create,
+ * update or delete call for this shape anywhere in this app.
+ *
+ * `organizationId` is `NOT NULL` on the server, which bounds what this table can hold and is worth
+ * knowing before reading it as "every attack": an attempt against an account that matches no
+ * tenant has nowhere to be filed and is deliberately absent. Those are refused at the media server
+ * and appear in its security log, not here.
+ */
+export interface SipAuthEventRow {
+	readonly id: string;
+	readonly organizationId: string;
+	readonly eventType: SipAuthEventType;
+	readonly scope: SipAclScope;
+	/** The source address. Null when the surface that refused did not know it. */
+	readonly sourceIp: string | null;
+	/** The account, extension number or MAC that was attempted. Never a credential. */
+	readonly accountRef: string | null;
+	readonly transport: string | null;
+	readonly userAgent: string | null;
+	/** Whatever names the refusal: the matched ACL entry, the rate-limit window, the device id. */
+	readonly detail: Readonly<Record<string, unknown>> | null;
+	readonly requestId: string | null;
+	readonly occurredAt: string;
+	readonly createdAt: string;
+}
+
+/**
+ * The query string `GET /api/v1/sip-auth-events` accepts.
+ *
+ * The same shape as {@link AuditLogQueryParams} — a defaulted, echoed window, a keyset cursor and
+ * exact filters — because the server deliberately made the two ledgers page identically. The one
+ * divergence is the default window: SEVEN days here rather than thirty, because an attack log is
+ * read operationally ("what is happening now") and a change ledger historically.
+ *
+ * `sourceIp` is an ADDRESS and not a network: the server refuses a prefix, because the question an
+ * operator asks of this table is "what has this address been doing", which is the address they are
+ * about to block.
+ */
+export interface SipAuthEventQueryParams {
+	readonly from?: string;
+	readonly to?: string;
+	readonly eventType?: SipAuthEventType;
+	readonly scope?: SipAclScope;
+	readonly sourceIp?: string;
+	readonly accountRef?: string;
+	readonly limit?: number;
+	readonly cursor?: string;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Webhooks
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The four event families a subscription may select, and the subject root each is written as.
+ *
+ * Mirrored from `apps/api/src/pbx/webhooks/webhook-selectors.ts`, which builds them from
+ * `@optimiq-voice/events`' `SUBJECT_ROOTS`. That package is not a dependency of this app — it
+ * would drag the broker's codecs into the browser bundle — so the four roots are restated and
+ * `webhook-selectors.spec.ts` pins the grammar rather than the import.
+ *
+ * `cdr` is `cdr.leg.v1`, not `cdr.evt.v1`. The other four families the platform publishes —
+ * `media`, `registration`, `audit`, `provision` — are deliberately not deliverable: they are
+ * engine plumbing, a per-REGISTER firehose, a loop over the ledger that records webhook edits, and
+ * credential-adjacent provisioning detail respectively.
+ */
+export const WEBHOOK_FAMILIES = ["call", "queue", "voicemail", "cdr"] as const;
+export type WebhookFamily = (typeof WEBHOOK_FAMILIES)[number];
+
+export const WEBHOOK_FAMILY_ROOTS: Readonly<Record<WebhookFamily, string>> = {
+	call: "calls.evt.v1",
+	queue: "queue.evt.v1",
+	voicemail: "voicemail.evt.v1",
+	cdr: "cdr.leg.v1",
+};
+
+/**
+ * One outbound webhook subscription.
+ *
+ * ## `secret` is present on exactly one response and nowhere else
+ *
+ * `secret` is in `secretColumns` on the server's resource, so the generic redaction strips it from
+ * every list, get and update body. The single exception is the CREATE response, which re-attaches
+ * the key — generated or supplied — precisely once, because a signing key nobody can read is a
+ * subscription nobody can verify.
+ *
+ * It is declared optional here rather than in a separate row type so that the one screen which
+ * legitimately receives it does not need a cast, and so this comment sits on the field. A screen
+ * must never render it from a list row: it is not there, and `undefined` in a "Secret" column
+ * would read as "this endpoint has no secret" when every endpoint has one.
+ *
+ * ## The failure fields are read-only and are the whole answer to "why did it stop?"
+ *
+ * `consecutiveFailures` counts CONSECUTIVE failures and is zeroed by the first success.
+ * `autoDisabledAt` is set when the platform switched the subscription off on the tenant's behalf,
+ * and is deliberately separate from `enabled`: an administrator who disabled an endpoint knows
+ * why, and one who finds it disabled needs to be told that we did it and when. Re-enabling through
+ * `PATCH { enabled: true }` clears both, which is what makes "fix the endpoint, turn it back on" a
+ * complete recovery rather than one that re-disables on the next bad delivery.
+ */
+export interface WebhookRow extends EntityRow {
+	readonly description: string | null;
+	readonly url: string;
+	/** Present ONLY on the create response. See the note above; never render it from a list row. */
+	readonly secret?: string;
+	readonly eventSelectors: readonly string[];
+	readonly enabled: boolean;
+	readonly consecutiveFailures: number;
+	readonly lastFailureAt: string | null;
+	/** One line: a status code, a timeout, a DNS error. Never a response body. */
+	readonly lastFailureReason: string | null;
+	readonly lastSuccessAt: string | null;
+	/** When the platform disabled this endpoint itself, after consecutive failures. */
+	readonly autoDisabledAt: string | null;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Routing operations
 // ---------------------------------------------------------------------------------------------
 
@@ -899,4 +2002,121 @@ export interface SimulateResult {
 	readonly dialedNumber?: string;
 	readonly reason?: string;
 	readonly diagnostics: readonly WireDiagnostic[];
+}
+
+// ---------------------------------------------------------------------------------------------
+// Carrier compliance — who this organization is, and which caller IDs it may present
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * How the legal entity behind this organization is constituted.
+ *
+ * A closed set because it is what the carrier's own KYC form asks, and because the answer changes
+ * which documents a reviewer will demand. Mirrored by hand from the API's DTO, like everything
+ * else in this file — there is no generator, and importing across the app boundary is not an
+ * option this repo has.
+ */
+export const KYC_ENTITY_TYPES = [
+	"sole-proprietor",
+	"partnership",
+	"private-company",
+	"public-company",
+	"non-profit",
+	"government",
+] as const;
+export type KycEntityType = (typeof KYC_ENTITY_TYPES)[number];
+
+/**
+ * Where the record stands with whoever reviews it.
+ *
+ * `needs-info` is NOT a rejection and must never be rendered as one: it is the reviewer asking for
+ * something, and the thing they asked for is in `reviewNotes`. A screen that painted it red would
+ * make the one state the tenant can act on look like the one they cannot.
+ */
+export const KYC_DECISIONS = ["pending", "approved", "rejected", "needs-info"] as const;
+export type KycDecision = (typeof KYC_DECISIONS)[number];
+
+/**
+ * The organization's know-your-customer record. One per organization, hence no list endpoint:
+ * `GET /compliance/kyc` and `PUT /compliance/kyc`, both guarded by `compliance.read`/`.write`.
+ *
+ * ## `taxIdLast4` is the whole of what comes back, and that is deliberate
+ *
+ * The tax id is encrypted at rest and the API never returns it. The form therefore takes it as a
+ * WRITE-ONLY input — an empty box means "leave what is stored alone", not "clear it" — and renders
+ * `taxIdLast4` beside the box as the only evidence that something is on file. Treating the field
+ * as a normal round-tripped value would silently wipe the stored id on every save that left the
+ * box untouched.
+ *
+ * ## `decision`, `reviewedAt` and `reviewNotes` are read-only here
+ *
+ * They are the REVIEWER's half of the record and a `PUT` from this screen does not carry them. A
+ * tenant editing their address does not get to mark themselves approved.
+ */
+export interface KycRecord {
+	readonly id: string;
+	readonly legalEntityName: string;
+	readonly entityType: KycEntityType;
+	/** The last four digits of the stored tax id, or `null` when none is on file. Never the id. */
+	readonly taxIdLast4: string | null;
+	readonly addressLine1: string;
+	readonly addressLine2: string | null;
+	readonly addressCity: string;
+	readonly addressRegion: string;
+	readonly addressPostalCode: string;
+	/** ISO 3166-1 alpha-2. */
+	readonly addressCountry: string;
+	readonly contactName: string;
+	readonly contactEmail: string;
+	readonly contactPhone: string;
+	readonly websiteUrl: string | null;
+	/** Free text: what this organization says its calls are. A reviewer reads it against the CDR. */
+	readonly expectedTrafficProfile: string | null;
+	readonly expectedMonthlyMinutes: number | null;
+	readonly decision: KycDecision;
+	readonly reviewedAt: string | null;
+	/** What the reviewer wrote. The only actionable content of a `needs-info` decision. */
+	readonly reviewNotes: string | null;
+	readonly createdAt: string;
+	readonly updatedAt: string;
+}
+
+/** The fields a tenant may submit. The reviewer's half of {@link KycRecord} is not among them. */
+export type KycRecordInput = Omit<
+	KycRecord,
+	"id" | "taxIdLast4" | "decision" | "reviewedAt" | "reviewNotes" | "createdAt" | "updatedAt"
+> & {
+	/**
+	 * The full tax id, sent only when the user typed one. Omitted — not `null` — to leave the
+	 * stored value alone; `null` would be a request to clear it.
+	 */
+	readonly taxId?: string;
+};
+
+/**
+ * How a caller ID this organization does not own was proved to be theirs to present.
+ *
+ * The method is what an outbound call's `B` attestation rests on, so it is stored rather than
+ * inferred: `document` is an LOA or a bill on file, `call-back` is a code read back on the number
+ * itself, and `carrier-loa` is the losing carrier's own authorisation.
+ */
+export const CALLER_ID_VERIFICATION_METHODS = ["document", "call-back", "carrier-loa"] as const;
+export type CallerIdVerificationMethod = (typeof CALLER_ID_VERIFICATION_METHODS)[number];
+
+/**
+ * An external number this organization has proved it may present as caller ID.
+ *
+ * `expiresAt` is not decoration: a verification goes stale, and a number whose proof has lapsed
+ * can no longer support a `B` attestation. The list renders the expiry so an operator finds out
+ * before a carrier does.
+ */
+export interface VerifiedCallerIdRow extends EntityRow {
+	readonly e164: string;
+	readonly label: string | null;
+	readonly verificationMethod: CallerIdVerificationMethod;
+	/** The LOA reference, ticket number or call-back code that can be produced on request. */
+	readonly verificationReference: string | null;
+	readonly verifiedAt: string | null;
+	readonly expiresAt: string | null;
+	readonly notes: string | null;
 }

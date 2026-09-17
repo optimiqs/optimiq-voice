@@ -21,6 +21,14 @@ import { hasPermission, type Permission } from "@optimiq-voice/auth";
  * | `queue:<id>`     | `queues.monitor`   | Literally "Watch live queue and agent state"            |
  * | `agent-state`    | `queues.monitor`   | Same surface, org-wide rather than per queue            |
  * | `voicemail`      | `voicemail.read`   | The counts, which is strictly less than the list        |
+ * | `trunks`         | `trunks.read`      | A status transition is one row of the trunk list, sooner |
+ *
+ * `trunks → trunks.read` follows the voicemail argument exactly: the topic carries
+ * `trunk.evt.v1.<org>.<trunk>.status.changed`, whose payload is a status word, a reason and a
+ * round-trip time — the same columns `GET /trunks` already returns to anyone holding
+ * `trunks.read`. Gating "the same row, sooner" more tightly than the list would protect nothing
+ * while making the status pill disagree with the page under it; gating it more loosely would leak
+ * the carrier roster to roles that may not see it.
  *
  * `voicemail → voicemail.read` needs no argument at all, and that is the point of saying so: the
  * topic carries `voicemail.evt.v1.<org>.<mailbox>.mwi.updated`, whose whole payload is a mailbox
@@ -56,6 +64,8 @@ export const LIVE_TOPIC_KINDS = [
 	"queue",
 	"agent-state",
 	"voicemail",
+	"trunks",
+	"conferences",
 ] as const;
 export type LiveTopicKind = (typeof LIVE_TOPIC_KINDS)[number];
 
@@ -65,6 +75,8 @@ export type LiveTopic =
 	| { readonly kind: "active-calls" }
 	| { readonly kind: "agent-state" }
 	| { readonly kind: "voicemail" }
+	| { readonly kind: "trunks" }
+	| { readonly kind: "conferences" }
 	| { readonly kind: "queue"; readonly queueId: string };
 
 export const LIVE_TOPIC_PERMISSIONS = {
@@ -73,7 +85,31 @@ export const LIVE_TOPIC_PERMISSIONS = {
 	queue: "queues.monitor",
 	"agent-state": "queues.monitor",
 	voicemail: "voicemail.read",
+	trunks: "trunks.read",
+	conferences: "conferences.read",
 } as const satisfies Record<LiveTopicKind, Permission>;
+
+/**
+ * A SECOND grant that also opens a topic. Additive: the map above still says what each topic is
+ * primarily for, and nothing is taken away.
+ *
+ * One entry, and the argument for it is the softphone's recording indicator. `active-calls` is the
+ * wallboard's feed and `cdr.read` is the right gate for a wallboard — but it is also the ONLY
+ * producer of the recording state a softphone's pause control is drawn from (the engine writes
+ * `recording` / `recording-paused` onto the channel snapshot and nothing else carries them to a
+ * browser). So an agent who may reach INSIDE a live call — `calls.control`, exactly what
+ * `POST /calls/:id/recording/{pause,resume}` requires — but who may not read the call ledger saw no
+ * feed, and therefore no indicator and no pause button, over a recorder they are allowed to stop.
+ *
+ * That is not a widening worth arguing about: `calls.control` already lets its holder pause the
+ * recording of any call in the tenant by id. Being told which calls are live is strictly less.
+ * `cdr.read.own` is deliberately NOT here — `hasPermission`'s rule is that a scoped grant never
+ * covers an unscoped requirement, and there is no per-connection filter that could turn an
+ * org-wide live feed into "calls you were on".
+ */
+export const LIVE_TOPIC_ALTERNATE_PERMISSIONS: Partial<Record<LiveTopicKind, Permission>> = {
+	"active-calls": "calls.control",
+};
 
 /**
  * The upstream this server has to be reading for a topic to produce anything.
@@ -88,15 +124,28 @@ export const LIVE_SOURCES = [
 	"channels-kv",
 	"call-events",
 	"agent-state-kv",
+	"queue-waiting-kv",
 	"queue-events",
 	"voicemail-events",
+	"trunk-events",
+	"conference-claims-kv",
+	"conference-events",
 ] as const;
 export type LiveSource = (typeof LIVE_SOURCES)[number];
 
 export const LIVE_TOPIC_SOURCES = {
 	registrations: ["registrations-kv"],
 	"active-calls": ["channels-kv", "call-events"],
-	queue: ["queue-events", "agent-state-kv"],
+	/**
+	 * Three sources, and each answers a question the other two cannot.
+	 *
+	 * `queue-waiting-kv` is the LINE — who is holding, in what order, and since when — so a wallboard
+	 * gets waiting-count, positions and longest-wait from one snapshot frame and a watch, instead of
+	 * reconstructing them by replaying joins and abandonments it may have missed. `agent-state-kv` is
+	 * the roster's live half. `queue-events` is what CHANGED, which is what turns "an agent answered"
+	 * into a row that moves rather than a table that redraws.
+	 */
+	queue: ["queue-events", "agent-state-kv", "queue-waiting-kv"],
 	"agent-state": ["agent-state-kv", "queue-events"],
 	/**
 	 * One source, and no bucket behind it.
@@ -108,6 +157,33 @@ export const LIVE_TOPIC_SOURCES = {
 	 * number changed while somebody was looking at it.
 	 */
 	voicemail: ["voicemail-events"],
+	/**
+	 * One source, and no bucket behind it, on exactly the voicemail argument above: the current
+	 * statuses live in the `trunk.status*` columns and the trunk list has already fetched them
+	 * over HTTP. The stream is what tells an open page a carrier's status moved while somebody
+	 * was looking at it.
+	 */
+	trunks: ["trunk-events"],
+	/**
+	 * Two sources, on exactly the `active-calls` argument: a BUCKET says what IS and a STREAM says
+	 * what CHANGED, and a panel that had only the second would be blank until somebody moved.
+	 *
+	 * `conference-claims-kv` is the ROOMS. It is the value the engines already maintain to agree on a
+	 * room's bridge, and it happens to be a complete answer to "which meetings are running, how many
+	 * people are in each, has a moderator arrived, is it locked" — cluster-wide, because that is what
+	 * a claim is for. So a console opening mid-meeting gets a snapshot with no new writer anywhere.
+	 *
+	 * `conference-events` is the PARTICIPANTS. The claim deliberately does not name them (it is an
+	 * ownership record, and a member list in it would be written on every mute), so who is in the
+	 * room is assembled from `conference.joined` / `conference.left` and kept honest by
+	 * `conference.participant.updated`, which carries a member's whole state after every change.
+	 *
+	 * The cost is named rather than hidden: a console that connects mid-meeting sees the room and its
+	 * COUNT immediately and learns the participants as they move. Fixing that means a per-member
+	 * projection somebody has to write on every join and reap after every crash — see
+	 * `conference-control.client.ts` for why that price was not paid here either.
+	 */
+	conferences: ["conference-claims-kv", "conference-events"],
 } as const satisfies Record<LiveTopicKind, readonly LiveSource[]>;
 
 /** A UUID, which is what every queue id on this platform is (`packages/identifiers`). */
@@ -126,7 +202,9 @@ export function parseLiveTopic(value: string): LiveTopic | undefined {
 		value === "registrations" ||
 		value === "active-calls" ||
 		value === "agent-state" ||
-		value === "voicemail"
+		value === "voicemail" ||
+		value === "trunks" ||
+		value === "conferences"
 	) {
 		return { kind: value };
 	}
@@ -147,6 +225,14 @@ export function permissionForTopic(topic: LiveTopic): Permission {
 	return LIVE_TOPIC_PERMISSIONS[topic.kind];
 }
 
+/** Every grant that opens a topic: its own, plus the alternate where there is one. */
+function permissionsForTopicKind(kind: LiveTopicKind): readonly Permission[] {
+	const alternate = LIVE_TOPIC_ALTERNATE_PERMISSIONS[kind];
+	return alternate === undefined
+		? [LIVE_TOPIC_PERMISSIONS[kind]]
+		: [LIVE_TOPIC_PERMISSIONS[kind], alternate];
+}
+
 export function sourcesForTopic(topic: LiveTopic): readonly LiveSource[] {
 	return LIVE_TOPIC_SOURCES[topic.kind];
 }
@@ -160,10 +246,16 @@ export function sourcesForTopic(topic: LiveTopic): readonly LiveSource[] {
  * filter that could turn an org-wide live feed into that.
  */
 export function mayReadTopic(granted: Iterable<string>, topic: LiveTopic): boolean {
-	return hasPermission(granted, permissionForTopic(topic));
+	const grants = [...granted];
+	return permissionsForTopicKind(topic.kind).some((permission) =>
+		hasPermission(grants, permission),
+	);
 }
 
 /** The topics a caller could subscribe to at all, for the `welcome` frame. */
 export function allowedTopicKinds(granted: Iterable<string>): readonly LiveTopicKind[] {
-	return LIVE_TOPIC_KINDS.filter((kind) => hasPermission(granted, LIVE_TOPIC_PERMISSIONS[kind]));
+	const grants = [...granted];
+	return LIVE_TOPIC_KINDS.filter((kind) =>
+		permissionsForTopicKind(kind).some((permission) => hasPermission(grants, permission)),
+	);
 }

@@ -158,6 +158,27 @@ export const ariEndpointSchema = z.object({
 
 export type AriEndpoint = z.infer<typeof ariEndpointSchema>;
 
+/**
+ * `Peer` — the qualify verdict rider on a `PeerStatusChange` event.
+ *
+ * `peer_status` is `Reachable` / `Unreachable` / `Unknown` / `Created` / `Removed` for PJSIP (and
+ * `Lagged` for the drivers that report one). It defaults to the empty string rather than being
+ * required because Asterisk's channel drivers do not all agree on which rider fields accompany
+ * which transition, and a strict parse here would turn a driver quirk into a dropped event — the
+ * mapping above this seam already treats an unrecognised word as "unknown", which is the honest
+ * reading of a peer that said nothing.
+ */
+export const ariPeerSchema = z.object({
+	peer_status: z.string().default(""),
+	cause: z.string().optional(),
+	address: z.string().optional(),
+	port: z.string().optional(),
+	/** The qualify round-trip, in milliseconds, as a string — when the driver measured one. */
+	time: z.string().optional(),
+});
+
+export type AriPeer = z.infer<typeof ariPeerSchema>;
+
 /** `DeviceState` — `NOT_INUSE`, `INUSE`, `BUSY`, `RINGING`, `UNAVAILABLE`, … */
 export const ariDeviceStateSchema = z.object({
 	name: z.string().min(1),

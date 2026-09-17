@@ -53,6 +53,16 @@ export interface SipTransferCallPath {
 	 * all the SIP edge has: it is a registrar, not a B2BUA, and it is not in the media path.
 	 */
 	resolveDialog(request: SipTransferRequest): Promise<string | undefined>;
+	/**
+	 * Resolve the dialog a `Replaces` NAMED — the consultation the transferor is holding — onto the
+	 * media channel carrying it.
+	 *
+	 * Separate from {@link resolveDialog} because it answers about a different call, and OPTIONAL
+	 * because a call path that cannot resolve one is a call path that cannot honour an attended
+	 * transfer at all: absent, every `Replaces` is still refused `attended_unsupported`, which is
+	 * what this responder did before either of these existed.
+	 */
+	resolveReplacedDialog?(request: SipTransferRequest): Promise<string | undefined>;
 	/** The orchestrator's own index. `CallControlBinding.legFor`, unchanged. */
 	legFor(mediaChannelId: string): ControlledLeg | undefined;
 	/**
@@ -71,6 +81,18 @@ export interface SipTransferCallPath {
 	isDialableTarget?(leg: ControlledLeg, destination: string): Promise<boolean>;
 	/** `CallControlPort.transfer`, unchanged. This responder adds no transfer semantics of its own. */
 	transfer(leg: ControlledLeg, request: TransferRequest): Promise<CallControlResult>;
+	/**
+	 * `CallControlPort.completeAttendedRefer` — join the two calls the transferor is holding.
+	 *
+	 * Optional for the same reason {@link resolveReplacedDialog} is, and the two travel together: a
+	 * call path that supplies one and not the other cannot complete an attended transfer either, and
+	 * is answered `attended_unsupported` exactly as an unattached one is.
+	 */
+	completeAttendedTransfer?(
+		transferor: ControlledLeg,
+		consultation: ControlledLeg,
+		destination: string,
+	): Promise<CallControlResult>;
 }
 
 /**
@@ -205,13 +227,15 @@ export class SipTransferService implements OnApplicationBootstrap, OnApplication
 			return this.refuse(request.sipCallId, "shutting_down", "this engine instance is draining");
 		}
 
-		// Checked before anything is resolved, because the answer does not depend on the dialog: this
-		// engine cannot join two dialogs it never brokered, whichever call the Call-ID names.
-		if (request.kind === "attended" || request.replaces !== undefined) {
+		const attended = request.kind === "attended" || request.replaces !== undefined;
+		if (attended && request.replaces === undefined) {
+			// RFC 3891 is the whole of what makes an attended transfer nameable. A REFER that says it
+			// is attended and carries no `Replaces` names no consultation, so there is nothing to join
+			// and nothing to guess.
 			return this.refuse(
 				request.sipCallId,
-				"attended_unsupported",
-				"this engine cannot honour a Replaces from a consultation it did not broker",
+				"bad_request",
+				"an attended transfer carried no Replaces, so it names no consultation",
 			);
 		}
 
@@ -221,6 +245,19 @@ export class SipTransferService implements OnApplicationBootstrap, OnApplication
 				request.sipCallId,
 				"correlation_unavailable",
 				"no call path is attached to this instance, so it cannot look a SIP Call-ID up at all",
+			);
+		}
+		// Checked before anything is resolved, because the answer does not depend on the dialog: a
+		// call path that cannot resolve a `Replaces` cannot honour one, whichever call it names.
+		if (
+			attended &&
+			(callPath.resolveReplacedDialog === undefined ||
+				callPath.completeAttendedTransfer === undefined)
+		) {
+			return this.refuse(
+				request.sipCallId,
+				"attended_unsupported",
+				"this call path cannot join the two dialogs a Replaces names",
 			);
 		}
 
@@ -267,6 +304,10 @@ export class SipTransferService implements OnApplicationBootstrap, OnApplication
 			);
 		}
 
+		if (attended) {
+			return await this.completeAttended(request, callPath, leg);
+		}
+
 		// Last, after the leg is known to be ours and the referrer's: resolving a destination reads the
 		// tenant's compiled artifact, and doing that for a Call-ID that turned out to belong to
 		// somebody else would let an unauthorised request probe another tenant's dial plan by timing.
@@ -311,6 +352,129 @@ export class SipTransferService implements OnApplicationBootstrap, OnApplication
 				referredBy: request.referredBy.username,
 			},
 			"transferred a call on a desk phone's REFER",
+		);
+		return {
+			ok: true,
+			sipCallId: request.sipCallId,
+			instanceId: this.env.ENGINE_INSTANCE_ID,
+			legId: leg.legId,
+			callId: leg.callId,
+			destination: request.target.user,
+		};
+	}
+
+	/**
+	 * The attended half: resolve the consultation the `Replaces` named, authorise it on its own
+	 * terms, and ask the call path to join the two calls.
+	 *
+	 * ## What authorises this, given the engine cannot match the tags
+	 *
+	 * RFC 3891's model is that the `Replaces` triple is a shared secret, and the process that can
+	 * match all three is `apps/sipd` — the engine indexes a `Call-ID` and nothing else, which
+	 * `authorizeInviteReplaces` in the orchestrator says at length. On THIS path the engine does not
+	 * need the triple, because it has something stronger: the REFER was digest-authenticated at the
+	 * edge, and the referrer is checked to be a party to BOTH calls — the one being transferred and
+	 * the consultation being handed over. A phone that guessed a `Call-ID` it is not on is refused by
+	 * that check, tags or no tags.
+	 *
+	 * `isDialableTarget` is deliberately NOT consulted. A blind transfer dials the `Refer-To` and a
+	 * destination that resolves to nothing costs the caller their call; here the target is already
+	 * answered and talking, so the dial plan has no say in whether the two may be joined, and asking
+	 * it would refuse a legitimate transfer to anything that is reachable but not dialable.
+	 */
+	private async completeAttended(
+		request: SipTransferRequest,
+		callPath: SipTransferCallPath,
+		leg: ControlledLeg,
+	): Promise<SipTransferResponse> {
+		const replaces = request.replaces;
+		const resolveReplaced = callPath.resolveReplacedDialog;
+		const complete = callPath.completeAttendedTransfer;
+		if (replaces === undefined || resolveReplaced === undefined || complete === undefined) {
+			// Unreachable: `answer` refuses both of these before it gets here. Narrowed rather than
+			// asserted, because an assertion on this path would end the subscription loop.
+			return this.refuse(request.sipCallId, "attended_unsupported", "no attended transfer path");
+		}
+
+		let consultationMediaChannelId: string | undefined;
+		try {
+			consultationMediaChannelId = await resolveReplaced(request);
+		} catch (error) {
+			this.logger.error({ err: String(error) }, "resolving a replaced sip dialog threw");
+			return this.refuse(request.sipCallId, "internal", String(error), leg);
+		}
+		if (consultationMediaChannelId === undefined) {
+			return this.refuse(
+				request.sipCallId,
+				"unknown_dialog",
+				"no live call on this instance matches the Call-ID the Replaces named",
+				leg,
+			);
+		}
+
+		const consultation = callPath.legFor(consultationMediaChannelId);
+		if (consultation === undefined || consultation.isTearingDown) {
+			// The ordinary race: the consulted party hung up between the phone sending the REFER and
+			// this request being served. The original call is untouched, and the phone can consult
+			// again.
+			return this.refuse(
+				request.sipCallId,
+				"channel_gone",
+				"the consultation ended before the transfer could be completed",
+				leg,
+			);
+		}
+		if (consultation.organizationId !== request.orgId) {
+			return this.refuse(
+				request.sipCallId,
+				"not_permitted",
+				"the consultation belongs to another organization",
+				leg,
+			);
+		}
+		if (!isReferrerOnLeg(consultation, request.referredBy.username)) {
+			return this.refuse(
+				request.sipCallId,
+				"not_permitted",
+				"the referrer is not a party to the consultation",
+				leg,
+			);
+		}
+		if (replaces.earlyOnly && consultation.isAnswered) {
+			// RFC 3891 §3. The same rule the INVITE path honours, and for the same reason: a phone
+			// that said "only if it has not connected" must not have a confirmed call replaced by a
+			// race it lost.
+			return this.refuse(
+				request.sipCallId,
+				"not_permitted",
+				"the Replaces carried early-only and the dialog it named is already confirmed",
+				leg,
+			);
+		}
+
+		let result: CallControlResult;
+		try {
+			result = await complete(leg, consultation, request.target.user);
+		} catch (error) {
+			this.logger.error({ err: String(error) }, "an attended sip transfer threw");
+			return this.refuse(request.sipCallId, "internal", String(error), leg);
+		}
+		if (!result.ok) {
+			// Every refusal from the call path leaves both calls up. `transfer_failed` is the reason
+			// the edge turns into a failing NOTIFY, which is what puts the transferring phone back in
+			// charge of a consultation it is still on.
+			return this.refuse(request.sipCallId, "transfer_failed", result.reason, leg);
+		}
+
+		this.logger.info(
+			{
+				sipCallId: request.sipCallId,
+				legId: leg.legId,
+				consultationLegId: consultation.legId,
+				destination: request.target.user,
+				referredBy: request.referredBy.username,
+			},
+			"completed an attended transfer on a phone's REFER with Replaces",
 		);
 		return {
 			ok: true,

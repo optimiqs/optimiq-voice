@@ -223,10 +223,56 @@ describe("a code dialled alone", () => {
 		expect(m.state).toBe("executing");
 	});
 
-	it("asks for no timer once it is executing", () => {
-		const m = machine();
+	/**
+	 * `executing` is left only via `settle` or `cancel`, so an engine that lost the `settle()` — a
+	 * transfer whose routing walk threw, a fiber killed mid-action — would swallow every digit that
+	 * party pressed for the rest of the call. A step that leaves the machine mid-capture carries a
+	 * `wakeAtMs`, this one included.
+	 */
+	it("asks for a watchdog timer while it is executing", () => {
+		const m = machine(VANILLA, { executionTimeoutMs: 500 });
+		const fired = press(m, "*3")[1];
+		expect(fired?.wakeAtMs).toBe(501);
+		expect(m.push("7", 2).wakeAtMs).toBe(501);
+	});
+
+	it("returns itself to idle when the engine never settles", () => {
+		const m = machine(VANILLA, { executionTimeoutMs: 500 });
 		press(m, "*3");
-		expect(m.push("7", 2).wakeAtMs).toBeUndefined();
+		const expired = m.expire(600);
+		expect(expired.kind).toBe("abandoned");
+		expect(m.state).toBe("idle");
+		// And the next digit reaches the far end rather than vanishing.
+		expect(m.push("7", 601).kind).toBe("pass-through");
+	});
+
+	/**
+	 * With `*1` and `*12` both in the table, `*1` arms without firing because `*12` is still live.
+	 * A third digit matching neither used to abandon the whole capture — discarding a code that had
+	 * already matched exactly. The record toggle never ran and the `3` never reached the far end.
+	 */
+	it("fires the complete code it already matched when the next digit cannot extend it", () => {
+		const m = machine([
+			{ code: "*1", action: "record-toggle" },
+			{ code: "*12", action: "park" },
+		]);
+		expect(m.push("*", 0).kind).toBe("captured");
+		expect(m.push("1", 1).kind).toBe("captured");
+		const fired = m.push("3", 2);
+		expect(fired.kind).toBe("execute");
+		expect(fired.execution).toEqual({ action: "record-toggle", code: "*1", argument: "" });
+		expect(fired.passThrough).toBe("3");
+	});
+
+	it("still abandons when nothing complete was ever matched", () => {
+		const m = machine([
+			{ code: "*1", action: "record-toggle" },
+			{ code: "*12", action: "park" },
+		]);
+		press(m, "*");
+		const abandoned = m.push("9", 1);
+		expect(abandoned.kind).toBe("abandoned");
+		expect(abandoned.swallowed).toBe("*9");
 	});
 
 	it("swallows the digits pressed while the engine is still running the action", () => {

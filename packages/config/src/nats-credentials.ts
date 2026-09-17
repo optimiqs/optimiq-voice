@@ -226,6 +226,10 @@ export function natsTlsOptions(source: NatsCredentialSource): NatsTlsOptions {
 export function natsConnectionOptions(
 	source: NatsCredentialSource,
 	service?: NatsServiceName,
-): NatsClientCredentials & NatsTlsOptions {
-	return { ...natsCredentials(source, service), ...natsTlsOptions(source) };
+): NatsClientCredentials & NatsTlsOptions & { readonly inboxPrefix?: string } {
+	return {
+		...natsCredentials(source, service),
+		...natsTlsOptions(source),
+		...(service === undefined ? {} : { inboxPrefix: "_INBOX." + service }),
+	};
 }

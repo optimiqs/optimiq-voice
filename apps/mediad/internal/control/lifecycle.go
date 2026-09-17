@@ -10,36 +10,44 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/directory"
 	mediaevents "github.com/optimiqs/optimiq-voice/apps/mediad/internal/events"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
+	"github.com/optimiqs/optimiq-voice/packages/runtime-go/ackpub"
 )
 
 // LifecycleAnnouncer is the TELL half of the media contract: it turns the packet path's session
 // transitions into `media.evt.v1.*` events and cleans the session directory behind them.
 //
-// # Why it is a separate type from Server
+// It is separate from Server because the two run on different threads: a handler runs on a NATS
+// callback with its caller waiting, while an announcement runs from the reaper or a drain with
+// nobody waiting, so the announcement path can take a two-second publish deadline.
 //
-// The Server answers questions; this announces facts, and they run on different threads for
-// different reasons. A handler runs on a NATS callback and its caller is waiting; an announcement
-// runs from the reaper or a drain and nobody is. Keeping them apart is what lets the announcement
-// path take a two-second publish deadline without any chance of that deadline landing inside a call
-// setup.
-//
-// # Why publishing is asynchronous
-//
-// `rtp.Manager` calls Lifecycle from the goroutine that is tearing a session down — the reaper's,
-// or Drain's. A JetStream publish is a round trip to a broker that may be exactly the thing that has
-// gone wrong, so doing it inline would let a sick broker stall a drain, which turns one failure into
-// two. The publish is handed to a goroutine and the teardown continues.
-//
-// The ordering guarantee that matters is preserved anyway: `session.rtp-timeout` is published from
-// the same sequence as, and before, the `session.ended` that follows it, and both carry the session
-// id, so a consumer that receives them out of order can still make sense of them. JetStream's
-// per-subject ordering does the rest, since both land on the same subject prefix.
+// Publishing is asynchronous because rtp.Manager calls this from the goroutine tearing a session
+// down; an inline round trip would let a sick broker stall a drain. Order is preserved per SESSION
+// rather than per goroutine (see ackpub): `recording.finished` reaches the broker before the
+// `session.ended` that follows it, and two DTMF digits reach it in the order they were pressed.
 type LifecycleAnnouncer struct {
 	publisher  mediaevents.Publisher
 	dir        directory.Store
 	log        *slog.Logger
 	instanceID string
+
+	// events orders and retries the publishes. It is what a shutdown waits on: otherwise the process
+	// exits under publishes that never reached the broker, losing the `session.ended` for every
+	// drained call.
+	events *ackpub.Publisher
 }
+
+// The publisher's capacity. Concurrency bounds how many publishes talk to the broker at once — a
+// mass reap otherwise puts hundreds of concurrent JetStream publishes on a broker that is quite
+// possibly already unwell — and the pending limits bound what waits behind them.
+const (
+	lifecyclePublishConcurrency = 8
+	lifecyclePendingEvents      = 4096
+	lifecyclePendingPerSession  = 64
+	// lifecyclePublishAttempts and lifecyclePublishBackoff apply to CRITICAL events only: the ones a
+	// consumer's workflow is blocked on. Telemetry is attempted once.
+	lifecyclePublishAttempts = 3
+	lifecyclePublishBackoff  = 200 * time.Millisecond
+)
 
 var _ rtp.Lifecycle = (*LifecycleAnnouncer)(nil)
 
@@ -54,23 +62,74 @@ func NewLifecycleAnnouncer(
 	if log == nil {
 		log = slog.Default()
 	}
-	return &LifecycleAnnouncer{publisher: publisher, dir: dir, log: log, instanceID: instanceID}
+	events, err := ackpub.New(ackpub.Options{
+		MaxConcurrent:    lifecyclePublishConcurrency,
+		MaxPending:       lifecyclePendingEvents,
+		MaxPendingPerKey: lifecyclePendingPerSession,
+		Timeout:          mediaevents.PublishTimeout,
+		Attempts:         lifecyclePublishAttempts,
+		Backoff:          lifecyclePublishBackoff,
+		Logger:           log,
+	})
+	if err != nil {
+		// Only a non-positive limit reaches this, which would be a constant edited to zero.
+		panic("control: " + err.Error())
+	}
+	return &LifecycleAnnouncer{
+		publisher:  publisher,
+		dir:        dir,
+		log:        log,
+		instanceID: instanceID,
+		events:     events,
+	}
+}
+
+// publishAsync hands a publish over, ordered behind this session's earlier events and bounded by
+// the publisher's capacity.
+//
+// The hand-off itself never blocks the caller, which is the whole point: this runs on the goroutine
+// tearing a session down, and a sick broker must not be able to stall a drain. eventID is the
+// envelope's own id and stays the same across a retry, so a re-delivered critical event lands in
+// JetStream's duplicate window rather than twice in the call's history.
+func (a *LifecycleAnnouncer) publishAsync(
+	do func(context.Context) error,
+	eventType, sessionID, eventID string,
+	critical bool,
+) {
+	err := a.events.Publish(ackpub.Event{
+		ID:       eventID,
+		Key:      sessionID,
+		Type:     eventType,
+		Critical: critical,
+		Publish:  do,
+	})
+	if err != nil {
+		a.log.Error("dropping a media lifecycle event at admission",
+			"type", eventType, "sessionId", sessionID, "eventId", eventID, "error", err)
+	}
+}
+
+// Wait closes admission and blocks until every handed-off publish has finished or the context
+// expires, reporting whether they all finished. Called on shutdown, after the manager has drained
+// and before the NATS connection goes away — closing admission here is what stops a late announcer
+// from outrunning the drain.
+func (a *LifecycleAnnouncer) Wait(ctx context.Context) bool {
+	a.events.Close()
+	return a.events.Wait(ctx)
 }
 
 // SessionEnded publishes `session.ended` and removes the directory entry.
 //
-// The directory delete happens here as well as in the release handler, and that is not redundancy
-// for its own sake: a session can end WITHOUT a release — an RTP timeout, the idle reaper, a drain —
-// and every one of those paths would otherwise leave an entry pointing at a session that no longer
-// exists. The release handler's delete stays because a release for a session this instance never
-// had must still clear a stale entry, which this path never sees.
+// The directory delete happens here as well as in the release handler: a session can end WITHOUT a
+// release — an RTP timeout, the idle reaper, a drain — and each of those would otherwise leave an
+// entry pointing at a session that no longer exists. The release handler's delete stays because a
+// release for a session this instance never had must still clear a stale entry.
 func (a *LifecycleAnnouncer) SessionEnded(session rtp.SessionSummary, reason rtp.EndReason) {
 	a.forget(session.SessionID)
 
 	if a.publisher == nil || session.OrgID == "" {
-		// No org means no subject to publish on. It cannot happen through the control surface,
-		// which refuses an allocate without one; it can happen in a test, and silently dropping is
-		// better than building a subject with an empty token.
+		// No org means no subject to publish on. Unreachable through the control surface, which refuses
+		// an allocate without one; dropping silently beats building a subject with an empty token.
 		return
 	}
 
@@ -81,6 +140,7 @@ func (a *LifecycleAnnouncer) SessionEnded(session rtp.SessionSummary, reason rtp
 		return
 	}
 
+	quality := qualityOf(session.Quality)
 	data := contract.MediaSessionEndedData{
 		SessionID:       session.SessionID,
 		InstanceID:      a.instanceID,
@@ -91,9 +151,10 @@ func (a *LifecycleAnnouncer) SessionEnded(session rtp.SessionSummary, reason rtp
 		PacketsSent:     int(session.Stats.PacketsSent),
 		Reason:          contract.MediaSessionEndedReason(reason),
 		DurationMs:      int(session.Duration.Milliseconds()),
+		Quality:         &quality,
 	}
 
-	go a.publish(func(ctx context.Context) error {
+	a.publishAsync(func(ctx context.Context) error {
 		return a.publisher.SessionEnded(ctx, contract.Envelope[contract.MediaSessionEndedData]{
 			ID:      envelope.id,
 			At:      envelope.at,
@@ -103,7 +164,26 @@ func (a *LifecycleAnnouncer) SessionEnded(session rtp.SessionSummary, reason rtp
 			Source:  mediaevents.Source,
 			Data:    data,
 		})
-	}, "session.ended", session.SessionID)
+	}, "session.ended", session.SessionID, envelope.id, true)
+}
+
+// qualityOf carries the RTCP view of a leg onto the wire.
+//
+// The struct is ALWAYS sent, never elided on all-zeroes: `reportsReceived: 0` is a fact about the
+// ENDPOINT — it sends no RTCP — and differs from the field being absent, which is what a media plane
+// with no RTCP at all produces.
+func qualityOf(quality rtp.QualityStats) contract.MediaSessionEndedQuality {
+	return contract.MediaSessionEndedQuality{
+		InboundJitterMs:      quality.InboundJitterMs,
+		ReportedLossFraction: quality.ReportedLossFraction,
+		ReportedLossTotal:    int(quality.ReportedLossTotal),
+		ReportedJitterMs:     quality.ReportedJitterMs,
+		RoundTripMs:          quality.RoundTripMs,
+		ReportsReceived:      int(quality.ReportsReceived),
+		ReportsSent:          int(quality.ReportsSent),
+		Malformed:            int(quality.Malformed),
+		LastReportUnixMs:     int(quality.LastReportUnixMs),
+	}
 }
 
 // RTPTimedOut publishes `session.rtp-timeout`.
@@ -134,7 +214,7 @@ func (a *LifecycleAnnouncer) RTPTimedOut(session rtp.SessionSummary, silentFor t
 		RemoteAddress:   stringPtr(session.RemoteAddr),
 	}
 
-	go a.publish(func(ctx context.Context) error {
+	a.publishAsync(func(ctx context.Context) error {
 		return a.publisher.SessionRTPTimeout(ctx,
 			contract.Envelope[contract.MediaSessionRTPTimeoutData]{
 				ID:      envelope.id,
@@ -145,26 +225,17 @@ func (a *LifecycleAnnouncer) RTPTimedOut(session rtp.SessionSummary, silentFor t
 				Source:  mediaevents.Source,
 				Data:    data,
 			})
-	}, "session.rtp-timeout", session.SessionID)
+	}, "session.rtp-timeout", session.SessionID, envelope.id, false)
 }
 
 // PlaybackFinished publishes `playback.finished`.
 //
-// # Why this is announced at all, when nothing branches on it
+// Nothing branches on it: `MediaPort.play` returns the moment audio starts and the engine's
+// `MediaEvent` union has no playback member. It is published for the `error` reason — a failed
+// playback is a caller sitting in silence on an otherwise healthy call, and nothing else on this
+// backbone records that.
 //
-// The engine does not act on it: `MediaPort.play` returns the moment audio STARTS, the twelve-member
-// `MediaEvent` union has no playback member, and `mediad-event-mapping.ts` answers `undefined` for
-// this type — exactly as the ARI path drops `PlaybackFinished`. Adding a union member nobody
-// branches on would be making two media planes agree on a shape for no reason.
-//
-// It is published because of the `error` reason. A playback that fails is a caller sitting in
-// silence where a menu should be, on a call that is otherwise perfectly healthy: the command already
-// answered `ok`, the session is still up, and nothing else on this backbone records it. This is the
-// same argument that makes `session.rtp-timeout` worth publishing while mapping to nothing.
-//
-// It does NOT touch the session directory. A prompt ending is not a session ending, and deleting
-// the entry here would make the leg uncommandable from a neighbouring instance the moment its
-// greeting finished.
+// It does NOT touch the session directory: a prompt ending is not a session ending.
 func (a *LifecycleAnnouncer) PlaybackFinished(
 	session rtp.SessionSummary,
 	playback rtp.PlaybackSummary,
@@ -191,7 +262,7 @@ func (a *LifecycleAnnouncer) PlaybackFinished(
 		Detail:      stringPtr(playback.Detail),
 	}
 
-	go a.publish(func(ctx context.Context) error {
+	a.publishAsync(func(ctx context.Context) error {
 		return a.publisher.PlaybackFinished(ctx,
 			contract.Envelope[contract.MediaPlaybackFinishedData]{
 				ID:      envelope.id,
@@ -202,27 +273,20 @@ func (a *LifecycleAnnouncer) PlaybackFinished(
 				Source:  mediaevents.Source,
 				Data:    data,
 			})
-	}, "playback.finished", session.SessionID)
+	}, "playback.finished", session.SessionID, envelope.id, false)
 }
 
 // RecordingFinished publishes `recording.finished`.
 //
-// # The one media event above this seam that is actually branched on
+// Unlike the other lifecycle events, the engine BLOCKS on this one: `plan-walker`'s voicemail node
+// and `call-control`'s on-demand recording wait for the file before publishing
+// `channel.record.stopped`, and `apps/api`'s archiver copies the object once that lands.
 //
-// `session.rtp-timeout` and `playback.finished` map to nothing in the engine's `MediaEvent` union.
-// This one maps to two members — `recording-finished` and, for `reason: error`, `recording-failed` —
-// because the engine BLOCKS on it: `plan-walker`'s voicemail node and `call-control`'s on-demand
-// recording both wait for the file before they publish `channel.record.stopped`, and `apps/api`'s
-// archiver copies the object the moment that lands.
+// So the packet path calls this only AFTER the WAV header has been patched with the real lengths,
+// the bytes fsynced and the file renamed from its `.partial` name into the object key. A moment
+// earlier archives a file that is still being written.
 //
-// Which is why the packet path calls this only AFTER the WAV header has been patched with the real
-// lengths, the bytes fsynced and the file renamed from its `.partial` name into the object key. An
-// event published a moment earlier archives a file that is still being written — a truncated
-// recording nobody discovers until somebody plays it back weeks later.
-//
-// It does NOT touch the session directory. A recording ending is not a session ending, and deleting
-// the entry here would make the leg uncommandable from a neighbouring instance the moment it
-// stopped being recorded.
+// It does NOT touch the session directory: a recording ending is not a session ending.
 func (a *LifecycleAnnouncer) RecordingFinished(
 	session rtp.SessionSummary,
 	recording rtp.RecordingSummary,
@@ -249,10 +313,11 @@ func (a *LifecycleAnnouncer) RecordingFinished(
 		Bytes:        int(recording.Bytes),
 		ObjectKey:    recording.ObjectKey,
 		Direction:    contract.MediaRecordingFinishedDirection(recording.Direction),
+		Pauses:       recordingPauses(recording.Pauses),
 		Detail:       stringPtr(recording.Detail),
 	}
 
-	go a.publish(func(ctx context.Context) error {
+	a.publishAsync(func(ctx context.Context) error {
 		return a.publisher.RecordingFinished(ctx,
 			contract.Envelope[contract.MediaRecordingFinishedData]{
 				ID:      envelope.id,
@@ -263,25 +328,36 @@ func (a *LifecycleAnnouncer) RecordingFinished(
 				Source:  mediaevents.Source,
 				Data:    data,
 			})
-	}, "recording.finished", session.SessionID)
+	}, "recording.finished", session.SessionID, envelope.id, true)
 }
 
-// DtmfReceived publishes `dtmf.received`.
+// recordingPauses is the PCI half of the payload: every stretch `pause-recording` silenced, against
+// the file's own timeline. Nil when nothing was paused, so the field is absent on the wire rather
+// than an empty array — the two mean the same thing and one of them is smaller.
+func recordingPauses(pauses []rtp.RecordingPause) []contract.MediaRecordingFinishedPauses {
+	if len(pauses) == 0 {
+		return nil
+	}
+	out := make([]contract.MediaRecordingFinishedPauses, 0, len(pauses))
+	for _, pause := range pauses {
+		out = append(out, contract.MediaRecordingFinishedPauses{
+			StartMs: pause.StartMs,
+			EndMs:   pause.EndMs,
+		})
+	}
+	return out
+}
+
+// DtmfReceived publishes `dtmf.received`, one event per KEYPRESS.
 //
-// # One event per KEYPRESS, and the de-duplication is below this line
+// RFC 4733 sends a digit as an update packet every 20 ms plus three copies of the END packet, so the
+// packet path collapses them (see `rtp.dtmfDetector`) before this is called. Publishing per packet
+// would put the de-duplication in every consumer, and the first to get it wrong is a `gather` that
+// fills a four-digit PIN from one press.
 //
-// RFC 4733 sends a digit as an update packet every 20 ms plus three copies of the END packet, so
-// the packet path decodes and collapses them (see `rtp.dtmfDetector`) and this method is handed the
-// digit. Publishing per packet would put the de-duplication in every consumer, and the first one to
-// get it wrong is a `gather` that fills a four-digit PIN from one press.
-//
-// # Why it is announced at all, when a bridged digit already reaches the far end
-//
-// Because the engine is not the far end. A relayed telephone-event packet is heard by the peer LEG;
-// this event is what tells the ORCHESTRATOR a key was pressed, which is how the confirmation IVR
-// answers "press 1 to accept", how feature codes are collected, and how a `gather` terminates. The
-// two are independent by design: the relay continues untouched while this fires, exactly as ARI
-// raises `ChannelDtmfReceived` on a channel that is happily bridged.
+// A relayed telephone-event packet is heard by the peer LEG; this event is what tells the
+// ORCHESTRATOR a key was pressed, which is how a confirmation IVR and feature codes work. The two
+// are independent: the relay continues untouched while this fires.
 //
 // It does NOT touch the session directory. A keypress is not a session ending.
 func (a *LifecycleAnnouncer) DtmfReceived(session rtp.SessionSummary, digit rtp.DtmfDigit) {
@@ -305,7 +381,7 @@ func (a *LifecycleAnnouncer) DtmfReceived(session rtp.SessionSummary, digit rtp.
 		DurationMs: digit.DurationMs,
 	}
 
-	go a.publish(func(ctx context.Context) error {
+	a.publishAsync(func(ctx context.Context) error {
 		return a.publisher.DtmfReceived(ctx, contract.Envelope[contract.MediaDtmfReceivedData]{
 			ID:      envelope.id,
 			At:      envelope.at,
@@ -315,7 +391,7 @@ func (a *LifecycleAnnouncer) DtmfReceived(session rtp.SessionSummary, digit rtp.
 			Source:  mediaevents.Source,
 			Data:    data,
 		})
-	}, "dtmf.received", session.SessionID)
+	}, "dtmf.received", session.SessionID, envelope.id, true)
 }
 
 // envelopeHeader is the three values every envelope needs that are derived rather than copied.
@@ -338,21 +414,6 @@ func (a *LifecycleAnnouncer) envelope(
 		at:      contract.NewEventTime(time.Now()),
 		subject: subject,
 	}, nil
-}
-
-// publish runs one publish under a bounded deadline and logs a failure rather than retrying.
-//
-// No retry, deliberately. These events describe something that has ALREADY happened to a call that
-// is already over; a retry loop would keep a goroutine alive per failed publish exactly when the
-// broker is struggling, and JetStream's own duplicate window already handles the case where the
-// publish succeeded and the ack was lost.
-func (a *LifecycleAnnouncer) publish(do func(context.Context) error, eventType, sessionID string) {
-	ctx, cancel := context.WithTimeout(context.Background(), mediaevents.PublishTimeout)
-	defer cancel()
-	if err := do(ctx); err != nil {
-		a.log.Warn("cannot publish a media lifecycle event",
-			"type", eventType, "sessionId", sessionID, "error", err)
-	}
 }
 
 // forget removes a session's directory entry, best effort.

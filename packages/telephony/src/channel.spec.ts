@@ -41,6 +41,13 @@ describe("channel shape", () => {
 			"proxy-mode",
 			"proxy-media",
 			"video",
+			// The recording pair is not in the reference document — it is this platform's own, and it
+			// is what carries a live call's recording state to a surface outside the engine. Pinned
+			// here because `LIVE_CHANNEL_RECORDING_FLAGS` in `@optimiq-voice/events` copies both
+			// strings rather than importing them, and a rename that missed the copy would silently
+			// stop every softphone showing the PCI pause.
+			"recording",
+			"recording-paused",
 		] as const) {
 			expect(CHANNEL_FLAGS).toContain(flag);
 		}

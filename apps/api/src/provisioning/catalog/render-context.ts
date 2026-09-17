@@ -46,6 +46,24 @@ export interface RenderKey {
 	readonly lineNumber: number;
 }
 
+/**
+ * A handset's dispatchable location, resolved.
+ *
+ * Both halves are carried, not just the formatted line: `addressId` is what an admin UI links to,
+ * `detail` is the part the person at the desk wrote and the part they will want to correct, and
+ * `validated` is the honest statement that the address behind it has (or has not) been checked by
+ * the upstream provider. A single string would make all three unreadable to a client.
+ */
+export interface DispatchableLocation {
+	readonly addressId: string | null;
+	/** Every part on one line, address detail then desk detail. Never empty when this exists. */
+	readonly formatted: string;
+	/** `device.emergency_location_detail` on its own — "Floor 3, desk by the window". */
+	readonly detail: string | null;
+	/** Whether the upstream provider validated the address. `false` is shown, never suppressed. */
+	readonly validated: boolean;
+}
+
 export interface RenderContext {
 	readonly organizationId: string;
 	readonly deviceId: string;
@@ -66,6 +84,17 @@ export interface RenderContext {
 	readonly settings: ProvisioningSettings;
 	/** The SIP domain accounts register into. Used where a vendor wants a full AOR. */
 	readonly sipDomain: string;
+	/**
+	 * Where this handset physically is — the RAY BAUM'S dispatchable location, already formatted.
+	 *
+	 * `undefined` means the device carries no location of its own, which is the ordinary state: the
+	 * dispatch then falls back to the extension's number and the DID, as it always did. No desk-phone
+	 * template consumes this yet — a vendor `.cfg` has nowhere to put a street address — and it is in
+	 * the context because the SOFTPHONE payload does: a browser client is the one endpoint that can
+	 * show a user which address a 911 call from it will produce, which is the check §9.8 assumes
+	 * somebody has made and which nothing in this product previously made possible.
+	 */
+	readonly dispatchableLocation: DispatchableLocation | undefined;
 	/**
 	 * The absolute URL this configuration was fetched from, when the deployment knows its own
 	 * public base.

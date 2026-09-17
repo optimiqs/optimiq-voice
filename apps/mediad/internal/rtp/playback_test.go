@@ -14,19 +14,14 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 )
 
-// The playback suite drives REAL sockets, for the same reason the bridge suite does: a prompt is
-// bytes on a wire with a header on them, and a test with a fake socket asserts that a method was
-// called — which is exactly the assertion that stays green when the header is wrong.
-//
-// What it does NOT do is sleep. The pacing clock is injected, so a test steps a prompt frame by
-// frame and every assertion lands at a defined point rather than after a timeout somebody tuned.
+// The playback suite drives real sockets, because a prompt is bytes on a wire with a header on them.
+// It never sleeps: the pacing clock is injected, so a test steps a prompt frame by frame.
 
 // playbackRig is a bridged pair plus a hand-driven 20 ms clock.
 type playbackRig struct {
 	*bridgeRig
-	// ticks is UNBUFFERED, which is what makes the suite deterministic: a send blocks until the
-	// playback goroutine has taken it, so "tick, then read a packet" is a synchronisation point and
-	// not a race.
+	// ticks is unbuffered, which makes the suite deterministic: a send blocks until the playback
+	// goroutine has taken it, so "tick, then read a packet" is a synchronisation point.
 	ticks     chan time.Time
 	lifecycle *recordingLifecycle
 }
@@ -130,7 +125,7 @@ func TestPlaybackPacketisesFramesInOrder(t *testing.T) {
 
 	var previousSeq uint16
 	var previousTimestamp uint32
-	for index := 0; index < 3; index++ {
+	for index := range 3 {
 		rig.tick(t)
 		packet, ok := rig.aPhone.receive(t)
 		if !ok {
@@ -147,9 +142,8 @@ func TestPlaybackPacketisesFramesInOrder(t *testing.T) {
 			t.Errorf("frame %d carries clip frame %d; the prompt is out of order", index, packet.Payload[0]-1)
 		}
 
-		// The marker bit is RFC 3550's start-of-talkspurt flag, and it belongs on the FIRST frame
-		// only: the outbound stream just changed timestamp clocks, and every frame after it is a
-		// continuation.
+		// RFC 3550's start-of-talkspurt flag belongs on the first frame only: the outbound stream
+		// just changed timestamp clocks and every frame after it is a continuation.
 		if index == 0 && !packet.Marker {
 			t.Error("the first prompt frame has no marker bit; a receiver reads the timestamp jump as loss")
 		}
@@ -171,9 +165,8 @@ func TestPlaybackPacketisesFramesInOrder(t *testing.T) {
 }
 
 func TestPlaybackKeepsTheSessionsOwnSSRCAndSequenceSpace(t *testing.T) {
-	// A prompt is not a second stream: it is this leg's audio, sourced from a file for a while.
-	// Giving it its own SSRC would make the endpoint see one sender stop and another start around
-	// every prompt, which is the audible click the relay's header rewrite exists to avoid.
+	// A prompt is not a second stream: its own SSRC would make the endpoint see one sender stop and
+	// another start around every prompt.
 	rig := newPlaybackRig(t, 57020, 57039)
 	rig.latch(t)
 	if err := rig.manager.Bridge("bridge-1", rig.aID, rig.bID); err != nil {
@@ -205,9 +198,8 @@ func TestPlaybackKeepsTheSessionsOwnSSRCAndSequenceSpace(t *testing.T) {
 		t.Errorf("prompt sequence = %d, want %d: the prompt continues the leg's sequence space",
 			prompt.SequenceNumber, relayed.SequenceNumber+1)
 	}
-	// And the timestamp continues FORWARD from the relayed one rather than restarting at zero,
-	// which some endpoints read as a stream restart and answer by flushing — clipping the first
-	// syllable of every prompt.
+	// The timestamp continues forward from the relayed one; restarting at zero is read by some
+	// endpoints as a stream restart, which clips the first syllable of every prompt.
 	if prompt.Timestamp != relayed.Timestamp+audio.FrameTimestampStep {
 		t.Errorf("prompt timestamp = %d, want %d: it must not send the stream's clock backwards",
 			prompt.Timestamp, relayed.Timestamp+audio.FrameTimestampStep)
@@ -215,8 +207,8 @@ func TestPlaybackKeepsTheSessionsOwnSSRCAndSequenceSpace(t *testing.T) {
 }
 
 func TestPlaybackReplacesThePeersAudioAndResumesAfterwards(t *testing.T) {
-	// REPLACE is the rung 1 rule: a session has one outbound stream, and interleaving the peer's
-	// frames into a prompt would put two unrelated timestamp clocks under one SSRC.
+	// A session has one outbound stream: interleaving the peer's frames into a prompt would put two
+	// unrelated timestamp clocks under one SSRC.
 	rig := newPlaybackRig(t, 57040, 57059)
 	rig.latch(t)
 	if err := rig.manager.Bridge("bridge-1", rig.aID, rig.bID); err != nil {
@@ -268,10 +260,8 @@ func TestPlaybackReplacesThePeersAudioAndResumesAfterwards(t *testing.T) {
 }
 
 func TestPlaybackDoesNotInterruptDTMFTravellingTheOtherWay(t *testing.T) {
-	// THE test for barge-in. A caller pressing a digit while the menu is still talking sends RFC
-	// 4733 INTO the played-to leg, and that path must be completely untouched by playback —
-	// otherwise `gather` would collect nothing and every IVR would require the caller to wait out
-	// the prompt.
+	// Barge-in: a caller pressing a digit while the menu is talking sends RFC 4733 into the
+	// played-to leg, and that path must be untouched by playback.
 	rig := newPlaybackRig(t, 57060, 57079)
 	rig.latch(t)
 	if err := rig.manager.Bridge("bridge-1", rig.aID, rig.bID); err != nil {
@@ -339,8 +329,7 @@ func TestPlaybackStopMidPlay(t *testing.T) {
 	if summary.Reason != rtp.PlaybackStopped {
 		t.Errorf("reason = %q, want %q", summary.Reason, rtp.PlaybackStopped)
 	}
-	// playedMs is what actually reached the far end, not the clip's length: a barge-in one frame
-	// into a one-second menu played 20 ms.
+	// playedMs is what reached the far end, not the clip's length.
 	if summary.PlayedMs != audio.FrameDurationMs {
 		t.Errorf("playedMs = %d, want %d", summary.PlayedMs, audio.FrameDurationMs)
 	}
@@ -357,7 +346,7 @@ func TestPlaybackCompletesAndAnnouncesItself(t *testing.T) {
 	rig.latch(t)
 	startPrompt(t, rig, rig.aID, "pb-1", 2)
 
-	for index := 0; index < 2; index++ {
+	for index := range 2 {
 		rig.tick(t)
 		if _, ok := rig.aPhone.receive(t); !ok {
 			t.Fatalf("frame %d never arrived", index)
@@ -375,8 +364,7 @@ func TestPlaybackCompletesAndAnnouncesItself(t *testing.T) {
 		t.Errorf("playedMs = %d, want %d", summary.PlayedMs, 2*audio.FrameDurationMs)
 	}
 
-	// The reference is out of the index, so a late stop cannot match a session that has since
-	// started a different prompt.
+	// The reference is out of the index, so a late stop cannot match a later prompt.
 	if _, found := rig.manager.PlaybackSessionOf("pb-1"); found {
 		t.Error("the playback reference survived the prompt it named")
 	}
@@ -386,8 +374,7 @@ func TestPlaybackCompletesAndAnnouncesItself(t *testing.T) {
 }
 
 func TestPlaybackStopOfAnUnknownReferenceIsANoOp(t *testing.T) {
-	// The COMMON case, not an edge one: every `gather` stops its prompt whatever ended the
-	// collection, so a caller who listens to the whole menu produces exactly this on every call.
+	// The common case: every `gather` stops its prompt whatever ended the collection.
 	rig := newPlaybackRig(t, 57120, 57139)
 	if _, stopped := rig.manager.StopPlayback("never-started"); stopped {
 		t.Error("StopPlayback reported a stop for a reference nothing is playing")
@@ -412,8 +399,7 @@ func TestPlaybackEndsWhenTheSessionDoes(t *testing.T) {
 		return len(rig.lifecycle.playbackSummaries()) == 1
 	})
 	summary := rig.lifecycle.playbackSummaries()[0]
-	// `stopped`, not `error`: nothing failed, the leg went away, and the session.ended event carries
-	// the real story.
+	// `stopped`, not `error`: nothing failed, and `session.ended` carries the real story.
 	if summary.Reason != rtp.PlaybackStopped {
 		t.Errorf("reason = %q, want %q", summary.Reason, rtp.PlaybackStopped)
 	}
@@ -459,8 +445,8 @@ func TestPlaybackSupersedesTheOneBeforeIt(t *testing.T) {
 
 func TestPlaybackRefusals(t *testing.T) {
 	t.Run("no far end learned yet", func(t *testing.T) {
-		// Symmetric RTP means the address is LEARNED. A leg that has not sent has taught us nowhere
-		// to send, and a playback that "started" into that would report success and send nothing.
+		// Symmetric RTP learns the address, so a playback started on a leg that has not sent would
+		// report success and send nothing.
 		rig := newPlaybackRig(t, 57180, 57199)
 		err := rig.manager.StartPlayback(rig.aID, rtp.PlaybackOptions{
 			Ref: "pb-1", Frames: promptFrames(1), Encoding: audio.EncodingULaw,
@@ -513,8 +499,8 @@ func TestPlaybackRefusals(t *testing.T) {
 	})
 }
 
-// expectSilence asserts nothing more reaches the A-leg's phone, with a short deadline. Short is
-// correct: every caller has already synchronised on the event that decided the outcome.
+// expectSilence asserts nothing more reaches the A-leg's phone. The short deadline is correct:
+// every caller has already synchronised on the event that decided the outcome.
 func expectSilence(t *testing.T, rig *playbackRig) {
 	t.Helper()
 	if err := rig.aPhone.conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {

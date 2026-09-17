@@ -1,0 +1,22 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"sessionId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"direction": {
+			"default": "both",
+			"type": "string",
+			"enum": ["in", "out", "both"]
+		},
+		"unmute": {
+			"default": false,
+			"type": "boolean"
+		}
+	},
+	"required": ["sessionId", "direction", "unmute"],
+	"additionalProperties": false
+}

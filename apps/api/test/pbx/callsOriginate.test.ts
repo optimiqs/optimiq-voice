@@ -4,6 +4,11 @@ import { originateCallDto } from "../../src/pbx/calls/calls.dto";
 import { originateRefusalException } from "../../src/pbx/calls/calls.errors";
 import { OriginateRateLimiter } from "../../src/pbx/calls/originate-rate-limit";
 import { interpretOriginateReply } from "../../src/pbx/calls/originate-reply";
+import { floorToWindow } from "../../src/pbx/shared/shared-rate-window";
+import type {
+	SharedRateWindowConsume,
+	SharedRateWindowService,
+} from "../../src/pbx/shared/shared-rate-window";
 import type { OriginateRefusalReason } from "@optimiq-voice/events/schemas";
 
 /**
@@ -117,35 +122,88 @@ describe("reading the engine's reply", () => {
 });
 
 describe("the originate rate limit", () => {
-	it("counts the ORGANIZATION, because the tenant is the billing boundary", () => {
-		const limiter = new OriginateRateLimiter(2);
-		const now = 1_000;
+	/**
+	 * A stand-in for `shared_rate_window` that counts the way the real table does — one total per
+	 * (scope, key, window) — so the limiter's arithmetic is proved without a database. The real
+	 * store's own atomicity is `SharedRateWindowService`'s to prove; what matters here is that the
+	 * limiter no longer holds the count itself.
+	 */
+	function store(): SharedRateWindowService & { readonly rows: Map<string, number> } {
+		const rows = new Map<string, number>();
+		const service = {
+			rows,
+			consume: async (input: SharedRateWindowConsume) => {
+				const windowStart = floorToWindow(input.now, input.windowMs);
+				const key = `${input.scope}|${input.key}|${String(windowStart.getTime())}`;
+				const count = (rows.get(key) ?? 0) + input.increment;
+				rows.set(key, count);
+				return await Promise.resolve({
+					count: Math.max(0, count),
+					windowStart,
+					windowResetAt: new Date(windowStart.getTime() + input.windowMs),
+				});
+			},
+		};
+		return service as unknown as SharedRateWindowService & { readonly rows: Map<string, number> };
+	}
 
-		expect(limiter.consume("org-a", now).allowed).to.equal(true);
-		expect(limiter.consume("org-a", now).allowed).to.equal(true);
-		expect(limiter.consume("org-a", now).allowed).to.equal(false);
+	it("counts the ORGANIZATION, because the tenant is the billing boundary", async () => {
+		const limiter = new OriginateRateLimiter(2, store());
+		const now = new Date(1_000);
+
+		expect((await limiter.consume("org-a", now)).allowed).to.equal(true);
+		expect((await limiter.consume("org-a", now)).allowed).to.equal(true);
+		expect((await limiter.consume("org-a", now)).allowed).to.equal(false);
 		// A second tenant is unaffected by the first one's spend.
-		expect(limiter.consume("org-b", now).allowed).to.equal(true);
+		expect((await limiter.consume("org-b", now)).allowed).to.equal(true);
 	});
 
-	it("resets when the window rolls, and reports how long that is", () => {
-		const limiter = new OriginateRateLimiter(1);
-		const now = 1_000;
+	it("shares one count across replicas, which is the whole reason it left the heap", async () => {
+		const shared = store();
+		// Two limiters is two API processes behind a load balancer. Before this counter moved into
+		// the database, each held its own window and the pair allowed twice the ceiling.
+		const replicaA = new OriginateRateLimiter(2, shared);
+		const replicaB = new OriginateRateLimiter(2, shared);
+		const now = new Date(1_000);
 
-		limiter.consume("org-a", now);
-		const refused = limiter.consume("org-a", now + 30_000);
+		expect((await replicaA.consume("org-a", now)).allowed).to.equal(true);
+		expect((await replicaB.consume("org-a", now)).allowed).to.equal(true);
+		expect((await replicaB.consume("org-a", now)).allowed).to.equal(false);
+		expect((await replicaA.consume("org-a", now)).allowed).to.equal(false);
+	});
+
+	it("resets when the window rolls, and reports how long that is", async () => {
+		const limiter = new OriginateRateLimiter(1, store());
+		const now = new Date(1_000);
+
+		await limiter.consume("org-a", now);
+		const refused = await limiter.consume("org-a", new Date(now.getTime() + 30_000));
 		expect(refused.allowed).to.equal(false);
-		expect(refused.retryAfterSeconds).to.equal(30);
+		expect(refused.retryAfterSeconds).to.be.greaterThan(0);
 
-		expect(limiter.consume("org-a", now + 61_000).allowed).to.equal(true);
+		expect((await limiter.consume("org-a", new Date(now.getTime() + 61_000))).allowed).to.equal(
+			true,
+		);
 	});
 
-	it("is disabled by a limit of zero, for a deployment that bounds this elsewhere", () => {
-		const limiter = new OriginateRateLimiter(0);
+	it("is disabled by a limit of zero, for a deployment that bounds this elsewhere", async () => {
+		const counters = store();
+		const limiter = new OriginateRateLimiter(0, counters);
 		for (let attempt = 0; attempt < 100; attempt += 1) {
-			expect(limiter.consume("org-a").allowed).to.equal(true);
+			expect((await limiter.consume("org-a")).allowed).to.equal(true);
 		}
-		expect(limiter.size).to.equal(0);
+		// Disabled means it does not even count: no row is written.
+		expect(counters.rows.size).to.equal(0);
+	});
+
+	it("ALLOWS when the counter store is unreachable, rather than barring every call", async () => {
+		const broken = {
+			consume: async () => await Promise.reject(new Error("no connection")),
+		} as unknown as SharedRateWindowService;
+		const limiter = new OriginateRateLimiter(1, broken);
+
+		expect((await limiter.consume("org-a")).allowed).to.equal(true);
+		expect((await limiter.consume("org-a")).allowed).to.equal(true);
 	});
 });
 

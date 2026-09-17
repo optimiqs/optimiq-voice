@@ -5,9 +5,11 @@ import { getSession, setSessionOnRequest, withResolvedAccess } from "./app-sessi
 import {
 	MissingPermissionException,
 	NoActiveOrganizationException,
+	OrganizationSuspendedException,
 	UnauthenticatedRequestException,
 } from "./auth.errors";
 import { AuthService } from "./auth.service";
+import { OrganizationSuspensionService } from "./organization-suspension.service";
 import { PUBLIC_ROUTE_METADATA } from "./public-route.decorator";
 import { REQUIRE_PERMISSIONS_METADATA } from "./require-permissions.decorator";
 
@@ -29,8 +31,9 @@ import { REQUIRE_PERMISSIONS_METADATA } from "./require-permissions.decorator";
  * **Deny by default.** A route with no metadata at all requires an authenticated session. Opting
  * out is explicit and auditable via `@PublicRoute()`.
  *
- * Guard-then-execute order: public → session → active organization → permission. Each failure has
- * its own exception so a client can tell "sign in" from "pick an organization" from "not allowed".
+ * Guard-then-execute order: public → session → active organization → suspension → permission. Each
+ * failure has its own exception so a client can tell "sign in" from "pick an organization" from
+ * "your provider suspended this organization" from "not allowed".
  *
  * The caller was resolved once per request by the Fastify `preHandler` hook in
  * `auth-http.plugin.ts` (`auth.api.getSession`, which accepts the session cookie, the bearer
@@ -42,6 +45,8 @@ export class RequirePermissionsGuard implements CanActivate {
 	constructor(
 		@Inject(Reflector) private readonly reflector: Reflector,
 		@Inject(AuthService) private readonly authService: AuthService,
+		@Inject(OrganizationSuspensionService)
+		private readonly suspension: OrganizationSuspensionService,
 	) {}
 
 	async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -74,6 +79,12 @@ export class RequirePermissionsGuard implements CanActivate {
 		const access = await this.authService.resolveAccess(session);
 		if (!access.organizationId || !access.role) {
 			throw new NoActiveOrganizationException();
+		}
+		// After the tenant is known and before any permission is granted. A suspension is the
+		// reseller's answer to non-payment, and it has to bind every principal — an `x-api-key`
+		// integration most of all, since that is the one that keeps running with nobody watching.
+		if (await this.suspension.isSuspended(access.organizationId)) {
+			throw new OrganizationSuspendedException();
 		}
 		setSessionOnRequest(request, withResolvedAccess(session, access.role, access.permissions));
 

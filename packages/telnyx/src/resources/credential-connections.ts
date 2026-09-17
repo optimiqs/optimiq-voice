@@ -275,9 +275,13 @@ export function makeCredentialConnections(
 			const response = await transport.request({
 				method: "POST",
 				path: "/credential_connections",
-				// Creating a connection is cheap and non-billable, and a duplicate is detectable and
-				// deletable — unlike a duplicate number order. Retrying is therefore the safer default
-				// here, which is why this call does NOT opt out.
+				// Never retried, and cost is not the reason. Telnyx enforces `user_name` uniqueness
+				// (error 10027, "user_name is already taken") and honours no `Idempotency-Key` here,
+				// so a 5xx raised AFTER the connection was created turns the retry into a
+				// non-retryable 422: the caller sees a hard failure while a real connection exists at
+				// the carrier holding the only username the provisioner will mint for that org. One
+				// attempt leaves at most one connection and one truthful error.
+				retryable: false,
 				body: connectionBody(input),
 				schema: connectionResponse,
 			});

@@ -1,13 +1,9 @@
-// Package presence is sipd's view of the `presence` NATS KV bucket: the device state a busy-lamp
-// key renders.
+// Package presence is sipd's read-only view of the `presence` NATS KV bucket: the device state a
+// busy-lamp key renders.
 //
-// The bucket is written by apps/engine, which is the only process that can see a channel move
-// between call states, and read here — on the hot path of a SUBSCRIBE and of every state-change
-// NOTIFY. sipd never writes it: an edge that could publish presence could publish a lie about a
-// tenant's phones, and it has nothing to base one on anyway.
-//
-// The bucket definition (name, TTL, storage, limits) and the key builder come from
-// packages/events-go so sipd cannot disagree with the engine about what it is talking to.
+// apps/engine is the only writer; sipd only reads, on the hot path of a SUBSCRIBE and of every
+// state-change NOTIFY. The bucket definition and key builder come from packages/events-go so the
+// two processes cannot disagree about what they are talking to.
 package presence
 
 import (
@@ -15,7 +11,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
@@ -26,9 +25,8 @@ type State = contract.ExtensionPresence
 
 // Change is one presence transition observed on the bucket.
 //
-// Deleted is separate from a `down` value on purpose: the bucket's five-minute TTL means an entry
-// disappearing is the normal end of an extension's activity, not an error, and a watcher that
-// treated a delete as "no news" would leave a lamp lit after the last engine writing it stopped.
+// Deleted is distinct from a `down` state: the bucket's TTL makes an entry disappearing the normal
+// end of an extension's activity, and treating a delete as "no news" would leave a lamp lit.
 type Change struct {
 	OrgID           string
 	ExtensionNumber string
@@ -51,17 +49,16 @@ type Store interface {
 // NATSStore is the production Store, backed by the presence KV bucket.
 type NATSStore struct {
 	bucket jetstream.KeyValue
+	log    *slog.Logger
 }
 
 var _ Store = (*NATSStore)(nil)
 
 // Open binds to (creating if absent) the presence bucket described by packages/events-go.
 //
-// CreateOrUpdateKeyValue rather than a read-only bind, for the same reason kv.Open uses it: the
-// call is idempotent, and an edge that refused to start because the engine had not booted yet would
-// turn a deploy ordering detail into a SIP outage. sipd creating the bucket does not make it a
-// writer — the NATS permission set is what stops that, and it grants sipd no publish on
-// `$KV.presence.>`.
+// CreateOrUpdateKeyValue is idempotent, so sipd does not fail to start merely because the engine
+// has not booted yet. Creating the bucket does not make sipd a writer: the NATS permission set
+// grants it no publish on `$KV.presence.>`.
 func Open(ctx context.Context, js jetstream.JetStream) (*NATSStore, error) {
 	definition := contract.PresenceKV
 	bucket, err := js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
@@ -107,60 +104,97 @@ func (s *NATSStore) Get(ctx context.Context, orgID, extensionNumber string) (Sta
 	return state, true, nil
 }
 
-// Watch implements Store over the whole bucket.
+// Watch implements Store over the WHOLE bucket, not one key per subscription: one consumer per
+// instance plus an in-process fan-out, instead of one ordered consumer per BLF key.
 //
-// The WHOLE bucket, not one key per subscription. A phone with sixteen BLF keys would otherwise
-// open sixteen ordered consumers, and a fifty-phone office would open eight hundred — for a bucket
-// whose entire contents fit in a few hundred kilobytes. One watch and an in-process fan-out costs
-// one consumer per instance and makes the subscription table the only thing that has to know which
-// extensions anyone cares about.
+// Updates only — initial values are read by Get when a subscription is accepted, and replaying the
+// bucket on reconnect would send a redundant NOTIFY to every phone at once.
 //
-// Updates only: the initial values are read by Get when a subscription is accepted, and replaying
-// the bucket on every reconnect would send a redundant NOTIFY to every phone at once.
+// The watch RE-ESTABLISHES itself when the update stream ends without the context being cancelled: a
+// broker restart ends the ordered consumer ("stream not found: recreating ordered consumer"), and a
+// watch that gave up there would freeze every busy lamp in the fleet for the life of the process.
+// The returned channel STAYS OPEN across a re-establish and closes only when the watch is done for
+// good — the SUBSCRIBE handler drops its reference on close, so a close is permanent deafness.
 func (s *NATSStore) Watch(ctx context.Context) (<-chan Change, error) {
-	watcher, err := s.bucket.WatchAll(ctx, jetstream.UpdatesOnly())
+	updates, err := s.bucket.WatchAll(ctx, jetstream.UpdatesOnly())
 	if err != nil {
 		return nil, fmt.Errorf("presence: watching the %s bucket: %w", contract.PresenceKV.Name, err)
+	}
+	log := s.log
+	if log == nil {
+		log = slog.Default()
 	}
 
 	changes := make(chan Change, 64)
 	go func() {
 		defer close(changes)
-		defer func() { _ = watcher.Stop() }()
-
+		backoff := watchRetryMin
 		for {
+			ended := consume(ctx, updates, changes)
+			_ = updates.Stop()
+			if ctx.Err() != nil || !ended {
+				return
+			}
+			log.Warn("the presence watch ended; re-establishing it",
+				"bucket", contract.PresenceKV.Name, "retryIn", backoff)
 			select {
 			case <-ctx.Done():
 				return
-			case entry, ok := <-watcher.Updates():
-				if !ok {
-					return
-				}
-				if entry == nil {
-					// The end-of-initial-values marker. Harmless with UpdatesOnly, but nats.go still
-					// sends one and a nil dereference here would take the watch down.
-					continue
-				}
-				change, ok := changeFor(entry)
-				if !ok {
-					continue
-				}
-				select {
-				case changes <- change:
-				case <-ctx.Done():
-					return
-				}
+			case <-time.After(backoff):
 			}
+			backoff = min(backoff*2, watchRetryMax)
+			next, err := s.bucket.WatchAll(ctx, jetstream.UpdatesOnly())
+			if err != nil {
+				log.Error("cannot re-establish the presence watch",
+					"bucket", contract.PresenceKV.Name, "error", err)
+				continue
+			}
+			backoff = watchRetryMin
+			updates = next
 		}
 	}()
 	return changes, nil
 }
 
+// watchRetryMin and watchRetryMax bound the re-establish backoff. A broker that is down is down for
+// everything, so the ceiling is short enough that lamps resume promptly once it returns.
+const (
+	watchRetryMin = time.Second
+	watchRetryMax = 30 * time.Second
+)
+
+// consume drains one update stream into changes. It reports whether the stream ENDED (so a
+// replacement is wanted) rather than the context being cancelled.
+func consume(ctx context.Context, updates jetstream.KeyWatcher, changes chan<- Change) bool {
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case entry, ok := <-updates.Updates():
+			if !ok {
+				return true
+			}
+			if entry == nil {
+				// The end-of-initial-values marker; nats.go sends one even with UpdatesOnly.
+				continue
+			}
+			change, ok := changeFor(entry)
+			if !ok {
+				continue
+			}
+			select {
+			case changes <- change:
+			case <-ctx.Done():
+				return false
+			}
+		}
+	}
+}
+
 // changeFor turns one KV entry into a Change, reporting false for anything unusable.
 //
-// A value that will not decode is DROPPED rather than reported as `down`: the alternative is one
-// malformed write from a future engine release clearing every lamp in a tenant, which is a worse
-// outcome than a lamp that does not move until the next good write.
+// A value that will not decode is dropped rather than reported as `down`, so one malformed write
+// cannot clear every lamp in a tenant.
 func changeFor(entry jetstream.KeyValueEntry) (Change, bool) {
 	orgID, extensionNumber, ok := splitKey(entry.Key())
 	if !ok {
@@ -179,31 +213,18 @@ func changeFor(entry jetstream.KeyValueEntry) (Change, bool) {
 
 // splitKey reverses contract.PresenceKVKey: `<orgId>.<extensionNumber>`.
 //
-// Both tokens are subject tokens and therefore contain no dot, so the split is exact rather than a
-// best guess — a key with any other shape is not one this contract can produce and is skipped.
+// Both tokens are subject tokens and so contain no dot: any other shape is not a key this contract
+// can produce and is skipped.
 func splitKey(key string) (orgID, extensionNumber string, ok bool) {
-	for index := 0; index < len(key); index++ {
-		if key[index] != '.' {
-			continue
-		}
-		if index == 0 || index == len(key)-1 {
-			return "", "", false
-		}
-		orgID, extensionNumber = key[:index], key[index+1:]
-		// A second dot means a key shape this contract does not define.
-		for _, char := range extensionNumber {
-			if char == '.' {
-				return "", "", false
-			}
-		}
-		return orgID, extensionNumber, true
+	orgID, extensionNumber, found := strings.Cut(key, ".")
+	if !found || orgID == "" || extensionNumber == "" || strings.Contains(extensionNumber, ".") {
+		return "", "", false
 	}
-	return "", "", false
+	return orgID, extensionNumber, true
 }
 
-// MemoryStore is an in-process Store. It backs the unit tests and lets sipd run without a broker
-// during development; it is NOT a deployment option, because presence one instance invented is a
-// lamp the rest of the fleet does not agree with.
+// MemoryStore is an in-process Store backing the unit tests and broker-less development. It is not
+// a deployment option: presence one instance invents is a lamp the rest of the fleet disagrees with.
 type MemoryStore struct {
 	mu      sync.RWMutex
 	states  map[string]State

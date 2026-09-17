@@ -223,15 +223,21 @@ export class EmergencyConsumer implements OnModuleInit, OnApplicationShutdown {
 			message.ack();
 			return;
 		}
-		if (envelope.subject !== message.subject) {
-			// The tenancy cross-check `validateEvent` would have made: an envelope whose own subject
-			// disagrees with the one it was delivered on could scope this notification — and the
-			// settings read behind it — to the wrong tenant.
+		// The tenancy cross-check `validateEvent` would have made. Comparing the two subject strings to
+		// each other is NOT that check — it says nothing about `orgId`, which is what everything below
+		// is scoped by — so the org token is read off the delivery subject
+		// (`calls.evt.v1.<orgId>.<callId>.call.emergency.dialed`) and compared as well. Without it an
+		// envelope naming org A delivered on org B's subject mails B's 911 event to A's front desk and
+		// never tells B; for a Kari's Law path both halves are compliance failures.
+		const subjectOrgId = message.subject.split(".")[3];
+		if (envelope.subject !== message.subject || envelope.orgId !== subjectOrgId) {
 			this.terminated += 1;
 			logger.error(
 				{
 					subject: message.subject,
 					envelopeSubject: envelope.subject,
+					envelopeOrgId: envelope.orgId,
+					subjectOrgId,
 				},
 				"terminating an emergency event delivered on a foreign subject",
 			);
@@ -252,6 +258,7 @@ export class EmergencyConsumer implements OnModuleInit, OnApplicationShutdown {
 			number: data.number,
 			...(data.callerNumber === undefined ? {} : { callerNumber: data.callerNumber }),
 			...(data.callerName === undefined ? {} : { callerName: data.callerName }),
+			...(data.deviceId === undefined ? {} : { deviceId: data.deviceId }),
 			...(data.elin === undefined ? {} : { elin: data.elin }),
 			...(data.emergencyAddressId === undefined
 				? {}
@@ -301,6 +308,7 @@ interface EmergencyEnvelope {
 		readonly number: string;
 		readonly callerNumber?: string;
 		readonly callerName?: string;
+		readonly deviceId?: string;
 		readonly elin?: string;
 		readonly emergencyAddressId?: string;
 		readonly trunkName?: string;

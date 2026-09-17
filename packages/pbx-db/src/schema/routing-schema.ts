@@ -1,4 +1,14 @@
-import { boolean, index, integer, jsonb, pgTable, text, uniqueIndex } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import {
+	boolean,
+	check,
+	index,
+	integer,
+	jsonb,
+	pgTable,
+	text,
+	uniqueIndex,
+} from "drizzle-orm/pg-core";
 import {
 	auditTimestampColumns,
 	tenantOrganizationIdColumn,
@@ -7,8 +17,11 @@ import {
 } from "@optimiq-voice/db";
 import { tenantIsolationPolicy } from "../tenant";
 import { destinationCheck, destinationColumns, namedDestinationColumns } from "./columns";
-import { phoneNumber } from "./numbers-schema";
+import { prompt } from "./media-schema";
+import { phoneNumber, type RecordingConsentPolicy } from "./numbers-schema";
+import { pinSet } from "./pins-schema";
 import { timeCondition } from "./time-conditions-schema";
+import { translationRuleset } from "./translations-schema";
 import type { TollClass } from "./extensions-schema";
 
 /**
@@ -52,6 +65,26 @@ export const inboundRoute = pgTable.withRLS(
 			onDelete: "set null",
 		}),
 		recordEnabled: boolean("record_enabled").notNull().default(false),
+		/**
+		 * This route's consent posture, overriding both the DID it matched and the organization.
+		 * NULL — every pre-existing row — means "inherit", and that is the only reason it is nullable:
+		 * a `not null default 'none'` would turn silence into an assertion and make an inherited
+		 * policy indistinguishable from a deliberately disabled one.
+		 *
+		 * A route overrides its DID because a route is the narrower statement of intent: the same
+		 * number reaching the support queue and reaching a recorded-by-default sales line are two
+		 * different calls, and the row that chose the destination is the row that knows which.
+		 */
+		recordingConsentPolicy: text("recording_consent_policy").$type<RecordingConsentPolicy>(),
+		/**
+		 * The disclosure this route plays, falling back to the DID's, then the org's, then the seeded
+		 * system stem. `on delete set null` like every other prompt reference: losing a media file
+		 * costs the route its own wording, never the route itself, and the fallback still discloses.
+		 */
+		recordingConsentPromptId: uuidEntityId("recording_consent_prompt_id").references(
+			() => prompt.id,
+			{ onDelete: "set null" },
+		),
 		enabled: boolean("enabled").notNull().default(true),
 		...auditTimestampColumns(),
 	},
@@ -69,6 +102,12 @@ export const inboundRoute = pgTable.withRLS(
 		index("inbound_route_organization_time_condition_idx").on(
 			table.organizationId,
 			table.timeConditionId,
+		),
+		// NULL passes — it means "inherit", not "unspecified". Anything else must be a policy the
+		// compiler and the engine both understand; a typo is a call recorded without a disclosure.
+		check(
+			"inbound_route_recording_consent_policy_check",
+			sql`recording_consent_policy is null or recording_consent_policy in ('none', 'announce', 'announce-and-require-keypress')`,
 		),
 		destinationCheck("inbound_route"),
 		destinationCheck("inbound_route", "failover", true),
@@ -100,6 +139,27 @@ export const outboundRoute = pgTable.withRLS(
 		}),
 		/** Taken when every trunk in `trunkPriority` fails. */
 		...namedDestinationColumns("failover"),
+		/**
+		 * The authorisation codes a caller must satisfy before any trunk is dialled.
+		 *
+		 * NULL is the overwhelmingly common case and means no challenge. `on delete set null` rather
+		 * than `restrict`: deleting a PIN set removes the gate, and while that widens access it does
+		 * so with a row an administrator explicitly deleted — whereas `restrict` would make deleting a
+		 * retired set a puzzle, and `cascade` would delete the ROUTE, which takes the tenant's
+		 * international calling down to remove a code list.
+		 */
+		pinSetId: uuidEntityId("pin_set_id").references(() => pinSet.id, { onDelete: "set null" }),
+		/**
+		 * The shared rewrite applied to the dialled number, AFTER this route's own strip/prepend.
+		 *
+		 * The composition order and its argument are in `translations-schema.ts`: the inline pair
+		 * turns what somebody's fingers did into the number they meant, and the ruleset normalises
+		 * that number for the wire.
+		 */
+		translationRulesetId: uuidEntityId("translation_ruleset_id").references(
+			() => translationRuleset.id,
+			{ onDelete: "set null" },
+		),
 		callerIdNumberOverride: text("caller_id_number_override"),
 		recordEnabled: boolean("record_enabled").notNull().default(false),
 		enabled: boolean("enabled").notNull().default(true),
@@ -116,6 +176,11 @@ export const outboundRoute = pgTable.withRLS(
 		index("outbound_route_organization_time_condition_idx").on(
 			table.organizationId,
 			table.timeConditionId,
+		),
+		index("outbound_route_organization_pin_set_idx").on(table.organizationId, table.pinSetId),
+		index("outbound_route_organization_translation_idx").on(
+			table.organizationId,
+			table.translationRulesetId,
 		),
 		destinationCheck("outbound_route", "failover", true),
 		tenantIsolationPolicy("outbound_route"),

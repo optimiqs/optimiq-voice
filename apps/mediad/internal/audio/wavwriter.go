@@ -8,52 +8,33 @@ import (
 	"path/filepath"
 )
 
-// The WAV writer half of this package: rung 4 of plans/mediad-design.md §2.
-//
-// It is the mirror image of the reader above it. The reader walks chunks because real files are not
-// canonical; the writer emits exactly the canonical 44-byte PCM header, because the only consumer
-// that matters is `apps/api`'s archiver — which copies bytes it never inspects — and a player at the
-// other end of a download link. Writing anything more elaborate would be adding surface for no
-// reader.
+// The WAV writer half of this package. Unlike the reader, which walks chunks because real files are
+// not canonical, the writer emits exactly the canonical 44-byte PCM header.
 
-// The fixed geometry of what mediad writes. 16-bit linear PCM, mono, 8 kHz.
+// The fixed geometry of what mediad writes: 16-bit linear PCM, mono, 8 kHz.
 //
-// LINEAR and not the G.711 the leg negotiated, even though that would be a byte-for-byte copy and
-// half the size. Three reasons, in the order they bite: a `both` recording has to SUM two streams,
-// which only exists in the linear domain; `apps/api` serves every recording as `audio/wav` and
-// something at the far end has to play it, where µ-law-in-WAV is supported unevenly; and one law is
-// wrong for the other half of a call the day two legs answer differently.
+// Linear rather than the G.711 the leg negotiated because a `both` recording has to sum two streams
+// (only defined in the linear domain), µ-law-in-WAV is played unevenly by download clients, and one
+// law is wrong once two legs answer differently.
 const (
 	wavBitsPerSample = 16
 	wavChannels      = 1
 	wavBytesPerFrame = wavChannels * wavBitsPerSample / 8
 	// wavHeaderBytes is the canonical RIFF/WAVE PCM header: 12 of RIFF, 24 of fmt, 8 of data.
 	wavHeaderBytes = 44
-	// wavWriteBuffer is one second of audio. Big enough that a recording costs 1 write syscall a
-	// second rather than 50, small enough that a crash loses a second of a file nobody will read.
+	// wavWriteBuffer is one second of audio: one write syscall a second rather than fifty.
 	wavWriteBuffer = SampleRate * wavBytesPerFrame
 )
 
-// PartialSuffix is appended to a recording's path while it is being written.
-//
-// # Why a rename rather than an in-place header patch
-//
-// Because the final path must NEVER name an incomplete file. `apps/api`'s archiver stats the object
-// key the moment `channel.record.stopped` lands and copies whatever is there; a media plane that
-// crashed mid-recording and left a plausible-looking WAV at the real path would have that file
-// archived, downloaded, and found to be silence by the person who needed it. A rename within one
-// directory is atomic on every filesystem this runs on, so the object key either does not exist or
-// is a finished recording.
-//
-// It also makes a crash DETECTABLE rather than merely harmless: a `.partial` left behind is a
-// recording that was interrupted, it is greppable, and it is nothing else.
+// PartialSuffix is appended to a recording's path while it is being written, and the file is
+// renamed on Close. The final path must never name an incomplete file: `apps/api`'s archiver copies
+// whatever is at the object key as soon as `channel.record.stopped` lands. A rename within one
+// directory is atomic, and a leftover `.partial` is an unambiguous marker of an interrupted
+// recording.
 const PartialSuffix = ".partial"
 
-// WAVWriter streams 16-bit linear samples into a RIFF/WAVE file.
-//
-// Not safe for concurrent use. One recording owns one writer and writes from one goroutine, which
-// is what keeps the sample counter and the buffered file position in agreement without a lock on a
-// path that runs 50 times a second.
+// WAVWriter streams 16-bit linear samples into a RIFF/WAVE file. Not safe for concurrent use: one
+// recording owns one writer and writes from one goroutine.
 type WAVWriter struct {
 	path    string
 	partial string
@@ -63,13 +44,8 @@ type WAVWriter struct {
 	closed  bool
 }
 
-// CreateWAV opens a recording for writing, creating its parent directories.
-//
-// The header written here is a PLACEHOLDER: the two length fields are zero, because the length of a
-// recording is not known until it ends. Close patches them. A reader that opened the partial file
-// mid-recording would therefore see a well-formed WAV containing no audio — which is exactly the
-// right answer for a file that is still being written, and why the partial carries a different name
-// anyway.
+// CreateWAV opens a recording for writing, creating its parent directories. The header written here
+// is a placeholder with zero length fields; Close patches them once the length is known.
 func CreateWAV(path string) (*WAVWriter, error) {
 	if path == "" {
 		return nil, fmt.Errorf("audio: a recording path is required")
@@ -79,8 +55,8 @@ func CreateWAV(path string) (*WAVWriter, error) {
 	}
 
 	partial := path + PartialSuffix
-	// O_EXCL rather than O_TRUNC: two recordings racing for one reference is a caller bug, and
-	// truncating would make the second silently destroy the first's audio. Failing names it.
+	// O_EXCL rather than O_TRUNC, so two recordings racing for one reference fail loudly rather
+	// than the second destroying the first's audio.
 	file, err := os.OpenFile(partial, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
 	if err != nil {
 		return nil, fmt.Errorf("audio: creating %s: %w", partial, err)
@@ -124,18 +100,10 @@ func (w *WAVWriter) WriteSamples(samples []int16) error {
 	return nil
 }
 
-// Close finalises the file and returns its size in bytes.
-//
-// The order is the whole point and every step is load-bearing:
-//
-//  1. Flush the buffer, so every sample handed over is in the file rather than in this process.
-//  2. Patch the two length fields, which is the only moment the real lengths are known.
-//  3. fsync, so a machine that loses power after the rename still has the bytes the rename
-//     promised. A rename is atomic with respect to other readers, not with respect to a crash.
-//  4. Close, then rename into the final path. Only now does the object key exist.
-//
-// A failure anywhere removes the partial and reports it, rather than leaving a file that would be
-// archived as a real recording.
+// Close finalises the file and returns its size in bytes. The order is load-bearing: flush, patch
+// the length fields, fsync (a rename is atomic against other readers, not against a crash), close,
+// then rename into the final path. A failure anywhere removes the partial rather than leaving a
+// file that would be archived as a real recording.
 func (w *WAVWriter) Close() (int64, error) {
 	if w.closed {
 		return 0, fmt.Errorf("audio: %s is already closed", w.path)
@@ -148,9 +116,8 @@ func (w *WAVWriter) Close() (int64, error) {
 
 	dataBytes := w.samples * wavBytesPerFrame
 	if dataBytes > int64(^uint32(0))-wavHeaderBytes {
-		// A four-hour cap on the contract puts the ceiling at ~230 MB, three orders of magnitude
-		// under this. Checked anyway, because the failure it prevents is a header claiming a length
-		// it wrapped to — a file that opens and plays a fraction of itself with no error anywhere.
+		// Unreachable under the contract's four-hour cap, but a wrapped RIFF length would give a
+		// file that plays a fraction of itself with no error anywhere.
 		return 0, w.abortWith(fmt.Errorf("audio: %s is too long for a RIFF length field", w.partial))
 	}
 	if _, err := w.file.WriteAt(wavHeader(uint32(dataBytes)), 0); err != nil {
@@ -211,12 +178,20 @@ func wavHeader(dataBytes uint32) []byte {
 	return header
 }
 
-// DecodeLinear turns one G.711 frame into 16-bit linear samples.
-//
-// Exported because the recorder needs it and lives in internal/rtp: a recording is the reverse of a
-// playback, and the companding tables are here.
+// DecodeLinear turns one G.711 frame into 16-bit linear samples. Exported for internal/rtp's
+// recorder.
 func DecodeLinear(payload []byte, encoding Encoding) []int16 {
-	samples := make([]int16, len(payload))
+	return decodeLinearInto(make([]int16, len(payload)), payload, encoding)
+}
+
+// decodeLinearInto is DecodeLinear writing into a caller-supplied buffer, for the packet path.
+// `dst` is grown when it is too short, and sliced to the payload's length when it is longer.
+func decodeLinearInto(dst []int16, payload []byte, encoding Encoding) []int16 {
+	samples := dst
+	if cap(samples) < len(payload) {
+		samples = make([]int16, len(payload))
+	}
+	samples = samples[:len(payload)]
 	if encoding == EncodingALaw {
 		for index, encoded := range payload {
 			samples[index] = ALawToLinear(encoded)
@@ -229,17 +204,11 @@ func DecodeLinear(payload []byte, encoding Encoding) []int16 {
 	return samples
 }
 
-// MixInto sums one frame of linear audio into another, saturating rather than wrapping.
-//
-// Saturation is not a detail. Two G.711 streams at full scale sum past what an int16 holds, and a
-// wrap turns a loud moment into a full-amplitude sign flip — which is not "slightly clipped", it is
-// a bang. Clamping produces the mild distortion every mixer produces when two people shout at once.
+// MixInto sums one frame of linear audio into another, saturating rather than wrapping: two streams
+// at full scale sum past int16, and a wrap would turn a loud moment into a full-amplitude sign flip.
 func MixInto(destination, source []int16) {
-	limit := len(destination)
-	if len(source) < limit {
-		limit = len(source)
-	}
-	for index := 0; index < limit; index++ {
+	limit := min(len(destination), len(source))
+	for index := range limit {
 		sum := int32(destination[index]) + int32(source[index])
 		switch {
 		case sum > 32767:

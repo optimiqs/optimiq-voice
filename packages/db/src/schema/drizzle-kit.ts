@@ -8,3 +8,4 @@
 export * from "./auth/identity-schema";
 export * from "./auth/organization-schema";
 export * from "./auth/credential-schema";
+export * from "./platform/organization-platform-schema";

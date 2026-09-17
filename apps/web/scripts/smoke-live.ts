@@ -97,7 +97,8 @@ async function waitForServer(url: string, timeoutMs: number): Promise<boolean> {
 }
 
 async function main(): Promise<void> {
-	const databaseUrl = process.env.DATABASE_URL ?? "postgresql://optimiq:optimiq@localhost:5433/optimiq";
+	const databaseUrl =
+		process.env.DATABASE_URL ?? "postgresql://optimiq:optimiq@localhost:5433/optimiq";
 	const pbxDatabaseUrl =
 		process.env.PBX_DATABASE_URL ?? "postgresql://optimiq:optimiq@localhost:5433/optimiq_pbx";
 	const apiPort = await findFreePort();
@@ -206,10 +207,17 @@ async function main(): Promise<void> {
 		});
 		const organizationId = ((await created.json()) as { id?: string }).id ?? "";
 		await post("/api/auth/organization/set-active", { organizationId });
-		check("a session exists on the Next origin", jar.header().length > 0 && organizationId.length > 0);
+		check(
+			"a session exists on the Next origin",
+			jar.header().length > 0 && organizationId.length > 0,
+		);
 
 		const me = await fetch(`${webUrl}/api/v1/me`, { headers: { cookie: jar.header() } });
-		check("REST reaches the API through the /api rewrite", me.status === 200, `status ${me.status}`);
+		check(
+			"REST reaches the API through the /api rewrite",
+			me.status === 200,
+			`status ${me.status}`,
+		);
 
 		// The question.
 		const result = await new Promise<{ ok: boolean; detail: string }>((resolve) => {

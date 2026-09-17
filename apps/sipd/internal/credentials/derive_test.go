@@ -14,14 +14,9 @@ import (
 //
 // testdata/derive_parity.json is produced BY the TypeScript implementation
 // (apps/api/src/provisioning/render/provision-secret.ts) via
-// `pnpm --filter @optimiq-voice/api emit:sip-vectors`. Every assertion below therefore compares
-// this package against the behaviour of the code that actually renders a phone's configuration,
-// not against a second hand-written copy of it.
-//
-// If the TypeScript derivation changes and the golden is not regenerated, `emit:sip-vectors
-// --check` fails. If the golden is regenerated and Go diverges, these fail. Both are wanted: a
-// change to this derivation is a CREDENTIAL ROTATION that invalidates every provisioned handset,
-// and it must be impossible to make one by accident.
+// `pnpm --filter @optimiq-voice/api emit:sip-vectors`. Changing this derivation is a credential
+// rotation that invalidates every provisioned handset, so it must be impossible to do by accident:
+// an unregenerated golden fails `emit:sip-vectors --check`, a diverging Go side fails here.
 
 type parityDocument struct {
 	Algorithm      string         `json:"algorithm"`
@@ -88,8 +83,7 @@ func TestDerivationMatchesTheTypeScriptGolden(t *testing.T) {
 				t.Errorf("ha1 = %q, golden %q", ha1, v.HA1)
 			}
 
-			// The composition has to be exactly "derive, then hash" — not two independent paths
-			// that happen to agree on these inputs.
+			// The composition must be exactly "derive, then hash".
 			if want := credentials.HA1(v.Username, v.Realm, password); ha1 != want {
 				t.Errorf("DeriveHA1 = %q, but HA1(user, realm, DeriveSipPassword(...)) = %q", ha1, want)
 			}
@@ -98,9 +92,8 @@ func TestDerivationMatchesTheTypeScriptGolden(t *testing.T) {
 }
 
 func TestDerivedPasswordAlphabetIsPhoneSafe(t *testing.T) {
-	// base64url only. `+` and `/` are legal in a SIP password and illegal in practice in several
-	// vendors' plain-text .cfg parsers, which is why provision-secret.ts picked this alphabet.
-	// A password a phone cannot store is worse than a shorter one.
+	// base64url only: `+` and `/` are legal in a SIP password but break several vendors'
+	// plain-text .cfg parsers, which is why provision-secret.ts picked this alphabet.
 	safe := regexp.MustCompile(`^[A-Za-z0-9_-]{24}$`)
 
 	for _, v := range loadParity(t).Vectors {
@@ -138,18 +131,14 @@ func TestDerivationSeparatesTenantsAndRefs(t *testing.T) {
 	}
 }
 
-// The message is a plain `orgID + ":" + secretRef` concatenation, so it is NOT injective over
-// arbitrary strings: ("org-a", "b:c") and ("org-a:b", "c") both produce "org-a:b:c" and therefore
-// the same password. This test states that rather than hiding it, and pins that BOTH languages
-// agree on it — the golden's `separator-adjacent` pair carries the identical password, which is
-// how the TypeScript side records the same fact.
+// The message is a plain `orgID + ":" + secretRef` concatenation, so it is NOT injective:
+// ("org-a", "b:c") and ("org-a:b", "c") both produce "org-a:b:c" and the same password. Both
+// languages agree on this (the golden's `separator-adjacent` pair).
 //
-// It is not exploitable as written: `organizationId` is a UUID from the tenant column, and a UUID
-// contains no colon, so the split point of a real message is unambiguous no matter what is in
-// `secretRef` (device refs legitimately contain MAC-address colons — see the case above). Making
-// it injective — length-prefixing, or a colon-free encoding — would change every derived password
-// on every deployment, i.e. it is a credential rotation, not a bug fix. If that is ever done it
-// must be done in `provision-secret.ts` first and re-provisioned deliberately.
+// It is not exploitable as written: organizationId is a UUID, which contains no colon, so a real
+// message's split point is unambiguous whatever secretRef holds. Making it injective would change
+// every derived password on every deployment — a credential rotation, and one that must be done in
+// provision-secret.ts first.
 func TestDerivationMessageIsNotInjectiveAcrossTheSeparator(t *testing.T) {
 	const key = "provision-root-key-0123456789abcdef"
 
@@ -186,9 +175,8 @@ func TestDerivationIsDeterministic(t *testing.T) {
 }
 
 func TestDerivationRefusesAnEmptyRootKey(t *testing.T) {
-	// HMAC accepts an empty key without complaint, so without this guard a deployment that forgot
-	// the variable would authenticate every phone against a password derived from nothing — and
-	// would look like it was working.
+	// HMAC accepts an empty key, so without this guard a deployment that forgot the variable would
+	// authenticate every phone against a password derived from nothing.
 	if _, err := credentials.DeriveSipPassword("", "org-a", "ext/1001/sip"); !errors.Is(err, credentials.ErrNoRootKey) {
 		t.Errorf("DeriveSipPassword with no key: err = %v, want ErrNoRootKey", err)
 	}

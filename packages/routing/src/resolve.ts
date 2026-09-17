@@ -21,11 +21,13 @@
  * reproduced, and "why did this call go to the night service at 4pm?" is a question that gets asked.
  */
 
+import { decideAttestation } from "./attestation";
 import { PlanNodeNotFoundError } from "./errors";
 import { matchFeatureCode } from "./feature-codes";
 import { applyDigitManipulation, matchPattern } from "./patterns";
 import { tollClassCovers } from "./snapshot";
 import { evaluateTimeCondition } from "./time-conditions";
+import { applyTranslationRuleset } from "./translations";
 import type {
 	CompiledCallBlockRule,
 	EmergencyRule,
@@ -35,9 +37,22 @@ import type {
 	RoutingArtifact,
 	RoutingContext,
 } from "./artifact";
+import type {
+	AttestationDecision,
+	AttestationLevel,
+	CallerIdRightToUse,
+	CompiledAttestationPolicy,
+	OutboundComplianceRefusal,
+} from "./attestation";
 import type { Diagnostic } from "./diagnostics";
 import type { ExecutionPlan, PlanNode, PlanNodeId } from "./plan";
-import type { CallBlockAction, CallBlockDirection, TollClass } from "./snapshot";
+import type {
+	CallBlockAction,
+	CallBlockDirection,
+	CallerIdPresentation,
+	TollClass,
+} from "./snapshot";
+import type { TimeConditionEvaluation } from "./time-conditions";
 
 /** How far a chain of time-condition gates may be followed before it is called a loop. */
 export const MAX_GATE_DEPTH = 16;
@@ -48,6 +63,15 @@ export interface ResolveInboundInput {
 	readonly callerNumber?: string;
 	readonly callerName?: string;
 	readonly now: Date;
+	/**
+	 * The trunk the call arrived on, when the caller knows it.
+	 *
+	 * Only used to look up that trunk's caller-id normalisation. Optional because not every inbound
+	 * leg has one — a call from a WebRTC client or an internally originated leg has no trunk — and
+	 * because a caller that has not learned to pass it is a rollout state rather than a bug: the
+	 * number is then screened exactly as it arrived, which is what every release before this one did.
+	 */
+	readonly trunkId?: string;
 }
 
 export interface ResolveInternalInput {
@@ -91,9 +115,34 @@ export interface ResolvedRoute {
 	readonly featureArgument?: string;
 	readonly callerIdName?: string;
 	readonly callerIdNumber?: string;
+	/**
+	 * Whether the caller's number is presented to the far end — CLIR. Outbound only, and absent on
+	 * the emergency path on purpose: a 911 call presents the ELIN whatever the extension asked for.
+	 */
+	readonly callerIdPresentation?: CallerIdPresentation;
 	/** Regex capture groups from the matching pattern, `$1` first. */
 	readonly captures?: readonly string[];
 	readonly recordEnabled?: boolean;
+	/**
+	 * The STIR/SHAKEN level this platform asserts for the call, and the fact behind it. Outbound
+	 * only, and absent on the emergency path for the reason {@link callerIdPresentation} is absent
+	 * there: a 911 call presents the ELIN and is not a caller-id claim anybody attests.
+	 *
+	 * Absent also on an artifact compiled before the attestation block existed, which is what makes
+	 * this an additive field rather than a behaviour change for an old cache entry.
+	 */
+	readonly expectedAttestation?: AttestationLevel;
+	readonly callerIdRightToUse?: CallerIdRightToUse;
+	/**
+	 * Why an otherwise-routable outbound call was refused on compliance grounds.
+	 *
+	 * Set together with `matched: false` and the organization's denied terminal, so a caller that
+	 * knows nothing about attestation still behaves correctly — the refusal reaches the engine
+	 * through the same `deniedNodeId` path the toll-class gate and the kill switch already use, and
+	 * this field is the NAME of the cause for the CDR and the support ticket rather than a second
+	 * mechanism.
+	 */
+	readonly complianceRefusal?: OutboundComplianceRefusal;
 	/** Set when a call-block rule matched, whatever its action. */
 	readonly blocked?: BlockOutcome;
 	/** One line for the "why did this call go there?" ticket; mirrors the rpc contract's `reason`. */
@@ -233,11 +282,17 @@ interface GateWalk {
 }
 
 /**
- * Follows time-condition nodes until a node that actually does something.
+ * Follows gate nodes until a node that actually does something.
  *
  * The gate is evaluated here rather than by the engine so that the plan handed over is already the
  * answer for *this* instant. The nodes stay in the table so a call-flow inspector can still show
  * which gate was crossed.
+ *
+ * Two kinds are gates: a `time-condition`, whose answer is the clock (or an override), and a
+ * `call-flow`, whose answer is a switch somebody threw. They are followed by the same walk because
+ * they compose — a DID pointing at a call flow whose night branch is a time condition is the
+ * ordinary way an after-hours override is built — and because a walk that handled only one of them
+ * would hand the engine a plan that still had a gate in front of it.
  */
 function followGates(artifact: RoutingArtifact, entryNodeId: PlanNodeId, now: Date): GateWalk {
 	const diagnostics: Diagnostic[] = [];
@@ -245,6 +300,16 @@ function followGates(artifact: RoutingArtifact, entryNodeId: PlanNodeId, now: Da
 
 	for (let depth = 0; depth < MAX_GATE_DEPTH; depth += 1) {
 		const node = artifact.nodes[nodeId];
+		if (node !== undefined && node.kind === "call-flow") {
+			diagnostics.push({
+				severity: "info",
+				code: node.mode === "day" ? "time-condition-open" : "time-condition-closed",
+				message: `Call flow "${node.label ?? node.callFlowId}" is in ${node.mode} mode.`,
+				subject: { kind: "call-flow", id: node.callFlowId, name: node.label },
+			});
+			nodeId = node.mode === "day" ? node.dayNodeId : node.nightNodeId;
+			continue;
+		}
 		if (node === undefined || node.kind !== "time-condition") {
 			return { nodeId, diagnostics };
 		}
@@ -262,7 +327,7 @@ function followGates(artifact: RoutingArtifact, entryNodeId: PlanNodeId, now: Da
 		diagnostics.push({
 			severity: "info",
 			code: evaluation.matched ? "time-condition-open" : "time-condition-closed",
-			message: `Time condition "${condition.name}" evaluated ${evaluation.matched ? "open" : "closed"} at ${evaluation.at.date} ${pad2(evaluation.at.hour)}:${pad2(evaluation.at.minute)} ${condition.timezone}.`,
+			message: timeConditionMessage(condition.name, condition.timezone, evaluation),
 			subject: { kind: "time-condition", id: condition.id, name: condition.name },
 		});
 		const next = evaluation.matched ? node.matchNodeId : node.noMatchNodeId;
@@ -282,6 +347,26 @@ function followGates(artifact: RoutingArtifact, entryNodeId: PlanNodeId, now: Da
 
 function pad2(value: number): string {
 	return value < 10 ? `0${value}` : String(value);
+}
+
+/**
+ * The one-line explanation of a gate's answer.
+ *
+ * The clock is always named, override or not, because the support question is "why did this go to
+ * voicemail at 2pm on a Tuesday" and the clock is half of that answer. When an override is in force
+ * the sentence says so and says the rules were NOT read, which is the other half — without it a
+ * reader is left comparing the rule list against the timestamp and finding they disagree.
+ */
+function timeConditionMessage(
+	name: string,
+	timezone: string,
+	evaluation: TimeConditionEvaluation,
+): string {
+	const clock = `${evaluation.at.date} ${pad2(evaluation.at.hour)}:${pad2(evaluation.at.minute)} ${timezone}`;
+	if (evaluation.overridden !== undefined) {
+		return `Time condition "${name}" is manually overridden to ${evaluation.overridden}, so it evaluated ${evaluation.matched ? "open" : "closed"} at ${clock} without reading its rules.`;
+	}
+	return `Time condition "${name}" evaluated ${evaluation.matched ? "open" : "closed"} at ${clock}.`;
 }
 
 /** Evaluates a route's gate. `null` means "no gate"; `false` with no closed branch means "skip me". */
@@ -307,7 +392,7 @@ function gateOutcome(
 	diagnostics.push({
 		severity: "info",
 		code: evaluation.matched ? "time-condition-open" : "time-condition-closed",
-		message: `Time condition "${condition.name}" evaluated ${evaluation.matched ? "open" : "closed"} at ${evaluation.at.date} ${pad2(evaluation.at.hour)}:${pad2(evaluation.at.minute)} ${condition.timezone}.`,
+		message: timeConditionMessage(condition.name, condition.timezone, evaluation),
 		subject: { kind: "time-condition", id: condition.id, name: condition.name },
 	});
 	return evaluation.matched
@@ -330,9 +415,13 @@ function gateOutcome(
  */
 export function resolveInbound(
 	artifact: RoutingArtifact,
-	input: ResolveInboundInput,
+	rawInput: ResolveInboundInput,
 ): ResolvedRoute {
 	const diagnostics: Diagnostic[] = [];
+	// FIRST, before the screen and before the rule walk. The whole point of a per-trunk ruleset is
+	// that a tenant's blocklist should not have to know which carrier presented `0044…` and which
+	// presented `+44…`.
+	const input = normaliseInboundCaller(artifact, rawInput, diagnostics);
 	const blockRule = checkCallBlock(artifact.callBlock, input.callerNumber, "inbound");
 	let blocked: BlockOutcome | undefined;
 
@@ -390,6 +479,8 @@ export function resolveInbound(
 		);
 	}
 
+	// No `enabled` check, and none is missing: the compiler skips a disabled or voice-disabled DID
+	// before it writes the entry, so every row in this table is one the tenant switched on.
 	const did = artifact.inbound.didDefaults[input.did];
 	if (did !== undefined) {
 		const walk = followGates(artifact, did.destinationNodeId, input.now);
@@ -422,6 +513,52 @@ export function resolveInbound(
 		reason: `no inbound route matched ${input.did}`,
 		diagnostics,
 	});
+}
+
+/**
+ * Applies the arriving trunk's caller-id normalisation, if it has one.
+ *
+ * Returns the input unchanged whenever there is nothing to do — no trunk, no ruleset, no rule that
+ * matched — so the common path allocates nothing. A rewrite that took place is an `info` diagnostic
+ * naming the ruleset, because "the blocklist did not fire on the number the carrier sent" is only
+ * explicable if the walk records that the number changed.
+ */
+function normaliseInboundCaller(
+	artifact: RoutingArtifact,
+	input: ResolveInboundInput,
+	diagnostics: Diagnostic[],
+): ResolveInboundInput {
+	const caller = input.callerNumber;
+	if (input.trunkId === undefined || caller === undefined || caller.length === 0) {
+		return input;
+	}
+	const ruleset = artifact.inbound.inboundTranslations?.[input.trunkId];
+	if (ruleset === undefined || ruleset.rules.length === 0) {
+		return input;
+	}
+	const outcome = applyTranslationRuleset(ruleset, caller);
+	if (outcome.overflowed) {
+		diagnostics.push({
+			severity: "warning",
+			code: "number-translated",
+			message:
+				outcome.undialable === true
+					? `Ruleset "${ruleset.name}" would have rewritten caller id ${caller} to something that is not dialable; it was used as it arrived.`
+					: `Ruleset "${ruleset.name}" would have grown caller id ${caller} past the length bound; it was used as it arrived.`,
+			subject: { kind: "translation-ruleset", id: ruleset.id, name: ruleset.name },
+		});
+		return input;
+	}
+	if (outcome.value === caller) {
+		return input;
+	}
+	diagnostics.push({
+		severity: "info",
+		code: "number-translated",
+		message: `Ruleset "${ruleset.name}" normalised the inbound caller id ${caller} to ${outcome.value}.`,
+		subject: { kind: "translation-ruleset", id: ruleset.id, name: ruleset.name },
+	});
+	return { ...input, callerNumber: outcome.value };
 }
 
 function matchInboundRule(
@@ -491,9 +628,11 @@ function prefixedCallerName(
 /**
  * Resolves a call between two internal parties.
  *
- * Order is fixed and is part of the contract: feature codes, voicemail prefixes, exact internal
- * numbers, park slots. Feature codes first because they begin with `*` and no internal number may;
- * voicemail prefixes before numbers so `*99200` is a mailbox and not an extension named `*99200`.
+ * Order is fixed and is part of the contract: feature codes, voicemail prefixes, speed dials, exact
+ * internal numbers, park slots. Feature codes first because they begin with `*` and no internal
+ * number may; voicemail prefixes before numbers so `*99200` is a mailbox and not an extension named
+ * `*99200`; speed dials after the codes because a code must always win, and before the numbers
+ * because a bare-numeric code has to be reachable at all.
  */
 export function resolveInternal(
 	artifact: RoutingArtifact,
@@ -563,6 +702,26 @@ export function resolveInternal(
 			matchedRuleId: mailbox.voicemailBoxId,
 			matchedRuleName: `${entry.prefix}${mailboxNumber}`,
 			reason: `matched voicemail prefix ${entry.prefix}`,
+			diagnostics,
+		});
+	}
+
+	// AFTER the feature codes and the voicemail prefixes, BEFORE the exact numbers. The ordering and
+	// its argument are in `speed-dials-schema.ts`: a feature code must always win (an unguarded `*01`
+	// would otherwise be swallowed by the seeded `*0` eavesdrop code and its required argument), and
+	// a numeric code has to be reachable before the number map is consulted.
+	const speedDial = artifact.internal.speedDials?.[input.dialed];
+	if (speedDial !== undefined) {
+		const walk = followGates(artifact, speedDial.nodeId, input.now);
+		diagnostics.push(...walk.diagnostics);
+		return compactRoute({
+			matched: true,
+			context: "internal",
+			plan: planFrom(artifact, walk.nodeId),
+			matchedRuleId: speedDial.speedDialId,
+			matchedRuleName: speedDial.code,
+			callerIdNumber: input.from,
+			reason: `matched speed dial ${speedDial.code} ("${speedDial.label}")`,
 			diagnostics,
 		});
 	}
@@ -729,10 +888,16 @@ export function resolveOutbound(
 			});
 		}
 
-		const dialedNumber = applyDigitManipulation(
+		const manipulated = applyDigitManipulation(
 			{ stripDigits: rule.stripDigits, prependDigits: rule.prependDigits ?? null },
 			input.dialed,
 		);
+		// The shared ruleset runs SECOND, on the number the inline pair produced. See
+		// `translations-schema.ts`: the inline pair turns what fingers did into the number meant, and
+		// the ruleset normalises that for the wire — a ruleset that ran first would have to know about
+		// every route's outside-line prefix, which is the coupling the shared layer exists to remove.
+		const dialedNumber =
+			manipulated === null ? null : applyRouteTranslation(rule, manipulated, diagnostics);
 		if (dialedNumber === null) {
 			diagnostics.push({
 				severity: "warning",
@@ -741,6 +906,36 @@ export function resolveOutbound(
 				subject: { kind: "outbound-route", id: rule.id, name: rule.name },
 			});
 			continue;
+		}
+
+		const presentedCallerId =
+			rule.callerIdNumberOverride ??
+			caller?.outboundCallerIdNumber ??
+			artifact.settings.outboundCallerIdNumber;
+		// The attestation seam sits HERE and not earlier, because this is the first line at which the
+		// effective caller id exists: the route override, the extension and the org default have all
+		// had their say by now, and deciding a level against any of them individually would attest a
+		// number the call is not going to present. The emergency path returned long before this.
+		const attestation = outboundAttestation(
+			artifact.settings.attestation,
+			presentedCallerId,
+			artifact.settings.outboundCallerIdNumber,
+			diagnostics,
+		);
+		if (attestation?.refusal !== undefined) {
+			return compactRoute({
+				matched: false,
+				context: "outbound",
+				plan: planFrom(artifact, artifact.outbound.deniedNodeId),
+				matchedRuleId: rule.id,
+				matchedRuleName: rule.name,
+				expectedAttestation: attestation.attestation,
+				callerIdRightToUse: attestation.rightToUse,
+				callerIdNumber: attestation.callerIdNumber,
+				complianceRefusal: attestation.refusal,
+				reason: attestation.reason,
+				diagnostics,
+			});
 		}
 
 		return compactRoute({
@@ -752,11 +947,13 @@ export function resolveOutbound(
 			dialedNumber,
 			captures: match.captures.length > 0 ? match.captures : undefined,
 			recordEnabled: rule.recordEnabled,
-			callerIdNumber:
-				rule.callerIdNumberOverride ??
-				caller?.outboundCallerIdNumber ??
-				artifact.settings.outboundCallerIdNumber,
+			callerIdNumber: attestation?.callerIdNumber ?? presentedCallerId,
+			expectedAttestation: attestation?.attestation,
+			callerIdRightToUse: attestation?.rightToUse,
 			callerIdName: caller?.outboundCallerIdName ?? artifact.settings.outboundCallerIdName,
+			// The standing setting only. A per-call `*67`/`*82` overrides it further down, on the leg
+			// itself, because the code is dialled by the caller and the resolver never sees it.
+			callerIdPresentation: caller?.outboundCallerIdPresentation,
 			reason: `matched outbound route "${rule.name}"`,
 			diagnostics,
 		});
@@ -784,6 +981,67 @@ export function resolveOutbound(
 		reason: `no outbound route matched ${input.dialed}`,
 		diagnostics,
 	});
+}
+
+/**
+ * The attestation decision, on an artifact that may predate the block, with the diagnostics logged.
+ *
+ * `undefined` in and `undefined` out: an artifact compiled before the attestation block existed
+ * decides nothing and refuses nothing, which is exactly what every release before this one did and
+ * is why the block being optional is not an artifact-version bump. The pure decision itself lives in
+ * `attestation.ts` with no artifact and no diagnostic bag, so it can be re-run months later against
+ * the same compiled table to reproduce the answer.
+ */
+function outboundAttestation(
+	policy: CompiledAttestationPolicy | undefined,
+	presented: string | undefined,
+	mainNumber: string | undefined,
+	diagnostics: Diagnostic[],
+): AttestationDecision | undefined {
+	if (policy === undefined) {
+		return undefined;
+	}
+	const decision = decideAttestation(policy, presented, mainNumber);
+	diagnostics.push({
+		severity: decision.refusal === undefined ? "info" : "warning",
+		code: decision.refusal === undefined ? "attestation-decided" : "attestation-refused",
+		message: `Outbound attestation ${decision.attestation}: ${decision.reason}.`,
+	});
+	return decision;
+}
+
+/** Runs a matched route's shared ruleset over the already-manipulated number. */
+function applyRouteTranslation(
+	rule: OutboundRule,
+	dialed: string,
+	diagnostics: Diagnostic[],
+): string {
+	const ruleset = rule.translation;
+	if (ruleset === undefined || ruleset.rules.length === 0) {
+		return dialed;
+	}
+	const outcome = applyTranslationRuleset(ruleset, dialed);
+	if (outcome.overflowed) {
+		diagnostics.push({
+			severity: "warning",
+			code: "number-translated",
+			message:
+				outcome.undialable === true
+					? `Ruleset "${ruleset.name}" would have rewritten ${dialed} to something that is not dialable; route "${rule.name}" dialed it unchanged.`
+					: `Ruleset "${ruleset.name}" would have grown ${dialed} past the length bound; route "${rule.name}" dialed it unchanged.`,
+			subject: { kind: "translation-ruleset", id: ruleset.id, name: ruleset.name },
+		});
+		return dialed;
+	}
+	if (outcome.value !== dialed) {
+		diagnostics.push({
+			severity: "info",
+			code: "number-translated",
+			message: `Ruleset "${ruleset.name}" rewrote ${dialed} to ${outcome.value} for route "${rule.name}".`,
+			subject: { kind: "translation-ruleset", id: ruleset.id, name: ruleset.name },
+		});
+	}
+	return outcome.value;
 }
 
 function matchOutboundRule(

@@ -10,6 +10,7 @@ const SETTINGS = {
 	promptPrefix: "sound:prompts/",
 	fallbackMedia: "sound:unavailable",
 	objectMediaRoot: "",
+	prompts: {},
 };
 
 /** A deployment that HAS mounted its object store inside the media server. */
@@ -138,5 +139,43 @@ describe("translateMediaRef — object keys", () => {
 		expect(translateMediaRef("object://org-1/..hidden/x.wav", MOUNTED)).toBe(
 			"sound:/var/lib/optimiq/objects/org-1/..hidden/x",
 		);
+	});
+});
+
+/**
+ * The table that makes a tenant's own audio playable.
+ *
+ * Before it, a plan node's prompt ROW id was rendered under the deployment prefix and named a file
+ * that has never existed — the uploader mints a different id for the object — so every tenant
+ * prompt came back `no such prompt` from `mediad`.
+ */
+describe("resolveMediaRef — the artifact's prompt table", () => {
+	const WITH_TABLE = {
+		...MOUNTED,
+		prompts: { "row-1": "object://prompts/org-1/file-1.wav" },
+	};
+
+	it("resolves a prompt id through the table to the mounted object", () => {
+		expect(resolveMediaRef({ promptId: "row-1" }, WITH_TABLE)).toBe(
+			"sound:/var/lib/optimiq/objects/prompts/org-1/file-1",
+		);
+	});
+
+	it("resolves a `prompt://` ref through the same table", () => {
+		expect(translateMediaRef("prompt://row-1", WITH_TABLE)).toBe(
+			"sound:/var/lib/optimiq/objects/prompts/org-1/file-1",
+		);
+	});
+
+	it("falls back to the prefix for a bare stem, which is never a row", () => {
+		expect(resolveMediaRef({ promptId: "unavailable" }, WITH_TABLE)).toBe(
+			"sound:prompts/unavailable",
+		);
+	});
+
+	it("falls back to the prefix when the object store is not mounted", () => {
+		// The refusal, and its reason, stay exactly what they were before the table existed.
+		const unmounted = { ...SETTINGS, prompts: WITH_TABLE.prompts };
+		expect(resolveMediaRef({ promptId: "row-1" }, unmounted)).toBe("sound:prompts/row-1");
 	});
 });

@@ -1,0 +1,90 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"trunkId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"orgId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"name": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"kind": {
+			"type": "string",
+			"enum": ["register", "ip-auth"]
+		},
+		"sipDomain": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 255
+		},
+		"sipProxy": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 255
+		},
+		"outboundProxy": {
+			"type": "string",
+			"maxLength": 255
+		},
+		"authUser": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"secretRef": {
+			"type": "string",
+			"maxLength": 256
+		},
+		"transport": {
+			"type": "string",
+			"enum": ["udp", "tcp", "tls", "ws", "wss"]
+		},
+		"registerExpiresSeconds": {
+			"default": 300,
+			"type": "integer",
+			"minimum": 30,
+			"maximum": 86400
+		},
+		"maxChannels": {
+			"type": "integer",
+			"minimum": 1,
+			"maximum": 10000
+		},
+		"callerIdNumberOverride": {
+			"type": "string",
+			"maxLength": 64
+		},
+		"srtpPolicy": {
+			"type": "string",
+			"enum": ["none", "prefer", "require"]
+		},
+		"enabled": {
+			"default": true,
+			"type": "boolean"
+		},
+		"updatedAt": {
+			"type": "number"
+		}
+	},
+	"required": [
+		"trunkId",
+		"orgId",
+		"name",
+		"kind",
+		"sipDomain",
+		"sipProxy",
+		"transport",
+		"registerExpiresSeconds",
+		"enabled",
+		"updatedAt"
+	],
+	"additionalProperties": {}
+}

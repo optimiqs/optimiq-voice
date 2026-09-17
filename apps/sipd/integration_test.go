@@ -8,14 +8,15 @@
 //
 //	RUN_SIPD_INTEGRATION=1 go test -tags integration -v -timeout 5m ./...
 //
-// Requirements: a working `docker` (or a Docker-compatible CLI) on PATH. The test starts one
-// throwaway `nats:2.11 -js` container on a random port and removes it on the way out, including
-// after a panic or a failed assertion.
+// Requirements: a broker the test can start. Either a working `docker` (or a Docker-compatible CLI)
+// on PATH — one throwaway `nats:2.11 -js` container on a random port, removed on the way out
+// including after a panic or a failed assertion — or a local `nats-server` binary named by
+// NATS_SERVER_BIN, which is spawned directly on a free port with a per-test JetStream store. The
+// binary path exists because a machine without a container runtime is otherwise unable to run any
+// of this, and the suites assert on broker BEHAVIOUR rather than on how it was started.
 //
-// Why raw UDP rather than a sipgo client: the point of an integration test is to prove that bytes
-// on a wire produce a binding in a bucket. Building the REGISTER by hand and parsing the response
-// with sipgo's parser keeps the SIP visible in the test, and keeps the client half from sharing
-// code (and therefore bugs) with the server half.
+// Raw UDP rather than a sipgo client, so the client half shares no code — and therefore no bugs —
+// with the server half.
 package sipd_test
 
 import (
@@ -63,16 +64,127 @@ const (
 func requireIntegration(t *testing.T) {
 	t.Helper()
 	if os.Getenv("RUN_SIPD_INTEGRATION") != "1" {
-		t.Skip("set RUN_SIPD_INTEGRATION=1 to run the sipd integration suite (needs docker)")
+		t.Skip("set RUN_SIPD_INTEGRATION=1 to run the sipd integration suite (needs docker or NATS_SERVER_BIN)")
+	}
+	if natsServerBinary() != "" {
+		return
 	}
 	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker is not on PATH")
+		t.Skip("neither NATS_SERVER_BIN nor docker is available")
 	}
+}
+
+// natsServerBinary is the local broker binary, when one was named. Preferred over docker when set.
+func natsServerBinary() string {
+	binary := strings.TrimSpace(os.Getenv("NATS_SERVER_BIN"))
+	if binary == "" {
+		return ""
+	}
+	if _, err := exec.LookPath(binary); err != nil {
+		return ""
+	}
+	return binary
+}
+
+// freePort asks the kernel for a port and hands back the number.
+//
+// The listener is closed before the broker binds it, so this races in principle; a fixed port would
+// make two concurrent packages collide every time rather than never.
+func freePort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserving a port for nats-server: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatalf("releasing the reserved port: %v", err)
+	}
+	return port
+}
+
+// startLocalNATSWithConfig spawns the named binary against config/nats.conf.
+//
+// The config pins `port: 4222`, `http_port: 8222` and `store_dir: "/data"`. The ports are
+// overridden by flag, which wins over the file; `store_dir` cannot be, because a `-sd` alongside a
+// `jetstream` block that sets it is a "Duplicate 'store_dir' configuration" the server refuses to
+// start on. So the file is copied with that ONE line rewritten and nothing else, keeping every
+// account, user and permission under test the deployed one.
+func startLocalNATSWithConfig(t *testing.T, binary, configPath string, environment []string) string {
+	t.Helper()
+	source, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("reading config/nats.conf: %v", err)
+	}
+	store := filepath.Join(t.TempDir(), "jetstream")
+	rewritten := strings.Replace(string(source), `store_dir: "/data"`, `store_dir: "`+store+`"`, 1)
+	if rewritten == string(source) {
+		t.Fatalf(`config/nats.conf no longer contains store_dir: "/data"; this helper needs updating`)
+	}
+	localConfig := filepath.Join(t.TempDir(), "nats.conf")
+	if err := os.WriteFile(localConfig, []byte(rewritten), 0o600); err != nil {
+		t.Fatalf("writing the local copy of nats.conf: %v", err)
+	}
+
+	port := freePort(t)
+	cmd := exec.Command(binary,
+		"-c", localConfig,
+		"-a", "127.0.0.1", "-p", strconv.Itoa(port),
+		"-m", strconv.Itoa(freePort(t)),
+	)
+	cmd.Env = environment
+	var output strings.Builder
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting %s with the platform config: %v", binary, err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+		if t.Failed() {
+			t.Logf("nats-server output:\n%s", output.String())
+		}
+	})
+	return "nats://127.0.0.1:" + strconv.Itoa(port)
+}
+
+// startLocalNATS spawns the named binary and kills it on the way out.
+func startLocalNATS(t *testing.T, binary string, extra ...string) string {
+	t.Helper()
+	port := freePort(t)
+	args := append([]string{
+		"-a", "127.0.0.1", "-p", strconv.Itoa(port),
+		"-js", "-sd", t.TempDir(),
+	}, extra...)
+	cmd := exec.Command(binary, args...)
+	var output strings.Builder
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting %s: %v", binary, err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+		if t.Failed() {
+			t.Logf("nats-server output:\n%s", output.String())
+		}
+	})
+	return "nats://127.0.0.1:" + strconv.Itoa(port)
 }
 
 // startNATS runs a throwaway JetStream server and returns its client URL.
 func startNATS(t *testing.T) string {
 	t.Helper()
+
+	if binary := natsServerBinary(); binary != "" {
+		return waitForJetStream(t, startLocalNATS(t, binary))
+	}
 
 	out, err := exec.Command("docker", "run", "-d", "--rm",
 		"-p", "127.0.0.1::4222", natsImage, "-js").CombinedOutput()
@@ -108,6 +220,12 @@ func startNATS(t *testing.T) string {
 	}
 	url := "nats://" + mapped
 
+	return waitForJetStream(t, url)
+}
+
+// waitForJetStream blocks until the broker answers an AccountInfo, or fails the test.
+func waitForJetStream(t *testing.T, url string) string {
+	t.Helper()
 	// JetStream needs a moment to come up; poll rather than sleep a magic number.
 	deadline := time.Now().Add(60 * time.Second)
 	for {
@@ -115,7 +233,7 @@ func startNATS(t *testing.T) string {
 		if err == nil {
 			js, jsErr := jetstream.New(conn)
 			if jsErr == nil {
-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 				_, jsErr = js.AccountInfo(ctx)
 				cancel()
 			}
@@ -135,7 +253,7 @@ func startNATS(t *testing.T) string {
 // ensureRegistrationsStream provisions the REGISTRATIONS stream from the shared contract.
 //
 // sipd deliberately does not do this itself (see events.NewJetStreamPublisher): stream provisioning
-// belongs to the control plane's ensureStreams. The test therefore plays the control plane.
+// belongs to the control plane's ensureStreams, so the test plays the control plane.
 func ensureRegistrationsStream(t *testing.T, ctx context.Context, js jetstream.JetStream) jetstream.Stream {
 	t.Helper()
 	definition := contract.RegistrationsStream
@@ -212,9 +330,8 @@ func startEdge(t *testing.T, ctx context.Context, js jetstream.JetStream) *edge 
 }
 
 // startEdgeWithStore is startEdge with the credential store supplied, so the credential-RPC suite
-// can boot the same vertical against NATSStore instead of the file fixture. Everything else — the
-// socket, the bucket, the stream, the expiry policy — is identical, which is what makes a
-// behavioural difference between the two attributable to the store.
+// can boot the same vertical against NATSStore instead of the file fixture. Everything else is
+// identical, so a behavioural difference between the two is attributable to the store.
 func startEdgeWithStore(
 	t *testing.T,
 	ctx context.Context,
@@ -348,14 +465,15 @@ type sipClient struct {
 	conn   *net.UDPConn
 	parser *sip.Parser
 	cseq   int
-	// user and aor are what this client claims to be. They are fields rather than constants
-	// because the registrar checks that the digest username OWNS the AOR being registered, and
-	// that check runs BEFORE the credential lookup — so a test that wants to exercise the
-	// credential store with a different account has to move the AOR too, or it only ever proves
-	// the ownership check works.
+	// user and aor are what this client claims to be. Fields rather than constants because the
+	// registrar's username-owns-AOR check runs BEFORE the credential lookup, so a test exercising
+	// the credential store with a different account must move the AOR too.
 	user   string
 	aor    string
 	callID string
+	// nonceCount is the RFC 2617 `nc`, incremented on every answer. The registrar's replay guard
+	// accepts a nonce count exactly once per nonce, so a verbatim re-send is refused.
+	nonceCount int
 }
 
 func dialSIP(t *testing.T, addr string) *sipClient {
@@ -459,9 +577,10 @@ func (c *sipClient) authenticateAs(res *sip.Response, username, password string)
 	if err != nil {
 		c.t.Fatalf("parsing the challenge: %v", err)
 	}
+	c.nonceCount++
 	answer, err := digest.Digest(challenge, digest.Options{
 		Method: "REGISTER", URI: "sip:" + itRealm,
-		Username: username, Password: password, Count: 1, Cnonce: "0a4f113b",
+		Username: username, Password: password, Count: c.nonceCount, Cnonce: "0a4f113b",
 	})
 	if err != nil {
 		c.t.Fatalf("computing the digest: %v", err)
@@ -471,9 +590,8 @@ func (c *sipClient) authenticateAs(res *sip.Response, username, password string)
 
 // answerFor answers a challenge for a METHOD other than REGISTER.
 //
-// HA2 is MD5(method:uri), so a SUBSCRIBE answered with a REGISTER digest verifies against nothing —
-// which is exactly the bug this helper exists to make impossible to write by accident.
-func (c *sipClient) answerFor(res *sip.Response, method string) string {
+// HA2 is MD5(method:uri), so a SUBSCRIBE answered with a REGISTER digest verifies against nothing.
+func (c *sipClient) answerFor(res *sip.Response, method, uri string) string {
 	c.t.Helper()
 	header := res.GetHeader("WWW-Authenticate")
 	if header == nil {
@@ -483,9 +601,10 @@ func (c *sipClient) answerFor(res *sip.Response, method string) string {
 	if err != nil {
 		c.t.Fatalf("parsing the challenge: %v", err)
 	}
+	c.nonceCount++
 	answer, err := digest.Digest(challenge, digest.Options{
-		Method: method, URI: "sip:" + itRealm,
-		Username: c.user, Password: itPass, Count: 1, Cnonce: "0a4f113b",
+		Method: method, URI: uri,
+		Username: c.user, Password: itPass, Count: c.nonceCount, Cnonce: "0a4f113b",
 	})
 	if err != nil {
 		c.t.Fatalf("computing the digest: %v", err)
@@ -531,12 +650,10 @@ func (r *eventReader) next(timeout time.Duration) (string, contract.Envelope[map
 	}
 }
 
-// ---------------------------------------------------------------------------------------------
-
 func TestRegisterBindsPublishesAndExpires(t *testing.T) {
 	requireIntegration(t)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	url := startNATS(t)
@@ -556,13 +673,13 @@ func TestRegisterBindsPublishesAndExpires(t *testing.T) {
 	edge := startEdge(t, ctx, js)
 	client := dialSIP(t, edge.addr)
 
-	// --- 1. unauthenticated REGISTER is challenged -----------------------------------------------
+	// 1. Unauthenticated REGISTER is challenged.
 	challenge := client.register("", ";expires=2")
 	if challenge.StatusCode != 401 {
 		t.Fatalf("first response = %d %s, want 401", challenge.StatusCode, challenge.Reason)
 	}
 
-	// --- 2. authenticated REGISTER binds ---------------------------------------------------------
+	// 2. Authenticated REGISTER binds.
 	authorization := client.authenticate(challenge)
 	ok := client.register(authorization, ";expires=2")
 	if ok.StatusCode != 200 {
@@ -572,7 +689,7 @@ func TestRegisterBindsPublishesAndExpires(t *testing.T) {
 		t.Errorf("Expires = %v, want the granted 2", header)
 	}
 
-	// --- 3. the binding is in the real KV bucket --------------------------------------------------
+	// 3. The binding is in the real KV bucket.
 	binding, found, err := edge.bindings.Get(ctx, itOrg, edge.aorHash)
 	if err != nil {
 		t.Fatalf("reading the binding: %v", err)
@@ -596,7 +713,7 @@ func TestRegisterBindsPublishesAndExpires(t *testing.T) {
 		t.Error("binding.DeviceID is empty; the credential's device did not reach the bucket")
 	}
 
-	// --- 4. the registered event is on the real stream --------------------------------------------
+	// 4. The registered event is on the real stream.
 	subject, registered := reader.next(10 * time.Second)
 	wantSubject := "sip.reg.v1." + itOrg + "." + edge.aorHash + ".registered"
 	if subject != wantSubject {
@@ -621,7 +738,7 @@ func TestRegisterBindsPublishesAndExpires(t *testing.T) {
 		t.Errorf("data.expiresInSeconds = %v, want 2", got)
 	}
 
-	// --- 5. the sweeper expires it ----------------------------------------------------------------
+	// 5. The sweeper expires it.
 	subject, expired := reader.next(15 * time.Second)
 	wantSubject = "sip.reg.v1." + itOrg + "." + edge.aorHash + ".expired"
 	if subject != wantSubject {
@@ -654,7 +771,7 @@ func TestRegisterBindsPublishesAndExpires(t *testing.T) {
 func TestDeregisterRemovesTheBinding(t *testing.T) {
 	requireIntegration(t)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	url := startNATS(t)
@@ -686,8 +803,10 @@ func TestDeregisterRemovesTheBinding(t *testing.T) {
 		t.Fatalf("first event = %q", subjectEvent.Type)
 	}
 
-	// Expires: 0 — a phone being powered off, or a user logging out.
-	if res := client.register(authorization, ";expires=0"); res.StatusCode != 200 {
+	// Expires: 0 — a phone being powered off, or a user logging out. Answered afresh, because the
+	// registrar's nonce-count guard accepts each nc once: re-sending the header that registered the
+	// binding is a replay, and a phone increments instead.
+	if res := client.register(client.authenticate(challenge), ";expires=0"); res.StatusCode != 200 {
 		t.Fatalf("de-register = %d %s", res.StatusCode, res.Reason)
 	}
 
@@ -708,7 +827,7 @@ func TestDeregisterRemovesTheBinding(t *testing.T) {
 func TestOptionsAndUnsupportedMethodsOverTheWire(t *testing.T) {
 	requireIntegration(t)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	url := startNATS(t)
@@ -760,9 +879,8 @@ func TestOptionsAndUnsupportedMethodsOverTheWire(t *testing.T) {
 		"Content-Length: 0", "", "",
 	}, "\r\n")
 	// `presence` is RFC 3856 pidf+xml — a different thing wearing the same word as the `dialog`
-	// package a BLF key uses, and one this edge does not serve. It used to be answered 501 along with
-	// every other method; now that SUBSCRIBE is implemented, 489 with the honest `Allow-Events` is
-	// the answer a phone can act on, and 501 would stop it trying a package we DO serve.
+	// package a BLF key uses, and one this edge does not serve. 489 with an honest `Allow-Events`
+	// is the answer a phone can act on; 501 would stop it trying a package we DO serve.
 	res := send(subscribe)
 	if res.StatusCode != 489 {
 		t.Errorf("SUBSCRIBE = %d %s, want 489 Bad Event", res.StatusCode, res.Reason)
@@ -774,21 +892,16 @@ func TestOptionsAndUnsupportedMethodsOverTheWire(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------------------------
-// the presence spine, over a real bucket and a real socket
-// ---------------------------------------------------------------------------------------------
-
 // TestBlfSubscriptionLightsFromThePresenceBucket is the round trip the whole wave exists for: a
 // registered phone arms a busy-lamp key, an ENGINE-side writer moves an extension's device state in
 // the `presence` KV bucket, and the lamp changes.
 //
-// It is deliberately end to end through the parts that are easy to get subtly wrong and impossible
-// to unit-test together: a real JetStream KV watch, a real UDP socket in both directions, and a
-// NOTIFY the test parses as a request rather than trusting a recorder.
+// End to end through the parts that cannot be unit-tested together: a real JetStream KV watch, a
+// real UDP socket in both directions, and a NOTIFY parsed as a request rather than trusted.
 func TestBlfSubscriptionLightsFromThePresenceBucket(t *testing.T) {
 	requireIntegration(t)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	url := startNATS(t)
@@ -822,7 +935,7 @@ func TestBlfSubscriptionLightsFromThePresenceBucket(t *testing.T) {
 	if res.StatusCode != 401 {
 		t.Fatalf("SUBSCRIBE = %d %s, want a challenge", res.StatusCode, res.Reason)
 	}
-	res = client.subscribeDialog(client.answerFor(res, "SUBSCRIBE"), watched)
+	res = client.subscribeDialog(client.answerFor(res, "SUBSCRIBE", "sip:"+watched+"@"+itRealm), watched)
 	if res.StatusCode != 200 {
 		t.Fatalf("SUBSCRIBE = %d %s, want 200", res.StatusCode, res.Reason)
 	}
@@ -959,9 +1072,9 @@ func headerValueOf(message interface{ GetHeader(string) sip.Header }, name strin
 	return header.Value()
 }
 
-// dialogStatesIn parses a dialog-info body and returns the state of each dialog it reports. The test
-// parses rather than string-matches for the same reason the unit tests do: a phone that dislikes the
-// body does not complain, it leaves the lamp where it was.
+// dialogStatesIn parses a dialog-info body and returns the state of each dialog it reports. Parsed
+// rather than string-matched: a phone that dislikes the body does not complain, it leaves the lamp
+// where it was.
 func dialogStatesIn(t *testing.T, body []byte) []string {
 	t.Helper()
 	var document struct {
@@ -980,10 +1093,6 @@ func dialogStatesIn(t *testing.T, body []byte) []string {
 	return states
 }
 
-// ---------------------------------------------------------------------------------------------
-// the presence spine, under the REAL broker permissions
-// ---------------------------------------------------------------------------------------------
-
 // The enumerated identities from config/nats.conf. Passwords are per-run junk; the point of this
 // suite is the ALLOW-LISTS, not the secrets.
 const (
@@ -994,13 +1103,10 @@ const (
 
 // startNATSWithPlatformConfig runs a throwaway broker on the REAL `config/nats.conf`.
 //
-// This is the only test in the tree that exercises sipd against the permission set it actually
-// deploys with, and it exists because the failure mode of getting that wrong is invisible in every
-// other test: an allow-list that is one subject short produces a broker refusal, and a KV watch that
-// was refused looks exactly like a bucket nobody is writing to — a fleet of BLF keys that stay dark
-// with nothing in any log to say why. It is the same trap the registrations rehydration fell into
-// with the bare `$JS.API.CONSUMER.CREATE.KV_registrations` form, and the presence watch needs the
-// identical pair.
+// The only test that exercises sipd against the permission set it deploys with. The failure mode is
+// invisible everywhere else: an allow-list one subject short produces a broker refusal, and a
+// refused KV watch looks exactly like a bucket nobody is writing to — BLF keys that stay dark with
+// nothing in any log. The bare `$JS.API.CONSUMER.CREATE.KV_<bucket>` form is the usual omission.
 func startNATSWithPlatformConfig(t *testing.T) string {
 	t.Helper()
 
@@ -1012,14 +1118,9 @@ func startNATSWithPlatformConfig(t *testing.T) string {
 		t.Fatalf("config/nats.conf is not readable: %v", err)
 	}
 
-	args := []string{
-		"run", "-d", "--rm",
-		"-p", "127.0.0.1::4222",
-		"-v", configPath + ":/etc/nats/nats.conf:ro",
-	}
-	// Every `$NAME` in the file must resolve or the broker refuses to start — which is itself the
-	// behaviour the config's header promises, and is why all ten are passed.
-	for _, pair := range [][2]string{
+	// Every `$NAME` in the file must resolve or the broker refuses to start, which is why all
+	// twelve are passed.
+	credentials := [][2]string{
 		{"NATS_USER", "operator-it"},
 		{"NATS_PASS", itNATSPass},
 		{"NATS_API_USER", "api-it"},
@@ -1032,7 +1133,22 @@ func startNATSWithPlatformConfig(t *testing.T) string {
 		{"NATS_SIPD_PASS", itNATSPass},
 		{"NATS_SYS_USER", "sys-it"},
 		{"NATS_SYS_PASS", itNATSPass},
-	} {
+	}
+
+	if binary := natsServerBinary(); binary != "" {
+		environment := os.Environ()
+		for _, pair := range credentials {
+			environment = append(environment, pair[0]+"="+pair[1])
+		}
+		return waitForSipdLogin(t, startLocalNATSWithConfig(t, binary, configPath, environment))
+	}
+
+	args := []string{
+		"run", "-d", "--rm",
+		"-p", "127.0.0.1::4222",
+		"-v", configPath + ":/etc/nats/nats.conf:ro",
+	}
+	for _, pair := range credentials {
 		args = append(args, "-e", pair[0]+"="+pair[1])
 	}
 	args = append(args, natsImage, "-c", "/etc/nats/nats.conf")
@@ -1053,11 +1169,15 @@ func startNATSWithPlatformConfig(t *testing.T) string {
 		t.Fatalf("docker port: %v\n%s", err, port)
 	}
 	mapped := strings.TrimSpace(strings.Split(strings.TrimSpace(string(port)), "\n")[0])
-	url := "nats://" + mapped
+	return waitForSipdLogin(t, "nats://"+mapped)
+}
 
+// waitForSipdLogin blocks until the broker accepts the sipd account's credentials.
+func waitForSipdLogin(t *testing.T, url string) string {
+	t.Helper()
 	deadline := time.Now().Add(60 * time.Second)
 	for {
-		conn, err := nats.Connect(url, nats.UserInfo(itSipdUser, itNATSPass))
+		conn, err := nats.Connect(url, nats.UserInfo(itSipdUser, itNATSPass), nats.CustomInboxPrefix("_INBOX.sipd"))
 		if err == nil {
 			conn.Close()
 			return url
@@ -1084,12 +1204,12 @@ func startNATSWithPlatformConfig(t *testing.T) string {
 func TestSipdPresenceGrantsUnderThePlatformConfig(t *testing.T) {
 	requireIntegration(t)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	url := startNATSWithPlatformConfig(t)
 
-	engineConn, err := nats.Connect(url, nats.UserInfo(itEngineUser, itNATSPass))
+	engineConn, err := nats.Connect(url, nats.UserInfo(itEngineUser, itNATSPass), nats.CustomInboxPrefix("_INBOX.engine"))
 	if err != nil {
 		t.Fatalf("connecting as the engine identity: %v", err)
 	}
@@ -1099,7 +1219,7 @@ func TestSipdPresenceGrantsUnderThePlatformConfig(t *testing.T) {
 		t.Fatalf("jetstream.New (engine): %v", err)
 	}
 
-	sipdConn, err := nats.Connect(url, nats.UserInfo(itSipdUser, itNATSPass))
+	sipdConn, err := nats.Connect(url, nats.UserInfo(itSipdUser, itNATSPass), nats.CustomInboxPrefix("_INBOX.sipd"))
 	if err != nil {
 		t.Fatalf("connecting as the sipd identity: %v", err)
 	}

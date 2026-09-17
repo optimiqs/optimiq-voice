@@ -57,7 +57,7 @@ interface Harness {
 	readonly clock: { value: number };
 }
 
-function harness(): Harness {
+function harness(overrides: { readonly openTimeoutMs?: number } = {}): Harness {
 	FakeSocket.instances.length = 0;
 	const events: AriEvent[] = [];
 	const errors: unknown[] = [];
@@ -77,6 +77,7 @@ function harness(): Harness {
 		},
 		webSocketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
 		now: () => clock.value,
+		...overrides,
 	});
 
 	return { stream, events, errors, statuses, gaps, sockets: FakeSocket.instances, clock };
@@ -164,6 +165,44 @@ describe("AriEventStream", () => {
 		await Promise.resolve();
 		h.sockets[0]?.fail(1006, "connection refused");
 		await expect(started).rejects.toThrow(/closed before it opened/u);
+		h.stream.close();
+	});
+
+	/**
+	 * A rejected `start()` must not leave a retry loop running behind the caller's back. `onclose`
+	 * has already scheduled one by the time `connect` rejects, and `stopped` was still false — so a
+	 * second `start()` returned immediately without connecting, while sockets kept opening into a
+	 * half-constructed service.
+	 */
+	it("leaves the stream closed and restartable when start() rejects", async () => {
+		const h = harness();
+		const started = h.stream.start();
+		await Promise.resolve();
+		h.sockets[0]?.fail(1006, "connection refused");
+		await expect(started).rejects.toThrow();
+
+		expect(h.stream.status).toBe("closed");
+		const socketsAfterFailure = h.sockets.length;
+		await tick();
+		expect(h.sockets).toHaveLength(socketsAfterFailure);
+
+		// And a second start() actually connects rather than resolving into nothing.
+		await startAndOpen(h);
+		expect(h.stream.status).toBe("open");
+		h.stream.close();
+	});
+
+	/**
+	 * The open-timeout path abandoned a socket that was still CONNECTING or OPEN — one orphaned fd
+	 * and one half-open TCP connection per attempt, forever, against a media server that is by
+	 * definition already struggling when this timer fires.
+	 */
+	it("closes the socket it gives up on when the open timeout fires", async () => {
+		const h = harness({ openTimeoutMs: 1 });
+		const started = h.stream.start();
+		await Promise.resolve();
+		await expect(started).rejects.toThrow(/did not open before the timeout/u);
+		expect(h.sockets[0]?.closedWith).toBeDefined();
 		h.stream.close();
 	});
 

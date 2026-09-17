@@ -19,8 +19,9 @@ admin UI shows live state.
 | Control-plane API | NestJS 11 on Fastify 5, Effect 4, Drizzle + Postgres. One HTTP listener on 9876: `/api/auth/*` and `/api/v1/*`. Owns tenancy, auth, provisioning and the PBX schema. | `apps/api`                              |
 | Admin frontend    | Next.js 16 App Router. Talks to the API through a same-origin proxy so the session cookie stays first-party.                                                         | `apps/web`                              |
 | Call engine       | Turns Asterisk ARI events into domain state, walks the compiled routing artifact, publishes call events and emits one CDR per leg.                                   | `apps/engine`                           |
-| SIP edge          | Go 1.26 SIP service. Today a registrar: digest auth, AOR bindings in NATS KV, `sip.reg.v1` transitions. Proxying is next.                                            | `apps/sipd`                             |
-| Media server      | A dockerized Asterisk 22 (LTS) with generated `pjsip`/`ari` config. Scaffolding — the engine drives it over ARI.                                                     | `apps/asterisk`                         |
+| SIP edge          | Go 1.26 SIP service. Registrar and INVITE proxy: digest auth, AOR bindings in NATS KV, `sip.reg.v1` transitions, `sip.evt.v1` dialog lifecycle, WSS for browsers.    | `apps/sipd`                             |
+| Media plane       | Go RTP/WebRTC media server. The default (`ENGINE_MEDIA_DRIVER: mediad`): it owns the media sessions the engine's legs are bridged through.                           | `apps/mediad`                           |
+| Legacy media      | A dockerized Asterisk 22 (LTS) with generated `pjsip`/`ari` config, behind the `legacy-asterisk` compose profile. The engine still drives it over ARI.               | `apps/asterisk`                         |
 | Event backbone    | The versioned subject taxonomy, Zod event schemas and JetStream stream/KV definitions every service shares. A Go peer is generated from it and drift-gated in CI.    | `packages/events`, `packages/events-go` |
 | Routing compiler  | Compiles a PBX configuration snapshot into a cacheable routing artifact and resolves inbound, internal and outbound calls against it.                                | `packages/routing`                      |
 | Carrier           | Typed Telnyx API v2 client, with an in-package fake Telnyx server for tests.                                                                                         | `packages/telnyx`                       |
@@ -38,8 +39,9 @@ apps/
   api          control-plane API (NestJS + Fastify + Effect)
   web          admin frontend (Next.js 16) — the stack's ingress
   engine       ARI-driven call engine
-  sipd         Go SIP edge (registrar)
-  asterisk     Asterisk 22 image, config and run script
+  sipd         Go SIP edge (registrar and INVITE proxy)
+  mediad       Go RTP/WebRTC media plane
+  asterisk     Asterisk 22 image, config and run script (legacy-asterisk profile)
 packages/
   auth         better-auth composition, permission registry, call-token verifier
   cdr-db       CDR bounded context: per-leg records, call events, recordings
@@ -55,7 +57,8 @@ packages/
   routing      routing compiler
   telephony    pure call domain: state machines, verbs, hangup causes
   telnyx       Telnyx client and fake server
-config/        nats.conf — the broker's accounts and JetStream settings
+config/        nats.conf — the broker's accounts and JetStream settings; postgres/ and turn/
+docs/          deployment guides, including native-calling-deployment.md
 openspec/      specifications and in-flight change proposals
 plans/         migration plans and research notes
 ```
@@ -123,7 +126,8 @@ pnpm exec turbo run test                         # everything
 pnpm --filter @optimiq-voice/engine run test     # bun test src
 pnpm --filter @optimiq-voice/api run test        # mocha
 pnpm run test                                    # root Mocha suite (needs .env)
-cd apps/sipd && go test ./...                    # Go SIP edge
+cd apps/sipd && go test -race ./...              # Go SIP edge
+cd apps/mediad && go test -race ./...            # Go media plane
 ```
 
 CI (`.github/workflows/ci.yaml`) runs `turbo run build`, `turbo run test` and `turbo run typecheck`,
@@ -133,13 +137,26 @@ they need a live Postgres, NATS and Asterisk to run against.
 
 ## Running the whole stack in containers
 
-`compose.yaml` is the deployment topology — `web`, `api`, `engine`, `asterisk`, `postgres` and
-`nats`, with `web` on `WEB_PORT` (3100) as the only published port. `compose.dev.yaml` overlays
-local builds, published ports and the two development-only containers (Adminer, MailHog).
+`compose.yaml` is the BASE layer — `web`, `api`, `engine`, `asterisk`, `postgres` and `nats`, with
+`web` on `WEB_PORT` (3100) as the only published port, one `objects` volume shared by `api` and
+`asterisk`, and images pulled from `ghcr.io/optimiqs/optimiq-voice/*`. It is meant to be merged with
+an overlay rather than run alone. `compose.dev.yaml` overlays local builds, published ports and the
+two development-only containers (Adminer, MailHog).
 
 ```bash
 docker compose -f compose.yaml -f compose.dev.yaml up -d --build
 ```
+
+`compose.voice.yaml` is the actual deployment: it adds `sipd`, `mediad`, `coturn` and the `migrate`
+job, moves Asterisk behind the `legacy-asterisk` profile, and points the engine at `mediad`. Start
+from `.env.voice.example` and read `docs/native-calling-deployment.md`, which covers the certificate
+material, the published RTP range and the browser-calling flags.
+
+```bash
+docker compose --env-file .env.voice -f compose.yaml -f compose.voice.yaml up -d
+```
+
+`compose.tls.yaml` is a third overlay that puts the broker behind TLS.
 
 For a real deployment, start from `.env.example` instead. It is the production template: it ships
 placeholders rather than credentials, and `@optimiq-voice/config` refuses to boot a
@@ -151,8 +168,8 @@ enforces and which it does not.
 This is a platform under active migration, not a finished product. The routing compiler, the PBX
 schema and the admin frontend are the mature parts. The call engine implements a subset of the
 session protocol and reports the rest as unsupported rather than pretending; `apps/sipd` registers
-endpoints but does not yet proxy calls; E911 addresses are stored but never sent to a carrier; and
-container publishing beyond the Asterisk image is not wired up yet. Where something is not built,
+endpoints and proxies calls but the SIP surface is still growing; E911 addresses are stored but
+never sent to a carrier. Where something is not built,
 the code and the UI say so.
 
 ## Contributing

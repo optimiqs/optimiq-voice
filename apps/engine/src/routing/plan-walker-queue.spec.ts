@@ -34,6 +34,7 @@ interface HarnessOptions {
 	readonly seed?: Readonly<Record<string, "available" | "logged-out">>;
 	readonly noServices?: boolean;
 	readonly onCallTransitionFails?: boolean;
+	readonly sipRealm?: string;
 }
 
 function harness(options: HarnessOptions = {}) {
@@ -100,6 +101,9 @@ function harness(options: HarnessOptions = {}) {
 			states.push(next);
 			return true;
 		},
+		get bridgeId(): string | undefined {
+			return state.bridgeId;
+		},
 		setBridge: (bridgeId) => {
 			state.bridgeId = bridgeId;
 		},
@@ -129,7 +133,11 @@ function harness(options: HarnessOptions = {}) {
 		channel,
 		execute,
 		publish: async () => undefined,
-		settings: { answerTimeoutMs: 200, defaultRingTimeoutSeconds: 1 },
+		settings: {
+			answerTimeoutMs: 200,
+			defaultRingTimeoutSeconds: 1,
+			...(options.sipRealm === undefined ? {} : { sipRealm: options.sipRealm }),
+		},
 		peerLegId: (mediaChannelId) => `leg-of-${mediaChannelId}`,
 		legs: {
 			originated: (leg) => {
@@ -170,6 +178,30 @@ describe("walking a queue node", () => {
 		expect(h.media.methods()).toContain("startMusicOnHold");
 		expect(h.media.originated().map((request) => request.endpoint)).toEqual(["PJSIP/2001"]);
 		expect(h.media.methods()).toContain("createBridge");
+	});
+
+	it("only builds an agent AOR when the roster gave the agent an extension number", async () => {
+		// A realm makes an extension dialable as `sip:{number}@{realm}`. An agent whose roster contact
+		// is a raw dial string has no extension number, and an AOR built out of that string would be
+		// looked up in the tenant's registration bucket — a target nothing can reach.
+		const offNet = harness({
+			agents: [fakeAgent("aa", { contact: "PJSIP/+15559998888" })],
+			reactions: { "PJSIP/+1555": "answer" },
+			sipRealm: "acme.example.com",
+		});
+		await offNet.walker.walk({ plan: planOf([queueNode("q", { queueId: QUEUE_ID })]) });
+		expect(offNet.media.originated()[0]?.target).toBeUndefined();
+
+		const onNet = harness({
+			agents: [fakeAgent("aa", { contact: "PJSIP/2001", extensionNumber: "2001" })],
+			reactions: { "PJSIP/2001": "answer" },
+			sipRealm: "acme.example.com",
+		});
+		await onNet.walker.walk({ plan: planOf([queueNode("q", { queueId: QUEUE_ID })]) });
+		expect(onNet.media.originated()[0]?.target).toEqual({
+			kind: "aor",
+			aor: "sip:2001@acme.example.com",
+		});
 	});
 
 	it("stops the music before the agent's leg is dialled", async () => {

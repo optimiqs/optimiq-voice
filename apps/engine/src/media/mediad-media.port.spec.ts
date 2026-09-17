@@ -1,13 +1,19 @@
 import { describe, expect, it } from "bun:test";
 import {
+	mediaAcceptAnswerRequestSchema,
 	mediaAllocateSessionRequestSchema,
 	mediaBridgeSessionsRequestSchema,
+	mediaCreateOfferRequestSchema,
+	mediaHoldSessionRequestSchema,
+	mediaMuteSessionRequestSchema,
 	mediaReleaseSessionRequestSchema,
 	mediaSendDtmfRequestSchema,
 	mediaStartPlaybackRequestSchema,
 	mediaStartRecordingRequestSchema,
 	mediaStopPlaybackRequestSchema,
+	mediaPauseRecordingRequestSchema,
 	mediaStopRecordingRequestSchema,
+	mediaTapSessionRequestSchema,
 	mediaUnbridgeSessionsRequestSchema,
 	RPC_SUBJECTS,
 } from "@optimiq-voice/events";
@@ -33,6 +39,10 @@ const SESSION = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53";
 const OFFER =
 	"v=0\r\no=- 12345 1 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\nt=0 0\r\n" +
 	"m=audio 41000 RTP/AVP 0 8 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n";
+
+const ANSWER =
+	"v=0\r\no=- 54321 1 IN IP4 203.0.113.20\r\ns=-\r\nc=IN IP4 203.0.113.20\r\nt=0 0\r\n" +
+	"m=audio 42000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n";
 
 function newPort(): { port: MediadMediaPort; transport: FakeMediadTransport } {
 	const transport = new FakeMediadTransport();
@@ -140,6 +150,24 @@ describe("allocateSession", () => {
 	});
 
 	/**
+	 * `mediad` unreachable during a teardown storm used to mean every leg torn down in that window
+	 * stayed in the session set permanently: `channelExists` answering `true` for legs that are
+	 * gone, and a set that only grows. Release is idempotent, so forgetting locally is safe.
+	 */
+	it("forgets the session even when the release itself fails", async () => {
+		const { port, transport } = newPort();
+
+		await port.allocateSession({ sessionId: SESSION, orgId: ORG, callId: CALL, sdpOffer: OFFER });
+		expect(await port.channelExists(SESSION)).toBe(true);
+
+		transport.failure = new Error("no reply within 500ms");
+		await expect(port.releaseSession(SESSION)).rejects.toThrow("no reply within 500ms");
+
+		transport.failure = undefined;
+		expect(await port.channelExists(SESSION)).toBe(false);
+	});
+
+	/**
 	 * A refusal is a REPLY, and the engine branches on the code. Surfacing it as a typed error with
 	 * the code intact is what lets a caller tell "try another instance" from "route this to
 	 * Asterisk".
@@ -194,6 +222,99 @@ describe("allocateSession", () => {
 	});
 });
 
+describe("create-offer / accept-answer (the B-leg codec bound, §5.2)", () => {
+	it("writes an offer and makes the session visible to channelExists", async () => {
+		const { port, transport } = newPort();
+		transport.reply(RPC_SUBJECTS.mediaCreateOffer, {
+			ok: true,
+			sessionId: SESSION,
+			sdpOffer: OFFER,
+			instanceId: "mediad-fake",
+			address: "203.0.113.10",
+			rtpPort: 30_000,
+			rtcpPort: 30_001,
+			telephoneEventPayloadType: 101,
+		});
+
+		const response = await port.createOffer({
+			sessionId: SESSION,
+			orgId: ORG,
+			callId: CALL,
+			legId: "leg-1",
+		});
+
+		expect(response.ok).toBe(true);
+		expect(response.sdpOffer).toContain("v=0");
+		// On `ok`, the session is recorded so a later release and channelExists can find it.
+		expect(await port.channelExists(SESSION)).toBe(true);
+
+		const [request] = transport.on(RPC_SUBJECTS.mediaCreateOffer);
+		expect(() => mediaCreateOfferRequestSchema.parse(request?.payload)).not.toThrow();
+		const payload = request?.payload as Record<string, unknown>;
+		// The default is stated rather than left to the responder, exactly as allocate-session does.
+		expect(payload["direction"]).toBe("sendrecv");
+		expect(payload["legId"]).toBe("leg-1");
+	});
+
+	it("returns a refusal as DATA and does not record the session", async () => {
+		const { port, transport } = newPort();
+		transport.reply(RPC_SUBJECTS.mediaCreateOffer, {
+			ok: false,
+			sessionId: SESSION,
+			reason: "capacity",
+			error: "every port pair is in use",
+			instanceId: "mediad-7c9f",
+		});
+
+		const response = await port.createOffer({ sessionId: SESSION, orgId: ORG, callId: CALL });
+
+		// No throw — the composite has to branch on this, there is no offer to send.
+		expect(response.ok).toBe(false);
+		expect(response.reason).toBe("capacity");
+		expect(await port.channelExists(SESSION)).toBe(false);
+	});
+
+	it("settles a codec on an accept-answer", async () => {
+		const { port, transport } = newPort();
+		transport.reply(RPC_SUBJECTS.mediaAcceptAnswer, {
+			ok: true,
+			sessionId: SESSION,
+			codec: "PCMU",
+			telephoneEventPayloadType: 101,
+			instanceId: "mediad-fake",
+		});
+
+		const response = await port.acceptAnswer({ sessionId: SESSION, sdpAnswer: ANSWER });
+
+		expect(response.ok).toBe(true);
+		expect(response.codec).toBe("PCMU");
+
+		const [request] = transport.on(RPC_SUBJECTS.mediaAcceptAnswer);
+		expect(() => mediaAcceptAnswerRequestSchema.parse(request?.payload)).not.toThrow();
+		const payload = request?.payload as Record<string, unknown>;
+		expect(payload["sdpAnswer"]).toBe(ANSWER);
+	});
+
+	it("returns a not_supported codec refusal as a normal branch, not a throw", async () => {
+		// A callee that answered with G.729 is a documented outcome (§5.2): the composite hangs that
+		// B-leg up with INCOMPATIBLE_DESTINATION, so the reason must arrive as data rather than as an
+		// exception on the call path.
+		const { port, transport } = newPort();
+		transport.reply(RPC_SUBJECTS.mediaAcceptAnswer, {
+			ok: false,
+			sessionId: SESSION,
+			reason: "not_supported",
+			error: "the callee answered with G.729, which mediad cannot serve",
+			instanceId: "mediad-7c9f",
+		});
+
+		const response = await port.acceptAnswer({ sessionId: SESSION, sdpAnswer: ANSWER });
+
+		expect(response.ok).toBe(false);
+		expect(response.reason).toBe("not_supported");
+	});
+});
+
 describe("bridging", () => {
 	/** A relay with no members is nothing on the wire, so `createBridge` costs no round trip. */
 	it("creates a bridge locally, with no request", async () => {
@@ -223,21 +344,23 @@ describe("bridging", () => {
 	});
 
 	/**
-	 * N-way audio is MIXING — a decode, a jitter buffer and a mix-minus per participant — which is
-	 * rung 6. Relaying the first two would put the third participant in a room they cannot hear.
+	 * A THIRD LEG USED TO BE REFUSED HERE, naming rung 6: N-way audio is mixing, and relaying the
+	 * first two would have put the third participant in a room they cannot hear. Rung 6 arrived, so
+	 * the same call now builds a room — and the assertion that matters is that the command carries
+	 * the WHOLE membership rather than the newcomer, because a room is a list and not a delta.
 	 */
-	it("refuses a third leg, naming conferencing", async () => {
-		const { port } = newPort();
+	it("sends the whole room when a third leg arrives", async () => {
+		const { port, transport } = newPort();
 		await port.createBridge({ bridgeId: "bridge-1" });
 		await port.addToBridge("bridge-1", ["leg-a", "leg-b"]);
+		await port.addToBridge("bridge-1", ["leg-c"]);
 
-		const attempt = port.addToBridge("bridge-1", ["leg-c"]);
-		await expect(attempt).rejects.toThrow(MediaOperationNotSupportedError);
-		try {
-			await attempt;
-		} catch (error) {
-			expect((error as MediaOperationNotSupportedError).capability).toContain("rung 6");
-		}
+		const requests = transport.on(RPC_SUBJECTS.mediaBridgeSessions);
+		expect(requests).toHaveLength(2);
+		expect(requests[1]?.payload).toEqual({
+			bridgeId: "bridge-1",
+			sessionIds: ["leg-a", "leg-b", "leg-c"],
+		});
 	});
 
 	it("unbridges on removeFromBridge and on destroyBridge", async () => {
@@ -589,6 +712,21 @@ describe("recording (rung 4)", () => {
 		expect(objectKey).toBe("org/call/rec-1.wav");
 	});
 
+	it("records both directions through the call-control conversation operation", async () => {
+		const { port, transport } = newPort();
+		await port.recordConversation(SESSION, {
+			name: "conversation",
+			format: "wav",
+			maxDurationSeconds: 30,
+		});
+		expect(transport.on(RPC_SUBJECTS.mediaStartRecording)[0]?.payload).toMatchObject({
+			sessionId: SESSION,
+			recordingRef: "conversation",
+			direction: "both",
+			maxDurationMs: 30_000,
+		});
+	});
+
 	it("stops a recording by reference alone", async () => {
 		const { port, transport } = newPort();
 		await port.stopRecording("rec-1");
@@ -611,6 +749,33 @@ describe("recording (rung 4)", () => {
 
 		await expect(port.stopRecording("rec-1")).resolves.toBeUndefined();
 	});
+
+	it("pauses and resumes a recording on one subject with a resume bit", async () => {
+		// PCI: the file survives the gap, so this is not a stop followed by a start.
+		const { port, transport } = newPort();
+		await port.pauseRecording("rec-1", true);
+		await port.pauseRecording("rec-1", false);
+
+		const requests = transport.on(RPC_SUBJECTS.mediaPauseRecording);
+		expect(requests.map((request) => request.payload)).toEqual([
+			{ recordingRef: "rec-1", resume: false },
+			{ recordingRef: "rec-1", resume: true },
+		]);
+		expect(mediaPauseRecordingRequestSchema.parse(requests[0]?.payload)).toBeDefined();
+	});
+
+	it("treats pausing an already-finished recording as a no-op", async () => {
+		const { port, transport } = newPort();
+		transport.reply(RPC_SUBJECTS.mediaPauseRecording, {
+			ok: true,
+			recordingRef: "rec-1",
+			paused: false,
+			applied: false,
+			instanceId: "mediad-fake",
+		});
+
+		await expect(port.pauseRecording("rec-1", true)).resolves.toBeUndefined();
+	});
 });
 
 describe("the declared bridge mode", () => {
@@ -631,6 +796,203 @@ describe("the declared bridge mode", () => {
 	});
 });
 
+describe("rung 5: hold, mute, and music", () => {
+	/**
+	 * Music on hold is a PLAYBACK and not a hold, on either driver. `MediaPort` says so directly —
+	 * "separate from hold, which is signalling" — and the case that needs the separation is a queue:
+	 * a caller hearing music is still in a conversation with the queue, and holding them would make
+	 * them inaudible to the agent who then answers to silence.
+	 */
+	it("starts music as a looping moh: playback rather than a hold", async () => {
+		const { port, transport } = newPort();
+
+		await port.startMusicOnHold("leg-a", "sales");
+
+		expect(transport.on(RPC_SUBJECTS.mediaHoldSession)).toHaveLength(0);
+		const [request] = transport.on(RPC_SUBJECTS.mediaStartPlayback);
+		expect(request?.payload).toMatchObject({ sessionId: "leg-a", media: ["moh:sales"] });
+	});
+
+	it("falls back to the class every media plane calls default", async () => {
+		const { port, transport } = newPort();
+		await port.startMusicOnHold("leg-a");
+		const [request] = transport.on(RPC_SUBJECTS.mediaStartPlayback);
+		expect(request?.payload).toMatchObject({ media: ["moh:default"] });
+	});
+
+	/**
+	 * `stopMusicOnHold` carries a CHANNEL and `stop-playback` is keyed by a REFERENCE. The two do not
+	 * meet, and the only place that can join them is the adapter that started the loop.
+	 */
+	it("stops the loop it started, by the reference it minted", async () => {
+		const { port, transport } = newPort();
+
+		await port.startMusicOnHold("leg-a");
+		const [start] = transport.on(RPC_SUBJECTS.mediaStartPlayback);
+		const started = (start as { payload: { playbackRef: string } }).payload;
+		await port.stopMusicOnHold("leg-a");
+
+		const [stop] = transport.on(RPC_SUBJECTS.mediaStopPlayback);
+		expect(stop?.payload).toEqual({ playbackRef: started.playbackRef });
+	});
+
+	/**
+	 * The reference is DERIVED from the channel id rather than random, so it survives a restart that
+	 * loses the adapter's map. A caller left listening to hold music because the engine that started
+	 * it was replaced is a worse failure than any a random id would prevent.
+	 */
+	it("can still stop a loop this process did not start", async () => {
+		const first = newPort();
+		await first.port.startMusicOnHold("leg-a");
+		const [started] = first.transport.on(RPC_SUBJECTS.mediaStartPlayback);
+		const ref = (started as { payload: { playbackRef: string } }).payload.playbackRef;
+
+		const restarted = newPort();
+		await restarted.port.stopMusicOnHold("leg-a");
+
+		expect(restarted.transport.on(RPC_SUBJECTS.mediaStopPlayback)[0]?.payload).toEqual({
+			playbackRef: ref,
+		});
+	});
+
+	it("holds and unholds over one subject, with the bit that tells them apart", async () => {
+		const { port, transport } = newPort();
+
+		await port.hold("leg-a");
+		await port.unhold("leg-a");
+
+		const requests = transport.on(RPC_SUBJECTS.mediaHoldSession);
+		expect(requests).toHaveLength(2);
+		expect(requests[0]?.payload).toEqual({ sessionId: "leg-a", unhold: false });
+		expect(requests[1]?.payload).toEqual({ sessionId: "leg-a", unhold: true });
+	});
+
+	/**
+	 * A hold carries no music, and that is not an omission. `MediaPort.hold` takes no class, and
+	 * "the held caller hears the queue's music" and "the holding agent hears nothing" are two
+	 * different commands about two different legs — a media plane that inferred the second from the
+	 * first would be making a routing decision on the far side of the seam.
+	 */
+	it("never smuggles music into a hold", async () => {
+		const { port, transport } = newPort();
+		await port.hold("leg-a");
+		expect(transport.on(RPC_SUBJECTS.mediaHoldSession)[0]?.payload).not.toHaveProperty("music");
+	});
+
+	it("mutes and unmutes each direction under one subject", async () => {
+		const { port, transport } = newPort();
+
+		await port.mute("leg-a", "in");
+		await port.unmute("leg-a", "out");
+
+		const requests = transport.on(RPC_SUBJECTS.mediaMuteSession);
+		expect(requests[0]?.payload).toEqual({
+			sessionId: "leg-a",
+			direction: "in",
+			unmute: false,
+		});
+		expect(requests[1]?.payload).toEqual({
+			sessionId: "leg-a",
+			direction: "out",
+			unmute: true,
+		});
+	});
+
+	it("sends payloads the rung-5 contracts accept", async () => {
+		const { port, transport } = newPort();
+
+		await port.hold("leg-a");
+		await port.unhold("leg-a");
+		await port.mute("leg-a", "both");
+		await port.unmute("leg-a", "both");
+
+		for (const request of transport.on(RPC_SUBJECTS.mediaHoldSession)) {
+			expect(() => mediaHoldSessionRequestSchema.parse(request.payload)).not.toThrow();
+		}
+		for (const request of transport.on(RPC_SUBJECTS.mediaMuteSession)) {
+			expect(() => mediaMuteSessionRequestSchema.parse(request.payload)).not.toThrow();
+		}
+	});
+});
+
+describe("rung 6: supervision", () => {
+	/**
+	 * `targetSide` is the field that closes the gap the first `mediad` tap implementation named out
+	 * loud: the media plane used to fix the convention "`a` is the target session" and rely on the
+	 * engine ordering its arguments to match. The engine knows which leg is the target, so it says so.
+	 */
+	it("passes the side the engine already knows, instead of encoding it in argument order", async () => {
+		const { port, transport } = newPort();
+
+		await port.tap({
+			tapId: "tap-1",
+			targetChannelId: "leg-agent",
+			targetSide: "b",
+			supervisorChannelId: "leg-supervisor",
+			tapChannelId: "tap-chan-1",
+			bridgeId: "bridge-1",
+			application: "engine",
+			hear: "both",
+			speakTo: "b",
+			mode: "whisper",
+		});
+
+		const [request] = transport.on(RPC_SUBJECTS.mediaTapSession);
+		expect(request?.payload).toMatchObject({
+			tapId: "tap-1",
+			tapSessionId: "leg-supervisor",
+			targetSessionId: "leg-agent",
+			targetSide: "b",
+			hear: "both",
+			speakTo: "b",
+			mode: "whisper",
+		});
+		expect(() => mediaTapSessionRequestSchema.parse(request?.payload)).not.toThrow();
+	});
+
+	/**
+	 * `tapChannelId` and `bridgeId` exist because on ARI a tap materialises as a CHANNEL that enters
+	 * the engine's own application. Here the tap IS the supervisor's already-allocated session, and
+	 * `TapRequest` says a driver with no channel concept simply ignores both.
+	 */
+	it("drops the ARI-shaped ids and reports the room mediad actually used", async () => {
+		const { port, transport } = newPort();
+
+		const handle = await port.tap({
+			tapId: "tap-1",
+			targetChannelId: "leg-agent",
+			targetSide: "a",
+			supervisorChannelId: "leg-supervisor",
+			tapChannelId: "tap-chan-1",
+			bridgeId: "bridge-the-engine-minted",
+			application: "engine",
+			hear: "both",
+			speakTo: "none",
+		});
+
+		const payload = transport.on(RPC_SUBJECTS.mediaTapSession)[0]?.payload as Record<
+			string,
+			unknown
+		>;
+		expect(payload["tapChannelId"]).toBeUndefined();
+		expect(payload["bridgeId"]).toBeUndefined();
+		expect(payload["application"]).toBeUndefined();
+
+		expect(handle.tapChannelId).toBe("leg-supervisor");
+		// A tap on a two-party call converts it under the BRIDGE's own id, which is not the one the
+		// engine minted for a bridge this plane never made.
+		expect(handle.bridgeId).toBe("converted-bridge");
+	});
+
+	it("stops a tap by reference alone", async () => {
+		const { port, transport } = newPort();
+
+		await port.stopTap({ tapId: "tap-1", tapChannelId: "leg-supervisor", bridgeId: "room-1" });
+
+		expect(transport.on(RPC_SUBJECTS.mediaUntapSession)[0]?.payload).toEqual({ tapId: "tap-1" });
+	});
+});
+
 describe("the not-supported map", () => {
 	/**
 	 * Every unreached rung fails LOUDLY. A media plane that quietly accepted `record` would produce
@@ -643,7 +1005,15 @@ describe("the not-supported map", () => {
 		[
 			"originate",
 			"signalling",
-			(port) => port.originate({ endpoint: "PJSIP/1001", application: "app", channelId: "leg-b" }),
+			// Carrying `callerIdPresentation` here on purpose: an additive field must not change WHICH
+			// refusal an unreached rung produces.
+			(port) =>
+				port.originate({
+					endpoint: "PJSIP/1001",
+					application: "app",
+					channelId: "leg-b",
+					callerIdPresentation: "restricted",
+				}),
 		],
 		["getVariable", "dialplan", (port) => port.getVariable("leg-a", "X")],
 		["setVariable", "dialplan", (port) => port.setVariable("leg-a", "X", "1")],
@@ -661,12 +1031,13 @@ describe("the not-supported map", () => {
 					spy: "both",
 				}),
 		],
-		["startMusicOnHold", "rung 5", (port) => port.startMusicOnHold("leg-a")],
-		["stopMusicOnHold", "rung 5", (port) => port.stopMusicOnHold("leg-a")],
-		["hold", "rung 5", (port) => port.hold("leg-a")],
-		["unhold", "rung 5", (port) => port.unhold("leg-a")],
-		["mute", "rung 5", (port) => port.mute("leg-a", "both")],
-		["unmute", "rung 5", (port) => port.unmute("leg-a", "both")],
+		[
+			// Refused for the same reason `snoop` is — an Asterisk application rather than a media
+			// capability — and listed here because the map is only worth having if it is complete.
+			"echo",
+			"Asterisk's Echo() application",
+			(port) => port.echo("leg-a"),
+		],
 	];
 
 	for (const [operation, capabilityHint, call] of refusals) {
@@ -713,6 +1084,22 @@ describe("the not-supported map", () => {
 			// `RecordRequest` has nowhere to say which.
 			"record",
 			"stopRecording",
+			// Rung 4's PCI half: one file with a silence gap, which is the whole reason it is not a
+			// stop followed by a start.
+			"pauseRecording",
+			// Rung 5. Both halves of the state pair, plus the music that is a PLAYBACK rather than a
+			// hold — see the methods. These five moved out of the refused list together, because
+			// `hold-session` and `mute-session` reached the wire in one change.
+			"hold",
+			"unhold",
+			"mute",
+			"unmute",
+			"startMusicOnHold",
+			"stopMusicOnHold",
+			// Rung 6. Supervision, served by the mixer ARRIVING rather than by the contract being
+			// renegotiated — which is the whole claim `plans/mediad-design.md` §10 question 4 made.
+			"tap",
+			"stopTap",
 		];
 		const refused = refusals.map(([operation]) => operation);
 		const methods = [...supported, ...refused].sort();
@@ -722,11 +1109,13 @@ describe("the not-supported map", () => {
 			"channelExists",
 			"createBridge",
 			"destroyBridge",
+			"echo",
 			"getVariable",
 			"hangup",
 			"hold",
 			"mute",
 			"originate",
+			"pauseRecording",
 			"play",
 			"record",
 			"removeFromBridge",
@@ -738,11 +1127,15 @@ describe("the not-supported map", () => {
 			"stopMusicOnHold",
 			"stopPlayback",
 			"stopRecording",
+			"stopTap",
+			"tap",
 			"unhold",
 			"unmute",
 			"watchChannel",
 		];
 		expect(methods).toEqual(expected);
-		expect(methods).toHaveLength(24);
+		// One per `MediaPort` method. `bridgeMode` is a declaration, not a method, and is asserted in
+		// its own describe block above.
+		expect(methods).toHaveLength(28);
 	});
 });

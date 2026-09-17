@@ -44,9 +44,16 @@ func decodeStopRecording(t *testing.T, raw []byte) contract.MediaStopRecordingRe
 	return response
 }
 
-func intPtrOf(value int) *int { return &value }
+func decodePauseRecording(t *testing.T, raw []byte) contract.MediaPauseRecordingResponse {
+	t.Helper()
+	var response contract.MediaPauseRecordingResponse
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatalf("the pause-recording reply is not the contract: %v", err)
+	}
+	return response
+}
 
-// --- rung 3: send-dtmf -------------------------------------------------------------------------
+func intPtrOf(value int) *int { return &value }
 
 func TestSendDtmfStartsAnInjectionAndReportsHowLongItWillTake(t *testing.T) {
 	rig := newRig(t)
@@ -195,8 +202,6 @@ func TestSendDtmfAnswersAMalformedRequestRatherThanTimingOut(t *testing.T) {
 	}
 }
 
-// --- rung 4: start-recording / stop-recording ---------------------------------------------------
-
 func TestStartRecordingDerivesTheEnginesOwnObjectKey(t *testing.T) {
 	// `<orgId>/<callId>/<recordingRef>.wav` is exactly what apps/engine computes for the same
 	// recording and exactly what apps/api's archiver stats under CDR_RECORDING_ROOT, so one mount
@@ -234,6 +239,26 @@ func TestStartRecordingDerivesTheEnginesOwnObjectKey(t *testing.T) {
 	}
 }
 
+func TestStartRecordingRefusesATenancyThatEscapesTheRecordingsRoot(t *testing.T) {
+	// The allocate boundary refuses these tokens, so this asserts the SECOND guard: the call site
+	// that actually turns org and call into a path. `filepath.Join` cleans `../` rather than
+	// refusing it, so an unchecked token here writes a WAV — and creates the directories for it —
+	// anywhere this process can write.
+	rig := newRig(t)
+	allocateSession(t, rig)
+	rig.sessions.forceTenancy(testSession, "../../../etc", testCall)
+
+	response := decodeStartRecording(t, rig.server.HandleStartRecording(mustJSON(t,
+		contract.MediaStartRecordingRequest{SessionID: testSession, RecordingRef: "rec-1"})))
+
+	if response.Ok {
+		t.Fatalf("start-recording accepted a traversing org id: %+v", response)
+	}
+	if calls := rig.sessions.recordingCalls(); len(calls) != 0 {
+		t.Fatalf("the packet path was asked to write %q", calls[0].opts.Path)
+	}
+}
+
 func TestStartRecordingCarriesTheReceiveDirectionAndTheLimits(t *testing.T) {
 	rig := newRig(t)
 	allocateSession(t, rig)
@@ -266,28 +291,33 @@ func TestStartRecordingRefusesWhatItCannotDoRatherThanDroppingIt(t *testing.T) {
 		name     string
 		mutate   func(*contract.MediaStartRecordingRequest)
 		contains string
+		// reason defaults to not_supported, which is what every capability refusal answers.
+		reason string
 	}{
 		{
-			// A voicemail whose beep never sounds is a caller talking over the tail of the greeting,
-			// and the first words of every message clipped.
-			name:     "beep, which needs a tone generator",
-			mutate:   func(rq *contract.MediaStartRecordingRequest) { beep := true; rq.Beep = &beep },
-			contains: "tone generator",
-		},
-		{
-			// Ending on a digit needs DTMF DETECTION, the receive half of rung 3, which is not built.
-			name: "terminateOn, which needs DTMF detection",
+			// A terminator no keypad can produce is `bad_request` rather than `not_supported`: the capability
+			// exists and the request is wrong, so routing the leg to Asterisk would not help.
+			name: "a terminator that is not a DTMF digit",
 			mutate: func(rq *contract.MediaStartRecordingRequest) {
-				hash := "#"
-				rq.TerminateOn = &hash
+				bad := "z"
+				rq.TerminateOn = &bad
 			},
-			contains: "DTMF detection",
+			contains: "DTMF digits",
+			reason:   "bad_request",
 		},
 		{
 			// apps/api serves every recording as audio/wav and copies bytes it never inspects.
 			name:     "a container mediad does not write",
 			mutate:   func(rq *contract.MediaStartRecordingRequest) { rq.Format = "gsm" },
 			contains: "WAV",
+		},
+		{
+			// Parsed and refused rather than defaulting to `receive`, which turned a typo into HALF a
+			// recording reported as a success.
+			name:     "a direction that is not one",
+			mutate:   func(rq *contract.MediaStartRecordingRequest) { rq.Direction = "transmit" },
+			contains: "recording direction",
+			reason:   "bad_request",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -302,8 +332,12 @@ func TestStartRecordingRefusesWhatItCannotDoRatherThanDroppingIt(t *testing.T) {
 				t.Fatalf("%s answered ok; a media plane that quietly did nothing here is the worst "+
 					"defect shape this vocabulary exists to prevent", tc.name)
 			}
-			if response.Reason == nil || string(*response.Reason) != "not_supported" {
-				t.Errorf("reason = %v, want not_supported", response.Reason)
+			wantReason := tc.reason
+			if wantReason == "" {
+				wantReason = "not_supported"
+			}
+			if response.Reason == nil || string(*response.Reason) != wantReason {
+				t.Errorf("reason = %v, want %s", response.Reason, wantReason)
 			}
 			if response.Error == nil || !strings.Contains(*response.Error, tc.contains) {
 				t.Errorf("error = %v, want it to name %q", response.Error, tc.contains)
@@ -467,6 +501,56 @@ func TestStopRecordingRefusesAnEmptyReference(t *testing.T) {
 	}
 }
 
+func TestPauseRecordingReportsTheStateAfterTheCommand(t *testing.T) {
+	// PCI: the agent pauses while the caller reads a card number, and the FILE survives it — which
+	// is why `resume` is a bit on this subject rather than a stop followed by a start.
+	rig := newRig(t)
+	allocateSession(t, rig)
+	rig.server.HandleStartRecording(mustJSON(t,
+		contract.MediaStartRecordingRequest{SessionID: testSession, RecordingRef: "rec-1"}))
+
+	paused := decodePauseRecording(t, rig.server.HandlePauseRecording(mustJSON(t,
+		contract.MediaPauseRecordingRequest{RecordingRef: "rec-1"})))
+	if !paused.Ok || !paused.Applied || !paused.Paused {
+		t.Fatalf("pause-recording = %+v, want ok, applied and paused", paused)
+	}
+	if paused.SessionID == nil || *paused.SessionID != testSession {
+		t.Errorf("sessionId = %v, want the session mediad looked up for itself", paused.SessionID)
+	}
+
+	resumed := decodePauseRecording(t, rig.server.HandlePauseRecording(mustJSON(t,
+		contract.MediaPauseRecordingRequest{RecordingRef: "rec-1", Resume: true})))
+	if !resumed.Ok || !resumed.Applied || resumed.Paused {
+		t.Fatalf("resume = %+v, want ok, applied and not paused", resumed)
+	}
+}
+
+func TestPauseRecordingOfAFinishedRecordingIsASuccess(t *testing.T) {
+	// The same SUCCESS `stop-recording` reports for the same reason: the recording may have
+	// finalised itself before the command arrived.
+	rig := newRig(t)
+
+	response := decodePauseRecording(t, rig.server.HandlePauseRecording(mustJSON(t,
+		contract.MediaPauseRecordingRequest{RecordingRef: "long-gone"})))
+
+	if !response.Ok {
+		t.Error("pausing a finished recording answered a failure")
+	}
+	if response.Applied || response.Paused {
+		t.Errorf("pause of a reference nothing is recording = %+v, want applied and paused false",
+			response)
+	}
+}
+
+func TestPauseRecordingRefusesAnEmptyReference(t *testing.T) {
+	rig := newRig(t)
+	response := decodePauseRecording(t, rig.server.HandlePauseRecording(mustJSON(t,
+		contract.MediaPauseRecordingRequest{})))
+	if response.Ok || response.Reason == nil || string(*response.Reason) != "bad_request" {
+		t.Errorf("an empty recordingRef answered %+v, want a bad_request refusal", response)
+	}
+}
+
 func TestRecordingHandlersAreOnTheSubscriptionTable(t *testing.T) {
 	// The subject constants come from packages/events-go, so a rename in the Zod source is a compile
 	// error here rather than a subject nothing answers on.
@@ -474,6 +558,7 @@ func TestRecordingHandlersAreOnTheSubscriptionTable(t *testing.T) {
 		contract.SubjectMediaSendDtmfRPC,
 		contract.SubjectMediaStartRecordingRPC,
 		contract.SubjectMediaStopRecordingRPC,
+		contract.SubjectMediaPauseRecordingRPC,
 	} {
 		if !strings.HasPrefix(subject, "rpc.media.v1.") {
 			t.Errorf("subject %q is not in the media command family", subject)

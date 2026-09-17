@@ -11,14 +11,21 @@ import {
 } from "./auth/auth-bootstrap";
 import { assertCdrPreflight, isCdrAreaEnabled } from "./cdr/cdr-bootstrap";
 import { CdrModule } from "./cdr/cdr.module";
+import { ComplianceModule } from "./compliance/compliance.module";
 import { httpLoggerOptions } from "./core/http/log-redaction";
+import { observeHttpRequest } from "./core/metrics/metrics";
+import { startMetricsServer, type MetricsServer } from "./core/metrics/metrics-server";
 import { HTTP_BRIDGE_PORT } from "./envs";
 import { registerLiveTransport } from "./live/live-bootstrap";
 import { LiveModule } from "./live/live.module";
 import { assertMailPreflight, loadMailEnv, selectMailTransport } from "./mail";
+import { MessagingModule } from "./messaging/messaging.module";
 import { isPbxAreaEnabled, registerPbxTransport } from "./pbx/pbx-bootstrap";
+import { PbxCdrPortsModule } from "./pbx/pbx-cdr-ports.module";
 import { PbxModule } from "./pbx/pbx.module";
 import { ProvisioningModule } from "./provisioning/provisioning.module";
+import { registerSessionTransport } from "./session/session-bootstrap";
+import { SessionModule } from "./session/session.module";
 import { assertStoragePreflight, loadStorageEnv } from "./storage";
 import {
 	assertTranscriptionPreflight,
@@ -27,6 +34,17 @@ import {
 } from "./transcription";
 
 const logger = getLogger("api.bootstrap");
+
+/**
+ * The application once the container exists, so the boot-failure handler below can close it.
+ *
+ * Undefined for every failure before `NestFactory.create` — those hold nothing and already exit
+ * cleanly.
+ */
+let started: NestFastifyApplication | undefined;
+
+/** The private scrape listener, closed alongside the application on a boot failure. */
+let metricsServer: MetricsServer | undefined;
 
 async function bootstrap() {
 	/**
@@ -179,9 +197,26 @@ async function bootstrap() {
 	 * would make such a deployment fail to boot on a `PBX_DATABASE_URL` it has no use for. This is
 	 * the seam `PbxModule`, `LiveModule` and `CdrModule` are already composed through.
 	 */
+	/**
+	 * `PbxCdrPortsModule` mounts only when BOTH areas do. It is the `@Global()` seam that hands
+	 * the CDR area two PBX-owned facts (the tenant's recording retention window, the purge audit
+	 * ledger) under CDR-owned tokens — see its header. With only the PBX area it would provide
+	 * answers nothing asks for; with only the CDR area it could not construct them; in both cases
+	 * the CDR consumers inject the tokens `@Optional()` and degrade to the platform env values.
+	 */
+	/**
+	 * `ComplianceModule` mounts on the same condition and for the same reason. Its KYC file and its
+	 * verified caller ids are `pbx-db` rows; its traceback and its attestation summary read `cdr-db`;
+	 * and it is the one area that needs both at once, which is why it sits above them rather than
+	 * inside either. It is also `@Global()`, for one provider: the CDR leg writer injects
+	 * `CDR_ATTESTATION_STAMP` `@Optional()` and files legs unstamped without it.
+	 */
 	const extraModules = [
-		...(pbxAreaEnabled ? [PbxModule, ProvisioningModule, LiveModule] : []),
+		...(pbxAreaEnabled
+			? [PbxModule, ProvisioningModule, LiveModule, SessionModule, MessagingModule]
+			: []),
 		...(cdrAreaEnabled ? [CdrModule] : []),
+		...(pbxAreaEnabled && cdrAreaEnabled ? [PbxCdrPortsModule, ComplianceModule] : []),
 	];
 	const rootModule: Type<unknown> = authSliceEnabled
 		? createApiRootModule([AppModule], extraModules)
@@ -205,15 +240,50 @@ async function bootstrap() {
 	 * Fastify has nowhere to report a request that died before a controller saw it. Turning it on
 	 * means pino now serializes objects that requests hand it, which is why `httpLoggerOptions`
 	 * exists — it carries the `redact` path set that keeps `authorization`, `cookie`, `x-api-key`
-	 * and the SIP/PIN/token field names out of every line, and it reads the same `LOGS_LEVEL` the
+	 * and the SIP/PIN/token field names out of every line, and it reads the same `LOG_LEVEL` the
 	 * winston logger reads so one variable still governs logging in this process.
 	 */
 	const app = await NestFactory.create<NestFastifyApplication>(
 		rootModule,
-		new FastifyAdapter({ logger: httpLoggerOptions() }),
+		// A header that never arrives held its socket forever (Fastify's default is no timeout);
+		// 30 s bounds that without touching long-lived streaming responses, which are governed by
+		// requestTimeout (left unbounded on purpose for media ranges and exports).
+		new FastifyAdapter({ logger: httpLoggerOptions(), connectionTimeout: 30_000 }),
 		{ rawBody: true },
 	);
+	started = app;
 	app.enableShutdownHooks();
+
+	/**
+	 * Request latency, measured in the one place that sees every request.
+	 *
+	 * `onResponse` rather than a Nest interceptor: an interceptor only wraps requests that reached
+	 * a controller, so everything a guard refused, the 404s and the body-parse failures — exactly
+	 * the requests an operator is looking for — would be missing from the histogram.
+	 *
+	 * `request.routeOptions.url` is the matched PATTERN. See `observeHttpRequest` for why the raw
+	 * URL must never become a label.
+	 */
+	app
+		.getHttpAdapter()
+		.getInstance()
+		.addHook("onResponse", (request, reply, done) => {
+			observeHttpRequest(
+				request.method,
+				request.routeOptions?.url,
+				reply.statusCode,
+				reply.elapsedTime / 1_000,
+			);
+			done();
+		});
+	metricsServer = await startMetricsServer();
+	app
+		.getHttpAdapter()
+		.getInstance()
+		.addHook("onClose", async () => {
+			await metricsServer?.close();
+			metricsServer = undefined;
+		});
 
 	// Raw Fastify wiring has to exist before `listen`, which is when Nest installs its own router
 	// and not-found handler.
@@ -224,13 +294,29 @@ async function bootstrap() {
 	if (pbxAreaEnabled) {
 		await registerPbxTransport(app);
 		await registerLiveTransport(app);
+		await registerSessionTransport(app);
 	}
 
 	await app.listen(HTTP_BRIDGE_PORT, "0.0.0.0");
 	logger.info(`HTTP API is running on port ${HTTP_BRIDGE_PORT}`);
 }
 
-bootstrap().catch((error) => {
+bootstrap().catch(async (error) => {
 	logger.error({ err: error }, "failed to start API");
-	process.exitCode = 1;
+	/**
+	 * `process.exitCode` alone is not enough here, and the difference matters to an orchestrator.
+	 *
+	 * It takes effect only when the event loop drains, and by the time `bootstrap()` can throw the
+	 * container may hold a Postgres pool, NATS connections and a bound socket — every one of which
+	 * keeps the loop alive forever. An `EADDRINUSE` would then log one line and sit there looking
+	 * healthy while serving nothing. So the container is closed if it exists, and the process exits
+	 * either way.
+	 */
+	try {
+		await metricsServer?.close();
+		await started?.close();
+	} catch (closeError) {
+		logger.error({ err: closeError }, "failed to close the application after a boot failure");
+	}
+	process.exit(1);
 });

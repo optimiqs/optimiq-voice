@@ -1,12 +1,17 @@
 import { assertAgentTransition, isEligibleForDistribution } from "./agent-state";
 import { noAnswerCountOf } from "./agent-state.store";
-import { QueueCursors, QueuePositions } from "./queue-registry";
+import { QueueCursors } from "./queue-registry";
+import { QueueWaitingStore } from "./queue-waiting.store";
 import type {
 	AgentStatePort,
 	AgentTransitionRequest,
+	QueueAfterCallPort,
+	QueueCallbackSchedulePort,
+	QueueDispositionReport,
 	QueueEventPort,
 	QueueMembershipPort,
 	QueueServices,
+	QueueSurveyReport,
 } from "./queue-session";
 import type {
 	AgentStateEntry,
@@ -100,6 +105,9 @@ export interface RecordedTransition {
 	readonly callId: string;
 	readonly availableAt?: number;
 	readonly noAnswerCount?: number;
+	readonly reason?: string;
+	readonly dispositionCallId?: string;
+	readonly dispositionRequired?: boolean;
 	readonly refused?: boolean;
 }
 
@@ -217,6 +225,12 @@ export function makeFakeAgentStateStore(orgId: string, now: () => number): FakeA
 					? { callId: request.callId }
 					: {}),
 				...(request.legId === undefined ? {} : { legId: request.legId }),
+				...(request.dispositionCallId === undefined
+					? {}
+					: { dispositionCallId: request.dispositionCallId }),
+				...(request.dispositionRequired === undefined
+					? {}
+					: { dispositionRequired: request.dispositionRequired }),
 				...(request.reason === undefined ? {} : { reason: request.reason }),
 			};
 			entries.set(request.agentId, next);
@@ -227,6 +241,13 @@ export function makeFakeAgentStateStore(orgId: string, now: () => number): FakeA
 				callId: request.callId,
 				...(request.availableAt === undefined ? {} : { availableAt: request.availableAt }),
 				...(request.noAnswerCount === undefined ? {} : { noAnswerCount: request.noAnswerCount }),
+				...(request.reason === undefined ? {} : { reason: request.reason }),
+				...(request.dispositionCallId === undefined
+					? {}
+					: { dispositionCallId: request.dispositionCallId }),
+				...(request.dispositionRequired === undefined
+					? {}
+					: { dispositionRequired: request.dispositionRequired }),
 			});
 			return next;
 		},
@@ -267,6 +288,30 @@ export function makeFakeQueueEventPort(): FakeQueueEventPort {
 }
 
 // ---------------------------------------------------------------------------------------------
+// After-call records
+// ---------------------------------------------------------------------------------------------
+
+export interface FakeQueueAfterCallPort extends QueueAfterCallPort {
+	readonly dispositions: QueueDispositionReport[];
+	readonly surveys: QueueSurveyReport[];
+}
+
+export function makeFakeQueueAfterCallPort(): FakeQueueAfterCallPort {
+	const dispositions: QueueDispositionReport[] = [];
+	const surveys: QueueSurveyReport[] = [];
+	return {
+		dispositions,
+		surveys,
+		disposition: async (report) => {
+			dispositions.push(report);
+		},
+		surveyAnswered: async (report) => {
+			surveys.push(report);
+		},
+	};
+}
+
+// ---------------------------------------------------------------------------------------------
 // The bundle
 // ---------------------------------------------------------------------------------------------
 
@@ -274,8 +319,11 @@ export interface FakeQueueServices extends QueueServices {
 	readonly membership: ReturnType<typeof fakeMembershipPort>;
 	readonly agents: FakeAgentStateStore;
 	readonly events: FakeQueueEventPort;
-	readonly positions: QueuePositions;
+	readonly waiting: QueueWaitingStore;
 	readonly cursor: QueueCursors;
+	/** Writable so a spec can watch which queues the session hands to the callback sweep. */
+	callbacks?: QueueCallbackSchedulePort;
+	readonly afterCall: FakeQueueAfterCallPort;
 }
 
 /**
@@ -294,13 +342,7 @@ export function fakeQueueOrchestratorArgs(): readonly [
 	unknown,
 ] {
 	const services = makeFakeQueueServices({ orgId: "0195c0f0-1c2f-7000-8000-000000000001" });
-	return [
-		services.membership,
-		services.agents,
-		services.events,
-		services.positions,
-		services.cursor,
-	];
+	return [services.membership, services.agents, services.events, services.waiting, services.cursor];
 }
 
 export function makeFakeQueueServices(input: {
@@ -313,9 +355,12 @@ export function makeFakeQueueServices(input: {
 		membership: fakeMembershipPort(input.membership),
 		agents: makeFakeAgentStateStore(input.orgId, now),
 		events: makeFakeQueueEventPort(),
-		// The real registries: they are pure in-memory data structures with no I/O, so a fake would
-		// only be a second implementation of the thing under test.
-		positions: new QueuePositions(),
+		// The REAL store, over a JetStream service with no bucket configured, which is exactly the
+		// single-instance deployment: the same compare-and-set code path, the same pure ranking and
+		// pruning, backed by a map instead of a broker. A hand-written fake here would be a second
+		// implementation of the ordering — and the ordering is the thing under test.
+		waiting: new QueueWaitingStore({ queueWaiting: undefined } as never),
 		cursor: new QueueCursors(),
+		afterCall: makeFakeQueueAfterCallPort(),
 	};
 }

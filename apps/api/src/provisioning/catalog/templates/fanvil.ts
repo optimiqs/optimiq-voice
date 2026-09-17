@@ -149,6 +149,57 @@ function renderKey(key: RenderKey): readonly string[] {
 }
 
 /**
+ * Auto-answer — the vendor of the five where the least could be corroborated, handled the way this
+ * file already handles that.
+ *
+ * ## What IS known
+ *
+ * Fanvil's intercom feature is four parameters, and they are the same four Yealink has, which is not
+ * a coincidence — the feature and its vocabulary are an industry convention. They appear in
+ * Fanvil-authored and Fanvil-derived provisioning templates as `Enable_Intercom`, `Intercom_Mute`,
+ * `Intercom_Tone` and `Intercom_Barge`, under a `TELE_CONFIG_MODULE` section.
+ *
+ * Those spellings are from the `<sysConf>` XML dialect. This template writes the TEXT dialect, whose
+ * mapping is mechanical and visible throughout this file: underscores become spaces and the section
+ * becomes a single-bracket module header. `SIP_CONFIG_MODULE` / `SIP1_Enable_Reg` in the XML are
+ * `<SIP CONFIG MODULE>` / `SIP1 Enable Reg` here, and the same transformation gives
+ * `<TELE CONFIG MODULE>` / `Enable Intercom`.
+ *
+ * ## What is NOT known, and is therefore said out loud
+ *
+ * **Whether Fanvil triggers on `Alert-Info: info=alert-autoanswer` at all.** Nothing readable states
+ * which wire signal turns these flags into an answered call. Fanvil's own documentation describes
+ * the intercom feature from the CALLER's side — a DSS key configured as intercom — and is silent on
+ * the header. It may honour the Alert-Info token, it may want `Call-Info: …;answer-after=0` like
+ * Grandstream, it may want both. The flags are emitted because they are the necessary half and are
+ * inert on their own: `Enable Intercom` with no matching header produces a phone that rings
+ * normally, which is the same behaviour as not writing it. What it cannot do is answer something it
+ * was never asked to.
+ *
+ * **`SIPn Auto Answer` is deliberately NOT written**, even though the XML dialect has an
+ * `Auto_Answer` under the SIP module and it is the parameter whose name a search finds first. On
+ * every vendor in this catalogue that has one, that parameter answers EVERY inbound call on the line
+ * unconditionally — it is not header-triggered — and shipping it would turn a fleet of desk phones
+ * into open microphones. The Yealink template refuses the identical trap for the identical reason.
+ *
+ * The remedy is this file's standing one: configure intercom in the phone's web UI, export the
+ * backup, and diff it against what we produce.
+ */
+function autoAnswerEntries(): readonly string[] {
+	return [
+		entry("Enable Intercom", 1),
+		// A warning tone before the microphone opens. See the Yealink template: a phone that answers
+		// silently is a phone whose owner cannot tell that it did.
+		entry("Intercom Tone", 1),
+		// Not muted: a page nobody can reply to is not the feature.
+		entry("Intercom Mute", 0),
+		// Off, as a decision rather than a copied default — an intercom that interrupts a call in
+		// progress is right for an emergency page and wrong for the ordinary case.
+		entry("Intercom Barge", 0),
+	];
+}
+
+/**
  * `2.` plus ten digits derived from the body. See the class comment for why this is not a constant.
  *
  * Ten digits rather than a hex prefix because Fanvil's observed version strings are decimal
@@ -178,6 +229,9 @@ export const FANVIL_TEMPLATE: VendorTemplate = {
 			"<SIP CONFIG MODULE>",
 			...context.lines.flatMap((line) => renderAccount(line)),
 			"",
+			"<TELE CONFIG MODULE>",
+			...autoAnswerEntries(),
+			"",
 			...(context.keys.length === 0
 				? []
 				: ["<DSSKEY CONFIG MODULE>", ...context.keys.flatMap((key) => renderKey(key)), ""]),
@@ -201,11 +255,14 @@ export const FANVIL_TEMPLATE: VendorTemplate = {
 		"Fanvil Auto Provision Description (official) — `<<VOIP CONFIG FILE>>Version:` header (64 chars, CRLF), unclosed single-bracket module headers, `<<END OF FILE>>`, per-model fixed common-file names, `$mac` URL token",
 		"Fanvil X-series parameter spreadsheet — `SIPn *` parameter names, `FkeyN Type/Value/Title/ICON`, numeric key-type codes",
 		"BroadSoft Partner Configuration Guide, Fanvil (Cisco-hosted) — cross-check of the SIP parameter names",
-		"Fanvil-authored provisioning templates — `<number>@<line>/<subtype>` memory-key value encoding, `bc` = BLF",
+		"Fanvil-authored provisioning templates — `<number>@<line>/<subtype>` memory-key value encoding, `bc` = BLF, and the `TELE_CONFIG_MODULE` intercom quartet `Enable_Intercom` / `Intercom_Mute` / `Intercom_Tone` / `Intercom_Barge`",
 	],
 	caveats: [
 		"UNVERIFIED: the TLS transport integer is 2 on the X3S/X4 generation and 3 on X5S/X6/X210/X7/XU in Fanvil's own sheets. This template writes 2; a newer-generation deployment must override `SIPn Transport` through the settings cascade until this is settled on hardware.",
 		"UNVERIFIED: only the `bc` (BLF) memory-key subtype is corroborated. `park`, `intercom` and `transfer` render as Type 0 (None) rather than a guessed subtype letter. Configure one of each in the phone's web UI, export, and read back the exact Value strings.",
+		"UNVERIFIED: the intercom quartet is written as `<TELE CONFIG MODULE>` / `Enable Intercom` etc., derived from the `TELE_CONFIG_MODULE` / `Enable_Intercom` names in Fanvil-authored templates by the same underscore-to-space mapping the rest of this dialect uses. The mapping is consistent everywhere else in this file but has not been confirmed for this module.",
+		"UNVERIFIED: which wire signal Fanvil answers on. No readable Fanvil document states whether the intercom flags are triggered by `Alert-Info: info=alert-autoanswer`, by `Call-Info: …;answer-after=0`, or by something else. The flags are the necessary half and are inert without a matching header, so a phone that does not honour ours simply rings.",
+		"`SIPn Auto Answer` is deliberately NOT written. It answers every inbound call on the line unconditionally rather than on a header, which would make the handset an open microphone.",
 		"The version string is a change marker, not a format version — it is derived from the rendered body so an unchanged device does not trigger a re-apply.",
 		"Models with a separate expansion module index those keys under a prefix this template does not emit.",
 		"Not validated against physical hardware.",

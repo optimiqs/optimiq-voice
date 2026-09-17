@@ -8,16 +8,11 @@ import (
 	"time"
 )
 
-// Cross-language parity.
-//
-// testdata/parity.json is produced BY the TypeScript implementation (packages/events/src) during
-// `pnpm --filter @optimiq-voice/events codegen`. Every assertion below therefore compares this
-// package against the behaviour of the real contract, not against a second hand-written copy of it.
-//
-// If a TypeScript change is not mirrored here, one of these fails. If a Go change diverges, the
-// same. That is the entire point: the generated structs cover SHAPE, and this file covers the
-// BEHAVIOUR that cannot be generated — subject assembly, AOR hashing, subject matching, KV keys and
-// the stream/bucket definitions.
+// Cross-language parity. testdata/parity.json is produced by the TypeScript implementation during
+// `pnpm --filter @optimiq-voice/events codegen`, so these assertions compare this package against
+// the real contract rather than a second hand-written copy. The generated structs cover shape; this
+// file covers the behaviour that cannot be generated — subject assembly, AOR hashing, subject
+// matching, KV keys and the stream/bucket definitions.
 
 type goldenParsedSubject struct {
 	Kind      string `json:"kind"`
@@ -29,9 +24,11 @@ type goldenParsedSubject struct {
 	QueueID   string `json:"queueId"`
 	MailboxID string `json:"mailboxId"`
 	SessionID string `json:"sessionId"`
+	TrunkID   string `json:"trunkId"`
 	Event     string `json:"event"`
 	Service   string `json:"service"`
 	Method    string `json:"method"`
+	Target    string `json:"target"`
 }
 
 type goldenStream struct {
@@ -70,6 +67,11 @@ type golden struct {
 		AOR   string `json:"aor"`
 		Token string `json:"token"`
 	} `json:"aorSubjectTokens"`
+
+	InstanceSubjectTokens []struct {
+		InstanceID string `json:"instanceId"`
+		Token      string `json:"token"`
+	} `json:"instanceSubjectTokens"`
 
 	DIDIndexTokens []struct {
 		DID   string `json:"did"`
@@ -122,6 +124,13 @@ type golden struct {
 		GoType   string          `json:"goType"`
 		Envelope json.RawMessage `json:"envelope"`
 	} `json:"eventSamples"`
+
+	RPCSamples []struct {
+		Subject  string          `json:"subject"`
+		GoType   string          `json:"goType"`
+		Request  json.RawMessage `json:"request"`
+		Response json.RawMessage `json:"response"`
+	} `json:"rpcSamples"`
 }
 
 func loadGolden(t *testing.T) golden {
@@ -162,10 +171,14 @@ func TestParityConstants(t *testing.T) {
 	roots := map[string]string{
 		"call":         SubjectRootCall,
 		"registration": SubjectRootRegistration,
+		"sipDialog":    SubjectRootSIPDialog,
 		"queue":        SubjectRootQueue,
 		"voicemail":    SubjectRootVoicemail,
 		"media":        SubjectRootMedia,
+		"messaging":    SubjectRootMessaging,
+		"trunk":        SubjectRootTrunk,
 		"cdrLeg":       SubjectRootCDRLeg,
+		"security":     SubjectRootSecurity,
 		"audit":        SubjectRootAudit,
 		"provision":    SubjectRootProvision,
 	}
@@ -174,22 +187,51 @@ func TestParityConstants(t *testing.T) {
 	}
 
 	rpc := map[string]string{
-		"routingResolve":        SubjectRoutingResolveRPC,
-		"authzCheck":            SubjectAuthzCheckRPC,
-		"voicemailList":         SubjectVoicemailListRPC,
-		"sipCredential":         SubjectSipCredentialRPC,
-		"sipTransfer":           SubjectSipTransferRPC,
-		"mediaAllocateSession":  SubjectMediaAllocateSessionRPC,
-		"mediaBridgeSessions":   SubjectMediaBridgeSessionsRPC,
-		"mediaUnbridgeSessions": SubjectMediaUnbridgeSessionsRPC,
-		"mediaReleaseSession":   SubjectMediaReleaseSessionRPC,
-		"mediaStartPlayback":    SubjectMediaStartPlaybackRPC,
-		"mediaStopPlayback":     SubjectMediaStopPlaybackRPC,
-		"mediaSendDtmf":         SubjectMediaSendDtmfRPC,
-		"mediaStartRecording":   SubjectMediaStartRecordingRPC,
-		"mediaStopRecording":    SubjectMediaStopRecordingRPC,
-		"engineOriginate":       SubjectOriginateRPC,
-		"engineParkHandoff":     SubjectParkHandoffRPC,
+		"routingResolve":          SubjectRoutingResolveRPC,
+		"authzCheck":              SubjectAuthzCheckRPC,
+		"voicemailList":           SubjectVoicemailListRPC,
+		"pbxAuthorizeOutbound":    SubjectAuthorizeOutboundRPC,
+		"pbxExtensionFeature":     SubjectExtensionFeatureRPC,
+		"pbxLastCaller":           SubjectLastCallerRPC,
+		"pbxFileGreeting":         SubjectFileGreetingRPC,
+		"pbxToggleFeature":        SubjectToggleFeatureRPC,
+		"pbxHotDesk":              SubjectHotDeskRPC,
+		"pbxQueueDisposition":     SubjectQueueDispositionRPC,
+		"pbxQueueSurvey":          SubjectQueueSurveyRPC,
+		"sipCredential":           SubjectSipCredentialRPC,
+		"sipTrunkCredential":      SubjectSipTrunkCredentialRPC,
+		"sipTransfer":             SubjectSipTransferRPC,
+		"sipInvite":               SubjectSipInviteRPC,
+		"sipRing":                 SubjectSipRingRPC,
+		"sipAnswer":               SubjectSipAnswerRPC,
+		"sipHangup":               SubjectSipHangupRPC,
+		"sipReinvite":             SubjectSipReinviteRPC,
+		"sipOriginate":            SubjectSipOriginateRPC,
+		"sipResolveTarget":        SubjectSipResolveTargetRPC,
+		"engineRenegotiate":       SubjectEngineRenegotiateRPC,
+		"mediaAllocateSession":    SubjectMediaAllocateSessionRPC,
+		"mediaCreateOffer":        SubjectMediaCreateOfferRPC,
+		"mediaAcceptAnswer":       SubjectMediaAcceptAnswerRPC,
+		"mediaBridgeSessions":     SubjectMediaBridgeSessionsRPC,
+		"mediaUnbridgeSessions":   SubjectMediaUnbridgeSessionsRPC,
+		"mediaReleaseSession":     SubjectMediaReleaseSessionRPC,
+		"mediaStartPlayback":      SubjectMediaStartPlaybackRPC,
+		"mediaStopPlayback":       SubjectMediaStopPlaybackRPC,
+		"mediaSendDtmf":           SubjectMediaSendDtmfRPC,
+		"mediaStartRecording":     SubjectMediaStartRecordingRPC,
+		"mediaStopRecording":      SubjectMediaStopRecordingRPC,
+		"mediaTapSession":         SubjectMediaTapSessionRPC,
+		"mediaUntapSession":       SubjectMediaUntapSessionRPC,
+		"mediaMuteSession":        SubjectMediaMuteSessionRPC,
+		"mediaHoldSession":        SubjectMediaHoldSessionRPC,
+		"mediaPauseRecording":     SubjectMediaPauseRecordingRPC,
+		"engineOriginate":         SubjectOriginateRPC,
+		"engineParkHandoff":       SubjectParkHandoffRPC,
+		"engineQueueCallback":     SubjectQueueCallbackRPC,
+		"engineSessionVerb":       SubjectSessionVerbRPC,
+		"engineConferenceControl": SubjectConferenceControlRPC,
+		"engineCallControl":       SubjectCallControlRPC,
+		"sessionAnnounce":         SubjectSessionAnnounceRPC,
 	}
 	if !reflect.DeepEqual(rpc, g.RPCSubjects) {
 		t.Errorf("rpc subjects = %v, golden %v", rpc, g.RPCSubjects)
@@ -210,6 +252,25 @@ func TestParityAORSubjectToken(t *testing.T) {
 
 	if _, err := AORSubjectToken("   "); err == nil {
 		t.Error("AORSubjectToken(blank) should reject: an empty AOR has no stable token")
+	}
+}
+
+func TestParityInstanceSubjectToken(t *testing.T) {
+	for _, tc := range loadGolden(t).InstanceSubjectTokens {
+		token, err := InstanceSubjectToken(tc.InstanceID)
+		if err != nil {
+			t.Errorf("InstanceSubjectToken(%q): %v", tc.InstanceID, err)
+			continue
+		}
+		if token != tc.Token {
+			// A Go/TS disagreement here is a command published to a subject nobody subscribes: the
+			// engine addresses rpc.sip.v1.<verb>.<tok> and apps/sipd listens on a different <tok>.
+			t.Errorf("InstanceSubjectToken(%q) = %q, golden %q", tc.InstanceID, token, tc.Token)
+		}
+	}
+
+	if _, err := InstanceSubjectToken("   "); err == nil {
+		t.Error("InstanceSubjectToken(blank) should reject: an empty instance id has no token")
 	}
 }
 
@@ -239,12 +300,16 @@ func TestParitySubjectBuilders(t *testing.T) {
 			got = must(CallSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
 		case "registration":
 			got = must(RegistrationSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
+		case "sipDialog":
+			got = must(SIPDialogSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
 		case "queue":
 			got = must(QueueSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
 		case "voicemail":
 			got = must(VoicemailSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
 		case "media":
 			got = must(MediaSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
+		case "trunk":
+			got = must(TrunkSubject(tc.Args[0], tc.Args[1], tc.Args[2]))
 		case "cdrLeg":
 			got = must(CDRLegSubject(tc.Args[0]))
 		case "audit":
@@ -283,6 +348,12 @@ func TestParitySubjectFilters(t *testing.T) {
 			got = must(RegistrationsForAORFilter(tc.Args[0], tc.Args[1]))
 		case "registrationEventInOrg":
 			got = must(RegistrationEventInOrgFilter(tc.Args[0], tc.Args[1]))
+		case "allSipDialogs":
+			got = AllSIPDialogsFilter()
+		case "sipDialogsInOrg":
+			got = must(SIPDialogsInOrgFilter(tc.Args[0]))
+		case "sipDialog":
+			got = must(SIPDialogFilter(tc.Args[0], tc.Args[1]))
 		case "allQueues":
 			got = AllQueuesFilter()
 		case "queuesInOrg":
@@ -307,6 +378,12 @@ func TestParitySubjectFilters(t *testing.T) {
 			got = must(MediaSessionFilter(tc.Args[0], tc.Args[1]))
 		case "mediaEventInOrg":
 			got = must(MediaEventInOrgFilter(tc.Args[0], tc.Args[1]))
+		case "allTrunks":
+			got = AllTrunksFilter()
+		case "trunksInOrg":
+			got = must(TrunksInOrgFilter(tc.Args[0]))
+		case "trunkStatusInOrg":
+			got = must(TrunkStatusInOrgFilter(tc.Args[0]))
 		case "allCdrLegs":
 			got = AllCDRLegsFilter()
 		case "cdrLegsInOrg":
@@ -351,9 +428,11 @@ func TestParityParseSubject(t *testing.T) {
 			QueueID:   parsed.QueueID,
 			MailboxID: parsed.MailboxID,
 			SessionID: parsed.SessionID,
+			TrunkID:   parsed.TrunkID,
 			Event:     parsed.Event,
 			Service:   parsed.Service,
 			Method:    parsed.Method,
+			Target:    parsed.Target,
 		}
 		if got != *tc.Parsed {
 			t.Errorf("ParseSubject(%q) = %+v, golden %+v", tc.Subject, got, *tc.Parsed)
@@ -388,8 +467,16 @@ func TestParityKVKeys(t *testing.T) {
 			got, err = DIDIndexKVKey(tc.Args[0])
 		case "queueMembership":
 			got, err = QueueMembershipKVKey(tc.Args[0], tc.Args[1])
+		case "queueWaiting":
+			got, err = QueueWaitingKVKey(tc.Args[0], tc.Args[1])
 		case "mediaSession":
 			got, err = MediaSessionKVKey(tc.Args[0])
+		case "sipDialog":
+			got, err = SIPDialogKVKey(tc.Args[0])
+		case "trunk":
+			got, err = TrunkKVKey(tc.Args[0], tc.Args[1])
+		case "sipAcl":
+			got, err = SIPACLKVKey(tc.Args[0], tc.Args[1], tc.Args[2])
 		default:
 			t.Fatalf("golden names KV key builder %q, which this package does not implement", tc.Builder)
 		}
@@ -479,6 +566,8 @@ func TestParityVocabularies(t *testing.T) {
 		"RecordingStopReason": asStrings(RecordingStopReasonValues),
 		"SIPTransport":        asStrings(SIPTransportValues),
 		"AgentStatus":         asStrings(AgentStatusValues),
+		"TapMode":             asStrings(TapModeValues),
+		"TapEndReason":        asStrings(TapEndReasonValues),
 	}
 	if !reflect.DeepEqual(named, g.Vocabularies) {
 		t.Errorf("telephony vocabularies = %v, golden %v", named, g.Vocabularies)
@@ -490,6 +579,7 @@ func TestParityVocabularies(t *testing.T) {
 		"queue":        EventTypesOfFamily(FamilyQueue),
 		"voicemail":    EventTypesOfFamily(FamilyVoicemail),
 		"media":        EventTypesOfFamily(FamilyMedia),
+		"trunk":        EventTypesOfFamily(FamilyTrunk),
 	}
 	if !reflect.DeepEqual(events, g.EventVocabularies) {
 		t.Errorf("event vocabularies = %v, golden %v", events, g.EventVocabularies)
@@ -513,14 +603,9 @@ func TestParityEventTypeRegistry(t *testing.T) {
 	}
 }
 
-// canonical re-encodes JSON through a generic value so key order stops mattering: Go marshals
-// struct fields in declaration order and map keys in sorted order, TypeScript in insertion order.
-//
-// It also drops explicit nulls. Every nullable field in the contract is `.nullish()` — null and
-// absent are the same statement ("there is no originating leg"), the TypeScript schema accepts
-// both, and the cdr-db column they land in is nullable either way. Go models that as *T with
-// omitempty, which necessarily writes "absent"; treating the two as distinct here would fail the
-// comparison over a difference the contract says does not exist.
+// canonical re-encodes JSON through a generic value so key order stops mattering, and drops
+// explicit nulls: every nullable field in the contract is `.nullish()`, so null and absent are the
+// same statement, while Go's *T with omitempty can only write "absent".
 func canonical(t *testing.T, raw []byte) string {
 	t.Helper()
 	var value any
@@ -557,9 +642,9 @@ func dropNulls(value any) any {
 }
 
 // TestParityEventSamples is the shape half of the parity proof: every sample envelope built by the
-// TypeScript makers is decoded into the generated Go structs and re-encoded. A field the emitter
-// got wrong — a missing json tag, a value type where a pointer was needed, a dropped passthrough
-// key — changes the bytes and fails here.
+// TypeScript makers is decoded into the generated Go structs and re-encoded, so an emitter mistake
+// (a missing json tag, a value where a pointer was needed, a dropped passthrough key) changes the
+// bytes and fails here.
 func TestParityEventSamples(t *testing.T) {
 	g := loadGolden(t)
 	if len(g.EventSamples) == 0 {
@@ -591,7 +676,6 @@ func TestParityEventSamples(t *testing.T) {
 				t.Errorf("payload round-trip lost or invented fields:\n got %s\nwant %s", got, want)
 			}
 
-			// Whole-envelope round trip, which additionally pins the EventTime formatting.
 			reEncodedEnvelope, err := Marshal(raw)
 			if err != nil {
 				t.Fatalf("re-encode envelope: %v", err)
@@ -671,5 +755,56 @@ func TestEventTimeMarshalsLikeToISOString(t *testing.T) {
 	}
 	if string(encoded) != `"2026-08-05T10:00:00.000Z"` {
 		t.Errorf("EventTime = %s, want the same instant normalised to UTC", encoded)
+	}
+}
+
+// TestParityEventSampleCoverage fails if a generated payload struct has no sample: an unsampled
+// struct is one nothing round-trips, so an emitter mistake on it would ship silently.
+func TestParityEventSampleCoverage(t *testing.T) {
+	g := loadGolden(t)
+
+	sampled := make(map[string]struct{}, len(g.EventSamples))
+	for _, sample := range g.EventSamples {
+		sampled[sample.GoType] = struct{}{}
+	}
+	for _, info := range g.EventTypes {
+		if _, ok := sampled[info.GoType]; !ok {
+			t.Errorf("no parity sample for %s (%s %s)", info.GoType, info.Family, info.Type)
+		}
+	}
+}
+
+// TestParityRPCSamples is TestParityEventSamples for the request-reply half.
+func TestParityRPCSamples(t *testing.T) {
+	g := loadGolden(t)
+	if len(g.RPCSamples) == 0 {
+		t.Fatal("golden carries no rpc samples")
+	}
+
+	for _, sample := range g.RPCSamples {
+		t.Run(sample.Subject, func(t *testing.T) {
+			for _, side := range []struct {
+				name  string
+				raw   json.RawMessage
+				value any
+			}{
+				{"request", sample.Request, NewRPCRequestFor(sample.Subject)},
+				{"response", sample.Response, NewRPCResponseFor(sample.Subject)},
+			} {
+				if side.value == nil {
+					t.Fatalf("%s: the registry is missing %q", side.name, sample.Subject)
+				}
+				if err := json.Unmarshal(side.raw, side.value); err != nil {
+					t.Fatalf("%s: decode into %T: %v", side.name, side.value, err)
+				}
+				reEncoded, err := json.Marshal(side.value)
+				if err != nil {
+					t.Fatalf("%s: re-encode: %v", side.name, err)
+				}
+				if got, want := canonical(t, reEncoded), canonical(t, side.raw); got != want {
+					t.Errorf("%s round-trip lost or invented fields:\n got %s\nwant %s", side.name, got, want)
+				}
+			}
+		})
 	}
 }

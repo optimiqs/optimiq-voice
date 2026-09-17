@@ -1,5 +1,6 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
+import { createEntityId } from "@optimiq-voice/identifiers";
 import { getLogger } from "@optimiq-voice/logging";
 import {
 	and,
@@ -7,22 +8,26 @@ import {
 	eq,
 	extension,
 	inArray,
-	sql,
 	voicemailBox,
 	voicemailMessage,
 } from "@optimiq-voice/pbx-db";
 import { openMediaResponse } from "../../media/media-response";
 import { ObjectKeyOutsideRootError } from "../../storage";
+import { asInetAddress, actorFromSession, insertAuditLog } from "../shared/audit-log";
 import { normalizePagination, paged } from "../shared/pagination";
 import { PBX_DATABASE, PBX_ENV, PBX_VOICEMAIL_STORE } from "../shared/pbx.tokens";
+import { assertOwnsRow, holdsUnscoped, ownedVoicemailBoxIds } from "../shared/self-ownership";
+import { VoicemailEmailService } from "./voicemail-email.service";
 import {
 	mintVoicemailMediaToken,
 	verifyVoicemailMediaToken,
+	voicemailContentTypeFor,
 	voicemailMediaPath,
 } from "./voicemail-media-token";
 import { isMessageRead } from "./voicemail-messages.dto";
 import { readMailboxCounts, VoicemailMwiPublisher } from "./voicemail-mwi.publisher";
 import {
+	VoicemailForwardTargetInvalidException,
 	VoicemailLinkExpiredException,
 	VoicemailLinkInvalidException,
 	VoicemailMediaGoneException,
@@ -33,9 +38,13 @@ import type { MediaResponse } from "../../media/media-response";
 import type { ObjectStore } from "../../storage";
 import type { PagedResult } from "../shared/pagination";
 import type { PbxEnv } from "../shared/pbx-env";
-import type { UpdateVoicemailMessage, VoicemailMessageListQuery } from "./voicemail-messages.dto";
+import type {
+	ForwardVoicemailMessage,
+	UpdateVoicemailMessage,
+	VoicemailMessageListQuery,
+} from "./voicemail-messages.dto";
 import type { MailboxCounts, MwiReason } from "./voicemail-mwi.publisher";
-import type { AppSession } from "@optimiq-voice/auth";
+import type { AppSession, Permission } from "@optimiq-voice/auth";
 import type {
 	PbxDatabaseClient,
 	PbxDatabaseTransaction,
@@ -92,6 +101,15 @@ export class VoicemailMessagesService {
 		 * an archive rather than a migration.
 		 */
 		@Inject(PBX_VOICEMAIL_STORE) private readonly store: ObjectStore,
+		/**
+		 * Voicemail-to-email for a mailbox that receives a forwarded message.
+		 *
+		 * The same service the deposit path calls, rather than a second event published at it: the
+		 * notification's whole decision tree — the organization's policy, the box's mode and address,
+		 * the `email_sent_at` compare-and-set that makes it once — lives in there, and a forwarded
+		 * message is a message arriving in a mailbox by every test that tree applies.
+		 */
+		@Inject(VoicemailEmailService) private readonly email: VoicemailEmailService,
 	) {}
 
 	// -------------------------------------------------------------------------------------------
@@ -112,6 +130,7 @@ export class VoicemailMessagesService {
 		query: VoicemailMessageListQuery,
 	): Promise<VoicemailMessageListEnvelope> {
 		const organizationId = requireActiveOrganizationId(session);
+		await this.assertMayReachBox(session, organizationId, boxId, "voicemail.read");
 		const pagination = normalizePagination(query);
 
 		return await this.database.withTenantScope(organizationId, async (transaction) => {
@@ -133,10 +152,6 @@ export class VoicemailMessagesService {
 					transcriptionStatus: voicemailMessage.transcriptionStatus,
 					transcribedAt: voicemailMessage.transcribedAt,
 					callLegRef: voicemailMessage.callLegRef,
-					// `count(*) over ()` on the same query rather than a second `select count(*)`, so
-					// the count and the page cannot disagree about the snapshot they were taken from —
-					// the rule `pagination.ts` states for every list in this area.
-					total: sql<number>`count(*) over ()`.mapWith(Number),
 				})
 				.from(voicemailMessage)
 				.where(
@@ -153,7 +168,14 @@ export class VoicemailMessagesService {
 				.offset(pagination.offset);
 
 			const counts = await readMailboxCounts(transaction, boxId);
-			const total = rows[0]?.total ?? 0;
+			// The folder counts, not a `count(*) over ()` window. The window counts the RETURNED rows,
+			// so an offset past the last row returns none and the total collapses to 0 — after which
+			// `paged` reports `totalPages: 0` and the pager renders "no messages" for a mailbox
+			// holding forty, with no page count to clamp back to. `readMailboxCounts` is already in
+			// hand and runs in the same transaction, so it answers the same snapshot the window did.
+			const total =
+				(folders.includes("new") ? counts.newCount : 0) +
+				(folders.includes("saved") ? counts.savedCount : 0);
 
 			return {
 				...paged(rows.map(toWireMessage), total, pagination),
@@ -172,6 +194,12 @@ export class VoicemailMessagesService {
 	 *
 	 * See `voicemail-messages.dto.ts`: there is no `read` column and there should not be, because
 	 * the MWI lamp is defined by the NEW count. One fact, one place.
+	 *
+	 * The reach check is here rather than in {@link move}, because `remove` has already made it with
+	 * `voicemail.delete` before it moves a message to the `deleted` folder. Today `voicemail.write`
+	 * has no `.own` variant in the registry, so a `user` cannot reach this route at all and the
+	 * check is only ever satisfied by the unscoped grant — see the controller header. When
+	 * `voicemail.write.own` exists this is the row half that is already in place.
 	 */
 	async update(
 		session: AppSession,
@@ -179,6 +207,12 @@ export class VoicemailMessagesService {
 		messageId: string,
 		patch: UpdateVoicemailMessage,
 	): Promise<VoicemailMessageEnvelope> {
+		await this.assertMayReachBox(
+			session,
+			requireActiveOrganizationId(session),
+			boxId,
+			"voicemail.write",
+		);
 		const folder: VoicemailFolder = patch.folder ?? (patch.read === true ? "saved" : "new");
 		return await this.move(session, boxId, messageId, folder, reasonForFolder(folder));
 	}
@@ -197,12 +231,15 @@ export class VoicemailMessagesService {
 		messageId: string,
 		purge: boolean,
 	): Promise<VoicemailMessageDeletion> {
+		const scopeOrganizationId = requireActiveOrganizationId(session);
+		await this.assertMayReachBox(session, scopeOrganizationId, boxId, "voicemail.delete");
+
 		if (!purge) {
 			const moved = await this.move(session, boxId, messageId, "deleted", "message-deleted");
 			return { data: { id: moved.data.id, purged: false }, mailbox: moved.mailbox };
 		}
 
-		const organizationId = requireActiveOrganizationId(session);
+		const organizationId = scopeOrganizationId;
 		const result = await this.database.withTenantScope(organizationId, async (transaction) => {
 			const box = await requireBox(transaction, boxId);
 			await requireMessage(transaction, boxId, messageId);
@@ -214,6 +251,155 @@ export class VoicemailMessagesService {
 		return {
 			data: { id: messageId, purged: true },
 			mailbox: mailboxSummary(result.box, result.counts),
+		};
+	}
+
+	/**
+	 * Forwards or copies a message into another mailbox in the same organization.
+	 *
+	 * ## One operation, one extra step
+	 *
+	 * Both modes write the AUDIO and then the ROW into the target box. `forward` then deletes the
+	 * source row; `copy` does not. Everything else — the tenancy proof, the object copy, the two
+	 * lamps, the notification — is identical, which is why they are one method and one route rather
+	 * than two that would have to be kept in step.
+	 *
+	 * ## The target is proved by TENANCY, not by ownership
+	 *
+	 * The SOURCE box takes the ordinary `.own` reach check: a self-service user may only forward out
+	 * of a mailbox linked to their own extension. The TARGET takes none, deliberately — forwarding a
+	 * message to a colleague is the entire point of the feature, and a user who could only forward
+	 * into boxes they already own could only forward to themselves. What the target does get is the
+	 * tenant boundary: `requireBox` runs inside `withTenantScope`, so a box id from another
+	 * organization is invisible to RLS and answers 404, indistinguishable from an id that never
+	 * existed.
+	 *
+	 * ## The object goes first, and the row failing reaps it
+	 *
+	 * The same order `branding-logo-upload.service.ts` sets out, for the same reason: an object with
+	 * no row is inert and reapable, a row pointing at a missing object is a message that plays as an
+	 * error. If the transaction throws, the copy this method wrote is unlinked before the failure is
+	 * re-thrown.
+	 *
+	 * The SOURCE object is never unlinked, even on a forward. Retention owns the object store's
+	 * lifecycle here as everywhere else in this file — see {@link remove} — and the copy is a new
+	 * object under its own key, so nothing the forward wrote depends on the original surviving.
+	 *
+	 * ## A recorded introduction is out of scope
+	 *
+	 * A desk phone's "record your comment, then send" prepends a fresh recording to the forwarded
+	 * audio. That needs a recording leg on the call path, which is `apps/engine`'s to own and which
+	 * nothing in the control plane can fabricate. The DTO says so too.
+	 */
+	async forward(
+		session: AppSession,
+		boxId: string,
+		messageId: string,
+		input: ForwardVoicemailMessage,
+	): Promise<VoicemailForwardResult> {
+		const organizationId = requireActiveOrganizationId(session);
+		await this.assertMayReachBox(session, organizationId, boxId, "voicemail.write");
+		const targetBoxId = input.targetVoicemailBoxId;
+		if (targetBoxId === boxId) {
+			throw new VoicemailForwardTargetInvalidException();
+		}
+
+		const context = await this.database.withTenantScope(organizationId, async (transaction) => ({
+			source: await requireBox(transaction, boxId),
+			target: await requireBox(transaction, targetBoxId),
+			message: await requireMessage(transaction, boxId, messageId),
+		}));
+
+		const copyId = createEntityId();
+		const objectKey = copiedObjectKey(organizationId, copyId, context.message.objectKey);
+		const sizeBytes = await this.copyObject(context.message.objectKey, objectKey);
+
+		// A transcript belongs to the audio, so it travels with it — but only once it EXISTS. A copy
+		// carrying `pending` would be a row nothing is coming for: the transcription queue is fed by
+		// the deposit path, and no worker is ever handed this message.
+		const transcribed = context.message.transcriptionStatus === "done";
+
+		let result: {
+			readonly row: MessageRow;
+			readonly targetCounts: MailboxCounts;
+			readonly sourceCounts: MailboxCounts;
+		};
+		try {
+			result = await this.database.withTenantScope(organizationId, async (transaction) => {
+				const inserted = await transaction
+					.insert(voicemailMessage)
+					.values({
+						id: copyId,
+						organizationId,
+						voicemailBoxId: targetBoxId,
+						// Always `new`: to the recipient this is a message that has just arrived, and the
+						// folder is what lights their lamp.
+						folder: "new",
+						callerIdName: context.message.callerIdName,
+						callerIdNumber: context.message.callerIdNumber,
+						receivedAt: context.message.receivedAt,
+						durationMs: context.message.durationMs,
+						objectKey,
+						sizeBytes,
+						transcription: transcribed ? context.message.transcription : null,
+						transcriptionStatus: transcribed ? "done" : "disabled",
+						transcribedAt: transcribed ? context.message.transcribedAt : null,
+						callLegRef: context.message.callLegRef,
+					})
+					.returning();
+
+				if (input.mode === "forward") {
+					await transaction.delete(voicemailMessage).where(eq(voicemailMessage.id, messageId));
+				}
+
+				// The ledger gap `E2E-records.md` F9 records, closed for the one message action that
+				// moves a recording between two people. `before` names where it came from; `after`
+				// names where it went, so "how did my message reach that mailbox" is answerable.
+				await insertAuditLog(transaction, {
+					organizationId,
+					actor: actorFromSession(session),
+					action: `voicemail-message.${input.mode}`,
+					resourceType: "voicemail_message",
+					resourceRef: copyId,
+					before: {
+						voicemailBoxId: boxId,
+						mailboxNumber: context.source.mailboxNumber,
+						messageId,
+						removed: input.mode === "forward",
+					},
+					after: {
+						voicemailBoxId: targetBoxId,
+						mailboxNumber: context.target.mailboxNumber,
+						messageId: copyId,
+					},
+				});
+
+				return {
+					row: inserted[0] as MessageRow,
+					targetCounts: await readMailboxCounts(transaction, targetBoxId),
+					sourceCounts: await readMailboxCounts(transaction, boxId),
+				};
+			});
+		} catch (cause) {
+			// The row did not take the new key, so the object it would have named must not survive.
+			await this.unlink(objectKey);
+			throw cause;
+		}
+
+		// Two lamps moved, and only one of them is the caller's. The target gained a NEW message; the
+		// source lost one, but only on a forward — a copy leaves it exactly as it was, so publishing
+		// for it would be an event claiming a change that did not happen.
+		await this.announce(organizationId, context.target, result.targetCounts, "message-left");
+		if (input.mode === "forward") {
+			await this.announce(organizationId, context.source, result.sourceCounts, "message-deleted");
+		}
+		await this.notifyTarget(organizationId, targetBoxId, copyId);
+
+		return {
+			data: toWireMessage(result.row),
+			mailbox: mailboxSummary(context.target, result.targetCounts),
+			source: mailboxSummary(context.source, result.sourceCounts),
+			mode: input.mode,
 		};
 	}
 
@@ -234,18 +420,40 @@ export class VoicemailMessagesService {
 		messageId: string,
 	): Promise<{ readonly data: VoicemailPlaybackLink }> {
 		const organizationId = requireActiveOrganizationId(session);
+		await this.assertMayReachBox(session, organizationId, boxId, "voicemail.listen");
 		const secret = this.env.PBX_VOICEMAIL_URL_SECRET;
 		if (secret === undefined) {
 			throw new VoicemailSigningUnavailableException();
 		}
 
-		await this.database.withTenantScope(organizationId, async (transaction) => {
-			await requireBox(transaction, boxId);
-			await requireMessage(transaction, boxId, messageId);
-		});
-
 		const ttl = this.env.PBX_VOICEMAIL_URL_TTL_SECONDS;
 		const expiresAt = Math.floor(Date.now() / 1000) + ttl;
+
+		await this.database.withTenantScope(organizationId, async (transaction) => {
+			await requireBox(transaction, boxId);
+			const message = await requireMessage(transaction, boxId, messageId);
+			// The AUTHORISATION, recorded where it is granted. Until now this ledger could say who
+			// deleted a message and not who listened to one, which inverts the two facts' weight: a
+			// voicemail is somebody's voice saying something to somebody else, and a third party
+			// hearing it is the event with a data subject attached. Written INSIDE the same
+			// transaction that proved the box and the message, so a mint that was refused — a box the
+			// caller may not reach, a message that is not in it — leaves no row claiming otherwise.
+			await insertAuditLog(transaction, {
+				organizationId,
+				actor: actorFromSession(session),
+				action: "voicemail-message.play-url",
+				resourceType: "voicemail_message",
+				resourceRef: messageId,
+				before: null,
+				after: {
+					voicemailBoxId: boxId,
+					objectKey: message.objectKey,
+					expiresAt: new Date(expiresAt * 1000).toISOString(),
+					expiresInSeconds: ttl,
+				},
+			});
+		});
+
 		return {
 			data: {
 				url: voicemailMediaPath(
@@ -268,6 +476,7 @@ export class VoicemailMessagesService {
 	async openSignedMedia(
 		token: string,
 		rangeHeader?: string | undefined,
+		client?: { readonly ipAddress?: string | undefined; readonly userAgent?: string | undefined },
 	): Promise<ResolvedVoicemailMedia> {
 		const secret = this.env.PBX_VOICEMAIL_URL_SECRET;
 		if (secret === undefined) {
@@ -320,9 +529,48 @@ export class VoicemailMessagesService {
 			throw new VoicemailMediaGoneException();
 		}
 
+		// The LISTEN, once it is certain to be served. `system` with the token's own subject rather
+		// than a fabricated user: this route is anonymous by construction — an `<audio src>` cannot
+		// carry a session — and the party who minted the link is frequently not the party fetching
+		// it, which is exactly why the link scheme exists. Naming the minter here would turn "a
+		// bearer of this token, from this address" into a claim about a person the ledger does not
+		// know, and a ledger that guesses is worse than one that says what it saw.
+		await this.database
+			.withTenantScope(payload.o, async (transaction) => {
+				await insertAuditLog(transaction, {
+					organizationId: payload.o,
+					actor: {
+						type: "system",
+						userId: null,
+						ref: `voicemail-token:${payload.r}`,
+						ipAddress: asInetAddress(client?.ipAddress),
+						userAgent: client?.userAgent ?? null,
+						requestId: null,
+					},
+					action: "voicemail-message.play",
+					resourceType: "voicemail_message",
+					resourceRef: row.id,
+					before: null,
+					after: {
+						objectKey: row.objectKey,
+						sizeBytes: stat.sizeBytes,
+						ranged: rangeHeader !== undefined && rangeHeader.length > 0,
+					},
+				});
+			})
+			// Never fails the read: the listen is authorised and about to happen either way, so the
+			// honest failure mode of a ledger that would not take the row is a gap somebody can grep
+			// for — not a player that stops working because an insert did.
+			.catch((cause: unknown) => {
+				logger.error(
+					{ organizationId: payload.o, messageId: row.id, cause },
+					"a voicemail playback could not be recorded in the audit ledger",
+				);
+			});
+
 		return await openMediaResponse(this.store, row.objectKey, stat.sizeBytes, {
-			contentType: contentTypeFor(row.objectKey),
-			fileName: downloadFileName(row.receivedAt, row.id, row.objectKey),
+			contentType: voicemailContentTypeFor(row.objectKey),
+			fileName: voicemailDownloadFileName(row.receivedAt, row.id, row.objectKey),
 			rangeHeader,
 		});
 	}
@@ -403,7 +651,6 @@ export class VoicemailMessagesService {
 					receivedAt: voicemailMessage.receivedAt,
 					callerIdNumber: voicemailMessage.callerIdNumber,
 					callerIdName: voicemailMessage.callerIdName,
-					total: sql<number>`count(*) over ()`.mapWith(Number),
 				})
 				.from(voicemailMessage)
 				.where(
@@ -428,7 +675,9 @@ export class VoicemailMessagesService {
 					...(row.callerIdNumber === null ? {} : { callerIdNumber: row.callerIdNumber }),
 					...(row.callerIdName === null ? {} : { callerIdName: row.callerIdName }),
 				})),
-				total: rows[0]?.total ?? 0,
+				// The folder's real size, not the window over the returned page — the window is capped
+				// by `request.limit`, so a mailbox with forty new messages announced twenty.
+				total: request.folder === "new" ? counts.newCount : counts.savedCount,
 				newCount: counts.newCount,
 				savedCount: counts.savedCount,
 			};
@@ -438,6 +687,33 @@ export class VoicemailMessagesService {
 	// -------------------------------------------------------------------------------------------
 	// Internals
 	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * The `.own` narrowing for the message surface — the same seam the box list takes, one level in.
+	 *
+	 * A `user` holds `voicemail.read.own` / `voicemail.delete.own` / `voicemail.listen.own` and no
+	 * unscoped grant, so the route's guard now names the scoped variant (which an unscoped holder
+	 * still satisfies). This is the row half: a `.own` holder may only touch messages in a box whose
+	 * extension is linked to them. An unscoped holder returns immediately and reaches every box, as
+	 * before. The box is proved again inside the tenant scope by `requireBox`, so this adds a reach
+	 * check, never replaces the tenancy one.
+	 */
+	private async assertMayReachBox(
+		session: AppSession,
+		organizationId: string,
+		boxId: string,
+		unscoped: Permission,
+	): Promise<void> {
+		if (holdsUnscoped(session, unscoped)) {
+			return;
+		}
+		const owned = await ownedVoicemailBoxIds(this.database, organizationId, session.user.id);
+		assertOwnsRow(
+			owned,
+			boxId,
+			"You hold access to your own voicemail only, and this mailbox is not linked to your account.",
+		);
+	}
 
 	private async move(
 		session: AppSession,
@@ -463,6 +739,70 @@ export class VoicemailMessagesService {
 			data: toWireMessage(result.row as MessageRow),
 			mailbox: mailboxSummary(result.box, result.counts),
 		};
+	}
+
+	/**
+	 * Copies one message's audio to a new key, and answers how many bytes landed.
+	 *
+	 * Buffered rather than piped because {@link ObjectStore.put} takes bytes — the seam has no
+	 * streaming write, deliberately (`object-store.ts`), and a voicemail is bounded by the recorder's
+	 * own limit rather than being an arbitrary object. The size is taken from what was actually read
+	 * and not from the source ROW, so a copy never inherits a `size_bytes` the store disagrees with.
+	 */
+	private async copyObject(sourceKey: string, targetKey: string): Promise<number> {
+		const stat = await this.store.head(sourceKey).catch((cause: unknown) => {
+			if (!(cause instanceof ObjectKeyOutsideRootError)) {
+				throw cause;
+			}
+			logger.error(
+				{ objectKey: sourceKey },
+				"a voicemail object key resolves outside the media root",
+			);
+			throw new VoicemailMediaGoneException();
+		});
+		if (stat === undefined) {
+			// Nothing to forward. A row whose audio is gone is a 410 here for the same reason it is one
+			// on the media route: "no such message" and "the recording is gone" are different facts.
+			throw new VoicemailMediaGoneException();
+		}
+
+		const chunks: Buffer[] = [];
+		for await (const chunk of await this.store.getStream(sourceKey)) {
+			chunks.push(Buffer.from(chunk as Buffer));
+		}
+		const bytes = Buffer.concat(chunks);
+		await this.store.put(targetKey, bytes, {
+			contentType: voicemailContentTypeFor(sourceKey),
+		});
+		return bytes.byteLength;
+	}
+
+	private async unlink(objectKey: string): Promise<void> {
+		await this.store.delete(objectKey).catch((cause: unknown) => {
+			logger.error({ objectKey, cause }, "could not unlink a forwarded voicemail object");
+		});
+	}
+
+	/**
+	 * Voicemail-to-email for the mailbox that received the copy.
+	 *
+	 * Best-effort and after the commit, on exactly the terms the deposit path uses: the row IS
+	 * filed, and a relay that is down must not turn a successful forward into an error.
+	 * {@link VoicemailEmailService.notify} does not throw — every refusal is a named outcome — so
+	 * this only records the one that is worth a line.
+	 */
+	private async notifyTarget(
+		organizationId: string,
+		mailboxId: string,
+		messageId: string,
+	): Promise<void> {
+		const outcome = await this.email.notify(organizationId, mailboxId, messageId);
+		if (outcome.outcome === "failed") {
+			logger.warn(
+				{ organizationId, mailboxId, messageId },
+				"a forwarded voicemail was filed but its notification could not be sent",
+			);
+		}
 	}
 
 	/**
@@ -541,6 +881,23 @@ export interface VoicemailMessageListEnvelope extends PagedResult<WireVoicemailM
 export interface VoicemailMessageEnvelope {
 	readonly data: WireVoicemailMessage;
 	readonly mailbox: MailboxSummary;
+}
+
+/**
+ * What a forward or a copy answers with.
+ *
+ * BOTH mailboxes' counts, not just the target's: a forward changes two lamps, and a UI that was
+ * handed only the destination's numbers would leave the badge on the box the user is looking at
+ * showing a message that is no longer in it.
+ */
+export interface VoicemailForwardResult {
+	/** The copy, as it now sits in the target mailbox. */
+	readonly data: WireVoicemailMessage;
+	/** The TARGET box's counts after the operation. */
+	readonly mailbox: MailboxSummary;
+	/** The SOURCE box's counts after the operation — unchanged on a copy. */
+	readonly source: MailboxSummary;
+	readonly mode: "forward" | "copy";
 }
 
 export interface VoicemailMessageDeletion {
@@ -625,6 +982,18 @@ interface MessageRow {
 	readonly callLegRef: string | null;
 }
 
+/**
+ * The same row plus where its audio is.
+ *
+ * `objectKey` is separated out rather than folded into {@link MessageRow} because the list query
+ * deliberately does not read it: the browser never receives a store key — playback goes through a
+ * signed link — and a column that is not selected cannot be leaked by a `toWireMessage` that
+ * forgets to drop it. The forward path is the one caller that needs the key, and it asks for it.
+ */
+interface StoredMessageRow extends MessageRow {
+	readonly objectKey: string;
+}
+
 /** The box, or a 404. RLS has already scoped the read, so "not visible" and "absent" are one case. */
 async function requireBox(transaction: PbxDatabaseTransaction, boxId: string): Promise<BoxRow> {
 	const found = await transaction
@@ -656,15 +1025,47 @@ async function requireMessage(
 	transaction: PbxDatabaseTransaction,
 	boxId: string,
 	messageId: string,
-): Promise<void> {
+): Promise<StoredMessageRow> {
 	const found = await transaction
-		.select({ id: voicemailMessage.id })
+		.select({
+			id: voicemailMessage.id,
+			voicemailBoxId: voicemailMessage.voicemailBoxId,
+			objectKey: voicemailMessage.objectKey,
+			folder: voicemailMessage.folder,
+			callerIdName: voicemailMessage.callerIdName,
+			callerIdNumber: voicemailMessage.callerIdNumber,
+			receivedAt: voicemailMessage.receivedAt,
+			durationMs: voicemailMessage.durationMs,
+			sizeBytes: voicemailMessage.sizeBytes,
+			transcription: voicemailMessage.transcription,
+			transcriptionStatus: voicemailMessage.transcriptionStatus,
+			transcribedAt: voicemailMessage.transcribedAt,
+			callLegRef: voicemailMessage.callLegRef,
+		})
 		.from(voicemailMessage)
 		.where(and(eq(voicemailMessage.id, messageId), eq(voicemailMessage.voicemailBoxId, boxId)))
 		.limit(1);
-	if (found[0] === undefined) {
+	const row = found[0];
+	if (row === undefined) {
 		throw new VoicemailNotFoundException("voicemail-message", messageId);
 	}
+	return row;
+}
+
+/**
+ * Where a forwarded copy's audio lives: a key this server minted, under the tenant's own prefix.
+ *
+ * The same shape the deposit path writes (`<organizationId>/<messageId>.<ext>`), so an operator
+ * looking at the store cannot tell a forwarded message from a deposited one — which is right, it IS
+ * one. Every segment but the extension is a UUID this process created, so the containment check in
+ * `ObjectStore.put` has nothing to escape with; the extension is carried from the source key and
+ * falls back to `wav` when it has none.
+ */
+function copiedObjectKey(organizationId: string, messageId: string, sourceKey: string): string {
+	const dot = sourceKey.lastIndexOf(".");
+	const slash = sourceKey.lastIndexOf("/");
+	const extension = dot > slash && dot < sourceKey.length - 1 ? sourceKey.slice(dot + 1) : "wav";
+	return `${organizationId}/${messageId}.${extension}`;
 }
 
 function toWireMessage(row: MessageRow): WireVoicemailMessage {
@@ -715,20 +1116,8 @@ function refuse(reason: string): BrokerListReply {
 	return { found: false, messages: [], total: 0, newCount: 0, savedCount: 0, reason };
 }
 
-/** Content type from the object key's extension. WAV is what the engine writes today. */
-function contentTypeFor(objectKey: string): string {
-	const lower = objectKey.toLowerCase();
-	if (lower.endsWith(".mp3")) {
-		return "audio/mpeg";
-	}
-	if (lower.endsWith(".ogg") || lower.endsWith(".opus")) {
-		return "audio/ogg";
-	}
-	return "audio/wav";
-}
-
 /** A file name a person can find again on their desktop, rather than a UUID. */
-function downloadFileName(receivedAt: Date, id: string, objectKey: string): string {
+function voicemailDownloadFileName(receivedAt: Date, id: string, objectKey: string): string {
 	const stamp = receivedAt.toISOString().slice(0, 19).replace(/[:T]/gu, "-");
 	const extension = objectKey.slice(objectKey.lastIndexOf(".") + 1) || "wav";
 	return `voicemail-${stamp}-${id.slice(0, 8)}.${extension}`;

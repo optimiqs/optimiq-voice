@@ -1,6 +1,8 @@
-import { BadRequestException, Inject, Injectable } from "@nestjs/common";
+import { BadRequestException, Inject, Injectable, Optional } from "@nestjs/common";
+import { encryptSecret, requireSecretKey } from "@optimiq-voice/db";
 import { PbxResourceService } from "../shared/pbx-resource.service";
 import { PBX_EFFECT_RUNTIME, PBX_ENV } from "../shared/pbx.tokens";
+import { WebhookDispatcher } from "./webhook-dispatcher.service";
 import { generateWebhookSecret } from "./webhook-signature";
 import { WEBHOOK_SUBSCRIPTION_RESOURCE } from "./webhooks.resource";
 import type { PbxEnv } from "../shared/pbx-env";
@@ -27,6 +29,18 @@ import type { AppSession } from "@optimiq-voice/auth";
  * time is unrecoverable and has to be rotated. That is the correct trade — the alternative is an
  * endpoint that hands out every tenant's signing keys to anybody holding `webhooks.read`.
  *
+ * ## The stored column is a ciphertext, and only the dispatcher opens it
+ *
+ * The key cannot be hashed — the platform is the signer — but it can be SEALED, and the envelope
+ * built for SSO client secrets is the same shape: a value the platform must present again. Both
+ * write paths therefore store `encryptSecret(secret, requireSecretKey())`, so a dump of
+ * `webhook_subscription` yields no usable signing key. `requireSecretKey` and not `loadSecretKey`,
+ * because a write is the one moment where a missing key can still be fixed without losing anything:
+ * failing the request is strictly better than minting a key that lands in the table in the clear.
+ *
+ * The plaintext returned by `create` is the one below, before sealing — the caller has to receive
+ * the value they will configure the far end with, not the envelope around it.
+ *
  * ## `update` clears the failure state when a subscription is switched back on
  *
  * An auto-disabled subscription carries a failure count and an `auto_disabled_at`. Re-enabling it
@@ -37,12 +51,20 @@ import type { AppSession } from "@optimiq-voice/auth";
  * Done on ENABLE only, not on every update: an administrator editing the selector list of a
  * currently-failing subscription has not fixed anything, and silently resetting the counter would
  * hide the failure they are about to make worse.
+ *
+ * ## Every mutation invalidates the dispatcher's cache
+ *
+ * The dispatcher holds a tenant's subscriptions for `PBX_WEBHOOK_CACHE_TTL_MS`. Without this call a
+ * DELETED subscription keeps receiving the tenant's call metadata at a URL an administrator just
+ * removed, and a ROTATED secret leaves every delivery in the window signed with the retired key.
+ * The dispatcher is optional so a spec can construct this service without a broker.
  */
 @Injectable()
 export class WebhooksService extends PbxResourceService {
 	constructor(
 		@Inject(PBX_EFFECT_RUNTIME) runtime: PbxRepositoryRuntime,
 		@Inject(PBX_ENV) private readonly env: PbxEnv,
+		@Optional() private readonly dispatcher?: WebhookDispatcher,
 	) {
 		super(runtime, WEBHOOK_SUBSCRIPTION_RESOURCE);
 	}
@@ -89,7 +111,11 @@ export class WebhooksService extends PbxResourceService {
 	): Promise<MutationEnvelope<Record<string, unknown>>> {
 		this.assertUrlAllowed(values);
 		const secret = typeof values.secret === "string" ? values.secret : generateWebhookSecret();
-		const created = await super.create(session, { ...values, secret });
+		const created = await super.create(session, {
+			...values,
+			secret: encryptSecret(secret, requireSecretKey()),
+		});
+		this.dispatcher?.invalidate(this.organizationId(session));
 		// Re-attached AFTER the generic redaction has run, so the exception is visible here rather
 		// than being a hole in `redactRow`.
 		return { ...created, data: { ...created.data, secret } };
@@ -105,6 +131,23 @@ export class WebhooksService extends PbxResourceService {
 			values.enabled === true
 				? { consecutiveFailures: 0, lastFailureReason: null, autoDisabledAt: null }
 				: {};
-		return await super.update(session, id, { ...values, ...revived });
+		// A rotation arrives here as an ordinary field and has to be sealed exactly as a new one is;
+		// every other key on the patch is configuration and is written verbatim.
+		const rotated =
+			typeof values.secret === "string"
+				? { secret: encryptSecret(values.secret, requireSecretKey()) }
+				: {};
+		const updated = await super.update(session, id, { ...values, ...rotated, ...revived });
+		this.dispatcher?.invalidate(this.organizationId(session));
+		return updated;
+	}
+
+	override async remove(
+		session: AppSession,
+		id: string,
+	): Promise<MutationEnvelope<{ readonly id: string }>> {
+		const removed = await super.remove(session, id);
+		this.dispatcher?.invalidate(this.organizationId(session));
+		return removed;
 	}
 }

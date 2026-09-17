@@ -1,8 +1,16 @@
-import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
+import {
+	Inject,
+	Injectable,
+	Optional,
+	type OnApplicationShutdown,
+	type OnModuleInit,
+} from "@nestjs/common";
 import { connect, type NatsConnection } from "nats";
 import {
+	and,
 	buildCallLegEnrichmentQuery,
 	eq,
+	isNull,
 	recordings,
 	sql,
 	withCdrWriterScope,
@@ -10,6 +18,7 @@ import {
 import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import { getLogger } from "@optimiq-voice/logging";
 import { isArchivingObjectStore } from "../../storage";
+import { RECORDING_RETENTION_POLICY } from "../recordings/retention-policy";
 import { CDR_DATABASE, CDR_ENV, CDR_RECORDING_STORE } from "../shared/cdr.tokens";
 import { quarantineMessage } from "./cdr-quarantine";
 import {
@@ -20,6 +29,7 @@ import {
 	type DurableMessage,
 } from "./durable-consumer";
 import type { ObjectStore } from "../../storage";
+import type { RecordingRetentionPolicy } from "../recordings/retention-policy";
 import type { CdrEnv } from "../shared/cdr-env";
 import type { CdrDatabaseClient, RecordingKind } from "@optimiq-voice/cdr-db";
 
@@ -109,6 +119,14 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 		@Inject(CDR_ENV) private readonly env: CdrEnv,
 		@Inject(CDR_DATABASE) private readonly database: CdrDatabaseClient,
 		@Inject(CDR_RECORDING_STORE) private readonly store: ObjectStore,
+		/**
+		 * The per-organization retention window, implemented on the PBX side of the port and
+		 * therefore OPTIONAL: `CdrModule` boots without the PBX area, and in that deployment this
+		 * is simply absent and the platform env decides — see `retention-policy.ts`.
+		 */
+		@Optional()
+		@Inject(RECORDING_RETENTION_POLICY)
+		private readonly retentionPolicy?: RecordingRetentionPolicy,
 	) {}
 
 	get stats(): {
@@ -294,15 +312,43 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 	 * When this recording becomes eligible for purging, or `null` for "keep indefinitely".
 	 *
 	 * Computed at WRITE time from the window in force now, never re-derived on the sweep — see
-	 * `CDR_RECORDING_RETENTION_DAYS`. `null` is the default and is what leaves a row invisible to
-	 * the sweeper forever, which is the pre-existing behaviour of every row already in the table.
+	 * `CDR_RECORDING_RETENTION_DAYS`. `null` leaves a row invisible to the sweeper forever, which
+	 * is the pre-existing behaviour of every row already in the table.
+	 *
+	 * The organization's own window wins when there is one: the port answers a number (an explicit
+	 * `0` included — the tenant may out-keep the platform) and the env is the fall-back for the
+	 * three absences — no PBX area mounted, no window ever set, or the policy read failing. The
+	 * failure case falls back rather than NAKs deliberately: redelivering a recording event
+	 * because a SETTINGS read failed would hold recording metadata hostage to the other database's
+	 * uptime, and stamping the platform floor is what every release before the port did for every
+	 * recording. Async now, so both call sites await it BEFORE opening their write transaction —
+	 * a cross-database read has no business inside `withCdrWriterScope`.
 	 */
-	private retentionUntil(): Date | null {
-		const days = this.env.CDR_RECORDING_RETENTION_DAYS;
+	private async retentionUntil(organizationId: string): Promise<Date | null> {
+		const days = await this.retentionDaysFor(organizationId);
 		if (days <= 0) {
 			return null;
 		}
 		return new Date(Date.now() + days * 24 * 60 * 60 * 1_000);
+	}
+
+	/** The org's window through the port, or the platform's `CDR_RECORDING_RETENTION_DAYS`. */
+	private async retentionDaysFor(organizationId: string): Promise<number> {
+		if (this.retentionPolicy !== undefined) {
+			try {
+				const days = await this.retentionPolicy.retentionDaysFor(organizationId);
+				if (days !== undefined) {
+					return days;
+				}
+			} catch (error) {
+				logger.warn(
+					{ organizationId, err: String(error) },
+					"could not read the organization's recording retention window; stamping the " +
+						"platform default for this recording",
+				);
+			}
+		}
+		return this.env.CDR_RECORDING_RETENTION_DAYS;
 	}
 
 	/** Creates the metadata row. Idempotent on `object_key`, which is unique across the bucket. */
@@ -311,6 +357,8 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 		callId: string,
 		data: RecordEventData,
 	): Promise<void> {
+		const retentionUntil = await this.retentionUntil(organizationId);
+		const consent = recordingConsentRow(data.consent);
 		await withCdrWriterScope(this.database.adminDb, organizationId, async (transaction) => {
 			const written = await transaction
 				.insert(recordings)
@@ -322,15 +370,47 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 					objectKey: data.objectKey,
 					durationMs: 0,
 					sizeBytes: 0,
-					retentionUntil: this.retentionUntil(),
+					// Absent rather than null when the producer sent none: `consent` is null on every
+					// row written before consent existed and on every recording no consent was required
+					// for, and the insert must not distinguish the two — see the column's own comment.
+					...(consent === undefined ? {} : { consent }),
+					retentionUntil,
 				})
 				.onConflictDoNothing()
 				.returning({ id: recordings.id });
 			if (written.length > 0) {
 				this.started += 1;
-			} else {
-				this.duplicates += 1;
+				return;
 			}
+			this.duplicates += 1;
+			/**
+			 * The row was already there, and the insert above therefore wrote NOTHING — including the
+			 * consent. Usually that is a redelivery of a `started` whose consent is already filed, and
+			 * this update finds nothing to do. The case it exists for is the other one: `stopped` can
+			 * legitimately arrive first (see {@link CdrRecordingWriter.recordStopped}) and creates the
+			 * row with no consent at all, because `channel.record.stopped` does not carry one. Without
+			 * this, a call whose consent was announced would file a recording that says nothing about
+			 * it purely because two messages arrived out of order.
+			 *
+			 * `is null` in the predicate is what makes it FORWARD-ONLY, and that is the whole
+			 * discipline: an event with no consent never reaches this line, and one that does can only
+			 * fill an empty column. A later delivery can never blank or rewrite a consent record that
+			 * is already filed — a recording's authorisation is evidence, and evidence that a
+			 * redelivery can edit is not evidence.
+			 */
+			if (consent === undefined) {
+				return;
+			}
+			await transaction
+				.update(recordings)
+				.set({ consent, updatedAt: new Date() })
+				.where(
+					and(
+						eq(recordings.organizationId, organizationId),
+						eq(recordings.objectKey, data.objectKey),
+						isNull(recordings.consent),
+					),
+				);
 		});
 	}
 
@@ -351,6 +431,15 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 		const durationMs = typeof data.durationMs === "number" ? Math.max(0, data.durationMs) : 0;
 		const sizeBytes = typeof data.bytes === "number" ? Math.max(0, data.bytes) : 0;
 		const usable = data.reason !== "failed" && durationMs > 0;
+		// The PCI half. Null rather than an empty array for a recording nobody paused: the column is
+		// null on every row written before pausing existed, and a reader must not have to tell the
+		// two apart. Copied out of the envelope so the row holds plain objects rather than whatever
+		// the parse handed back.
+		const pauses =
+			data.pauses === undefined || data.pauses.length === 0
+				? null
+				: data.pauses.map((pause) => ({ startMs: pause.startMs, endMs: pause.endMs }));
+		const retentionUntil = await this.retentionUntil(organizationId);
 
 		await withCdrWriterScope(this.database.adminDb, organizationId, async (transaction) => {
 			await transaction
@@ -363,7 +452,8 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 					objectKey: data.objectKey,
 					durationMs,
 					sizeBytes,
-					retentionUntil: this.retentionUntil(),
+					...(pauses === null ? {} : { pauses }),
+					retentionUntil,
 				})
 				.onConflictDoUpdate({
 					target: recordings.objectKey,
@@ -371,7 +461,15 @@ export class CdrRecordingWriter implements OnModuleInit, OnApplicationShutdown {
 					// the recording started, and a redelivery of `stopped` (or a `stopped` that arrives
 					// after a settings change) must not quietly extend or shorten a window that has
 					// already been recorded against this object.
-					set: { durationMs, sizeBytes, updatedAt: new Date() },
+					set: {
+						durationMs,
+						sizeBytes,
+						// Only ever written FORWARD: a redelivery carrying no intervals must not erase
+						// the ones a previous delivery filed, because the absence would then read as
+						// "nobody paused this" on a recording somebody did.
+						...(pauses === null ? {} : { pauses }),
+						updatedAt: new Date(),
+					},
 					// The tenant predicate on the conflict path. `object_key` is unique across the
 					// BUCKET rather than within a tenant, so without it a producer that guessed another
 					// organization's key could rewrite its metadata.
@@ -491,6 +589,51 @@ interface RecordEventData {
 	readonly durationMs?: number;
 	readonly bytes?: number;
 	readonly reason?: string;
+	readonly pauses?: readonly { readonly startMs: number; readonly endMs: number }[];
+	/** Present only on `channel.record.started`, and only from an engine that runs the consent gate. */
+	readonly consent?: ConsentRow;
+}
+
+/**
+ * The shape `recordings.consent` holds, restated here rather than imported.
+ *
+ * `cdr-db` declares it as `RecordingConsentRow` on the column but does not re-export the type from
+ * its index, and the column is `jsonb` — so what crosses the boundary is a SHAPE, and a structurally
+ * identical local declaration is exactly as strong a guarantee as a nominal import would be. The
+ * schema's own comment makes the same argument one level down, where it mirrors the vocabulary out
+ * of `packages/routing` rather than depending on it.
+ */
+interface ConsentRow {
+	readonly outcome: "not-required" | "announced" | "accepted" | "declined";
+	readonly method: "none" | "announcement" | "keypress";
+	readonly policy: "none" | "announce" | "announce-and-require-keypress";
+	readonly at: string;
+	readonly parties: readonly ("caller" | "callee")[];
+	readonly regions?: readonly string[];
+	readonly promptId?: string;
+}
+
+/**
+ * The consent record as a plain object, or `undefined` when the event carried none.
+ *
+ * Copied field by field rather than passed through, exactly as `pauses` is: what the parse hands
+ * back is a zod result over a `looseObject` envelope, and putting it straight into a jsonb column
+ * would file whatever else the producer attached to it. This is the place that guarantees the row
+ * holds the seven declared fields and nothing else.
+ */
+export function recordingConsentRow(consent: RecordEventData["consent"]): ConsentRow | undefined {
+	if (consent === undefined) {
+		return undefined;
+	}
+	return {
+		outcome: consent.outcome,
+		method: consent.method,
+		policy: consent.policy,
+		at: consent.at,
+		parties: [...consent.parties],
+		...(consent.regions === undefined ? {} : { regions: [...consent.regions] }),
+		...(consent.promptId === undefined ? {} : { promptId: consent.promptId }),
+	};
 }
 
 interface RecordEnvelope {

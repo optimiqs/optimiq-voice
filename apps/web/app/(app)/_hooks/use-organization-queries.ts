@@ -8,7 +8,7 @@ import {
 	type OrganizationMemberSummary,
 	type OrganizationView,
 } from "~/lib/api-client";
-import { authErrorMessage, organization, type Invitation } from "~/lib/auth-client";
+import { authQueryError, organization, type Invitation } from "~/lib/auth-client";
 import { queryKeys } from "~/lib/query-keys";
 
 /**
@@ -49,7 +49,7 @@ export function useOrganizationInvitations(
 				query: { organizationId: organizationId as string },
 			});
 			if (result.error) {
-				throw new Error(authErrorMessage(result.error));
+				throw authQueryError(result.error);
 			}
 			return (result.data ?? []) as readonly Invitation[];
 		},
@@ -79,13 +79,13 @@ export function useCreateOrganization() {
 		mutationFn: async (name: string) => {
 			const result = await organization.create({ name: name.trim(), slug: slugify(name) });
 			if (result.error) {
-				throw new Error(authErrorMessage(result.error));
+				throw authQueryError(result.error);
 			}
 			const created = result.data;
 			// A newly created organization is useless until the session is scoped to it.
 			const activated = await organization.setActive({ organizationId: created.id });
 			if (activated.error) {
-				throw new Error(authErrorMessage(activated.error));
+				throw authQueryError(activated.error);
 			}
 			return created;
 		},
@@ -108,7 +108,7 @@ export function useRenameOrganization(organizationId: string | undefined) {
 				data: { name: name.trim() },
 			});
 			if (result.error) {
-				throw new Error(authErrorMessage(result.error));
+				throw authQueryError(result.error);
 			}
 		},
 		onSuccess: async () => {
@@ -131,7 +131,7 @@ export function useInviteMember(organizationId: string | undefined) {
 				organizationId,
 			});
 			if (result.error) {
-				throw new Error(authErrorMessage(result.error));
+				throw authQueryError(result.error);
 			}
 		},
 		onSuccess: async () => {
@@ -151,7 +151,7 @@ export function useCancelInvitation(organizationId: string | undefined) {
 		mutationFn: async (invitationId: string) => {
 			const result = await organization.cancelInvitation({ invitationId });
 			if (result.error) {
-				throw new Error(authErrorMessage(result.error));
+				throw authQueryError(result.error);
 			}
 		},
 		onSuccess: async () => {
@@ -175,7 +175,7 @@ export function useUpdateMemberRole(organizationId: string | undefined) {
 				organizationId,
 			});
 			if (result.error) {
-				throw new Error(authErrorMessage(result.error));
+				throw authQueryError(result.error);
 			}
 		},
 		onSuccess: async () => {
@@ -195,7 +195,7 @@ export function useRemoveMember(organizationId: string | undefined) {
 		mutationFn: async (memberIdOrEmail: string) => {
 			const result = await organization.removeMember({ memberIdOrEmail, organizationId });
 			if (result.error) {
-				throw new Error(authErrorMessage(result.error));
+				throw authQueryError(result.error);
 			}
 		},
 		onSuccess: async () => {

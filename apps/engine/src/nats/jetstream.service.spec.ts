@@ -95,6 +95,32 @@ function serviceWith(
 }
 
 describe("JetStreamService channel ownership", () => {
+	/**
+	 * A key deleted between the losing `create` and the read that follows it means "nobody owns
+	 * it", not "somebody does". Answering "owned" left the arriving channel up in Stasis with no
+	 * aggregate and no teardown path, because `onLegArrived` deliberately never hangs up on a lost
+	 * claim — a leg that rings forever, with no CDR.
+	 */
+	it("retakes a claim whose key vanished between the losing create and the read", async () => {
+		const kv = new FakeChannelsKv();
+		// The key exists when the first `create` runs and is gone by the time `get` looks for it.
+		let creates = 0;
+		const racing = Object.assign(Object.create(FakeChannelsKv.prototype) as FakeChannelsKv, kv, {
+			create: async (key: string, value: Uint8Array) => {
+				creates += 1;
+				return creates === 1 ? Promise.reject(conflict()) : await kv.create(key, value);
+			},
+			get: async (key: string) => await kv.get(key),
+			update: async (key: string, value: Uint8Array, previousSeq: number) =>
+				await kv.update(key, value, previousSeq),
+		});
+		const service = serviceWith(racing);
+
+		await expect(service.claimChannel(snapshot(), 1_000)).resolves.toBe("claimed");
+		expect(creates).toBe(2);
+		expect(kv.read(KEY)?.variables[CHANNEL_OWNER_INSTANCE_VARIABLE]).toBe("engine-1");
+	});
+
 	it("claims the canonical key with a renewable ownership lease", async () => {
 		const kv = new FakeChannelsKv();
 		const service = serviceWith(kv);
@@ -220,5 +246,55 @@ describe("JetStreamService channel ownership", () => {
 		});
 
 		await expect(service.claimChannel(snapshot())).resolves.toBe("unavailable");
+	});
+});
+
+/**
+ * `presence` is a MEMORY-backed bucket, so a broker restart destroys it while this process keeps a
+ * `KV` handle bound to the stream that is gone. Every presence write then fails 503 for ever and
+ * `apps/sipd`'s watch retries `stream not found` for ever, which is BLF dark across the fleet until
+ * something reboots — `ensureKvBuckets` otherwise runs once, at boot.
+ */
+describe("JetStreamService reconnect", () => {
+	function connectionEmitting(statuses: readonly { type: string; data?: unknown }[]) {
+		let managers = 0;
+		return {
+			connection: {
+				status: () => statuses[Symbol.iterator](),
+				jetstreamManager: async () => {
+					managers += 1;
+					// Enough of the manager surface for `ensureKvBuckets` to fail fast and be caught;
+					// what is under test is that the reconnect reaches for it at all.
+					throw new Error("no broker in this test");
+				},
+			},
+			managerCalls: () => managers,
+		};
+	}
+
+	async function drive(statuses: readonly { type: string; data?: unknown }[]): Promise<number> {
+		const fake = connectionEmitting(statuses);
+		const service = new JetStreamService({
+			NATS_URL: "nats://127.0.0.1:4222",
+			ENGINE_MEDIA_DRIVER: "mediad",
+			ENGINE_ENSURE_STREAMS: true,
+		} as EngineEnv);
+		const internals = service as unknown as {
+			connection: unknown;
+			watchConnectionStatus(connection: unknown): void;
+		};
+		internals.connection = fake.connection;
+		internals.watchConnectionStatus(fake.connection);
+		// The status feed is consumed on a detached promise; one turn of the loop is enough.
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		return fake.managerCalls();
+	}
+
+	it("re-applies the KV definitions on a reconnect, so a lost memory bucket comes back", async () => {
+		expect(await drive([{ type: "reconnect", data: "nats://127.0.0.1:4222" }])).toBe(1);
+	});
+
+	it("does not re-apply them on a disconnect, which has lost nothing yet", async () => {
+		expect(await drive([{ type: "disconnect", data: "nats://127.0.0.1:4222" }])).toBe(0);
 	});
 });

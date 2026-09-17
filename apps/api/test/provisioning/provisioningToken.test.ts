@@ -134,6 +134,17 @@ describe("the rate limiter", () => {
 		expect(refused.retryAfterSeconds).to.be.greaterThan(0);
 	});
 
+	it("marks only the first refusal in a window, so a caller in a loop files one audit row", () => {
+		const limiter = new ProvisioningRateLimiter(1);
+		const now = 1_000_000;
+		expect(limiter.consume("ref", now).firstRefusal).to.equal(false);
+		expect(limiter.consume("ref", now).firstRefusal).to.equal(true);
+		expect(limiter.consume("ref", now).firstRefusal).to.equal(false);
+		expect(limiter.consume("ref", now).firstRefusal).to.equal(false);
+		// A new window starts the count over, so a sustained attack is one row per minute.
+		expect(limiter.consume("ref", now + 61_000).allowed).to.equal(true);
+	});
+
 	it("counts per device, so one phone's boot loop does not lock out another", () => {
 		const limiter = new ProvisioningRateLimiter(1);
 		const now = 1_000_000;

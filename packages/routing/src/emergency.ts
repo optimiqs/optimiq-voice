@@ -91,9 +91,11 @@ export function emergencyNumbers(configured?: readonly string[]): readonly Emerg
 	for (const seed of DEFAULT_EMERGENCY_NUMBERS) {
 		byDialed.set(seed.dialed, seed);
 	}
-	for (const raw of (configured ?? []).slice(0, MAX_EMERGENCY_NUMBERS)) {
-		const dialed = raw.trim();
-		if (!isEmergencyDialString(dialed) || byDialed.has(dialed)) {
+	// The cap is applied to the VALID entries, not to the raw list: capping first would spend the
+	// budget on malformed rows and drop dialable numbers behind them, which is a silent drop in the
+	// one subsystem where a silent drop is a compliance question.
+	for (const dialed of acceptedEmergencyNumbers(configured)) {
+		if (byDialed.has(dialed)) {
 			continue;
 		}
 		byDialed.set(dialed, { dialed, number: dialed });
@@ -101,6 +103,27 @@ export function emergencyNumbers(configured?: readonly string[]): readonly Emerg
 	return [...byDialed.values()].sort((left, right) =>
 		left.dialed < right.dialed ? -1 : left.dialed > right.dialed ? 1 : 0,
 	);
+}
+
+/** The valid configured entries, trimmed, in order, before the cap. */
+function validEmergencyNumbers(configured?: readonly string[]): readonly string[] {
+	return (configured ?? []).map((raw) => raw.trim()).filter((raw) => isEmergencyDialString(raw));
+}
+
+/** The valid configured entries that fit under {@link MAX_EMERGENCY_NUMBERS}. */
+function acceptedEmergencyNumbers(configured?: readonly string[]): readonly string[] {
+	return validEmergencyNumbers(configured).slice(0, MAX_EMERGENCY_NUMBERS);
+}
+
+/**
+ * Valid entries the cap discarded, so the compiler can say so.
+ *
+ * Separate from {@link invalidEmergencyNumbers} because the two are different tenant mistakes: one
+ * is "you typed something that is not a dial string", the other is "you listed more numbers than
+ * this release carries", and only the second is fixed by removing a number you still want.
+ */
+export function cappedEmergencyNumbers(configured?: readonly string[]): readonly string[] {
+	return validEmergencyNumbers(configured).slice(MAX_EMERGENCY_NUMBERS);
 }
 
 /** Configured entries this package refuses, so the compiler can name them in a diagnostic. */

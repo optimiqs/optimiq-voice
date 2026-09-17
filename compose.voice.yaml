@@ -1,0 +1,205 @@
+# Self-managed SIP and RTP deployment. Merge with compose.yaml.
+# SIPD_REALM must resolve to this host; MEDIAD_PUBLIC_IP must route to its published RTP range.
+services:
+  asterisk:
+    profiles: [legacy-asterisk]
+
+  postgres:
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - ./config/postgres/init-voice.sql:/docker-entrypoint-initdb.d/10-voice.sql:ro
+
+  migrate:
+    image: ghcr.io/optimiqs/optimiq-voice/migrations:${VOICE_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: migrations
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_DEPLOYMENT_STAGE: ${DATABASE_DEPLOYMENT_STAGE:-production}
+      DATABASE_MIGRATION_CONFIRM_PRODUCTION:
+      DATABASE_MIGRATION_URL: ${DATABASE_MIGRATION_URL:?Set the auth database migration owner URL}
+      PBX_DATABASE_MIGRATION_URL: ${PBX_DATABASE_MIGRATION_URL:?Set the PBX database migration owner URL}
+      CDR_DATABASE_MIGRATION_URL: ${CDR_DATABASE_MIGRATION_URL:?Set the CDR database migration owner URL}
+    command:
+      [
+        "node",
+        ".scripts/migrate-platform.mjs",
+        "--expected-stage",
+        "${DATABASE_DEPLOYMENT_STAGE:-production}",
+      ]
+
+  api:
+    command: ["node", "/service/dist/index.js"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    image: ghcr.io/optimiqs/optimiq-voice/api:${VOICE_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment:
+      NODE_ENV: production
+      OPTIMIQ_SERVICE: api
+      SMTP_HOST:
+      SMTP_PORT:
+      SMTP_SECURE:
+      SMTP_USER:
+      SMTP_PASS:
+      MAIL_FROM:
+      TELNYX_API_KEY:
+      TELNYX_PUBLIC_KEY:
+      TELNYX_SIP_REGION: ${TELNYX_SIP_REGION:-us}
+      TELNYX_WEBHOOK_URL:
+      PROVISION_SIP_SECRET_KEY: ${PROVISION_SIP_SECRET_KEY:?Set the provisioning encryption key}
+      PLATFORM_SECRET_ENCRYPTION_KEY: ${PLATFORM_SECRET_ENCRYPTION_KEY:?Set the platform secret encryption key}
+      # The SIP edge a phone sends packets TO — deployment-wide, and NOT a tenant's realm. The
+      # domain an account registers INTO is per-organization (`org_setting sip/realm`); the API
+      # refuses to provision an organization that has configured none rather than borrowing this.
+      PROVISION_SIP_SERVER: ${SIPD_REALM:?Set the public SIP domain}
+      PROVISION_BASE_URL:
+      PROVISION_SIP_TRANSPORT: ${PROVISION_SIP_TRANSPORT:-udp}
+      PROVISION_SIP_PORT: ${PROVISION_SIP_PORT:-5060}
+      # Browser calling is ONE switch with three consequences, and they used to be three unrelated
+      # variables: mediad's ICE stack (`MEDIAD_WEBRTC`), the SIP edge's WSS listener (`SIPD_WSS`,
+      # below) and this schema flag — which `provisioning-env.ts` refines to REQUIRE
+      # `PROVISION_SIP_WSS_URL`. An operator who flipped `MEDIAD_WEBRTC` on an existing
+      # `.env.voice` took the API from "WebRTC off" to "does not boot", with a zod issue naming a
+      # variable they had never heard of. `SIPD_WSS` derives from the same switch now, and the URL
+      # is required-if-enabled here so the failure names the flag that caused it.
+      PROVISION_WEBRTC_ENABLED: ${MEDIAD_WEBRTC:-false}
+      PROVISION_SIP_WSS_URL:
+      PROVISION_TURN_URLS:
+      PROVISION_TURN_SECRET:
+      PROVISION_TURN_TTL_SECONDS: ${PROVISION_TURN_TTL_SECONDS:-3600}
+      CDR_RECORDING_ROOT: /var/lib/optimiq/objects
+      # Under the mounted volume, not the schema default (`/opt/optimiq-voice/exports`): `/opt`
+      # in the runtime image is root-owned and the process is uid 1001, so every CSV export would
+      # fail its `mkdir` with EACCES.
+      CDR_EXPORT_ROOT: /var/lib/optimiq/objects/exports
+      PBX_MEDIA_OBJECT_ROOT: /var/lib/optimiq/objects
+      PBX_VOICEMAIL_MEDIA_ROOT: /var/lib/optimiq/objects
+      # The Prometheus listener, on a socket of its own so the public ingress never carries it —
+      # the same shape sipd and mediad use for theirs. `0.0.0.0` rather than the loopback default
+      # because a scraper on the compose network is a different container; the port is not
+      # published, so it stays inside the network. See docs/native-calling-deployment.md.
+      API_METRICS_ADDR: 0.0.0.0:9200
+      # Call-record retention. Off, and the dry-run interlock is on: `DROP TABLE` against the
+      # billing ledger is not something a deployment starts doing because it was upgraded.
+      CDR_LEG_RETENTION_MONTHS: ${CDR_LEG_RETENTION_MONTHS:-0}
+      CDR_RETENTION_DRY_RUN: ${CDR_RETENTION_DRY_RUN:-true}
+    volumes:
+      - voice-objects:/var/lib/optimiq/objects
+
+  engine:
+    image: ghcr.io/optimiqs/optimiq-voice/engine:${VOICE_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: apps/engine/Dockerfile
+    environment:
+      NODE_ENV: production
+      OPTIMIQ_SERVICE: engine
+      ENGINE_MEDIA_DRIVER: mediad
+      ENGINE_MEDIAD_RPC_TIMEOUT_MS: ${ENGINE_MEDIAD_RPC_TIMEOUT_MS:-3000}
+      ENGINE_MEDIA_OBJECT_ROOT: /var/lib/optimiq/objects
+      # The same decision as the API's, one port along: private socket, unpublished, `0.0.0.0`
+      # because a scraper on the compose network is a different container.
+      ENGINE_METRICS_ADDR: 0.0.0.0:9201
+
+  web:
+    environment:
+      PORT: "3100"
+    image: ghcr.io/optimiqs/optimiq-voice/web:${VOICE_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+
+  sipd:
+    image: ghcr.io/optimiqs/optimiq-voice/sipd:${VOICE_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: apps/sipd/Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 35s
+    environment:
+      NATS_URL: nats://nats:4222
+      NATS_SIPD_USER: ${NATS_SIPD_USER}
+      NATS_SIPD_PASS: ${NATS_SIPD_PASS}
+      SIPD_REALM: ${SIPD_REALM:?Set the public SIP domain}
+      SIPD_NONCE_SECRET: ${SIPD_NONCE_SECRET:?Set a shared random nonce secret}
+      SIPD_CREDENTIAL_SOURCE: nats
+      SIPD_INVITE: "true"
+      SIPD_LISTEN_ADDR: 0.0.0.0:5060
+      SIPD_EXTERNAL_LISTEN_ADDR: 0.0.0.0:5088
+      SIPD_TRUNK_ACL: ${SIPD_TRUNK_ACL:-}
+      SIPD_TLS: ${SIPD_TLS:-false}
+      # Derived from the browser-calling switch — see the api service. An explicit `SIPD_WSS` still
+      # wins, for a deployment that terminates WSS somewhere else.
+      SIPD_WSS: ${SIPD_WSS:-${MEDIAD_WEBRTC:-false}}
+      SIPD_WSS_LISTEN_ADDR: 0.0.0.0:8089
+      SIPD_TLS_CERT_FILE: ${SIPD_TLS_CERT_FILE:-}
+      SIPD_TLS_KEY_FILE: ${SIPD_TLS_KEY_FILE:-}
+      SIPD_HEALTH_ADDR: 0.0.0.0:9090
+    ports:
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+      - "5061:5061/tcp"
+      - "8089:8089/tcp"
+      - "5088:5088/udp"
+      - "5088:5088/tcp"
+    volumes:
+      - ${VOICE_CERTS_DIR:-./config/certs}:/etc/optimiq/certs:ro
+
+  mediad:
+    image: ghcr.io/optimiqs/optimiq-voice/mediad:${VOICE_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: apps/mediad/Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 35s
+    environment:
+      NATS_URL: nats://nats:4222
+      NATS_MEDIAD_USER: ${NATS_MEDIAD_USER}
+      NATS_MEDIAD_PASS: ${NATS_MEDIAD_PASS}
+      MEDIAD_PUBLIC_IP: ${MEDIAD_PUBLIC_IP:?Set the public RTP address}
+      MEDIAD_BIND_IP: 0.0.0.0
+      MEDIAD_RTP_PORT_MIN: "30000"
+      MEDIAD_RTP_PORT_MAX: "30999"
+      MEDIAD_SOUNDS_DIR: /var/lib/optimiq/objects
+      MEDIAD_RECORDINGS_DIR: /var/lib/optimiq/objects
+      MEDIAD_HEALTH_ADDR: 0.0.0.0:9091
+      MEDIAD_WEBRTC: ${MEDIAD_WEBRTC:-false}
+      MEDIAD_WEBRTC_PORT_MIN: "31000"
+      MEDIAD_WEBRTC_PORT_MAX: "31999"
+    ports:
+      - "30000-30999:30000-30999/udp"
+      - "31000-31999:31000-31999/udp"
+    volumes:
+      - voice-objects:/var/lib/optimiq/objects
+
+  turn:
+    image: coturn/coturn:4.17.2-r0-alpine@sha256:771a95d04cb97bbc5bfc672e5fdf455591c7d2b2a15f02bb9ceda3e27561695f
+    profiles: [webrtc]
+    restart: unless-stopped
+    # The mounted file contains the shared secret and public/private address mapping.
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    # Linux host networking preserves relay source ports and supports co-hosted media.
+    # Publish 3478 UDP/TCP, 5349 TCP and 32000-32999 UDP in the host firewall.
+    network_mode: host
+    volumes:
+      - ${VOICE_TURN_CONFIG:-./config/turn/turnserver.conf}:/etc/coturn/turnserver.conf:ro
+      - ${VOICE_CERTS_DIR:-./config/certs}:/etc/optimiq/certs:ro
+    tmpfs:
+      - /var/lib/coturn
+
+volumes:
+  voice-objects:

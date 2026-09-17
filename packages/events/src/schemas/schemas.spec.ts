@@ -7,18 +7,40 @@ import { makeAuditEvent } from "./audit-events";
 import { CALL_EVENT_DEFINITIONS, callEventSchema, makeCallEvent } from "./call-events";
 import { cdrEventSchema, makeCdrLegWriteEvent } from "./cdr-events";
 import { baseEventEnvelopeSchema, defineEvent, makeEvent } from "./envelope";
+import { contactsOf, registrationBindingSchema } from "./live-state";
 import { makeProvisionEvent, provisionEventSchema } from "./provision-events";
 import { makeQueueEvent, queueEventSchema } from "./queue-events";
 import { makeRegistrationEvent, registrationEventSchema } from "./registration-events";
 import {
 	AUTHZ_CHECK_RPC,
+	SESSION_ANNOUNCE_RPC,
+	CALL_CONTROL_REFUSAL_REASONS,
+	CALL_CONTROL_RPC,
+	CALL_CONTROL_VERBS,
+	SESSION_VERB_RPC,
+	SESSION_VERBS,
+	FILE_GREETING_RPC,
 	ORIGINATE_REFUSAL_REASONS,
 	ORIGINATE_RPC,
+	QUEUE_CALLBACK_RPC,
 	ROUTING_RESOLVE_RPC,
+	SIP_ANSWER_RPC,
+	SIP_DIALOG_REFUSAL_REASONS,
+	SIP_HANGUP_RPC,
+	SIP_INVITE_REFUSAL_REASONS,
+	SIP_INVITE_RPC,
+	SIP_ORIGINATE_RPC,
+	SIP_RING_RPC,
 	SIP_TRANSFER_REFUSAL_REASONS,
 	SIP_TRANSFER_RPC,
+	sipDialTargetSchema,
 	VOICEMAIL_LIST_RPC,
 } from "./rpc";
+import {
+	makeSipDialogEvent,
+	SIP_TERMINATION_REASONS,
+	sipDialogEventSchema,
+} from "./sip-dialog-events";
 
 const ORG = createEntityId();
 const CALL = createEntityId();
@@ -354,6 +376,52 @@ describe("queue events", () => {
 		expect(event.subject).toBe(`queue.evt.v1.${ORG}._all.agent.state`);
 	});
 
+	/**
+	 * Virtual hold's lifecycle. `callback.placed` is published when the CALL EXISTS rather than when
+	 * the customer answers, and it carries the queued call it settles — the only thing that relates
+	 * a callback's `call_id` to the wait behind it.
+	 */
+	it("builds the callback lifecycle, carrying the call the callback settles", () => {
+		const event = makeQueueEvent("callback.placed", {
+			orgId: ORG,
+			queueId: QUEUE,
+			source: "engine",
+			data: {
+				callId: CALL,
+				originalCallId: createEntityId(),
+				callerNumber: "+15551234567",
+				attempts: 0,
+				heldMs: 60_000,
+			},
+		});
+		expect(event.subject).toBe(`queue.evt.v1.${ORG}.${QUEUE}.callback.placed`);
+		expect(queueEventSchema.parse(event)).toEqual(event);
+	});
+
+	/** One event for both endings, with `dropped` as the discriminator. */
+	it("builds a failed attempt, and refuses one that claims no attempt was spent", () => {
+		const event = makeQueueEvent("callback.failed", {
+			orgId: ORG,
+			queueId: QUEUE,
+			source: "engine",
+			data: {
+				callerNumber: "+15551234567",
+				attempts: 3,
+				dropped: true,
+				reason: "extension_offline",
+			},
+		});
+		expect(queueEventSchema.parse(event)).toEqual(event);
+		expect(() =>
+			makeQueueEvent("callback.failed", {
+				orgId: ORG,
+				queueId: QUEUE,
+				source: "engine",
+				data: { callerNumber: "+15551234567", attempts: 0, dropped: false },
+			}),
+		).toThrow(EventValidationError);
+	});
+
 	it("rejects an unknown agent status and a zero position", () => {
 		expect(() =>
 			makeQueueEvent("agent.state", {
@@ -397,6 +465,16 @@ describe("cdr.leg.write", () => {
 		expect(cdrEventSchema.parse(event)).toEqual(event);
 	});
 
+	it.each([
+		"f9b30a2a-4f17-3244-a6d4-726667409ae4",
+		"f4ed4f27-3c04-4b08-9c0e-f789dd2fca0b",
+		"0195c0f0-1c2f-7000-8000-000000000001",
+	])("preserves domain leg UUID %s independently of its event UUID", (id) => {
+		const event = makeCdrLegWriteEvent({ orgId: ORG, source: "engine", data: { ...core, id } });
+		expect(cdrEventSchema.parse(event).data.id).toBe(id);
+		expect(event.id).not.toBe(id);
+	});
+
 	it("passes unknown columns through untouched", () => {
 		const event = makeCdrLegWriteEvent({
 			orgId: ORG,
@@ -416,12 +494,51 @@ describe("cdr.leg.write", () => {
 		expect(event.data.answeredAt).toBeNull();
 	});
 
+	/**
+	 * The consent projection: four flat columns a report groups by, on a leg that may carry no
+	 * recording at all. The `declined` case is the one the columns exist for — there is no
+	 * `recordings` row to file it beside, so the leg is the only record that the platform asked.
+	 */
+	it("pins the recording-consent columns, including on a leg that was never recorded", () => {
+		const event = makeCdrLegWriteEvent({
+			orgId: ORG,
+			source: "engine",
+			data: {
+				...core,
+				recordingConsent: "declined",
+				recordingConsentMethod: "keypress",
+				recordingConsentAt: AT,
+				recordingConsentRegions: ["US-CA", "EU"],
+			},
+		});
+		expect(event.data.recordingConsent).toBe("declined");
+		expect(event.data.recordingConsentRegions).toEqual(["US-CA", "EU"]);
+	});
+
+	it("accepts the consent columns null, which is every leg written before consent existed", () => {
+		const event = makeCdrLegWriteEvent({
+			orgId: ORG,
+			source: "engine",
+			data: {
+				...core,
+				recordingConsent: null,
+				recordingConsentMethod: null,
+				recordingConsentAt: null,
+				recordingConsentRegions: null,
+			},
+		});
+		expect(event.data.recordingConsent).toBeNull();
+	});
+
 	it.each([
 		["a non-v7 leg id", { id: "6f9619ff-8b86-d011-b42d-00c04fc964ff" }],
 		["a missing partition key", { startedAt: undefined }],
 		["a negative billsec", { billsecMs: -1 }],
 		["an upper-case destination type", { destinationType: "EXTENSION" }],
 		["an unknown direction", { direction: "sideways" }],
+		["a consent outcome outside the vocabulary", { recordingConsent: "maybe" }],
+		["a consent method outside the vocabulary", { recordingConsentMethod: "shrug" }],
+		["a consent timestamp that is not ISO 8601", { recordingConsentAt: "yesterday" }],
 	])("rejects %s", (_label, override) => {
 		expect(() =>
 			makeCdrLegWriteEvent({
@@ -557,6 +674,128 @@ describe("rpc contracts", () => {
 		).toBe(false);
 	});
 
+	/**
+	 * The session protocol's two contracts. Both subjects are PREFIXES on the wire, so what is
+	 * pinned here is the prefix — the token that follows it is `subjects.spec.ts`'s business.
+	 */
+	it("pins the session announce contract, and its accept carries a session id", () => {
+		expect(SESSION_ANNOUNCE_RPC.subject).toBe("rpc.session.v1.announce");
+		const request = SESSION_ANNOUNCE_RPC.request.parse({
+			orgId: ORG,
+			application: "autopilot",
+			callId: createEntityId(),
+			legId: createEntityId(),
+			instanceId: "engine-1",
+			direction: "inbound",
+			answered: false,
+			at: new Date().toISOString(),
+		});
+		expect(request.answered).toBe(false);
+		expect(
+			SESSION_ANNOUNCE_RPC.response.parse({ accepted: false, reason: "no-application" }).accepted,
+		).toBe(false);
+	});
+
+	/**
+	 * The wire refuses a verb the executor does not implement, rather than accepting it and failing
+	 * one hop later on a call that is already up.
+	 */
+	it("carries only the verbs the engine implements", () => {
+		expect(SESSION_VERBS).toContain("dial");
+		expect(SESSION_VERBS).toContain("bridge");
+		expect(SESSION_VERBS).toContain("unbridge");
+		for (const absent of ["say", "earlyMedia", "stream", "playbackControl"]) {
+			expect(SESSION_VERBS).not.toContain(absent as never);
+		}
+		expect(
+			SESSION_VERB_RPC.request.safeParse({
+				orgId: ORG,
+				sessionId: "s-1",
+				callId: createEntityId(),
+				legId: createEntityId(),
+				verb: "say",
+			}).success,
+		).toBe(false);
+	});
+
+	it("validates a session verb both ways", () => {
+		expect(SESSION_VERB_RPC.subject).toBe("rpc.engine.v1.session-verb");
+		const request = SESSION_VERB_RPC.request.parse({
+			orgId: ORG,
+			sessionId: "s-1",
+			callId: createEntityId(),
+			legId: createEntityId(),
+			verb: "gather",
+			arguments: { maxDigits: 4, timeoutMs: 5_000, interDigitTimeoutMs: 2_000, terminators: ["#"] },
+		});
+		expect(request.arguments?.maxDigits).toBe(4);
+		expect(
+			SESSION_VERB_RPC.response.parse({
+				ok: true,
+				verb: "gather",
+				instanceId: "engine-1",
+				endReason: "completed",
+				digits: ["1", "2"],
+			}).digits,
+		).toEqual(["1", "2"]);
+	});
+
+	it("refuses a DTMF terminator that is not one digit", () => {
+		expect(
+			SESSION_VERB_RPC.request.safeParse({
+				orgId: ORG,
+				sessionId: "s-1",
+				callId: createEntityId(),
+				legId: createEntityId(),
+				verb: "gather",
+				arguments: { terminators: ["##"] },
+			}).success,
+		).toBe(false);
+	});
+
+	it("validates a PBX call-control verb both ways, with the leg optional", () => {
+		expect(CALL_CONTROL_RPC.subject).toBe("rpc.engine.v1.call-control");
+		const callId = createEntityId();
+		// The common case: the control plane knows the CALL and not which of its legs is recorded.
+		const request = CALL_CONTROL_RPC.request.parse({ orgId: ORG, callId, verb: "pauseRecord" });
+		expect(request.legId).toBeUndefined();
+		expect(
+			CALL_CONTROL_RPC.request.safeParse({
+				orgId: ORG,
+				callId,
+				legId: createEntityId(),
+				verb: "stopRecord",
+			}).success,
+		).toBe(true);
+		expect(
+			CALL_CONTROL_RPC.response.parse({
+				ok: true,
+				verb: "pauseRecord",
+				instanceId: "engine-1",
+				legId: "leg-1",
+				recording: true,
+				paused: true,
+			}).paused,
+		).toBe(true);
+	});
+
+	it("carries only the three recording verbs, so it cannot become a remote control", () => {
+		expect([...CALL_CONTROL_VERBS]).toEqual(["pauseRecord", "resumeRecord", "stopRecord"]);
+		for (const absent of ["hangup", "hold", "transfer", "dial"]) {
+			expect(
+				CALL_CONTROL_RPC.request.safeParse({
+					orgId: ORG,
+					callId: createEntityId(),
+					verb: absent,
+				}).success,
+			).toBe(false);
+		}
+	});
+
+	it("spells the stale-address refusal exactly as mediad and sipd do", () => {
+		expect(CALL_CONTROL_REFUSAL_REASONS).toContain("wrong_instance");
+	});
+
 	it("pins the voicemail list contract to its subject", () => {
 		expect(VOICEMAIL_LIST_RPC.subject).toBe("rpc.voicemail.v1.list");
 	});
@@ -628,6 +867,51 @@ describe("rpc contracts", () => {
 				],
 			}).success,
 		).toBe(false);
+	});
+
+	it("pins the greeting-filing contract to its subject and defaults its slot", () => {
+		expect(FILE_GREETING_RPC.subject).toBe("rpc.pbx.v1.file-greeting");
+		const request = FILE_GREETING_RPC.request.parse({
+			orgId: ORG,
+			voicemailBoxId: createEntityId(),
+			mailboxNumber: "1001",
+			greetingId: createEntityId(),
+			objectKey: `${ORG}/${CALL}/rec.wav`,
+			durationMs: 4_200,
+		});
+		// `*99` is one code and the catalogue gives it no argument, so the slot it fills is a default
+		// rather than something every caller has to remember to send.
+		expect(request.kind).toBe("unavailable");
+	});
+
+	it("refuses a greeting with no audio in it", () => {
+		// The floor is the rule the walk already applies: an ACTIVE greeting containing silence stops
+		// a mailbox announcing itself and says nothing about why, so an empty recording is discarded
+		// rather than filed. A zero arriving here is a caller that skipped that, and the schema is the
+		// second place it cannot get through.
+		expect(
+			FILE_GREETING_RPC.request.safeParse({
+				orgId: ORG,
+				voicemailBoxId: createEntityId(),
+				mailboxNumber: "1001",
+				greetingId: createEntityId(),
+				objectKey: `${ORG}/${CALL}/rec.wav`,
+				durationMs: 0,
+			}).success,
+		).toBe(false);
+	});
+
+	it("separates a greeting that was stored from one that is being heard", () => {
+		// `applied` and `active` are two fields for the same reason `applied` and `enabled` are on the
+		// feature subject: a greeting that was filed and not activated is a different fact from one
+		// that was not filed, and a runtime reading only the first would confirm a recording nobody
+		// will ever hear.
+		const refused = FILE_GREETING_RPC.response.parse({
+			applied: false,
+			kind: "unavailable",
+			reason: "no such mailbox",
+		});
+		expect(refused.active).toBe(false);
 	});
 });
 
@@ -806,5 +1090,325 @@ describe("the originate contract", () => {
 			ORIGINATE_RPC.response.safeParse({ ok: false, originateId: "a", reason: "no_dialtone" })
 				.success,
 		).toBe(false);
+	});
+});
+
+describe("the queue callback contract", () => {
+	const request = () => ({
+		orgId: ORG,
+		callbackId: createEntityId(),
+		queueId: createEntityId(),
+		to: "+15551230000",
+	});
+
+	it("pins the subject and the deadline", () => {
+		expect(QUEUE_CALLBACK_RPC.subject).toBe("rpc.engine.v1.queue-callback");
+		// The originate's five seconds: the reply means the channel exists, not that anybody answered.
+		expect(QUEUE_CALLBACK_RPC.timeoutMs).toBe(5_000);
+	});
+
+	/**
+	 * The whole reason it is a sibling subject and not a variant of the originate: there is no
+	 * extension anywhere in it, so `fromExtension` cannot quietly become optional on the surface a
+	 * click-to-call is authorised against.
+	 */
+	it("has no extension in it at all", () => {
+		const parsed = QUEUE_CALLBACK_RPC.request.parse(request());
+		expect("fromExtension" in parsed).toBe(false);
+		expect(ORIGINATE_RPC.request.safeParse(request()).success).toBe(false);
+	});
+
+	it("carries the queued call it settles, which is the only cross-call link there is", () => {
+		const relatedCallId = createEntityId();
+		expect(QUEUE_CALLBACK_RPC.request.parse({ ...request(), relatedCallId }).relatedCallId).toBe(
+			relatedCallId,
+		);
+	});
+
+	it("refuses a callback handle that is not a uuid — it becomes a channel id", () => {
+		expect(QUEUE_CALLBACK_RPC.request.safeParse({ ...request(), callbackId: "cb-1" }).success).toBe(
+			false,
+		);
+	});
+
+	it("refuses a request with no number to ring", () => {
+		expect(QUEUE_CALLBACK_RPC.request.safeParse({ ...request(), to: "" }).success).toBe(false);
+	});
+
+	it("shares the originate's refusal vocabulary, because the codes are the engine's", () => {
+		expect(
+			QUEUE_CALLBACK_RPC.response.safeParse({
+				ok: false,
+				callbackId: "cb",
+				reason: "extension_offline",
+			}).success,
+		).toBe(true);
+		expect(
+			QUEUE_CALLBACK_RPC.response.safeParse({ ok: false, callbackId: "cb", reason: "no_agent" })
+				.success,
+		).toBe(false);
+	});
+});
+
+describe("the sip invite contract", () => {
+	const intent = {
+		legId: LEG,
+		sipdInstanceId: "sipd-7c9f",
+		authentication: "trunk-acl" as const,
+		routingContext: "inbound-untrusted",
+		from: { number: "+441632960111" },
+		to: { number: "+441632960100" },
+		sipCallId: "a84b4c76e66710@pc33",
+		hasOffer: true,
+		sdpOffer: "v=0\r\no=- 1 1 IN IP4 203.0.113.7\r\n",
+	};
+
+	it("accepts a trunk INVITE with no tenant, because the engine resolves it", () => {
+		const parsed = SIP_INVITE_RPC.request.parse(intent);
+		expect(parsed.orgId).toBeUndefined();
+		expect(parsed.hasOffer).toBe(true);
+	});
+
+	it("accepts a digest INVITE that names its tenant and its caller's canonical AOR", () => {
+		const parsed = SIP_INVITE_RPC.request.parse({
+			...intent,
+			orgId: ORG,
+			authentication: "digest",
+			routingContext: "internal",
+			from: { number: "1001", aor: "sip:1001@acme.example.com", name: "Ada Lovelace" },
+			trunkId: undefined,
+		});
+		expect(parsed.orgId).toBe(ORG);
+		expect(parsed.from.aor).toBe("sip:1001@acme.example.com");
+	});
+
+	it("carries the media hint, so a NAT latch is an expectation rather than a surprise", () => {
+		const parsed = SIP_INVITE_RPC.request.parse({
+			...intent,
+			mediaHint: { signallingSource: "203.0.113.7:5060", advertisedMedia: "10.0.0.5" },
+		});
+		// Both booleans default rather than being optional: a hint that omitted them would make
+		// "we did not look" and "they agree" the same value.
+		expect(parsed.mediaHint?.mismatch).toBe(false);
+		expect(parsed.mediaHint?.private).toBe(false);
+	});
+
+	it("carries a Replaces alongside the leg it already resolved", () => {
+		const parsed = SIP_INVITE_RPC.request.parse({
+			...intent,
+			replaces: { callId: "other@pc33", toTag: "9f2a", fromTag: "31c8" },
+			replacesLegId: CALL,
+		});
+		expect(parsed.replaces?.earlyOnly).toBe(false);
+		expect(parsed.replacesLegId).toBe(CALL);
+	});
+
+	it("names every refusal the engine may send, in contract order", () => {
+		// Each of these becomes a SIP status a STRANGER sees, and the table that maps them lives in
+		// apps/sipd. Adding one here without adding a row there is a 500 on somebody's handset.
+		expect([...SIP_INVITE_REFUSAL_REASONS]).toEqual([
+			"unattributed",
+			"unknown_target",
+			"not_permitted",
+			"congestion",
+			"shutting_down",
+			"bad_request",
+			"internal",
+		]);
+	});
+
+	it("refuses a reason outside that vocabulary", () => {
+		expect(
+			SIP_INVITE_RPC.response.safeParse({ ok: false, legId: LEG, reason: "no_dialtone" }).success,
+		).toBe(false);
+	});
+
+	it("stays inside the deadline every RPC on this backbone is bounded by", () => {
+		expect(SIP_INVITE_RPC.timeoutMs).toBeLessThanOrEqual(2_000);
+	});
+});
+
+describe("the sipd command contracts", () => {
+	it("answers a leg with a body, because a 200 with no answer is silence", () => {
+		expect(SIP_ANSWER_RPC.request.safeParse({ legId: LEG }).success).toBe(false);
+		expect(SIP_ANSWER_RPC.request.parse({ legId: LEG, sdpAnswer: "v=0\r\n" }).sdpAnswer).toBe(
+			"v=0\r\n",
+		);
+	});
+
+	it("rings without a body by default", () => {
+		expect(SIP_RING_RPC.request.parse({ legId: LEG }).status).toBe(180);
+	});
+
+	it("takes a cause on hangup and never a method — the edge owns that choice", () => {
+		const parsed = SIP_HANGUP_RPC.request.parse({ legId: LEG, cause: 16 });
+		expect(parsed.cause).toBe(16);
+		expect(parsed).not.toHaveProperty("method");
+		// The REPLY reports what was actually sent, including the two RFC 3261 deferrals.
+		expect(SIP_HANGUP_RPC.response.parse({ ok: true, legId: LEG, method: "deferred" }).method).toBe(
+			"deferred",
+		);
+	});
+
+	it("pairs a dial target's kind with the fields that kind requires", () => {
+		expect(
+			sipDialTargetSchema.safeParse({ kind: "aor", aor: "sip:1002@acme.example.com" }).success,
+		).toBe(true);
+		expect(
+			sipDialTargetSchema.safeParse({ kind: "trunk", trunkId: ORG, number: "+44163" }).success,
+		).toBe(true);
+		// A kind whose fields are missing is the failure this refinement exists to catch: Go has no
+		// sum type, so nothing above the wire would have caught it.
+		expect(sipDialTargetSchema.safeParse({ kind: "trunk", trunkId: ORG }).success).toBe(false);
+		expect(sipDialTargetSchema.safeParse({ kind: "aor", uri: "sip:x@y" }).success).toBe(false);
+	});
+
+	it("names every dialog refusal, in contract order", () => {
+		expect([...SIP_DIALOG_REFUSAL_REASONS]).toEqual([
+			"bad_request",
+			"unknown_dialog",
+			"wrong_instance",
+			"dialog_gone",
+			"invalid_state",
+			"unregistered_target",
+			"unknown_trunk",
+			"no_route",
+			"capacity",
+			"shutting_down",
+			"not_supported",
+			"internal",
+		]);
+	});
+
+	it("replies inside a second on every command, because a caller hears the wait", () => {
+		for (const contract of [SIP_RING_RPC, SIP_ANSWER_RPC, SIP_HANGUP_RPC, SIP_ORIGINATE_RPC]) {
+			expect(contract.timeoutMs).toBeLessThanOrEqual(1_000);
+		}
+	});
+});
+
+describe("sip dialog events", () => {
+	const base = {
+		legId: LEG,
+		callId: CALL,
+		instanceId: "sipd-7c9f",
+		role: "uas" as const,
+		identity: { sipCallId: "a84b4c76e66710@pc33", localTag: "9f2a" },
+	};
+
+	it("derives the subject from the payload's leg, so the two cannot disagree", () => {
+		const event = makeSipDialogEvent("dialog.answered", {
+			orgId: ORG,
+			source: "sipd",
+			data: base,
+		});
+		expect(event.subject).toBe(`sip.evt.v1.${ORG}.${LEG}.dialog.answered`);
+		const parsed = parseSubjectOrThrow(event.subject);
+		if (parsed.kind !== "sip-dialog") throw new Error("unreachable");
+		expect(parsed.legId).toBe(event.data.legId);
+	});
+
+	it("carries a real Q.850 cause and says whether a Reason header supplied it", () => {
+		const event = makeSipDialogEvent("dialog.terminated", {
+			orgId: ORG,
+			source: "sipd",
+			data: {
+				...base,
+				reason: "rejected",
+				cause: 17,
+				status: 486,
+				causeFromReasonHeader: true,
+				initiator: "remote",
+			},
+		});
+		expect(event.data.cause).toBe(17);
+		// The far end's own switch told us; the status table would have said the same thing here and
+		// will not always, which is the whole reason the flag exists.
+		expect(event.data.causeFromReasonHeader).toBe(true);
+	});
+
+	it("separates a cancel from a reject, which share a cause", () => {
+		expect([...SIP_TERMINATION_REASONS]).toContain("cancelled");
+		expect([...SIP_TERMINATION_REASONS]).toContain("rejected");
+		expect([...SIP_TERMINATION_REASONS]).toContain("instance-lost");
+	});
+
+	it("distinguishes ringback from early media on a progressed event", () => {
+		const ringing = makeSipDialogEvent("dialog.progressed", {
+			orgId: ORG,
+			source: "sipd",
+			data: { ...base, status: 180, hasEarlyMedia: false },
+		});
+		expect(ringing.data.hasEarlyMedia).toBe(false);
+		const early = makeSipDialogEvent("dialog.progressed", {
+			orgId: ORG,
+			source: "sipd",
+			data: { ...base, status: 183, hasEarlyMedia: true, sdpAnswer: "v=0\r\n" },
+		});
+		expect(early.data.hasEarlyMedia).toBe(true);
+	});
+
+	it("validates through the family union", () => {
+		const event = makeSipDialogEvent("dialog.dtmf", {
+			orgId: ORG,
+			source: "sipd",
+			data: { ...base, digit: "5" },
+		});
+		expect(sipDialogEventSchema.safeParse(JSON.parse(JSON.stringify(event))).success).toBe(true);
+	});
+});
+
+describe("multi-contact registration bindings", () => {
+	const binding = {
+		orgId: ORG,
+		aor: "sip:1001@acme.example.com",
+		aorHash: "abc",
+		contact: "sip:1001@10.0.0.5:5060",
+		transport: "udp" as const,
+		registeredAt: new Date().toISOString(),
+		expiresAt: new Date(Date.now() + 300_000).toISOString(),
+		expiresInSeconds: 300,
+	};
+
+	it("reads a binding written before the array existed", () => {
+		const parsed = registrationBindingSchema.parse(binding);
+		expect(parsed.contacts).toBeUndefined();
+		// The whole point of keeping the flat fields: a reader that never heard of `contacts` still
+		// gets a routable answer, and one that has heard of it gets the same answer through one call.
+		expect(contactsOf(parsed).map((c) => c.contact)).toEqual([binding.contact]);
+	});
+
+	it("reads every contact when the registrar tracked more than one", () => {
+		const parsed = registrationBindingSchema.parse({
+			...binding,
+			contacts: [
+				{
+					contact: binding.contact,
+					transport: "udp",
+					registeredAt: binding.registeredAt,
+					expiresAt: binding.expiresAt,
+				},
+				{
+					contact: "sip:1001@10.0.0.9:5061",
+					transport: "tcp",
+					registeredAt: binding.registeredAt,
+					expiresAt: binding.expiresAt,
+				},
+			],
+		});
+		expect(contactsOf(parsed)).toHaveLength(2);
+		// contacts[0] IS the primary, and the flat fields are its copy. A value where they disagree
+		// is a bug in the writer.
+		expect(contactsOf(parsed)[0]?.contact).toBe(parsed.contact);
+	});
+
+	it("refuses a roster nobody asked for", () => {
+		const many = Array.from({ length: 21 }, (_unused, index) => ({
+			contact: `sip:1001@10.0.0.${index}:5060`,
+			transport: "udp" as const,
+			registeredAt: binding.registeredAt,
+			expiresAt: binding.expiresAt,
+		}));
+		expect(registrationBindingSchema.safeParse({ ...binding, contacts: many }).success).toBe(false);
 	});
 });

@@ -34,9 +34,11 @@ import {
 	useVoicemailMessages,
 	useVoicemailPlaybackUrl,
 } from "../../_hooks/use-voicemail-queries";
+import { VoicemailForwardDialog } from "./voicemail-forward-dialog";
 import type {
 	VoicemailBoxRow,
 	VoicemailFolder,
+	VoicemailForwardMode,
 	VoicemailMessageRow,
 } from "~/lib/pbx/contracts";
 
@@ -66,13 +68,15 @@ import type {
  * per row sitting in the DOM, most of them never played, all of them expiring in minutes.
  */
 
-const FOLDER_TABS: readonly { readonly value: VoicemailFolder | "inbox"; readonly label: string }[] =
-	[
-		{ value: "inbox", label: "Inbox" },
-		{ value: "new", label: "Unread" },
-		{ value: "saved", label: "Read" },
-		{ value: "deleted", label: "Trash" },
-	];
+const FOLDER_TABS: readonly {
+	readonly value: VoicemailFolder | "inbox";
+	readonly label: string;
+}[] = [
+	{ value: "inbox", label: "Inbox" },
+	{ value: "new", label: "Unread" },
+	{ value: "saved", label: "Read" },
+	{ value: "deleted", label: "Trash" },
+];
 
 export function VoicemailMessagesDialog({
 	open,
@@ -86,9 +90,13 @@ export function VoicemailMessagesDialog({
 	const [folder, setFolder] = useState<VoicemailFolder | "inbox">("inbox");
 	const [page, setPage] = useState(1);
 
-	const canWrite = usePermission("voicemail.write");
-	const canDelete = usePermission("voicemail.delete");
-	const canListen = usePermission("voicemail.listen");
+	// Every route behind this dialog — list, PATCH folder, DELETE, play-url — accepts the `.own`
+	// scope, because a mailbox owner acts on their own messages. Asking for the `.own` grant is
+	// therefore what matches the API: `hasPermission` treats the unscoped grant as covering it, so
+	// a supervisor holding `voicemail.write` still passes.
+	const canWrite = usePermission("voicemail.write.own");
+	const canDelete = usePermission("voicemail.delete.own");
+	const canListen = usePermission("voicemail.listen.own");
 
 	const list = useVoicemailMessages(open && box !== null ? box.id : undefined, {
 		...(folder === "inbox" ? {} : { folder }),
@@ -106,6 +114,14 @@ export function VoicemailMessagesDialog({
 	const setRead = useSetVoicemailMessageRead();
 	const remove = useDeleteVoicemailMessage();
 
+	// One dialog for both row actions: the destination question is the same, and only the sentence
+	// and the button label differ. `null` is what closes it, so the message it acts on and whether it
+	// is open are one fact rather than two that could disagree.
+	const [sending, setSending] = useState<{
+		readonly message: VoicemailMessageRow;
+		readonly mode: VoicemailForwardMode;
+	} | null>(null);
+
 	return (
 		<Dialog
 			open={open}
@@ -119,9 +135,7 @@ export function VoicemailMessagesDialog({
 		>
 			<DialogContent className="flex max-h-[calc(100dvh-3rem)] w-[min(52rem,calc(100vw-2rem))] flex-col">
 				<DialogHeader>
-					<DialogTitle>
-						{box === null ? "Messages" : `Mailbox ${box.mailboxNumber}`}
-					</DialogTitle>
+					<DialogTitle>{box === null ? "Messages" : `Mailbox ${box.mailboxNumber}`}</DialogTitle>
 					<DialogDescription>
 						{newCount} unread · {savedCount} read. Playback links are signed and expire within
 						minutes, so they are never shareable by accident.
@@ -157,6 +171,9 @@ export function VoicemailMessagesDialog({
 						pending={setRead.isPending || remove.isPending}
 						onToggleRead={(row) => {
 							setRead.mutate({ boxId: row.voicemailBoxId, messageId: row.id, read: !row.read });
+						}}
+						onForward={(row, mode) => {
+							setSending({ message: row, mode });
 						}}
 						onDelete={(row) => {
 							remove.mutate({
@@ -202,6 +219,18 @@ export function VoicemailMessagesDialog({
 					</div>
 				</DialogFooter>
 			</DialogContent>
+
+			<VoicemailForwardDialog
+				open={sending !== null}
+				onOpenChange={(next) => {
+					if (!next) {
+						setSending(null);
+					}
+				}}
+				sourceBoxId={box?.id ?? ""}
+				message={sending?.message ?? null}
+				mode={sending?.mode ?? "forward"}
+			/>
 		</Dialog>
 	);
 }
@@ -216,6 +245,7 @@ function MessagesTable({
 	canListen,
 	pending,
 	onToggleRead,
+	onForward,
 	onDelete,
 }: {
 	boxId: string;
@@ -227,6 +257,7 @@ function MessagesTable({
 	canListen: boolean;
 	pending: boolean;
 	onToggleRead: (row: VoicemailMessageRow) => void;
+	onForward: (row: VoicemailMessageRow, mode: VoicemailForwardMode) => void;
 	onDelete: (row: VoicemailMessageRow) => void;
 }) {
 	if (isPending) {
@@ -281,7 +312,9 @@ function MessagesTable({
 								{formatBytes(row.sizeBytes ?? 0)}
 							</TableCell>
 							<TableCell>
-								<Badge tone={row.folder === "deleted" ? "neutral" : row.read ? "neutral" : "accent"}>
+								<Badge
+									tone={row.folder === "deleted" ? "neutral" : row.read ? "neutral" : "accent"}
+								>
 									{row.folder === "deleted" ? "Deleted" : row.read ? "Read" : "Unread"}
 								</Badge>
 							</TableCell>
@@ -298,6 +331,26 @@ function MessagesTable({
 									>
 										{row.read ? "Mark unread" : "Mark read"}
 									</Button>
+								) : null}
+								{canWrite && row.folder !== "deleted" ? (
+									<>
+										<Button
+											size="sm"
+											variant="ghost"
+											disabled={pending}
+											onClick={() => onForward(row, "forward")}
+										>
+											Forward…
+										</Button>
+										<Button
+											size="sm"
+											variant="ghost"
+											disabled={pending}
+											onClick={() => onForward(row, "copy")}
+										>
+											Copy to…
+										</Button>
+									</>
 								) : null}
 								{canDelete ? (
 									<Button

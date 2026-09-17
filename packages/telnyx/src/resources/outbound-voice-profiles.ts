@@ -129,6 +129,14 @@ export interface OutboundVoiceProfilesResource {
 	) => Promise<TelnyxOutboundVoiceProfile>;
 	readonly remove: (profileId: string) => Promise<TelnyxOutboundVoiceProfile>;
 	readonly list: (nameContains?: string) => Promise<readonly TelnyxOutboundVoiceProfile[]>;
+	/**
+	 * The reconciliation read after a `create` that failed without saying whether it landed.
+	 *
+	 * Exact name match, filtered client-side: the API's filter is `contains`, and "did MY profile
+	 * get created" is not a question a substring answers. Returns every match rather than one,
+	 * because more than one is itself the finding.
+	 */
+	readonly findByName: (name: string) => Promise<readonly TelnyxOutboundVoiceProfile[]>;
 }
 
 export function makeOutboundVoiceProfiles(
@@ -142,6 +150,11 @@ export function makeOutboundVoiceProfiles(
 			const response = await transport.request({
 				method: "POST",
 				path: "/outbound_voice_profiles",
+				// Never retried. A profile has no uniqueness constraint and no `Idempotency-Key`, so
+				// a 5xx raised after creation would leave a second profile — each carrying a
+				// `daily_spend_limit` — with nothing to tell the two apart. `findByName` is the
+				// reconciliation read a caller uses instead of guessing.
+				retryable: false,
 				body: profileBody(input),
 				schema: profileResponse,
 			});
@@ -190,6 +203,16 @@ export function makeOutboundVoiceProfiles(
 				schema: profileListResponse,
 			});
 			return response.data;
+		},
+
+		findByName: async (name) => {
+			const response = await transport.request({
+				method: "GET",
+				path: "/outbound_voice_profiles",
+				query: { "filter[name][contains]": name, "page[size]": 50 },
+				schema: profileListResponse,
+			});
+			return response.data.filter((profile) => profile.name === name);
 		},
 	};
 }

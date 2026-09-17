@@ -297,7 +297,7 @@ export async function insertAuditLog(
 		actorRef: entry.actor.ref,
 		action: entry.action,
 		resourceType: entry.resourceType,
-		resourceRef: entry.resourceRef,
+		resourceRef: asUuid(entry.resourceRef),
 		before: entry.before,
 		after: entry.after,
 		ipAddress: entry.actor.ipAddress,

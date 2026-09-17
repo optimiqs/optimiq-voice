@@ -258,7 +258,7 @@ const ACME: OrgRoutingSnapshot = {
 			maxWaitNoAgentSeconds: 60,
 			announcePositionEnabled: true,
 			announceFrequencySeconds: 60,
-			recordEnabled: true,
+			recordPolicy: "all",
 			timeoutDestinationType: "voicemail",
 			timeoutDestinationRef: "vm-main",
 		},
@@ -272,7 +272,7 @@ const ACME: OrgRoutingSnapshot = {
 			requiresPin: true,
 			maxMembers: 20,
 			waitForModerator: true,
-			recordEnabled: false,
+			recordPolicy: "none",
 		},
 	],
 	parkLots: [
@@ -424,8 +424,15 @@ const DURING_HOURS = new Date("2026-08-05T15:00:00Z");
 const AFTER_HOURS = new Date("2026-08-06T01:00:00Z");
 
 describe("Acme — the artifact", () => {
-	it("compiles cleanly", () => {
-		expect(artifact.diagnostics).toEqual([]);
+	/**
+	 * "Cleanly" means no errors and nothing the tenant should act on. Acme's main menu allows direct
+	 * dial and offers a `1`, and every Acme extension is `1xxx` — so the compiler says so, once. That
+	 * warning is the feature working: it is the one fact about this configuration a person cannot
+	 * see from the form, and asserting it here is what keeps it from being lost in a later change.
+	 */
+	it("compiles with nothing but the direct-dial prefix warning", () => {
+		expect(artifact.diagnostics.map((entry) => entry.code)).toEqual(["ivr-direct-dial-ambiguous"]);
+		expect(artifact.diagnostics[0]?.severity).toBe("warning");
 	});
 
 	it("is closed under reference", () => {

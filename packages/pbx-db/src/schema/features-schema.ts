@@ -36,6 +36,24 @@ export const FEATURE_CODE_ACTIONS = [
 	"agent-status",
 	"eavesdrop",
 	"transfer",
+	/**
+	 * Hot desking: an agent claims a shared handset for their own extension, and gives it back.
+	 *
+	 * These ARE rows in this catalogue, unlike `call-flow-toggle` and `time-condition-override`
+	 * (which `packages/routing` adds on its own side because each belongs to one entity). Neither
+	 * of these names an entity: login takes the extension as its dialled ARGUMENT and the device is
+	 * whichever handset the call came from, so one row per tenant serves the whole fleet.
+	 */
+	"hotdesk-login",
+	"hotdesk-logout",
+	/**
+	 * Per-call CLIR: `*67<destination>` withholds this call's caller id, `*82<destination>` presents
+	 * it. Both take the destination as their dialled ARGUMENT — the code decides how ONE call is
+	 * presented and then dials it, so there is nothing for a bare `*67` to act on. The standing
+	 * setting is `extension.outbound_caller_id_presentation`; these two override it for one call.
+	 */
+	"caller-id-presentation-restrict",
+	"caller-id-presentation-allow",
 ] as const;
 export type FeatureCodeAction = (typeof FEATURE_CODE_ACTIONS)[number];
 

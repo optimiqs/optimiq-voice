@@ -12,6 +12,7 @@ import {
 import { RowActions } from "~/components/pbx/row-actions";
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
+import { MenuItem } from "~/components/ui/menu";
 import { PageHeader } from "~/components/ui/page-header";
 import { DEFAULT_PAGE_LIMIT, PBX_RESOURCES } from "~/lib/pbx/client";
 import { followMeSummary } from "~/lib/pbx/follow-me";
@@ -19,6 +20,8 @@ import { usePermission } from "../../_context/session-context";
 import { useLiveRegistrations } from "../../_hooks/use-live-queries";
 import { usePbxDelete, usePbxList } from "../../_hooks/use-pbx-queries";
 import { ExtensionDialog } from "./extension-dialog";
+import { ExtensionUsersDialog } from "./extension-users-dialog";
+import { RotateSecretDialog } from "./rotate-secret-dialog";
 import type { ExtensionRow } from "~/lib/pbx/contracts";
 
 /**
@@ -50,7 +53,16 @@ export function ExtensionsScreen() {
 	const remove = usePbxDelete(resource);
 
 	const canWrite = usePermission(resource.permissions.write);
+	const canAssign = usePermission("extensions.assign");
+	const [assigning, setAssigning] = useState<ExtensionRow | null>(null);
 	const canDelete = usePermission(resource.permissions.delete);
+	/**
+	 * Its own grant, not `extensions.write`: invalidating the credential a physical handset holds is
+	 * an outage on a schedule the handset chooses, which is the argument the permission registry
+	 * makes for `security.rotate-credentials` existing at all.
+	 */
+	const canRotate = usePermission("security.rotate-credentials");
+	const [rotating, setRotating] = useState<ExtensionRow | null>(null);
 	const registrations = useLiveRegistrations();
 
 	const [editing, setEditing] = useState<ExtensionRow | null>(null);
@@ -179,6 +191,18 @@ export function ExtensionsScreen() {
 				rowActions={(row) => (
 					<RowActions
 						label={`extension ${row.number}`}
+						extra={
+							canAssign || canRotate ? (
+								<>
+									{canAssign ? (
+										<MenuItem onClick={() => setAssigning(row)}>Assign users</MenuItem>
+									) : null}
+									{canRotate ? (
+										<MenuItem onClick={() => setRotating(row)}>Rotate SIP secret</MenuItem>
+									) : null}
+								</>
+							) : undefined
+						}
 						onEdit={canWrite ? () => openEdit(row) : undefined}
 						onDelete={
 							canDelete
@@ -211,6 +235,22 @@ export function ExtensionsScreen() {
 				onOpenChange={setDialogOpen}
 				extension={editing}
 			/>
+
+			{assigning ? (
+				<ExtensionUsersDialog
+					key={assigning.id}
+					extension={assigning}
+					onClose={() => setAssigning(null)}
+				/>
+			) : null}
+
+			{rotating ? (
+				<RotateSecretDialog
+					key={rotating.id}
+					extension={rotating}
+					onClose={() => setRotating(null)}
+				/>
+			) : null}
 
 			<DeleteEntityDialog
 				open={pendingDelete !== null}

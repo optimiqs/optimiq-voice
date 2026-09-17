@@ -29,7 +29,6 @@
 		"**/.turbo/**",
 		"**/*.d.ts",
 		"**/bin/**",
-		".scripts/**",
 		"**/test/**",
 		"**/*.test.ts",
 		"**/*.test.tsx",

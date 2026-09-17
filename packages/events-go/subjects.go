@@ -19,14 +19,12 @@ import (
 //	voicemail.evt.v1.<orgId>.<mailboxId>.<event>  event = message.left | mwi.updated
 //	media.evt.v1.<orgId>.<sessionId>.<event>   event = session.ended | session.rtp-timeout |
 //	                                                   playback.finished | recording.finished
+//	trunk.evt.v1.<orgId>.<trunkId>.<event>     event = status.changed
 //	cdr.leg.v1.<orgId>                         one subject per org; the type is in the envelope
 //	audit.evt.v1.<orgId>
 //	provision.evt.v1.<orgId>
 //	rpc.routing.v1.resolve                     request-reply, not JetStream (see rpc_gen.go)
 //	rpc.authz.v1.check
-//
-// The version token is a MAJOR version and is part of the subject, not the payload: a breaking
-// payload change ships as v2 subjects alongside v1. Additive changes never bump it.
 //
 // Event names are hierarchical and may contain dots (channel.record.started), so the event occupies
 // the subject's TAIL rather than a single token. Every filter that spans events therefore ends in
@@ -39,10 +37,14 @@ const SubjectVersion = "v1"
 const (
 	SubjectRootCall         = "calls.evt." + SubjectVersion
 	SubjectRootRegistration = "sip.reg." + SubjectVersion
+	SubjectRootSIPDialog    = "sip.evt." + SubjectVersion
 	SubjectRootQueue        = "queue.evt." + SubjectVersion
 	SubjectRootVoicemail    = "voicemail.evt." + SubjectVersion
 	SubjectRootMedia        = "media.evt." + SubjectVersion
+	SubjectRootMessaging    = "messaging.evt." + SubjectVersion
+	SubjectRootTrunk        = "trunk.evt." + SubjectVersion
 	SubjectRootCDRLeg       = "cdr.leg." + SubjectVersion
+	SubjectRootSecurity     = "security.evt." + SubjectVersion
 	SubjectRootAudit        = "audit.evt." + SubjectVersion
 	SubjectRootProvision    = "provision.evt." + SubjectVersion
 )
@@ -50,6 +52,12 @@ const (
 // QueueScopeAll is the reserved queue-scope token for events that belong to the org rather than to
 // one queue — in practice agent.state, since an agent has one status across every tier they sit in.
 const QueueScopeAll = "_all"
+
+// SecurityScopeOrg is the reserved security-scope token for a signal that belongs to the
+// ORGANIZATION rather than to one extension — a tenant-wide minutes spike with no single account
+// behind it. Same idiom as QueueScopeAll: the subject's middle token is the thing the signal is
+// ABOUT, and inventing an extension id for a finding that has none would make the subject lie.
+const SecurityScopeOrg = "_org"
 
 // EventFamily identifies a family by its SUBJECT. An envelope's `type` is unique within its family
 // only: "registered" means nothing without sip.reg.v1.… around it.
@@ -59,10 +67,14 @@ type EventFamily string
 const (
 	FamilyCall         EventFamily = "call"
 	FamilyRegistration EventFamily = "registration"
+	FamilySIPDialog    EventFamily = "sipDialog"
 	FamilyQueue        EventFamily = "queue"
 	FamilyVoicemail    EventFamily = "voicemail"
 	FamilyMedia        EventFamily = "media"
+	FamilyMessaging    EventFamily = "messaging"
+	FamilyTrunk        EventFamily = "trunk"
 	FamilyCDR          EventFamily = "cdr"
+	FamilySecurity     EventFamily = "security"
 	FamilyAudit        EventFamily = "audit"
 	FamilyProvision    EventFamily = "provision"
 )
@@ -74,7 +86,10 @@ var EventFamilies = []EventFamily{
 	FamilyQueue,
 	FamilyVoicemail,
 	FamilyMedia,
+	FamilyMessaging,
+	FamilyTrunk,
 	FamilyCDR,
+	FamilySecurity,
 	FamilyAudit,
 	FamilyProvision,
 }
@@ -168,19 +183,38 @@ func eventName(value string) (string, error) {
 	return value, nil
 }
 
+// InstanceSubjectToken returns the stable subject token for a service instance id.
+//
+// The Go mirror of instanceSubjectToken in packages/events/src/subjects.ts, and it MUST agree with
+// it byte for byte: the engine builds rpc.sip.v1.{ring,answer,hangup,reinvite}.<tok> from its side
+// while apps/sipd subscribes through this function, so a disagreement is a command published where
+// nobody is listening.
+//
+// An id that is already a single token (sipd, sipd-7d9f4c-xk2lp) is returned verbatim, so an
+// operator can `nats sub` the exact subject a stuck call is addressed at. Otherwise — an FQDN
+// hostname carries dots, and a dot is a separator — it is the first 32 hex characters of its
+// SHA-256, the same escape hatch AORSubjectToken uses.
+func InstanceSubjectToken(instanceID string) (string, error) {
+	normalized := strings.TrimSpace(instanceID)
+	if normalized == "" {
+		return "", &SubjectTokenError{Role: "instanceId", Value: instanceID}
+	}
+	if IsSubjectToken(normalized) {
+		return normalized, nil
+	}
+	sum := sha256.Sum256([]byte(normalized))
+	return hex.EncodeToString(sum[:])[:32], nil
+}
+
 // AORSubjectToken returns the stable subject token for an Address of Record.
 //
 // An AOR (sip:1001@acme.example.com) contains "@", ":" and dots, none of which survive as a single
 // subject token, and it is PII-adjacent. The token is the first 32 hex characters of the SHA-256 of
-// the lower-cased AOR — 128 bits, collision-free at any registrar scale, and stable across
-// processes and languages so sip.reg.v1.<org>.<aorHash>.> is a usable per-device filter.
+// the trimmed, lower-cased AOR, stable across processes and languages so sip.reg.v1.<org>.<hash>.>
+// is a usable per-device filter. The full AOR travels in the payload; the hash is addressing only.
 //
-// The full AOR always travels in the event payload; the hash is addressing only.
-//
-// Normalisation is trim + lower-case, matching String.prototype.trim/toLowerCase for every input a
-// SIP AOR can contain (ASCII plus the Latin-1/Unicode letters a domain or user part may carry). The
-// few code points where JavaScript's and Go's case folding disagree (dotted/dotless I, final sigma)
-// are not valid in a SIP user or host part.
+// The few code points where JavaScript's and Go's case folding disagree (dotted/dotless I, final
+// sigma) are not valid in a SIP user or host part, so the two sides always agree.
 func AORSubjectToken(aor string) (string, error) {
 	normalized := strings.ToLower(strings.TrimSpace(aor))
 	if normalized == "" {
@@ -192,15 +226,13 @@ func AORSubjectToken(aor string) (string, error) {
 
 // DIDIndexToken returns the stable key token for a DID, for the did-index KV bucket.
 //
-// An E.164 number is stored as "+441632960111" and dialled as "441632960111", "+441632960111" or
-// (from a carrier that strips it) with punctuation. None of "+", spaces, dashes or parentheses
-// survive as a KV key token, and none of them carry meaning, so the token is the DIGITS and nothing
-// else. Both writers and readers go through this one function, which is what makes "the DID the
-// tenant configured" and "the DID the carrier delivered" the same key.
+// None of "+", spaces, dashes or parentheses survive as a KV key token, and none carry meaning, so
+// the token is the digits and nothing else. Both writers and readers go through this function,
+// which is what makes "the DID the tenant configured" and "the DID the carrier delivered" one key.
 //
-// What it deliberately does NOT do is guess a dial plan: "0044…" and "+44…" are the same number to a
-// human and different tokens here, because turning a national prefix into a country code needs to
-// know which country the trunk is in. That belongs to the SIP edge, not to the contract package.
+// It deliberately does not guess a dial plan: "0044…" and "+44…" are the same number to a human and
+// different tokens here, because a national prefix needs the trunk's country. That belongs to the
+// SIP edge, not to the contract package.
 func DIDIndexToken(did string) (string, error) {
 	digits := make([]byte, 0, len(did))
 	for i := 0; i < len(did); i++ {
@@ -213,10 +245,6 @@ func DIDIndexToken(did string) (string, error) {
 	}
 	return string(digits), nil
 }
-
-// ---------------------------------------------------------------------------------------------
-// publish subjects
-// ---------------------------------------------------------------------------------------------
 
 // CallSubject builds calls.evt.v1.<orgId>.<callId>.<event>.
 func CallSubject(orgID, callID, event string) (string, error) {
@@ -251,6 +279,27 @@ func RegistrationSubject(orgID, aorHash, event string) (string, error) {
 		return "", err
 	}
 	return SubjectRootRegistration + "." + org + "." + hash + "." + name, nil
+}
+
+// SIPDialogSubject builds sip.evt.v1.<orgId>.<legId>.<event>.
+//
+// The middle token is the leg id: one string names the leg, the mediad session and sipd's dialog.
+// The SIP dialog identifier (Call-ID plus tags) stays on the payload, because a Call-ID is
+// phone-chosen and full of characters IsSubjectToken rejects.
+func SIPDialogSubject(orgID, legID, event string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	leg, err := token("legId", legID)
+	if err != nil {
+		return "", err
+	}
+	name, err := eventName(event)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootSIPDialog + "." + org + "." + leg + "." + name, nil
 }
 
 // QueueSubject builds queue.evt.v1.<orgId>.<queueId>.<event>. Pass QueueScopeAll as queueID for an
@@ -291,8 +340,8 @@ func VoicemailSubject(orgID, mailboxID, event string) (string, error) {
 
 // MediaSubject builds media.evt.v1.<orgId>.<sessionId>.<event>.
 //
-// Keyed by SESSION and not by call: a call has one id and several media sessions (one per leg), and
-// the thing that ends, times out or is reaped is the session. The call travels in the payload.
+// Keyed by session and not by call: a call has several media sessions (one per leg), and the thing
+// that ends, times out or is reaped is the session. The call id travels in the payload.
 func MediaSubject(orgID, sessionID, event string) (string, error) {
 	org, err := token("orgId", orgID)
 	if err != nil {
@@ -307,6 +356,63 @@ func MediaSubject(orgID, sessionID, event string) (string, error) {
 		return "", err
 	}
 	return SubjectRootMedia + "." + org + "." + session + "." + name, nil
+}
+
+// TrunkSubject builds trunk.evt.v1.<orgId>.<trunkId>.<event>.
+//
+// trunkID is the trunk row id, not its name: a tenant may rename a trunk while it is down, and a
+// subject that moved under a rename would strand a durable consumer's ordering mid-outage. The name
+// travels in the payload.
+func TrunkSubject(orgID, trunkID, event string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	trunk, err := token("trunkId", trunkID)
+	if err != nil {
+		return "", err
+	}
+	name, err := eventName(event)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootTrunk + "." + org + "." + trunk + "." + name, nil
+}
+
+// MessagingSubject builds messaging.evt.v1.<orgId>.<conversationId>.<event>. The middle token is
+// the conversation, not the message: a thread is the unit an inbox subscribes to.
+func MessagingSubject(orgID, conversationID, event string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	conversation, err := token("conversationId", conversationID)
+	if err != nil {
+		return "", err
+	}
+	name, err := eventName(event)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootMessaging + "." + org + "." + conversation + "." + name, nil
+}
+
+// SecuritySubject builds security.evt.v1.<orgId>.<subjectRef>.<event>, where subjectRef is
+// SecurityScopeOrg or the extension id the signal is about.
+func SecuritySubject(orgID, subjectRef, event string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	ref, err := token("subjectRef", subjectRef)
+	if err != nil {
+		return "", err
+	}
+	name, err := eventName(event)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootSecurity + "." + org + "." + ref + "." + name, nil
 }
 
 // CDRLegSubject builds cdr.leg.v1.<orgId> — a single ordered subject per org.
@@ -335,10 +441,6 @@ func ProvisionSubject(orgID string) (string, error) {
 	}
 	return SubjectRootProvision + "." + org, nil
 }
-
-// ---------------------------------------------------------------------------------------------
-// subscription filters
-// ---------------------------------------------------------------------------------------------
 
 // AllCallsFilter matches every call event of every org — the CALLS stream's own subject list.
 func AllCallsFilter() string { return SubjectRootCall + ".>" }
@@ -423,6 +525,32 @@ func RegistrationEventInOrgFilter(orgID, event string) (string, error) {
 		return "", err
 	}
 	return SubjectRootRegistration + "." + org + ".*." + name, nil
+}
+
+// AllSIPDialogsFilter matches every SIP dialog event — the SIP stream's subjects, and the filter
+// the engine subscribes with.
+func AllSIPDialogsFilter() string { return SubjectRootSIPDialog + ".>" }
+
+// SIPDialogsInOrgFilter matches every dialog event of one org.
+func SIPDialogsInOrgFilter(orgID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootSIPDialog + "." + org + ".>", nil
+}
+
+// SIPDialogFilter matches every event of ONE dialog.
+func SIPDialogFilter(orgID, legID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	leg, err := token("legId", legID)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootSIPDialog + "." + org + "." + leg + ".>", nil
 }
 
 // AllQueuesFilter matches every queue event — the QUEUES stream's subjects.
@@ -539,11 +667,72 @@ func MediaEventInOrgFilter(orgID, event string) (string, error) {
 	return SubjectRootMedia + "." + org + ".*." + name, nil
 }
 
+// AllTrunksFilter matches every trunk event — the TRUNKS stream's subjects.
+func AllTrunksFilter() string { return SubjectRootTrunk + ".>" }
+
+// TrunksInOrgFilter matches every trunk event of one org.
+func TrunksInOrgFilter(orgID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootTrunk + "." + org + ".>", nil
+}
+
+// TrunkStatusInOrgFilter matches status.changed across every trunk of one org.
+//
+// The event name is DOTTED, so the tail is two tokens and the trunk wildcard cannot be a ">":
+// trunk.evt.v1.<org>.> would be the whole family, and a trailing ".*.*" would match nothing.
+func TrunkStatusInOrgFilter(orgID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootTrunk + "." + org + ".*.status.changed", nil
+}
+
 // AllCDRLegsFilter matches every org's CDR subject. One token, so "*" not ">".
 func AllCDRLegsFilter() string { return SubjectRootCDRLeg + ".*" }
 
 // CDRLegsInOrgFilter matches one org's CDR subject.
 func CDRLegsInOrgFilter(orgID string) (string, error) { return CDRLegSubject(orgID) }
+
+// AllMessagingFilter matches every org's messaging events — the MESSAGING stream's subject list.
+func AllMessagingFilter() string { return SubjectRootMessaging + ".>" }
+
+// MessagingInOrgFilter matches one org's messaging events.
+func MessagingInOrgFilter(orgID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootMessaging + "." + org + ".>", nil
+}
+
+// MessagingConversationFilter matches one thread's events.
+func MessagingConversationFilter(orgID, conversationID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	conversation, err := token("conversationId", conversationID)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootMessaging + "." + org + "." + conversation + ".>", nil
+}
+
+// AllSecurityFilter matches every org's security signals.
+func AllSecurityFilter() string { return SubjectRootSecurity + ".>" }
+
+// SecurityInOrgFilter matches one org's security signals.
+func SecurityInOrgFilter(orgID string) (string, error) {
+	org, err := token("orgId", orgID)
+	if err != nil {
+		return "", err
+	}
+	return SubjectRootSecurity + "." + org + ".>", nil
+}
 
 // AllAuditFilter matches every org's audit subject.
 func AllAuditFilter() string { return SubjectRootAudit + ".*" }
@@ -557,10 +746,6 @@ func AllProvisionFilter() string { return SubjectRootProvision + ".*" }
 // ProvisionInOrgFilter matches one org's provisioning subject.
 func ProvisionInOrgFilter(orgID string) (string, error) { return ProvisionSubject(orgID) }
 
-// ---------------------------------------------------------------------------------------------
-// parsing
-// ---------------------------------------------------------------------------------------------
-
 // SubjectKind names the shape a parsed subject has, including the non-event rpc shape.
 type SubjectKind string
 
@@ -568,10 +753,14 @@ type SubjectKind string
 const (
 	KindCall         SubjectKind = "call"
 	KindRegistration SubjectKind = "registration"
+	KindSIPDialog    SubjectKind = "sip-dialog"
 	KindQueue        SubjectKind = "queue"
 	KindVoicemail    SubjectKind = "voicemail"
 	KindMedia        SubjectKind = "media"
+	KindMessaging    SubjectKind = "messaging"
+	KindTrunk        SubjectKind = "trunk"
 	KindCDRLeg       SubjectKind = "cdr-leg"
+	KindSecurity     SubjectKind = "security"
 	KindAudit        SubjectKind = "audit"
 	KindProvision    SubjectKind = "provision"
 	KindRPC          SubjectKind = "rpc"
@@ -591,22 +780,33 @@ type ParsedSubject struct {
 	CallID string
 	// AORHash is set for KindRegistration.
 	AORHash string
+	// LegID is set for KindSIPDialog.
+	LegID string
 	// QueueID is set for KindQueue.
 	QueueID string
 	// MailboxID is set for KindVoicemail.
 	MailboxID string
 	// SessionID is set for KindMedia.
 	SessionID string
+	// TrunkID is set for KindTrunk.
+	TrunkID string
+	// ConversationID is set for KindMessaging.
+	ConversationID string
+	// SubjectRef is set for KindSecurity: SecurityScopeOrg, or the extension id the signal is about.
+	SubjectRef string
 	// Event is the (possibly dotted) event name, for the four per-entity families.
 	//
-	// It is returned as a plain string, not a checked vocabulary member: a v1.n producer may emit
-	// an event name a v1.0 consumer has never heard of, and dropping that message at parse time
-	// would break the additive-evolution guarantee. Narrow with IsEventTypeOfFamily when the code
-	// actually needs to branch.
+	// A plain string, not a checked vocabulary member: a v1.n producer may emit an event name a
+	// v1.0 consumer has never heard of, and rejecting it at parse time would break additive
+	// evolution. Narrow with IsEventTypeOfFamily when the code needs to branch.
 	Event string
 	// Service and Method are set for KindRPC.
 	Service string
 	Method  string
+	// Target is the variable tail an instance-addressed RPC subject carries — the <instanceToken>
+	// of rpc.sip.v1.ring.<tok>, or the <orgId>.<appToken> of rpc.session.v1.announce. Empty on the
+	// flat, queue-grouped subjects.
+	Target string
 }
 
 // UnknownSubjectError is returned by ParseSubjectOrError for a subject outside the taxonomy.
@@ -645,6 +845,11 @@ func ParseSubject(subject string) (ParsedSubject, bool) {
 			Kind: KindRegistration, Family: string(FamilyRegistration), Version: version,
 			OrgID: rest[0], AORHash: rest[1], Event: strings.Join(rest[2:], "."),
 		}, true
+	case prefix == "sip.evt" && len(rest) >= 3:
+		return ParsedSubject{
+			Kind: KindSIPDialog, Family: string(FamilySIPDialog), Version: version,
+			OrgID: rest[0], LegID: rest[1], Event: strings.Join(rest[2:], "."),
+		}, true
 	case prefix == "queue.evt" && len(rest) >= 3:
 		return ParsedSubject{
 			Kind: KindQueue, Family: string(FamilyQueue), Version: version,
@@ -660,9 +865,24 @@ func ParseSubject(subject string) (ParsedSubject, bool) {
 			Kind: KindMedia, Family: string(FamilyMedia), Version: version,
 			OrgID: rest[0], SessionID: rest[1], Event: strings.Join(rest[2:], "."),
 		}, true
+	case prefix == "trunk.evt" && len(rest) >= 3:
+		return ParsedSubject{
+			Kind: KindTrunk, Family: string(FamilyTrunk), Version: version,
+			OrgID: rest[0], TrunkID: rest[1], Event: strings.Join(rest[2:], "."),
+		}, true
 	case prefix == "cdr.leg" && len(rest) == 1:
 		return ParsedSubject{
 			Kind: KindCDRLeg, Family: string(FamilyCDR), Version: version, OrgID: rest[0],
+		}, true
+	case prefix == "messaging.evt" && len(rest) >= 3:
+		return ParsedSubject{
+			Kind: KindMessaging, Family: string(FamilyMessaging), Version: version,
+			OrgID: rest[0], ConversationID: rest[1], Event: strings.Join(rest[2:], "."),
+		}, true
+	case prefix == "security.evt" && len(rest) >= 3:
+		return ParsedSubject{
+			Kind: KindSecurity, Family: string(FamilySecurity), Version: version,
+			OrgID: rest[0], SubjectRef: rest[1], Event: strings.Join(rest[2:], "."),
 		}, true
 	case prefix == "audit.evt" && len(rest) == 1:
 		return ParsedSubject{
@@ -672,9 +892,10 @@ func ParseSubject(subject string) (ParsedSubject, bool) {
 		return ParsedSubject{
 			Kind: KindProvision, Family: string(FamilyProvision), Version: version, OrgID: rest[0],
 		}, true
-	case first == "rpc" && len(rest) == 1:
+	case first == "rpc" && len(rest) >= 1:
 		return ParsedSubject{
 			Kind: KindRPC, Family: "rpc", Version: version, Service: second, Method: rest[0],
+			Target: strings.Join(rest[1:], "."),
 		}, true
 	}
 	return ParsedSubject{}, false
@@ -702,8 +923,8 @@ func EventFamilyForSubject(subject string) (EventFamily, bool) {
 // MatchesSubject implements NATS subject matching: "*" matches exactly one token, ">" matches one
 // or more trailing tokens and is only meaningful as the final token.
 //
-// Reimplemented here rather than taken from a client so filters can be unit-tested without a
-// broker, and so a fake in-process bus routes exactly like the server does.
+// Reimplemented rather than taken from a client so filters can be unit-tested without a broker, and
+// so a fake in-process bus routes exactly like the server does.
 func MatchesSubject(filter, subject string) bool {
 	filterTokens := strings.Split(filter, ".")
 	subjectTokens := strings.Split(subject, ".")

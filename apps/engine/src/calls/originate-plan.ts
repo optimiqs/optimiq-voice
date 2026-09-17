@@ -44,6 +44,14 @@ export type OriginatePlan =
 			/** The extension's own outbound caller id, when the artifact carries one. */
 			readonly callerIdNumber?: string;
 			readonly callerIdName?: string;
+			/**
+			 * The extension's CLIR setting, when the artifact carries one. Absent means `allowed`.
+			 *
+			 * Read through a cast because `ExtensionIndexEntry` has no such field YET — the column, the
+			 * compiler mapping and the API surface are `packages/routing`'s and `apps/api`'s to add. The
+			 * engine is written to honour it the moment it appears rather than to need a second change.
+			 */
+			readonly callerIdPresentation?: "allowed" | "restricted";
 	  }
 	| { readonly ok: false; readonly reason: OriginateRefusalReason; readonly error: string };
 
@@ -94,14 +102,135 @@ export function planOriginate(artifact: RoutingArtifact, input: OriginatePlanInp
 		}
 	}
 
+	const presentation = (
+		extension as { readonly outboundCallerIdPresentation?: "allowed" | "restricted" }
+	).outboundCallerIdPresentation;
+
 	return {
 		ok: true,
 		endpoint: input.extensionDialTemplate.replaceAll("{number}", from),
+		...(presentation === "allowed" || presentation === "restricted"
+			? { callerIdPresentation: presentation }
+			: {}),
 		...(extension.outboundCallerIdNumber === undefined
 			? {}
 			: { callerIdNumber: extension.outboundCallerIdNumber }),
 		...(extension.outboundCallerIdName === undefined
 			? {}
 			: { callerIdName: extension.outboundCallerIdName }),
+	};
+}
+
+/**
+ * The decidable half of a QUEUE CALLBACK — the third question this file answers.
+ *
+ * ## What is different from a click-to-call, and why it is a second function
+ *
+ * The two share a shape and almost nothing else. A click-to-call rings an extension and is
+ * authorised as that extension; a callback rings whoever was WAITING and is authorised as the
+ * queue. There is no `fromExtension` to look up, so `unknown_extension` cannot happen.
+ *
+ * The destination is resolved internal-then-outbound, because the party who waited is as likely to
+ * be an extension as a customer on a trunk — see the note at the resolve itself for why that is not
+ * the coincidence this used to refuse.
+ *
+ * ## The caller-ID policy, which is the whole reason this is not a parameter on `planOriginate`
+ *
+ * A callback presents the QUEUE's identity. The person answering is the customer, and showing them
+ * either their own number (the caller id of the call being settled) or an agent's direct line (which
+ * they would then ring back and bypass the queue) are both wrong. So the cascade is: the queue's
+ * pinned caller id, then whatever the matched outbound route resolved — which is already the org's
+ * `outboundCallerIdNumber` cascade with the route's own override in front of it.
+ *
+ * ## `tollClass` fails CLOSED, deliberately
+ *
+ * A queue reached on an extension number carries that extension's class; one that is not reachable
+ * on a number has no entitlement of its own, and this refuses rather than inventing one. Inventing
+ * `international` would turn a queue with a misconfigured callback into an unmetered dialler, and
+ * the refusal names what to fix — give the queue a number, or pin a class on it.
+ */
+export type QueueCallbackPlan =
+	| {
+			readonly ok: true;
+			/** The number to dial, after the matched route's digit manipulation. */
+			readonly destination: string;
+			/**
+			 * Which rung matched — `internal` for a party this organization owns, `outbound` for one
+			 * reached over a trunk. The orchestrator needs it because the two are dialled completely
+			 * differently: an AOR at the tenant's realm, or a trunk the matched route names.
+			 */
+			readonly context: "internal" | "outbound";
+			/** What the callback presents. See the caller-ID note above. */
+			readonly callerIdNumber?: string;
+			readonly callerIdName?: string;
+			/** The outbound plan node the resolve matched, for the orchestrator's trunk selection. */
+			readonly planNodeId?: string;
+	  }
+	| { readonly ok: false; readonly reason: OriginateRefusalReason; readonly error: string };
+
+export interface QueueCallbackPlanInput {
+	/** The number to ring — the one the caller presented while they were waiting. */
+	readonly to: string;
+	/** The queue's own number, when it has one. Supplies the toll class; see the note above. */
+	readonly queueNumber?: string;
+	/** Caller id pinned on the queue. Takes precedence over the route's own. */
+	readonly callerIdNumber?: string;
+	readonly callerIdName?: string;
+	/** Evaluation instant — outbound routes carry time gates, so a plan needs a clock. */
+	readonly now: Date;
+}
+
+export function planQueueCallback(
+	artifact: RoutingArtifact,
+	input: QueueCallbackPlanInput,
+): QueueCallbackPlan {
+	const to = input.to.trim();
+	if (to === "") {
+		return { ok: false, reason: "bad_request", error: "a callback needs a number to dial" };
+	}
+	const from = input.queueNumber?.trim() ?? "";
+
+	// INTERNAL first, then outbound — the same ladder a handset gets, and it is here because the
+	// outbound-only resolve refused every callback this platform has ever promised. A caller who
+	// waited in a queue and asked to be rung back is very often an EXTENSION: an internal transfer
+	// into support, a branch office, a warm hand-off. `resolveOutbound` matches nothing for `1201`,
+	// so the runner answered `invalid_target` every thirty seconds after the caller had been told
+	// their place was held.
+	//
+	// The collision this order used to be afraid of is not one. `resolveInternal` matches only what
+	// is actually IN the tenant's internal table, so a match means the number names a destination
+	// this organization owns — not a coincidence with a customer's DID, which is an E.164 no
+	// extension table contains. An external number therefore falls straight through to the outbound
+	// rung it always used, unchanged.
+	const internal = resolveInternal(artifact, { from, dialed: to, now: input.now });
+	const onNet = internal.matched && internal.blocked === undefined;
+	const resolved = onNet
+		? internal
+		: resolveOutbound(artifact, { from, dialed: to, now: input.now });
+
+	if (!resolved.matched) {
+		return {
+			ok: false,
+			reason: "invalid_target",
+			error: resolved.reason ?? `nothing in this organization's plan matches ${to}`,
+		};
+	}
+	if (resolved.blocked !== undefined) {
+		return {
+			ok: false,
+			reason: "invalid_target",
+			error: `${to} is blocked by this organization's call-block rules`,
+		};
+	}
+
+	const callerIdNumber = input.callerIdNumber ?? resolved.callerIdNumber;
+	const callerIdName = input.callerIdName ?? resolved.callerIdName;
+	return {
+		ok: true,
+		destination: resolved.dialedNumber ?? to,
+		context: onNet ? "internal" : "outbound",
+		...(callerIdNumber === undefined ? {} : { callerIdNumber }),
+		...(callerIdName === undefined ? {} : { callerIdName }),
+		...(resolved.plan?.entryNodeId === undefined ? {} : { planNodeId: resolved.plan.entryNodeId }),
 	};
 }

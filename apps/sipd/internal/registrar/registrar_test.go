@@ -2,9 +2,11 @@ package registrar_test
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,11 +23,10 @@ import (
 
 // Binding-lifecycle tests, driven through the real SIP handler with real digest credentials.
 //
-// The requests are parsed from wire text and the responses are produced by sipgo's own transaction
-// recorder, so these exercise header parsing and response assembly rather than a Go-level mock of
-// them. The digest answer is computed by github.com/icholy/digest — the CLIENT side of the same
-// RFC — which means the server side here is checked against an independent implementation, not
-// against itself.
+// Requests are parsed from wire text and responses come from sipgo's own transaction recorder, so
+// header parsing and response assembly are exercised rather than mocked. The digest answer is
+// computed by github.com/icholy/digest — the client side of the same RFC — so the server side is
+// checked against an independent implementation.
 
 const (
 	testRealm = "acme.example.com"
@@ -52,6 +53,60 @@ type staticCredentials struct {
 	err        error
 }
 
+type realmCredentials map[string]credentials.Credential
+
+func (s realmCredentials) Lookup(_ context.Context, realm, username string) (credentials.Credential, error) {
+	if credential, ok := s[realm]; ok && credential.Username == username {
+		return credential, nil
+	}
+	return credentials.Credential{}, credentials.ErrNotFound
+}
+
+func TestTwoOrganizationsRegisterTheSameExtensionOnOneEdge(t *testing.T) {
+	accounts := realmCredentials{}
+	for i, realm := range []string{testRealm, "tenant-b.example"} {
+		accounts[realm] = credentials.Credential{OrgID: "organization-" + strconv.Itoa(i), Realm: realm,
+			Username: testUser, HA1: credentials.HA1(testUser, realm, testPass)}
+	}
+	h := newHarness(t, accounts)
+	for realm, account := range accounts {
+		makeRequest := func(authorization string) *sip.Request {
+			request := h.newRegister(authorization, contactHeader("sip:1001@203.0.113.9:5060"))
+			request.Recipient.Host = realm
+			request.From().Address.Host = realm
+			request.To().Address.Host = realm
+			return request
+		}
+		challenge := h.send(makeRequest(""))
+		if challenge.StatusCode != 401 {
+			t.Fatalf("%s challenge = %d", realm, challenge.StatusCode)
+		}
+		parsed, err := digest.ParseChallenge(challenge.GetHeader("WWW-Authenticate").Value())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if parsed.Realm != realm {
+			t.Fatalf("wrong realm: %s", parsed.Realm)
+		}
+		answer, err := digest.Digest(parsed, digest.Options{Username: testUser, Password: testPass,
+			Method: "REGISTER", URI: "sip:" + realm, Count: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response := h.send(makeRequest(answer.String())); response.StatusCode != 200 {
+			t.Fatalf("%s registration = %d", realm, response.StatusCode)
+		}
+		key, err := contract.AORSubjectToken("sip:" + testUser + "@" + realm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		binding, found, err := h.store.Get(h.t.Context(), account.OrgID, key)
+		if err != nil || !found || binding.OrgID != account.OrgID {
+			t.Fatalf("registration crossed organization boundaries: %+v, %v", binding, err)
+		}
+	}
+}
+
 func (s staticCredentials) Lookup(_ context.Context, _, _ string) (credentials.Credential, error) {
 	if s.err != nil {
 		return credentials.Credential{}, s.err
@@ -59,7 +114,11 @@ func (s staticCredentials) Lookup(_ context.Context, _, _ string) (credentials.C
 	return s.credential, nil
 }
 
-func newHarness(t *testing.T, lookup credentials.Store) *harness {
+// harnessOption adjusts the registrar the harness builds, for the tests that need a source ACL or
+// a connection probe.
+type harnessOption func(*registrar.Options)
+
+func newHarness(t *testing.T, lookup credentials.Store, options ...harnessOption) *harness {
 	t.Helper()
 
 	authenticator, err := registrar.NewAuthenticator(testRealm, []byte("test-nonce-secret"), time.Minute)
@@ -91,7 +150,7 @@ func newHarness(t *testing.T, lookup credentials.Store) *harness {
 		}}
 	}
 
-	reg, err := registrar.New(registrar.Options{
+	opts := registrar.Options{
 		Realm:       testRealm,
 		Auth:        authenticator,
 		Expiry:      registrar.ExpiryPolicy{Min: 60 * time.Second, Max: time.Hour, Default: 300 * time.Second},
@@ -100,9 +159,13 @@ func newHarness(t *testing.T, lookup credentials.Store) *harness {
 		Publisher:   h.publisher,
 		Logger:      slog.New(slog.DiscardHandler),
 		Source:      "sipd",
-		BaseContext: context.Background(),
+		BaseContext: t.Context(),
 		Now:         func() time.Time { return h.now },
-	})
+	}
+	for _, option := range options {
+		option(&opts)
+	}
+	reg, err := registrar.New(opts)
 	if err != nil {
 		t.Fatalf("registrar.New: %v", err)
 	}
@@ -126,6 +189,13 @@ func (h *harness) register(headers ...string) *sip.Response {
 
 func (h *harness) answerChallenge(res *sip.Response) string {
 	h.t.Helper()
+	return h.answerChallengeCount(res, 1)
+}
+
+// answerChallengeCount answers with an explicit nonce count, for the tests that reuse one nonce
+// across requests — the registrar's replay guard refuses a repeated count.
+func (h *harness) answerChallengeCount(res *sip.Response, count int) string {
+	h.t.Helper()
 	header := res.GetHeader("WWW-Authenticate")
 	if header == nil {
 		h.t.Fatal("401 carried no WWW-Authenticate header")
@@ -139,7 +209,7 @@ func (h *harness) answerChallenge(res *sip.Response) string {
 		URI:      "sip:" + testRealm,
 		Username: testUser,
 		Password: testPass,
-		Count:    1,
+		Count:    count,
 		Cnonce:   "0a4f113b",
 	})
 	if err != nil {
@@ -202,14 +272,12 @@ func contactHeader(uri string, params ...string) string {
 
 func (h *harness) binding() (kv.Binding, bool) {
 	h.t.Helper()
-	binding, found, err := h.store.Get(context.Background(), testOrg, h.aorHash)
+	binding, found, err := h.store.Get(h.t.Context(), testOrg, h.aorHash)
 	if err != nil {
 		h.t.Fatalf("reading the binding: %v", err)
 	}
 	return binding, found
 }
-
-// ---------------------------------------------------------------------------------------------
 
 func TestRegisterChallengesThenBinds(t *testing.T) {
 	h := newHarness(t, nil)
@@ -290,6 +358,173 @@ func TestRegisterChallengesThenBinds(t *testing.T) {
 	}
 	if err := contract.CheckSubject(event.Subject, event); err != nil {
 		t.Errorf("the published envelope is inconsistent with its subject: %v", err)
+	}
+}
+
+func TestMultipleDevicesRegisterQueryAndRemoveIndependently(t *testing.T) {
+	h := newHarness(t, nil)
+	desk, browser := "sip:1001@203.0.113.9:5060", "sip:browser@device.invalid;transport=ws"
+	res := h.register(contactHeader(desk, "expires=120", "q=1"), contactHeader(browser, "expires=300", "q=0.5"))
+	if res.StatusCode != 200 || len(res.GetHeaders("Contact")) != 2 {
+		t.Fatalf("multi-contact REGISTER: %s", res.String())
+	}
+	binding, _ := h.binding()
+	if len(binding.Contacts) != 2 || binding.Contact != desk {
+		t.Fatalf("contacts not preserved in preference order: %+v", binding)
+	}
+	h.now = h.now.Add(30 * time.Second)
+	query := h.register()
+	if got, _ := query.GetHeaders("Contact")[0].(*sip.ContactHeader).Params.Get("expires"); got != "90" {
+		t.Fatalf("query expiry = %s, want remaining 90 seconds", got)
+	}
+	res = h.register(contactHeader(browser, "expires=0"))
+	if res.StatusCode != 200 || len(res.GetHeaders("Contact")) != 1 {
+		t.Fatalf("individual removal: %s", res.String())
+	}
+	binding, _ = h.binding()
+	if len(binding.Contacts) != 1 || binding.Contact != desk {
+		t.Fatal("removing the browser also removed the desk phone")
+	}
+}
+
+func TestMultiContactRegistrationRejectsWholeInvalidUpdate(t *testing.T) {
+	h := newHarness(t, nil)
+	res := h.register(contactHeader("sip:desk@203.0.113.9", "expires=300"), contactHeader("sip:browser@203.0.113.10", "expires=20"))
+	if res.StatusCode != 423 {
+		t.Fatalf("status = %d, want 423", res.StatusCode)
+	}
+	if _, found := h.binding(); found {
+		t.Fatal("part of a rejected REGISTER was persisted")
+	}
+	res = h.register(contactHeader("sip:desk@203.0.113.9", "expires=-1"))
+	if res.StatusCode != 400 {
+		t.Fatalf("negative expiry status = %d", res.StatusCode)
+	}
+}
+
+func TestStaleRegisterCannotOverwriteOrRemoveCurrentContact(t *testing.T) {
+	h := newHarness(t, nil)
+	contact := contactHeader("sip:1001@203.0.113.9:5060", "expires=300")
+	challenge := h.send(h.newRegister("", contact))
+	req := h.newRegister(h.answerChallengeCount(challenge, 1), contact)
+	if res := h.send(req); res.StatusCode != 200 {
+		t.Fatalf("REGISTER = %d", res.StatusCode)
+	}
+	// A byte-identical replay never reaches the binding: the nonce count has been used, so the
+	// digest layer re-challenges. See the replay note in auth.go.
+	if res := h.send(req.Clone()); res.StatusCode != 401 {
+		t.Fatalf("replayed REGISTER = %d, want a fresh challenge", res.StatusCode)
+	}
+	// A genuinely re-authenticated but OUT OF ORDER REGISTER — fresh nonce count, stale CSeq — is
+	// what the binding's own guard has to catch.
+	reauthorize := func(count int) *sip.Request {
+		stale := req.Clone()
+		stale.RemoveHeader("Authorization")
+		stale.AppendHeader(sip.NewHeader("Authorization", h.answerChallengeCount(challenge, count)))
+		return stale
+	}
+	if res := h.send(reauthorize(2)); res.StatusCode != 500 {
+		t.Fatalf("stale REGISTER = %d", res.StatusCode)
+	}
+	removal := reauthorize(3)
+	removal.Contact().Params.Add("expires", "0")
+	if res := h.send(removal); res.StatusCode != 500 {
+		t.Fatalf("stale removal = %d", res.StatusCode)
+	}
+	if _, found := h.binding(); !found {
+		t.Fatal("out-of-order removal deleted a current contact")
+	}
+}
+
+func TestSweeperPreservesARefreshFromAnotherRegistrar(t *testing.T) {
+	h := newHarness(t, nil)
+	if res := h.register(contactHeader("sip:desk@203.0.113.9", "expires=60")); res.StatusCode != 200 {
+		t.Fatal(res.StatusCode)
+	}
+	other := newHarness(t, nil)
+	other.store = h.store
+	other = rebuild(t, other)
+	other.now = h.now.Add(40 * time.Second)
+	other.cseq = h.cseq + 10
+	if res := other.register(contactHeader("sip:desk@203.0.113.9", "expires=300")); res.StatusCode != 200 {
+		t.Fatal(res.StatusCode)
+	}
+	h.now = h.now.Add(70 * time.Second)
+	if got := h.registrar.Sweep(t.Context()); got != 0 {
+		t.Fatalf("expired a refreshed contact: %d", got)
+	}
+	if _, found := h.binding(); !found {
+		t.Fatal("stale sweeper removed another registrar's refresh")
+	}
+}
+
+func TestConcurrentRegistrarsPreserveEachDevice(t *testing.T) {
+	h := newHarness(t, nil)
+	var workers sync.WaitGroup
+	for i := range 5 {
+		other := newHarness(t, nil)
+		other.store = h.store
+		other = rebuild(t, other)
+		workers.Go(func() {
+			res := other.register(contactHeader("sip:device"+strconv.Itoa(i)+"@203.0.113.9", "expires=300"))
+			if res.StatusCode != 200 {
+				t.Errorf("concurrent REGISTER = %d", res.StatusCode)
+			}
+		})
+	}
+	workers.Wait()
+	binding, _ := h.binding()
+	if len(binding.Contacts) != 5 {
+		t.Fatalf("lost registrations: contacts=%d", len(binding.Contacts))
+	}
+}
+
+func TestExpiryRemovesOnlyLapsedContact(t *testing.T) {
+	h := newHarness(t, nil)
+	h.register(contactHeader("sip:desk@203.0.113.9", "expires=60", "q=1"), contactHeader("sip:browser@203.0.113.10", "expires=300", "q=0.5"))
+	h.now = h.now.Add(70 * time.Second)
+	if got := h.registrar.Sweep(t.Context()); got != 1 {
+		t.Fatalf("expired %d contacts, want 1", got)
+	}
+	binding, _ := h.binding()
+	if len(binding.Contacts) != 1 || binding.Contact != "sip:browser@203.0.113.10" {
+		t.Fatalf("surviving browser lost: %+v", binding)
+	}
+	if len(h.publisher.ExpiredEvents()) != 1 {
+		t.Fatal("expiry event was missing or duplicated")
+	}
+}
+
+// A credential naming a shared line appearance must carry it onto the binding, so the INVITE path
+// can stamp a Call-Info appearance-index header on the call to this phone.
+func TestSharedLineAppearanceFlowsFromCredentialToBinding(t *testing.T) {
+	sharedLine := "2000"
+	appearance := 2
+	lookup := staticCredentials{credential: credentials.Credential{
+		OrgID:            testOrg,
+		Username:         testUser,
+		Realm:            testRealm,
+		HA1:              credentials.HA1(testUser, testRealm, testPass),
+		DeviceID:         "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b50",
+		ExtensionID:      "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51",
+		SharedLineNumber: &sharedLine,
+		AppearanceIndex:  &appearance,
+	}}
+	h := newHarness(t, lookup)
+
+	if res := h.register(contactHeader("sip:1001@203.0.113.9:5060", "expires=600")); res.StatusCode != 200 {
+		t.Fatalf("REGISTER = %d", res.StatusCode)
+	}
+
+	binding, found := h.binding()
+	if !found {
+		t.Fatal("no binding was written to the location service")
+	}
+	if binding.SharedLineNumber == nil || *binding.SharedLineNumber != sharedLine {
+		t.Errorf("binding.SharedLineNumber = %v, want %q", binding.SharedLineNumber, sharedLine)
+	}
+	if binding.AppearanceIndex == nil || *binding.AppearanceIndex != appearance {
+		t.Errorf("binding.AppearanceIndex = %v, want %d", binding.AppearanceIndex, appearance)
 	}
 }
 
@@ -449,14 +684,19 @@ func TestSweeperExpiresLapsedBindings(t *testing.T) {
 		t.Fatalf("tracked %d bindings, want 1", h.registrar.TrackedBindings())
 	}
 
-	// Still inside the granted interval: nothing may expire yet.
+	// Still inside the granted interval: nothing may expire yet, and — because the hint carries the
+	// exact deadline — nothing may cost a KV round trip either.
 	h.now = h.now.Add(59 * time.Second)
-	if swept := h.registrar.Sweep(context.Background()); swept != 0 {
+	updates := h.store.Updates()
+	if swept := h.registrar.Sweep(t.Context()); swept != 0 {
 		t.Fatalf("swept %d bindings before the deadline", swept)
+	}
+	if spent := h.store.Updates() - updates; spent != 0 {
+		t.Errorf("a sweep before the deadline spent %d KV round trips, want none", spent)
 	}
 
 	h.now = h.now.Add(2 * time.Second)
-	if swept := h.registrar.Sweep(context.Background()); swept != 1 {
+	if swept := h.registrar.Sweep(t.Context()); swept != 1 {
 		t.Fatalf("swept %d bindings after the deadline, want 1", swept)
 	}
 	if _, found := h.binding(); found {
@@ -478,7 +718,7 @@ func TestSweeperExpiresLapsedBindings(t *testing.T) {
 	}
 
 	// A second sweep must be a no-op: an `expired` event per tick would poison presence counting.
-	if swept := h.registrar.Sweep(context.Background()); swept != 0 {
+	if swept := h.registrar.Sweep(t.Context()); swept != 0 {
 		t.Errorf("a repeat sweep expired %d bindings", swept)
 	}
 }
@@ -494,7 +734,7 @@ func TestRehydrateAdoptsExistingBindings(t *testing.T) {
 	second.store = first.store
 	second = rebuild(t, second)
 
-	adopted, err := second.registrar.Rehydrate(context.Background())
+	adopted, err := second.registrar.Rehydrate(t.Context())
 	if err != nil {
 		t.Fatalf("Rehydrate: %v", err)
 	}
@@ -503,7 +743,7 @@ func TestRehydrateAdoptsExistingBindings(t *testing.T) {
 	}
 
 	second.now = second.now.Add(61 * time.Second)
-	if swept := second.registrar.Sweep(context.Background()); swept != 1 {
+	if swept := second.registrar.Sweep(t.Context()); swept != 1 {
 		t.Fatalf("the adopting instance swept %d bindings, want 1", swept)
 	}
 	if len(second.publisher.ExpiredEvents()) != 1 {
@@ -530,7 +770,7 @@ func rebuild(t *testing.T, h *harness) *harness {
 		Publisher:   h.publisher,
 		Logger:      slog.New(slog.DiscardHandler),
 		Source:      "sipd",
-		BaseContext: context.Background(),
+		BaseContext: t.Context(),
 		Now:         func() time.Time { return h.now },
 	})
 	if err != nil {
@@ -555,6 +795,15 @@ func TestUnknownAccountAndForeignAORAreRefused(t *testing.T) {
 		if res.StatusCode != 403 {
 			t.Errorf("status = %d, want the same 403 an unknown account gets, so the response "+
 				"cannot be used to enumerate extensions", res.StatusCode)
+		}
+	})
+
+	t.Run("credential RPC unavailable", func(t *testing.T) {
+		h := newHarness(t, staticCredentials{err: fmt.Errorf("%w: context deadline exceeded", credentials.ErrLookupFailed)})
+		res := h.register(contactHeader("sip:1001@203.0.113.9:5060"))
+		if res.StatusCode != 503 {
+			t.Errorf("status = %d, want 503: no answer from the credential RPC is not a claim about "+
+				"the account, and a 403 stops most handsets retrying", res.StatusCode)
 		}
 	})
 
@@ -673,6 +922,14 @@ func TestOptionsAndUnsupportedMethods(t *testing.T) {
 	}, "\r\n"))
 	tx = siptest.NewServerTxRecorder(invite)
 	h.registrar.HandleUnsupported(invite, tx)
+	// Terminate BEFORE reading the recorder, and only on the INVITE transaction.
+	//
+	// A final response to an INVITE puts sipgo's server transaction into Completed, arming
+	// RFC 3261 §17.2.1's Timer G, which retransmits from a timer goroutine until the ACK or Timer H.
+	// siptest.ServerTxRecorder takes no lock, so that goroutine writes the slice this test reads.
+	// Terminating first stops the FSM with the response already recorded, which is what a real
+	// transport does when the ACK arrives.
+	tx.Terminate()
 	res = lastResponse(t, tx)
 	if res.StatusCode != 501 {
 		t.Errorf("INVITE = %d, want 501 Not Implemented", res.StatusCode)
@@ -719,4 +976,91 @@ func TestNewRejectsInconsistentOptions(t *testing.T) {
 	if !strings.Contains(err.Error(), "challenges for") {
 		t.Errorf("error = %v, want it to name the realm mismatch", err)
 	}
+}
+
+// The attack the nonce count exists to stop: the digest covers the method, the request URI and the
+// nonce, but NOT the Contact, so an observer who captures one REGISTER on an unencrypted transport
+// could otherwise resend its Authorization header in a REGISTER carrying their own contact and fork
+// the victim's inbound calls.
+func TestAReplayedAuthorizationCannotBindAnAttackersContact(t *testing.T) {
+	h := newHarness(t, nil)
+	victim := contactHeader("sip:1001@203.0.113.9:5060", "expires=300")
+	challenge := h.send(h.newRegister("", victim))
+	authorization := h.answerChallengeCount(challenge, 1)
+	if res := h.send(h.newRegister(authorization, victim)); res.StatusCode != 200 {
+		t.Fatalf("the genuine REGISTER = %d", res.StatusCode)
+	}
+
+	attacker := h.newRegister(authorization, contactHeader("sip:1001@198.51.100.4:5060", "expires=300"))
+	if res := h.send(attacker); res.StatusCode != 401 {
+		t.Fatalf("replayed credentials with a different contact = %d, want 401", res.StatusCode)
+	}
+	binding, found := h.binding()
+	if !found {
+		t.Fatal("the victim's binding disappeared")
+	}
+	for _, contact := range binding.Contacts {
+		if strings.Contains(contact.URI, "198.51.100.4") {
+			t.Fatalf("the attacker's contact was bound: %+v", binding.Contacts)
+		}
+	}
+}
+
+// natClamp is a NATPolicy that answers one interval for every request.
+type natClamp time.Duration
+
+func (c natClamp) MaxRegistrationInterval(*sip.Request) time.Duration { return time.Duration(c) }
+
+// R16: the NAT clamp is the one pinhole mechanism this element has, so it has to reach the granted
+// interval a device is told about — not only the policy struct.
+func TestNATClampBoundsTheGrantedRegistration(t *testing.T) {
+	t.Run("a long registration is clamped to what the pinhole survives", func(t *testing.T) {
+		h := newHarness(t, nil, func(o *registrar.Options) { o.NATPolicy = natClamp(300 * time.Second) })
+		res := h.register(contactHeader("sip:1001@203.0.113.9:5060", "expires=3600"))
+		if res.StatusCode != 200 {
+			t.Fatalf("status = %d, want 200", res.StatusCode)
+		}
+		binding, _ := h.binding()
+		if binding.ExpiresInSeconds != 300 {
+			t.Errorf("granted %d seconds, want the profile's 300-second clamp", binding.ExpiresInSeconds)
+		}
+		if got := res.GetHeader("Expires"); got == nil || got.Value() != "300" {
+			t.Errorf("Expires header = %v, want the clamped 300 so the device refreshes in time", got)
+		}
+	})
+
+	t.Run("a shorter request is left alone", func(t *testing.T) {
+		h := newHarness(t, nil, func(o *registrar.Options) { o.NATPolicy = natClamp(300 * time.Second) })
+		if res := h.register(contactHeader("sip:1001@203.0.113.9:5060", "expires=120")); res.StatusCode != 200 {
+			t.Fatalf("status = %d, want 200", res.StatusCode)
+		}
+		binding, _ := h.binding()
+		if binding.ExpiresInSeconds != 120 {
+			t.Errorf("granted %d seconds, want the requested 120", binding.ExpiresInSeconds)
+		}
+	})
+
+	t.Run("a clamp never grants less than the policy minimum", func(t *testing.T) {
+		h := newHarness(t, nil, func(o *registrar.Options) { o.NATPolicy = natClamp(5 * time.Second) })
+		if res := h.register(contactHeader("sip:1001@203.0.113.9:5060", "expires=3600")); res.StatusCode != 200 {
+			t.Fatalf("status = %d, want 200", res.StatusCode)
+		}
+		binding, _ := h.binding()
+		if binding.ExpiresInSeconds != 60 {
+			t.Errorf("granted %d seconds, want the 60-second minimum floor", binding.ExpiresInSeconds)
+		}
+	})
+
+	t.Run("a de-registration is not a short registration", func(t *testing.T) {
+		h := newHarness(t, nil, func(o *registrar.Options) { o.NATPolicy = natClamp(300 * time.Second) })
+		if res := h.register(contactHeader("sip:1001@203.0.113.9:5060", "expires=600")); res.StatusCode != 200 {
+			t.Fatalf("status = %d", res.StatusCode)
+		}
+		if res := h.register(contactHeader("sip:1001@203.0.113.9:5060", "expires=0")); res.StatusCode != 200 {
+			t.Fatalf("de-registration status = %d, want 200", res.StatusCode)
+		}
+		if _, found := h.binding(); found {
+			t.Error("the clamp turned Expires: 0 into a live binding")
+		}
+	})
 }

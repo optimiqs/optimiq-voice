@@ -1,7 +1,6 @@
 package credentials_test
 
 import (
-	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -58,7 +57,7 @@ func TestFileStoreLoadsPasswordsAndPrecomputedHashes(t *testing.T) {
 		t.Fatalf("loaded %d accounts, want 3", store.Len())
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	byPassword, err := store.Lookup(ctx, "acme.example.com", "1001")
 	if err != nil {
@@ -99,7 +98,7 @@ func TestFileStoreRealmIsCaseInsensitiveAndUsernameIsNot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFileStore: %v", err)
 	}
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// RFC 3261 §19.1.4: host parts compare case-insensitively, user parts do not.
 	if _, err := store.Lookup(ctx, "acme.example.com", "Alice"); err != nil {
@@ -153,25 +152,21 @@ func TestFileStoreReloadKeepsTheOldSetOnFailure(t *testing.T) {
 	if err := store.Reload(); err == nil {
 		t.Fatal("Reload accepted a broken file")
 	}
-	// Every phone in the building must not fall off the network because someone fat-fingered a file.
-	if _, err := store.Lookup(context.Background(), "a.example.com", "1001"); err != nil {
+	// A fat-fingered file must not drop every phone off the network.
+	if _, err := store.Lookup(t.Context(), "a.example.com", "1001"); err != nil {
 		t.Errorf("a failed reload emptied the store: %v", err)
 	}
 }
 
 func TestNATSStoreRequiresAConnection(t *testing.T) {
-	// The stub this replaced constructed happily and failed at Lookup, because there was no
-	// transport to require. Now a nil connection is a wiring mistake, and a wiring mistake must
-	// stop the process at boot rather than turn into a 403 per REGISTER.
+	// A wiring mistake must stop the process at boot, not become a 403 per REGISTER.
 	if _, err := credentials.NewNATSStore(nil, credentials.NATSOptions{}); err == nil {
 		t.Error("NewNATSStore(nil) must fail: an edge with no transport authenticates nobody")
 	}
 }
 
 func TestFileStoreDerivesFromASecretRef(t *testing.T) {
-	// The derived form is what makes a development fixture agree with what apps/api would have
-	// rendered for the same line, instead of a literal somebody copied once. It is confined to the
-	// file store because it needs the root key, which production sipd deliberately does not hold.
+	// The derived form makes a fixture agree with what apps/api would render for the same line.
 	const (
 		key   = "provision-root-key-0123456789abcdef"
 		org   = "018f4f5e-0000-7000-8000-0000000000a1"
@@ -189,7 +184,7 @@ func TestFileStoreDerivesFromASecretRef(t *testing.T) {
 		t.Fatalf("NewFileStore: %v", err)
 	}
 
-	credential, err := store.Lookup(context.Background(), realm, user)
+	credential, err := store.Lookup(t.Context(), realm, user)
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}
@@ -202,9 +197,8 @@ func TestFileStoreDerivesFromASecretRef(t *testing.T) {
 		t.Errorf("ha1 = %q, want the derived %q", credential.HA1, want)
 	}
 
-	// Without the key the same fixture must refuse to load. Loading it with an empty-key
-	// derivation would produce an account whose password nobody can compute, and the symptom
-	// would be a phone that cannot register for no visible reason.
+	// Without the key the same fixture must refuse to load: an empty-key derivation would produce
+	// an account whose password nobody can compute.
 	if _, err := credentials.NewFileStore(path, credentials.FileStoreOptions{}); err == nil {
 		t.Error("a secretRef account with no root key must fail at load")
 	}
@@ -228,8 +222,7 @@ func TestCredentialValidate(t *testing.T) {
 	}
 }
 
-// The example fixture is what the README tells a newcomer to run with. If it stops loading, the
-// first five minutes of the project are broken, so it is checked here rather than in a comment.
+// The example fixture is what the README tells a newcomer to run with.
 func TestShippedExampleFixtureLoads(t *testing.T) {
 	store, err := credentials.NewFileStore(filepath.Join("..", "..", "config", "credentials.example.json"),
 		credentials.FileStoreOptions{})
@@ -239,7 +232,7 @@ func TestShippedExampleFixtureLoads(t *testing.T) {
 	if store.Len() == 0 {
 		t.Fatal("the example fixture declares no accounts")
 	}
-	credential, err := store.Lookup(context.Background(), "acme.example.com", "1001")
+	credential, err := store.Lookup(t.Context(), "acme.example.com", "1001")
 	if err != nil {
 		t.Fatalf("the account the README tells you to dial does not resolve: %v", err)
 	}

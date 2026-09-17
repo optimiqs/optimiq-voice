@@ -1,5 +1,5 @@
 import { expect } from "chai";
-import { queue, queueTier } from "@optimiq-voice/pbx-db";
+import { orgSetting, queue, queueTier } from "@optimiq-voice/pbx-db";
 import {
 	diagnosticField,
 	isPbxFailure,
@@ -72,6 +72,27 @@ describe("pbx failures", () => {
 		);
 		const body = failure.toHttpException().getResponse() as Record<string, unknown>;
 		expect(body.field).to.equal("queueId");
+	});
+
+	/**
+	 * The SIP realm's global index is on an EXPRESSION (`lower(btrim(value #>> '{}'))`), so there is
+	 * no column to read a field off — `constraintField` would answer "" and the settings form would
+	 * get a 409 it could not attach to an input. `PLATFORM_WIDE_CONSTRAINTS` states the field.
+	 */
+	it("names the form field for a platform-wide expression index, and discloses no other tenant", () => {
+		const failure = toPbxFailure(
+			"org-setting",
+			"update",
+			{ code: "23505", constraint_name: "org_setting_sip_realm_global_key" },
+			orgSetting,
+		);
+		const exception = failure.toHttpException();
+		const body = exception.getResponse() as Record<string, unknown>;
+		expect(exception.getStatus()).to.equal(409);
+		expect(body.field).to.equal("realm");
+		expect(body.message).to.equal("This SIP domain is already assigned to another organization.");
+		// Nothing about the organization that holds it, and not the index name either.
+		expect(String(body.message)).not.to.contain("org_setting");
 	});
 
 	it("falls back to the index-name parse when the schema does not describe the constraint", () => {

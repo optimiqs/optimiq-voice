@@ -281,7 +281,9 @@ async function main(): Promise<void> {
 			});
 		});
 		if (!apiReady) {
-			throw new Error("the API did not start (is Postgres reachable on :5433 with both databases?)");
+			throw new Error(
+				"the API did not start (is Postgres reachable on :5433 with both databases?)",
+			);
 		}
 
 		console.log(`starting the Next dev server on ${webUrl}\n`);
@@ -359,9 +361,20 @@ async function main(): Promise<void> {
 			"nextCursor" in list.body && "range" in list.body && !("totalPages" in list.body),
 			Object.keys(list.body).join(", "),
 		);
-		check("the seeded history is listed", rows(list).length >= 6, `${String(rows(list).length)} rows`);
+		check(
+			"the seeded history is listed",
+			rows(list).length >= 6,
+			`${String(rows(list).length)} rows`,
+		);
 		const firstRow = rows(list)[0] ?? {};
-		for (const field of ["callId", "leg", "originatingLegId", "disposition", "hangupCause", "billsecMs"]) {
+		for (const field of [
+			"callId",
+			"leg",
+			"originatingLegId",
+			"disposition",
+			"hangupCause",
+			"billsecMs",
+		]) {
 			check(`the row carries ${field}, which the table reads`, field in firstRow);
 		}
 
@@ -389,7 +402,10 @@ async function main(): Promise<void> {
 			rows(answered).length > 0 && rows(answered).every((row) => row.disposition === "answered"),
 		);
 		const pageOne = await client("GET", "/api/v1/cdr?limit=2");
-		check("a page returns the limit and a cursor", rows(pageOne).length === 2 && typeof pageOne.body.nextCursor === "string");
+		check(
+			"a page returns the limit and a cursor",
+			rows(pageOne).length === 2 && typeof pageOne.body.nextCursor === "string",
+		);
 		const pageTwo = await client(
 			"GET",
 			`/api/v1/cdr?limit=2&cursor=${encodeURIComponent(String(pageOne.body.nextCursor))}`,
@@ -438,8 +454,9 @@ async function main(): Promise<void> {
 		const bytes = Buffer.from(await media.arrayBuffer());
 		check("the bytes are the seeded object", bytes.subarray(0, 4).toString("ascii") === "RIFF");
 
-		const tampered = signedUrl.replace(/token=(.)/u, (match, first: string) =>
-			`token=${first === "A" ? "B" : "A"}`,
+		const tampered = signedUrl.replace(
+			/token=(.)/u,
+			(match, first: string) => `token=${first === "A" ? "B" : "A"}`,
 		);
 		const tamperedResponse = await fetch(`${webUrl}${tampered}`);
 		check(
@@ -448,7 +465,11 @@ async function main(): Promise<void> {
 			`status ${String(tamperedResponse.status)}`,
 		);
 		const noToken = await fetch(`${webUrl}/api/v1/recordings/media`);
-		check("the media route with no token is refused", noToken.status === 403, `status ${String(noToken.status)}`);
+		check(
+			"the media route with no token is refused",
+			noToken.status === 403,
+			`status ${String(noToken.status)}`,
+		);
 
 		// The ledger has no delete endpoint by design, so the fixture is torn down through the same
 		// owner-principal script that created it. Leaving it would make every run add six more legs

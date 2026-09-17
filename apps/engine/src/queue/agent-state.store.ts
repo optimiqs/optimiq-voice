@@ -62,9 +62,25 @@ export function noAnswerCountOf(
  * Login, logout and manual pause. See `agent-state.ts`: those are the control plane's, the guard
  * refuses them from here, and the refusal is deliberate rather than an omission.
  */
+/**
+ * How long one roster's state snapshot is reused.
+ *
+ * Every waiting caller polls its roster once a second, so `C` callers on an `A`-agent queue would
+ * otherwise cost `C x A` bucket gets per second from a single process — and the busy hour is exactly
+ * when both are large. A quarter of a second is far below the poll interval and far above the time a
+ * pass takes, so the reads collapse to one per roster per second without any pass ever seeing state
+ * from the previous one. Every write invalidates its own org, so a reservation is never read stale.
+ */
+const ROSTER_CACHE_TTL_MS = 250;
+
 @Injectable()
 export class AgentStateStore implements AgentStatePort {
 	private readonly logger = getLogger("engine.agent-state");
+	/** `org + roster -> in-flight or recent snapshot`. See {@link ROSTER_CACHE_TTL_MS}. */
+	private readonly rosterReads = new Map<
+		string,
+		{ readonly at: number; readonly states: Promise<Map<string, AgentStateEntry>> }
+	>();
 	private writes = 0;
 	private refusals = 0;
 	private failures = 0;
@@ -98,21 +114,58 @@ export class AgentStateStore implements AgentStatePort {
 		orgId: string,
 		agentIds: readonly string[],
 	): Promise<Map<string, AgentStateEntry>> {
-		const states = new Map<string, AgentStateEntry>();
 		const bucket = this.jetstream.agentState;
 		if (bucket === undefined || agentIds.length === 0) {
-			return states;
+			return new Map<string, AgentStateEntry>();
 		}
 
-		await Promise.all(
-			agentIds.map(async (agentId) => {
-				const read = await this.readState(orgId, agentId);
-				if (read.kind === "found") {
-					states.set(agentId, read.entry);
-				}
-			}),
-		);
-		return states;
+		const now = Date.now();
+		const key = `${orgId}\n${[...agentIds].sort().join(",")}`;
+		const cached = this.rosterReads.get(key);
+		if (cached !== undefined && now - cached.at < ROSTER_CACHE_TTL_MS) {
+			return await cached.states;
+		}
+		this.pruneRosterReads(now);
+
+		const states = (async () => {
+			const found = new Map<string, AgentStateEntry>();
+			await Promise.all(
+				agentIds.map(async (agentId) => {
+					const read = await this.readState(orgId, agentId);
+					if (read.kind === "found") {
+						found.set(agentId, read.entry);
+					}
+				}),
+			);
+			return found;
+		})();
+		// Cached BEFORE the await, so the callers that arrive while it is in flight share it rather
+		// than each starting their own fan-out.
+		this.rosterReads.set(key, { at: now, states });
+		try {
+			return await states;
+		} catch (error) {
+			this.rosterReads.delete(key);
+			throw error;
+		}
+	}
+
+	/** Drops every roster snapshot for one organization. Called after each write to the bucket. */
+	private invalidateRosterReads(orgId: string): void {
+		const prefix = `${orgId}\n`;
+		for (const key of this.rosterReads.keys()) {
+			if (key.startsWith(prefix)) {
+				this.rosterReads.delete(key);
+			}
+		}
+	}
+
+	private pruneRosterReads(now: number): void {
+		for (const [key, entry] of this.rosterReads) {
+			if (now - entry.at >= ROSTER_CACHE_TTL_MS) {
+				this.rosterReads.delete(key);
+			}
+		}
 	}
 
 	async readState(orgId: string, agentId: string): Promise<AgentStateRead> {
@@ -174,6 +227,7 @@ export class AgentStateStore implements AgentStatePort {
 		try {
 			await bucket.update(key, new TextEncoder().encode(JSON.stringify(next)), read.revision);
 			this.writes += 1;
+			this.invalidateRosterReads(request.orgId);
 		} catch (error) {
 			if (isConflict(error)) {
 				this.refusals += 1;
@@ -292,6 +346,12 @@ export class AgentStateStore implements AgentStatePort {
 				: {}),
 			...(request.legId === undefined ? {} : { legId: request.legId }),
 			...(request.queueId === undefined ? {} : { queueId: request.queueId }),
+			...(request.dispositionCallId === undefined
+				? {}
+				: { dispositionCallId: request.dispositionCallId }),
+			...(request.dispositionRequired === undefined
+				? {}
+				: { dispositionRequired: request.dispositionRequired }),
 			...(request.reason === undefined ? {} : { reason: request.reason }),
 		};
 
@@ -303,6 +363,7 @@ export class AgentStateStore implements AgentStatePort {
 				await bucket.update(key, value, stored.revision);
 			}
 			this.writes += 1;
+			this.invalidateRosterReads(request.orgId);
 		} catch (error) {
 			const conflict = isConflict(error);
 			if (conflict) {

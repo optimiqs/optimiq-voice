@@ -3,6 +3,7 @@ import { emergencyDialedMail, formatDispatchableLocation } from "../../src/mail/
 import {
 	EMERGENCY_DURABLE,
 	EMERGENCY_SUBJECT_FILTER,
+	EmergencyConsumer,
 } from "../../src/pbx/emergency-addresses/emergency-consumer.service";
 import {
 	EMERGENCY_EVENT_ID_HEADER,
@@ -35,29 +36,69 @@ const NOTICE: EmergencyDialedNotice = {
 	trunkName: "primary",
 };
 
+const EXTENSION_ID = "019fd3c2-6666-76be-a6b3-b0f1914e39b6";
+/** The handset the SIP edge said placed the call, when the event names one. */
+const DEVICE_ID = "019fd3c2-7777-76be-a6b3-b0f1914e39c7";
+
+const DEVICE_ADDRESS_ID = "019fd3c2-7777-76be-a6b3-b0f1914e39b6";
+
+/** The address the DID resolves to — the granularity that was all this product had. */
+const NUMBER_ADDRESS = {
+	label: "HQ",
+	streetLine1: "1 Main St",
+	streetLine2: null,
+	locationDetail: "Floor 3, Room 314",
+	locality: "New York",
+	administrativeArea: "NY",
+	postalCode: "10001",
+	country: "US",
+	validated: true,
+};
+
 interface SentMail {
 	readonly to: string;
 	readonly subject: string;
 	readonly text: string;
+	readonly html: string;
 	readonly headers: Record<string, string> | undefined;
 }
 
-/** A transaction whose selects answer with the rows the test lines up, in call order. */
+/**
+ * A transaction whose selects answer with the rows the test lines up, in call order.
+ *
+ * Both terminals resolve an answer: `limit` ends the single-row lookups, `orderBy` ends the device
+ * lookup, which reads every handset on the extension and therefore has no limit. Answers are
+ * consumed in the order `readContext` issues them — address, extension, then the handset lookup and
+ * its address. The handset lookup is a single-row `limit` when the notice NAMED a device and an
+ * `orderBy` over the extension's handsets when it did not; both terminals answer, so the order is
+ * the same either way. A test that supplies only the first two is asserting the pre-device
+ * behaviour unchanged.
+ */
 function fakeTransaction(answers: readonly (readonly Record<string, unknown>[])[]): unknown {
 	let call = 0;
 	const chain = {
 		select: () => chain,
 		from: () => chain,
 		where: () => chain,
+		innerJoin: () => chain,
 		limit: async () => answers[call++] ?? [],
+		orderBy: async () => answers[call++] ?? [],
 	};
 	return chain;
+}
+
+interface TemplateScript {
+	readonly productName?: string;
+	readonly subject?: string | null;
+	readonly bodyIntro?: string | null;
+	readonly throws?: boolean;
 }
 
 function makeService(
 	settings: Partial<NotificationSettings>,
 	answers: readonly (readonly Record<string, unknown>[])[] = [[], []],
 	delivered = true,
+	template: TemplateScript = {},
 ): { service: EmergencyNotificationService; sent: SentMail[] } {
 	const sent: SentMail[] = [];
 	const database = {
@@ -68,10 +109,16 @@ function makeService(
 		appUrl: undefined,
 		sendRendered: async (
 			to: string,
-			rendered: { subject: string; text: string },
+			rendered: { subject: string; text: string; html: string },
 			options?: { headers?: Record<string, string> },
 		) => {
-			sent.push({ to, subject: rendered.subject, text: rendered.text, headers: options?.headers });
+			sent.push({
+				to,
+				subject: rendered.subject,
+				text: rendered.text,
+				html: rendered.html,
+				headers: options?.headers,
+			});
 			return { delivered, transport: "log" as const };
 		},
 	};
@@ -86,11 +133,26 @@ function makeService(
 			...settings,
 		}),
 	};
+	const templates = {
+		resolveComposition: async (_org: string, _key: string, _lang: string) => {
+			if (template.throws) {
+				throw new Error("cascade read failed");
+			}
+			return {
+				productName: template.productName ?? "Optimiq Voice",
+				override:
+					template.subject === undefined && template.bodyIntro === undefined
+						? null
+						: { subject: template.subject ?? null, bodyIntro: template.bodyIntro ?? null },
+			};
+		},
+	};
 	return {
 		service: new EmergencyNotificationService(
 			database as never,
 			mailer as never,
 			orgSettings as never,
+			templates as never,
 		),
 		sent,
 	};
@@ -175,6 +237,187 @@ describe("emergency notification gating", () => {
 		expect(body).to.contain("Floor 3, Room 314");
 		expect(body).to.contain("+12125550100");
 		expect(body).to.contain("Reception");
+	});
+
+	it("brands the message with the resolved product name from the mail-template cascade", async () => {
+		const { service, sent } = makeService(
+			{ emergencyNotificationEmails: ["desk@example.com"] },
+			[[], []],
+			true,
+			{ productName: "Acme Telecom" },
+		);
+		await service.notify(ORGANIZATION_ID, NOTICE);
+		// The HTML shell is titled with the appName; the cascade's product name feeds it.
+		expect(sent[0]?.html ?? "").to.contain("Acme Telecom");
+	});
+
+	it("applies a per-tenant subject override to the emergency mail", async () => {
+		const { service, sent } = makeService(
+			{ emergencyNotificationEmails: ["desk@example.com"] },
+			[[], []],
+			true,
+			{ productName: "Acme Telecom", subject: "URGENT: 911 dialed on Acme" },
+		);
+		await service.notify(ORGANIZATION_ID, NOTICE);
+		expect(sent[0]?.subject).to.equal("URGENT: 911 dialed on Acme");
+	});
+
+	it("falls back to the default branding when the cascade read fails, and still sends", async () => {
+		const { service, sent } = makeService(
+			{ emergencyNotificationEmails: ["desk@example.com"] },
+			[[], []],
+			true,
+			{ throws: true },
+		);
+		const outcome = await service.notify(ORGANIZATION_ID, NOTICE);
+		expect(outcome.outcome).to.equal("sent");
+		expect(sent[0]?.html ?? "").to.contain("Optimiq Voice");
+	});
+
+	it("prefers the handset's own dispatchable location over the number's", async () => {
+		// The audit's finding, closed: two desks on one extension share a DID and therefore shared one
+		// address, so a responder was sent to the building. A device that names its own address wins.
+		const { service, sent } = makeService({ emergencyNotificationEmails: ["desk@example.com"] }, [
+			[NUMBER_ADDRESS],
+			[{ id: EXTENSION_ID, number: "+12125550100", label: "Reception" }],
+			[
+				{
+					label: "Desk 12",
+					macAddress: "001565abcdef",
+					emergencyAddressId: DEVICE_ADDRESS_ID,
+					emergencyLocationDetail: "Desk 12, by the window",
+				},
+			],
+			[
+				{
+					...NUMBER_ADDRESS,
+					label: "HQ Annexe",
+					streetLine1: "2 Side St",
+					locationDetail: "Floor 7",
+				},
+			],
+		]);
+		await service.notify(ORGANIZATION_ID, NOTICE);
+		const body = sent[0]?.text ?? "";
+		expect(body).to.contain("2 Side St");
+		expect(body).to.contain("Floor 7, Desk 12, by the window");
+		expect(body).to.not.contain("1 Main St");
+		// And the handset is named, so somebody can walk to the right desk rather than the right floor.
+		expect(body).to.contain("Device:    Desk 12");
+	});
+
+	it("refines the number's address when the handset carries only a detail", async () => {
+		// "Desk 12" is not a dispatchable location, it is a refinement of one. A device with no address
+		// of its own must not replace a street with a fragment nobody could drive to.
+		const { service, sent } = makeService({ emergencyNotificationEmails: ["desk@example.com"] }, [
+			[NUMBER_ADDRESS],
+			[{ id: EXTENSION_ID, number: "+12125550100", label: "Reception" }],
+			[
+				{
+					label: null,
+					macAddress: "001565abcdef",
+					emergencyAddressId: null,
+					emergencyLocationDetail: "Desk 12",
+				},
+			],
+		]);
+		await service.notify(ORGANIZATION_ID, NOTICE);
+		const body = sent[0]?.text ?? "";
+		expect(body).to.contain("1 Main St");
+		expect(body).to.contain("Floor 3, Room 314, Desk 12");
+		// No label, so the MAC identifies the handset — an unlabelled phone is still findable.
+		expect(body).to.contain("Device:    001565abcdef");
+	});
+
+	it("uses the handset the event named, in preference to inferring one", async () => {
+		// `call.emergency.dialed.deviceId` is what the digest credential resolved to at the SIP edge —
+		// the registration that actually placed the call. With it there is no inference left to make,
+		// so the extension's other handsets are never consulted and no ambiguity is claimed.
+		const { service, sent } = makeService({ emergencyNotificationEmails: ["desk@example.com"] }, [
+			[NUMBER_ADDRESS],
+			[{ id: EXTENSION_ID, number: "+12125550100", label: "Reception" }],
+			[
+				{
+					label: "Desk 40",
+					macAddress: "001565abcdff",
+					emergencyAddressId: null,
+					emergencyLocationDetail: "Desk 40",
+				},
+			],
+		]);
+		await service.notify(ORGANIZATION_ID, { ...NOTICE, deviceId: DEVICE_ID });
+		const body = sent[0]?.text ?? "";
+		expect(body).to.contain("Floor 3, Room 314, Desk 40");
+		expect(body).to.contain("Device:    Desk 40");
+		expect(body).to.not.contain("other handset");
+	});
+
+	it("falls back to the inference when the named device no longer exists", async () => {
+		// A deleted handset is still better answered by the extension's than by silence.
+		const { service, sent } = makeService({ emergencyNotificationEmails: ["desk@example.com"] }, [
+			[NUMBER_ADDRESS],
+			[{ id: EXTENSION_ID, number: "+12125550100", label: "Reception" }],
+			[],
+			[
+				{
+					label: "Desk 12",
+					macAddress: "001565abcdef",
+					emergencyAddressId: null,
+					emergencyLocationDetail: "Desk 12",
+				},
+			],
+		]);
+		await service.notify(ORGANIZATION_ID, { ...NOTICE, deviceId: DEVICE_ID });
+		expect(sent[0]?.text ?? "").to.contain("Floor 3, Room 314, Desk 12");
+	});
+
+	it("admits the ambiguity when several handsets on the extension each claim a location", async () => {
+		// Absent a `deviceId` on the event this is an inference. Two located
+		// handsets means it picked one; saying so sends somebody to check both rather than to trust a
+		// coin flip.
+		const { service, sent } = makeService({ emergencyNotificationEmails: ["desk@example.com"] }, [
+			[NUMBER_ADDRESS],
+			[{ id: EXTENSION_ID, number: "+12125550100", label: "Reception" }],
+			[
+				{
+					label: "Desk 12",
+					macAddress: "001565abcdef",
+					emergencyAddressId: null,
+					emergencyLocationDetail: "Desk 12",
+				},
+				{
+					label: "Desk 40",
+					macAddress: "001565abcdff",
+					emergencyAddressId: null,
+					emergencyLocationDetail: "Desk 40",
+				},
+			],
+		]);
+		await service.notify(ORGANIZATION_ID, NOTICE);
+		expect(sent[0]?.text ?? "").to.contain(
+			"1 other handset on this extension registers a different location",
+		);
+	});
+
+	it("says an unvalidated address is unvalidated rather than suppressing it", async () => {
+		// The best information anybody has at the moment somebody dials 911 is still the best
+		// information. Withholding it leaves the recipient with nothing; labelling it sends them to
+		// check on the way.
+		const { service, sent } = makeService({ emergencyNotificationEmails: ["desk@example.com"] }, [
+			[NUMBER_ADDRESS],
+			[{ id: EXTENSION_ID, number: "+12125550100", label: "Reception" }],
+			[
+				{
+					label: "Desk 12",
+					macAddress: "001565abcdef",
+					emergencyAddressId: DEVICE_ADDRESS_ID,
+					emergencyLocationDetail: null,
+				},
+			],
+			[{ ...NUMBER_ADDRESS, validated: false }],
+		]);
+		await service.notify(ORGANIZATION_ID, NOTICE);
+		expect(sent[0]?.text ?? "").to.contain("(address not validated)");
 	});
 
 	it("says the location is unreadable rather than omitting the line", async () => {
@@ -264,5 +507,84 @@ describe("emergency consumer binding", () => {
 		// so the tail is four literal tokens and the two wildcards are the tenant and the call.
 		expect(EMERGENCY_SUBJECT_FILTER).to.equal("calls.evt.v1.*.*.call.emergency.dialed");
 		expect(EMERGENCY_SUBJECT_FILTER.split(".")).to.have.length(8);
+	});
+
+	/**
+	 * The tenancy cross-check. Comparing the envelope's subject to the delivery subject says nothing
+	 * about `orgId`, which is what everything downstream is scoped by — so an envelope naming org A
+	 * delivered on org B's subject used to pass, and `notify` would read A's notification settings
+	 * and mail B's 911 event to A's front desk while telling B nothing. For a Kari's Law path both
+	 * halves are compliance failures.
+	 */
+	describe("the tenancy cross-check", () => {
+		const ORG_A = "11111111-1111-4111-8111-111111111111";
+		const ORG_B = "22222222-2222-4222-8222-222222222222";
+		const CALL = "33333333-3333-4333-8333-333333333333";
+
+		function fakeMessage(subject: string, envelope: Record<string, unknown>) {
+			const outcome = { acked: 0, termed: 0 };
+			return {
+				outcome,
+				message: {
+					subject,
+					data: new TextEncoder().encode(JSON.stringify(envelope)),
+					ack: () => {
+						outcome.acked += 1;
+					},
+					term: () => {
+						outcome.termed += 1;
+					},
+				},
+			};
+		}
+
+		function envelopeFor(orgId: string, subject: string): Record<string, unknown> {
+			return {
+				id: "019fd3c2-4444-76be-a6b3-b0f1914e39b6",
+				type: "call.emergency.dialed",
+				at: new Date().toISOString().replace(/\.\d+Z$/u, ".000Z"),
+				orgId,
+				callId: CALL,
+				subject,
+				source: "engine",
+				version: 1,
+				data: {
+					legId: "55555555-5555-4555-8555-555555555555",
+					dialed: "911",
+					number: "+12125550100",
+				},
+			};
+		}
+
+		async function run(subject: string, orgId: string) {
+			const notified: string[] = [];
+			const notifications = {
+				notify: async (organizationId: string) => {
+					notified.push(organizationId);
+					await Promise.resolve();
+					return "sent";
+				},
+			} as unknown as EmergencyNotificationService;
+			const consumer = new EmergencyConsumer({} as never, notifications);
+			const { message, outcome } = fakeMessage(subject, envelopeFor(orgId, subject));
+			await (consumer as unknown as { handle(m: unknown): Promise<void> }).handle(message);
+			return { notified, outcome };
+		}
+
+		it("terminates an event whose orgId is not the tenant it was delivered for", async () => {
+			const subject = `calls.evt.v1.${ORG_B}.${CALL}.call.emergency.dialed`;
+			const { notified, outcome } = await run(subject, ORG_A);
+			expect(outcome.termed).to.equal(1);
+			expect(outcome.acked).to.equal(0);
+			expect(notified).to.deep.equal([]);
+		});
+
+		it("lets an event through when the subject's tenant and the envelope's agree", async () => {
+			const subject = `calls.evt.v1.${ORG_A}.${CALL}.call.emergency.dialed`;
+			const { notified, outcome } = await run(subject, ORG_A);
+			expect(outcome.termed).to.equal(0);
+			expect(outcome.acked).to.equal(1);
+			expect(notified).to.deep.equal([ORG_A]);
+		});
 	});
 });

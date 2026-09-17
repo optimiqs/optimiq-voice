@@ -12,7 +12,7 @@
 			"properties": {
 				"type": {
 					"type": "string",
-					"enum": ["user", "api-key", "service"]
+					"enum": ["user", "api-key", "service", "extension"]
 				},
 				"id": {
 					"type": "string",

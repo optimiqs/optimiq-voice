@@ -2,7 +2,11 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { ModuleEffectRuntime } from "@optimiq-voice/effect-runtime";
-import { isTerminalVerb, verbRequiresMediaPath } from "@optimiq-voice/telephony";
+import {
+	isTerminalVerb,
+	verbRequiresAnswer,
+	verbRequiresMediaPath,
+} from "@optimiq-voice/telephony";
 import {
 	MediaCommandFailure,
 	UnsupportedVerbFailure,
@@ -15,6 +19,7 @@ import type { VerbFailure } from "./verb-errors";
 import type {
 	AcknowledgedResult,
 	DtmfCollection,
+	DialResult,
 	PlaybackResult,
 	RecordResult,
 	Verb,
@@ -28,7 +33,7 @@ import type {
  * ## The shape, and why
  *
  * One `Effect`-returning method per verb, plus a `dispatch` that switches EXHAUSTIVELY over the
- * 28-member union from `@optimiq-voice/telephony`. The `never` check in the default branch is
+ * 30-member union from `@optimiq-voice/telephony`. The `never` check in the default branch is
  * load-bearing: adding a verb to the protocol package becomes a compile error here, which is
  * exactly the reminder the next person needs. A registry of string-keyed handlers would have
  * compiled fine and failed at 3am on a live call.
@@ -45,12 +50,25 @@ import type {
  * ## What is implemented
  *
  * The P2 inbound slice — `answer`, `ringing`, `play`, `gather`, `hangup` — plus the call-control
- * wave: `hold`, `unhold`, `park`, `unpark`, `transfer`, `record`, `mute`, `unmute`, `playDtmf`,
- * `stopPlay`, `setVariable` and `sleep`.
+ * wave: `hold`, `unhold`, `park`, `unpark`, `transfer`, `record`, `pauseRecord`, `resumeRecord`,
+ * `mute`, `unmute`, `playDtmf`,
+ * `stopPlay`, `setVariable` and `sleep` — plus `dial`, `bridge` and `unbridge`, which the session
+ * protocol needed and which the domain-leg lookup on {@link CallControlHost} finally made
+ * addressable.
  *
  * The remaining eight are still {@link UnsupportedVerbFailure}, which is an honest answer an
  * application can act on rather than a silent no-op, and each one is unimplemented for a stated
  * reason rather than by omission — see the `default` group in {@link makeVerbExecutor}'s switch.
+ *
+ * ## `dial`, `bridge` and `unbridge` go to call control, and the reason is a security one
+ *
+ * All three could have been media commands. `dial` in particular is `MediaPort.originate` plus a
+ * bridge, and writing it that way here would have been shorter. It re-enters ROUTING instead — see
+ * {@link CallControlPort.dial} — because the caller of these verbs is an external application over
+ * a WebSocket, which is the least trusted principal on this platform, and an origination path that
+ * skipped the tenant's outbound rules would be the cheapest way to bill somebody else's account.
+ * `bridge` goes the same way for the sibling reason: its target is a leg id the APPLICATION chose,
+ * so the cross-tenant check has to run somewhere that can see both legs.
  *
  * ## Two kinds of verb, and why they take different routes
  *
@@ -71,6 +89,8 @@ export interface VerbChannelContext {
 	readonly isTearingDown: boolean;
 	/** Whether audio can reach the caller: answered, or early media is open. */
 	readonly hasMediaPath: boolean;
+	/** Whether the leg is ANSWERED, as opposed to merely carrying early media. */
+	readonly isAnswered: boolean;
 }
 
 /** Collects DTMF for a `gather`. Supplied by the orchestrator, which owns the digit queue. */
@@ -169,6 +189,18 @@ export function makeVerbExecutor(deps: VerbExecutorDependencies): VerbExecutorIn
 					verb,
 					channelId: context.channelId,
 					reason: "the leg has neither answered nor opened early media",
+				}),
+			);
+		}
+		// A media path is not enough for hold/unhold/park/unpark: the call-state machine has no edge
+		// from `early` to `held`, so letting one through the guard raises an invariant error mid-call
+		// instead of a clean refusal. See ANSWERED_VERBS in @optimiq-voice/telephony.
+		if (verbRequiresAnswer(verb) && !context.isAnswered) {
+			return Effect.fail(
+				new VerbNotPermittedFailure({
+					verb,
+					channelId: context.channelId,
+					reason: "the leg is in early media and has not answered",
 				}),
 			);
 		}
@@ -422,6 +454,94 @@ export function makeVerbExecutor(deps: VerbExecutorDependencies): VerbExecutorIn
 		);
 	};
 
+	/**
+	 * Originates towards the verb's targets and connects the first that answers.
+	 *
+	 * Sequential, always. `simultaneous` is REFUSED by name rather than quietly downgraded, because
+	 * an application that asked for ring-all and got sequential would watch a list of phones ring one
+	 * after another with no way to tell that from the feature working slowly. Ring-all with
+	 * lose-race semantics and CDR-correct losers belongs to the plan walker, which owns origination
+	 * — see {@link CallControlPort.dial}.
+	 *
+	 * Every target goes through routing, so the tenant's outbound rules and toll gates apply. That
+	 * is the `*69` precedent, and it is the reason this verb was worth enabling at all: an
+	 * origination path an integration could reach that skipped those would be the cheapest way to
+	 * defraud a customer on this platform.
+	 */
+	const dial = (
+		context: VerbChannelContext,
+		verb: Extract<Verb, { verb: "dial" }>,
+	): Effect.Effect<VerbResult, VerbFailure> =>
+		Effect.gen(function* () {
+			if (verb.strategy === "simultaneous") {
+				return yield* Effect.fail(
+					new VerbNotPermittedFailure({
+						verb: "dial",
+						channelId: context.channelId,
+						reason:
+							"the session protocol dials targets sequentially; ring-all belongs to a ring " +
+							"group in the dial plan, which owns lose-race semantics and the losers' CDRs",
+					}),
+				);
+			}
+			const startedAt = now();
+			const binding = yield* controlFor(context, "dial");
+			const outcome = yield* mediaCall("dial", context, () =>
+				binding.port.dial(binding.leg, {
+					targets: verb.targets.map((target) => ({
+						destination: target.destination,
+						// `external` and `trunk` resolve in the tenant's OUTBOUND rules; everything else
+						// resolves internally first. The verb's richer target model — per-target trunk
+						// refs, per-target caller ids, answer confirmation — is deliberately not
+						// forwarded: an application that could name a trunk could dial past the toll
+						// gate this routing hop exists to enforce.
+						...(target.kind === "external" || target.kind === "trunk"
+							? { context: "outbound" as const }
+							: {}),
+					})),
+					...(verb.continueOnCauses === undefined
+						? {}
+						: { continueOnCauses: verb.continueOnCauses }),
+				}),
+			);
+			// A dial that connected nobody is a RESULT, not a failure: the application asked whether
+			// anyone would answer and the answer is no, with the cause attached. That is exactly the
+			// distinction `VerbEndReason` exists to carry, and turning it into a typed failure would
+			// throw the cause away at the one point an application most needs it.
+			const result: DialResult = {
+				verb: "dial",
+				endReason: outcome.result.ok ? "completed" : "failed",
+				...(outcome.answeredTargetIndex === undefined
+					? {}
+					: { answeredTargetIndex: outcome.answeredTargetIndex }),
+				...(outcome.cause === undefined ? {} : { cause: outcome.cause }),
+				elapsedMs: now() - startedAt,
+			};
+			return result;
+		});
+
+	/** Joins this leg to another, by domain leg id. The tenancy check lives in call control. */
+	const bridge = (
+		context: VerbChannelContext,
+		verb: Extract<Verb, { verb: "bridge" }>,
+	): Effect.Effect<VerbResult, VerbFailure> =>
+		Effect.gen(function* () {
+			const binding = yield* controlFor(context, "bridge");
+			const outcome = yield* mediaCall("bridge", context, () =>
+				binding.port.bridge(binding.leg, { peerLegId: verb.legId }),
+			);
+			if (!outcome.result.ok) {
+				return yield* Effect.fail(
+					new VerbNotPermittedFailure({
+						verb: "bridge",
+						channelId: context.channelId,
+						reason: outcome.result.reason,
+					}),
+				);
+			}
+			return acknowledged("bridge");
+		});
+
 	const dispatch = Effect.fn("VerbExecutor.dispatch")(function* (
 		context: VerbChannelContext,
 		verb: Verb,
@@ -445,6 +565,23 @@ export function makeVerbExecutor(deps: VerbExecutorDependencies): VerbExecutorIn
 				return yield* setVariable(context, verb);
 			case "record":
 				return yield* record(context, verb);
+			// A refusal here is DATA — `CallControl.pauseRecording` answers "this leg is not being
+			// recorded" and "the media plane cannot pause a recording" the same way, so an ARI-driven
+			// leg that has no pause at all reaches the application as a reason rather than a throw.
+			case "pauseRecord":
+				return yield* controlled("pauseRecord", context, ({ port, leg }) =>
+					port.pauseRecording(leg, true),
+				);
+			case "resumeRecord":
+				return yield* controlled("resumeRecord", context, ({ port, leg }) =>
+					port.pauseRecording(leg, false),
+				);
+			case "dial":
+				return yield* dial(context, verb);
+			case "bridge":
+				return yield* bridge(context, verb);
+			case "unbridge":
+				return yield* controlled("unbridge", context, ({ port, leg }) => port.unbridge(leg));
 
 			case "hold":
 				return yield* controlled("hold", context, ({ port, leg }) =>
@@ -523,19 +660,11 @@ export function makeVerbExecutor(deps: VerbExecutorDependencies): VerbExecutorIn
 			//   surface yet; a pause that silently did nothing is worse than an honest refusal.
 			// `say` / `stopSay`: no TTS renderer is wired. Faking it with `sound:` files would play
 			//   the wrong words.
-			// `dial`: the plan walker owns origination, including lose-race and CDR-correct B-legs.
-			//   A second originator here would be a second, subtly different one.
-			// `bridge` / `unbridge`: both address a peer by DOMAIN leg id, and resolving one to a
-			//   media channel needs the registry the call-control seam owns — the next wave, alongside
-			//   the session-protocol transport that would send them.
 			// `stream` / `stopStream` / `streamGather` / `stopStreamGather`: the AudioSocket seam.
 			case "earlyMedia":
 			case "playbackControl":
 			case "say":
 			case "stopSay":
-			case "dial":
-			case "bridge":
-			case "unbridge":
 			case "stream":
 			case "stopStream":
 			case "streamGather":

@@ -1,5 +1,9 @@
 import { z } from "zod/v4";
-import { TELNYX_NUMBER_FEATURES, TELNYX_PHONE_NUMBER_TYPES } from "@optimiq-voice/telnyx";
+import {
+	TELNYX_CNAM_DETAILS_MAX_LENGTH,
+	TELNYX_NUMBER_FEATURES,
+	TELNYX_PHONE_NUMBER_TYPES,
+} from "@optimiq-voice/telnyx";
 import { destinationShape, e164 } from "../shared/dto";
 
 /**
@@ -118,3 +122,78 @@ export const provisionTrunkDto = z.strictObject({
 });
 
 export type ProvisionTrunkBody = z.infer<typeof provisionTrunkDto>;
+
+/**
+ * `POST /api/v1/carrier/porting-orders`.
+ *
+ * A batch, unlike `createNumberOrderDto` above, and the asymmetry is deliberate rather than an
+ * inconsistency. An order is refused one number at a time because a partial failure across a batch
+ * has no honest HTTP representation; a **port** has no such problem, because the carrier itself
+ * models the batch — it splits the request into one porting order per losing carrier and answers
+ * with all of them. Forcing one number per request would therefore produce more orders at Telnyx
+ * than the customer asked for, each with its own FOC date, which is worse for exactly the people
+ * porting a block of DIDs.
+ *
+ * Capped at 100 because that is the point past which the response stops being something a human
+ * reviews before the port is filed.
+ */
+export const createPortingOrderDto = z.strictObject({
+	e164s: z.array(e164).min(1).max(100),
+});
+
+export type CreatePortingOrderBody = z.infer<typeof createPortingOrderDto>;
+
+/**
+ * `GET /api/v1/carrier/porting-orders`.
+ *
+ * `status` is a free string rather than a `z.enum`, deliberately: the enum in
+ * `@optimiq-voice/telnyx` exists so the UI can label a status it received, not so this DTO can
+ * refuse one it has not heard of. A carrier adding a lifecycle state must not turn "show me my
+ * ports" into a 400.
+ */
+export const listPortingOrdersDto = z.strictObject({
+	status: z.string().min(1).max(40).optional(),
+	pageSize: z.coerce.number().int().min(1).max(100).default(25),
+	pageNumber: z.coerce.number().int().min(1).default(1),
+});
+
+export type ListPortingOrdersQueryBody = z.infer<typeof listPortingOrdersDto>;
+
+/**
+ * `PATCH /api/v1/carrier/numbers/:id/cnam`.
+ *
+ * Two switches and a string, because CNAM genuinely has two switches: `enabled` presents a name on
+ * outbound calls at all, `listingEnabled` is the listing record itself. Collapsing them into one
+ * boolean would be a friendlier form and a lie — the carrier can and does hold them independently,
+ * and a UI that showed one toggle would flip the wrong half.
+ *
+ * The 15-character ceiling is the NANP CNAM field width, enforced again here rather than only in
+ * the client so the caller gets a 400 with a field name instead of a 502 wrapping a client throw.
+ */
+export const updateCnamListingDto = z
+	/**
+	 * The emptiness check runs BEFORE the field schemas, through a pipe, rather than as a `.refine`
+	 * on the object.
+	 *
+	 * A refine would also fire on a body that set exactly one field badly — a 16-character name
+	 * would come back as "too big" AND "supply at least one of…", the second of which is untrue and
+	 * is the one a form would render next to the wrong control. Ordering the checks makes each error
+	 * message true of the request that produced it.
+	 */
+	.looseObject({})
+	.refine((value) => Object.keys(value).length > 0, {
+		message: "supply at least one of enabled, listingEnabled or details",
+	})
+	.pipe(
+		z.strictObject({
+			enabled: z.boolean().optional(),
+			listingEnabled: z.boolean().optional(),
+			details: z
+				.string()
+				.max(TELNYX_CNAM_DETAILS_MAX_LENGTH)
+				.regex(/^[\x20-\x7E]*$/u, "must be printable ASCII")
+				.optional(),
+		}),
+	);
+
+export type UpdateCnamListingBody = z.infer<typeof updateCnamListingDto>;

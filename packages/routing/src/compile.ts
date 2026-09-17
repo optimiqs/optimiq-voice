@@ -26,22 +26,32 @@
  * to the cache is needed at all.
  */
 
-import { isHangupCause, RETRYABLE_HANGUP_CAUSES } from "@optimiq-voice/telephony";
+import {
+	describeE164Rejection,
+	isHangupCause,
+	RETRYABLE_HANGUP_CAUSES,
+} from "@optimiq-voice/telephony";
 import { ROUTING_ARTIFACT_VERSION } from "./artifact";
+import { attestationKey, isUnverifiedCallerIdPolicy } from "./attestation";
 import { snapshotHash } from "./cache";
 import { destinationShapeIssues, isDestinationType } from "./destinations";
 import { DiagnosticBag } from "./diagnostics";
+import { directoryDigits } from "./dial-by-name";
+import { ingestDialTarget, ingestE164, readCallingCode } from "./e164-ingest";
 import {
 	EMERGENCY_CONTINUE_ON_CAUSES,
 	EMERGENCY_NODE_ID,
 	EMERGENCY_ROUTE_ID,
+	cappedEmergencyNumbers,
 	emergencyNumbers,
 	invalidEmergencyNumbers,
+	MAX_EMERGENCY_NUMBERS,
 } from "./emergency";
 import { RoutingCompileError, RoutingSnapshotError } from "./errors";
 import {
-	FEATURE_CODE_ARGUMENT_MODE,
+	featureCodeArgumentMode,
 	featureCodeIssues,
+	featureCodeWouldConsume,
 	isWellFormedFeatureCode,
 } from "./feature-codes";
 import {
@@ -52,22 +62,31 @@ import {
 	patternSubsumes,
 	validateDigitManipulation,
 } from "./patterns";
-import { planNodeReferences } from "./plan";
+import { planNodeReferences, QUEUE_SKILL_LEVEL_MAX, QUEUE_SKILL_LEVEL_MIN } from "./plan";
+import { DEFAULT_ALL_PARTY_REGIONS, isRecordingConsentPolicy } from "./recording-consent";
 import { checkCallBlock } from "./resolve";
 import {
 	isOptionalSnapshotCollection,
+	QUEUE_EXIT_KEYS,
+	QUEUE_PRIORITY_MAX,
+	QUEUE_PRIORITY_MIN,
 	SNAPSHOT_COLLECTIONS,
 	tollClassCovers,
 	VOICEMAIL_LEAVE_GREETING_PRECEDENCE,
 } from "./snapshot";
 import { compileTimePredicate, isKnownTimezone, validateTimePredicate } from "./time-conditions";
+import { applyTranslationRuleset, validateTranslationRule } from "./translations";
 import { voicemailPinHashIssue } from "./voicemail-pin";
 import type {
 	CompiledCallBlockRule,
+	CompiledPhrase,
+	CompiledRecordingPolicy,
+	CompiledTollFraudPolicy,
 	CompiledRoutingSettings,
 	EmergencyMatchTable,
 	EmergencyRule,
 	ExtensionIndexEntry,
+	ExtensionSharedLineAppearance,
 	InboundDidDefault,
 	InboundMatchTable,
 	InboundRule,
@@ -79,34 +98,61 @@ import type {
 	ParkSlotRange,
 	RouteTimeGate,
 	RoutingArtifact,
+	SpeedDialEntry,
 	VoicemailPrefixEntry,
 } from "./artifact";
+import type { CallerIdRightToUse, CompiledAttestationPolicy } from "./attestation";
 import type { Destination } from "./destinations";
 import type { Diagnostic, DiagnosticSubject } from "./diagnostics";
 import type { CompiledFeatureCode } from "./feature-codes";
 import type { CompiledPattern } from "./patterns";
 import type {
+	CompiledPinEntry,
+	CompiledPinSet,
+	DirectoryEntry,
 	ExtensionPlanNode,
 	FollowMeDestination,
 	FollowMePlan,
+	IvrOption,
 	PlanNode,
+	QueueCallbackPlan,
+	QueueSkillRequirementPlan,
 	PlanNodeId,
 	RingGroupMember,
+	SharedLineAppearance,
 } from "./plan";
+import type { RecordingConsentPolicy } from "./recording-consent";
 import type {
+	AudioStreamInput,
 	CallBlockAction,
+	CallFlowInput,
+	DestinationAliasInput,
+	DialByNameDirectoryInput,
 	EmergencyAddressInput,
 	ExtensionInput,
+	FeatureCodeAction,
+	FeatureCodeParams,
 	FollowMeTargetInput,
 	IvrMenuOptionInput,
 	MohClassInput,
 	OrgRoutingSnapshot,
+	PagingGroupInput,
+	PhraseStepInput,
+	PinSetEntryInput,
+	PinSetInput,
+	PromptInput,
 	RingGroupDestinationInput,
+	RoutingSettingsInput,
+	TollFraudPolicyInput,
+	SharedLineInput,
 	TimeConditionRuleInput,
+	TranslationRuleInput,
+	TranslationRulesetInput,
 	VoicemailGreetingInput,
 	VoicemailGreetingKind,
 } from "./snapshot";
 import type { CompiledTimeCondition, CompiledTimeRule } from "./time-conditions";
+import type { CompiledTranslationRule, CompiledTranslationRuleset } from "./translations";
 import type { HangupCause } from "@optimiq-voice/telephony";
 
 /** Everything the compiler needs that is not in the snapshot. */
@@ -125,6 +171,35 @@ export type CompileResult =
 			readonly diagnostics: readonly Diagnostic[];
 	  }
 	| { readonly ok: false; readonly diagnostics: readonly Diagnostic[] };
+
+/**
+ * How deep an alias chain may be expanded.
+ *
+ * Aliases are macros and legitimately nest — "the front desk" pointing at "reception", pointing at a
+ * ring group — but a chain longer than a handful is a tenant who has lost track rather than a tenant
+ * who meant it, and the bound is what keeps a pathological configuration from being a compile that
+ * never finishes. The cycle check catches loops; this catches depth.
+ */
+const MAX_ALIAS_DEPTH = 8;
+
+/** What an organization speed-dial code may look like. Star-prefixed or bare digits, both dialable. */
+const SPEED_DIAL_CODE_PATTERN = /^[*#]?[0-9*#]{1,10}$/u;
+
+/**
+ * Whether a stream URL is one a media server may be asked to open.
+ *
+ * `http` and `https` and nothing else. The set of things a tenant can cause the media server to
+ * open is a security decision rather than a formatting one: `file:` would read the server's disk,
+ * and a scheme-less string is one a driver might interpret as a local path.
+ */
+function isPlayableStreamUrl(url: string): boolean {
+	try {
+		const parsed = new URL(url.trim());
+		return parsed.protocol === "http:" || parsed.protocol === "https:";
+	} catch {
+		return false;
+	}
+}
 
 /** Cause used when a destination points at something a tenant has switched off. */
 const DISABLED_TARGET_CAUSE: HangupCause = "SERVICE_UNAVAILABLE";
@@ -251,6 +326,7 @@ class Compiler {
 	>();
 	private readonly conferencesById = new Map<string, OrgRoutingSnapshot["conferences"][number]>();
 	private readonly parkLotsById = new Map<string, OrgRoutingSnapshot["parkLots"][number]>();
+	private readonly pagingGroupsById = new Map<string, PagingGroupInput>();
 	private readonly phoneNumbersById = new Map<string, OrgRoutingSnapshot["phoneNumbers"][number]>();
 	private readonly trunksById = new Map<string, OrgRoutingSnapshot["trunks"][number]>();
 	private readonly timeConditionsById = new Map<string, CompiledTimeCondition>();
@@ -268,15 +344,52 @@ class Compiler {
 	/** Every internal number claimed so far, so the second claimant can be reported. */
 	private readonly internalNumbers = new Map<string, InternalNumberEntry>();
 
+	// --- the T2 admin block ---------------------------------------------------------------------
+	private readonly callFlowsById = new Map<string, CallFlowInput>();
+	private readonly aliasesById = new Map<string, DestinationAliasInput>();
+	private readonly streamsById = new Map<string, AudioStreamInput>();
+	private readonly directoriesById = new Map<string, DialByNameDirectoryInput>();
+	private readonly promptsById = new Map<string, PromptInput>();
+	private readonly phraseStepsByPhrase = new Map<string, PhraseStepInput[]>();
+	private readonly pinSetsById = new Map<string, PinSetInput>();
+	private readonly pinEntriesBySet = new Map<string, PinSetEntryInput[]>();
+	private readonly translationRulesetsById = new Map<string, CompiledTranslationRuleset>();
+	/**
+	 * The raw rows, beside the compiled ones, exactly as `timeConditionInputsById` sits beside
+	 * `timeConditionsById`: the compiled form carries no `enabled` flag, and a scan of the raw
+	 * collection per reference is O(routes x rulesets).
+	 */
+	private readonly translationRulesetInputsById = new Map<string, TranslationRulesetInput>();
+	private readonly translationRulesByRuleset = new Map<string, TranslationRuleInput[]>();
+	/**
+	 * Aliases currently being expanded, innermost last.
+	 *
+	 * `claimed` cannot do this job: an alias produces no node to claim, so the ordinary
+	 * already-under-construction guard never sees one. This is the cycle guard flatness needs.
+	 */
+	private readonly aliasStack: string[] = [];
+
+	/**
+	 * The organization's calling code, for `e164-ingest.ts`. `undefined` means a bare national
+	 * number is reported rather than guessed at.
+	 */
+	private readonly defaultCallingCode: string | undefined;
+
 	constructor(snapshot: OrgRoutingSnapshot, compiledAt: string) {
 		this.snapshot = snapshot;
 		this.compiledAt = compiledAt;
+		this.defaultCallingCode = readCallingCode(snapshot.settings?.defaultCallingCode);
 	}
 
 	run(): CompileResult {
 		this.index();
 		this.ensureWellKnownTerminals();
 		const settings = this.compileSettings();
+		// Before the time conditions and before every entity, because a route, a trunk and a time
+		// condition can all name a ruleset and none of them may compile against a half-built one.
+		this.compileTranslationRulesets();
+		const phrases = this.compilePhrases();
+		const prompts = this.compilePrompts();
 		this.compileTimeConditions();
 		this.materialiseEntities();
 
@@ -315,6 +428,8 @@ class Compiler {
 			internal,
 			outbound,
 			callBlock,
+			...(Object.keys(phrases).length === 0 ? {} : { phrases }),
+			...(Object.keys(prompts).length === 0 ? {} : { prompts }),
 			extensionsByNumber: extensionIndex,
 			diagnostics,
 		};
@@ -353,11 +468,36 @@ class Compiler {
 		for (const lot of sortById(this.snapshot.parkLots)) {
 			this.parkLotsById.set(lot.id, lot);
 		}
-		for (const did of sortById(this.snapshot.phoneNumbers)) {
-			this.phoneNumbersById.set(did.id, did);
+		// `?? []`, because `pagingGroups` is an optional collection: a loader that has not learned to
+		// select `paging_group` yet is a rollout state, not a tenant with no paging.
+		for (const group of sortById(this.snapshot.pagingGroups ?? [])) {
+			this.pagingGroupsById.set(group.id, group);
 		}
+		// The DID's E.164 is canonicalised HERE, at ingestion, and not at each of the four places
+		// that read it. `didDefaults` is keyed by this string, an inbound rule bound to one number
+		// compares it with `===`, and the emergency ELIN is whichever spelling came out of the row —
+		// so a number normalised in one of those places and not the others would be worse than one
+		// normalised nowhere. One rewrite, before anything indexes it.
+		for (const did of sortById(this.snapshot.phoneNumbers)) {
+			const subject: DiagnosticSubject = { kind: "phone-number", id: did.id, name: did.e164 };
+			const e164 = this.e164Field(did.e164, "Number", subject, "e164") ?? did.e164;
+			this.phoneNumbersById.set(did.id, e164 === did.e164 ? did : { ...did, e164 });
+		}
+		// The override is canonicalised here rather than in `compileTrunkPlan`, which runs once per
+		// route that names the trunk and would report the same bad number once per route.
 		for (const trunk of sortById(this.snapshot.trunks)) {
-			this.trunksById.set(trunk.id, trunk);
+			const callerId = this.e164Field(
+				trunk.callerIdNumberOverride,
+				`Trunk "${trunk.name}" caller id override`,
+				{ kind: "trunk", id: trunk.id, name: trunk.name },
+				"callerIdNumberOverride",
+			);
+			this.trunksById.set(
+				trunk.id,
+				callerId === (trunk.callerIdNumberOverride ?? undefined)
+					? trunk
+					: { ...trunk, callerIdNumberOverride: callerId ?? null },
+			);
 		}
 		for (const condition of sortById(this.snapshot.timeConditions)) {
 			this.timeConditionInputsById.set(condition.id, condition);
@@ -367,6 +507,33 @@ class Compiler {
 		}
 		for (const address of sortById(this.snapshot.emergencyAddresses ?? [])) {
 			this.emergencyAddressesById.set(address.id, address);
+		}
+		for (const flow of sortById(this.snapshot.callFlows ?? [])) {
+			this.callFlowsById.set(flow.id, flow);
+		}
+		for (const alias of sortById(this.snapshot.destinationAliases ?? [])) {
+			this.aliasesById.set(alias.id, alias);
+		}
+		for (const stream of sortById(this.snapshot.audioStreams ?? [])) {
+			this.streamsById.set(stream.id, stream);
+		}
+		for (const directory of sortById(this.snapshot.directories ?? [])) {
+			this.directoriesById.set(directory.id, directory);
+		}
+		for (const entry of sortById(this.snapshot.prompts ?? [])) {
+			this.promptsById.set(entry.id, entry);
+		}
+		for (const step of sortByOrdinal(this.snapshot.phraseSteps ?? [])) {
+			pushInto(this.phraseStepsByPhrase, step.phraseId, step);
+		}
+		for (const set of sortById(this.snapshot.pinSets ?? [])) {
+			this.pinSetsById.set(set.id, set);
+		}
+		for (const entry of sortByOrdinal(this.snapshot.pinSetEntries ?? [])) {
+			pushInto(this.pinEntriesBySet, entry.pinSetId, entry);
+		}
+		for (const rule of sortByOrdinal(this.snapshot.translationRules ?? [])) {
+			pushInto(this.translationRulesByRuleset, rule.translationRulesetId, rule);
 		}
 		this.indexVoicemailGreetings();
 		for (const option of sortByOrdinal(this.snapshot.ivrMenuOptions)) {
@@ -398,9 +565,282 @@ class Compiler {
 		return compact({
 			defaultTimezone: timezone,
 			outboundEnabled: input.outboundEnabled ?? true,
-			outboundCallerIdNumber: input.outboundCallerIdNumber ?? undefined,
+			// `compact()` drops it when the tenant has not set it, which is what keeps an artifact
+			// compiled before this setting existed byte-identical to one compiled after.
+			requireSrtpForTlsPhones: input.requireSrtpForTlsPhones === true ? true : undefined,
+			outboundCallerIdNumber: this.e164Field(
+				input.outboundCallerIdNumber,
+				"Organization outbound caller id",
+				undefined,
+				"settings.outboundCallerIdNumber",
+			),
 			outboundCallerIdName: input.outboundCallerIdName ?? undefined,
+			// A per-org fact the engine cannot read any other way — it has no database handle, so the
+			// artifact is where the realm has to be. Empty/whitespace collapses to absent, and absent is
+			// what every tenant with no realm set carries, keeping their snapshot byte-identical.
+			realm: normaliseRealm(input.realm),
+			maxConcurrentCalls: this.concurrentCallCeiling(input.maxConcurrentCalls),
+			recording: this.compileRecordingPolicy(input),
+			tollFraud: this.compileTollFraudPolicy(input.tollFraud),
+			attestation: this.compileAttestationPolicy(input),
 		}) as CompiledRoutingSettings;
+	}
+
+	/**
+	 * The organization's outbound attestation block, fully defaulted.
+	 *
+	 * Always written, on the same argument {@link compileRecordingPolicy} makes: the values derive
+	 * from the inputs alone, so two compiles of one snapshot still produce the same bytes, and a
+	 * tenant that has set none of the fields gets the same block every time rather than a key that
+	 * comes and goes.
+	 *
+	 * ## Where `rightToUse` comes from
+	 *
+	 * The `owned` half is DERIVED from `phoneNumbers` rather than sent by the loader, and that is the
+	 * point: a DID this platform assigned is already a row in that collection, and asking the loader
+	 * to send the same numbers twice would create a second copy that can disagree with the first.
+	 * The A criterion in the April 2026 FNPRM is that the provider knows the customer has the right
+	 * to use the calling number, and for an assigned DID that IS the `phone_number` row.
+	 *
+	 * A DISABLED number is included on purpose. `enabled` is a routing switch — it stops the DID
+	 * receiving calls — and it says nothing about who owns the number. A tenant who parks an inbound
+	 * DID but still presents it outbound has not lost the right to use it, and downgrading their
+	 * calls to C on a switch that means something else would be wrong in the direction that matters.
+	 *
+	 * The `verified` half is the loader's, already filtered for expiry — the compiler reads no clock,
+	 * so a lapsed document has to arrive as an absent entry rather than as a row with a date on it.
+	 * `owned` wins a collision, because a number the platform assigned needs no document behind it.
+	 */
+	private compileAttestationPolicy(input: RoutingSettingsInput): CompiledAttestationPolicy {
+		const rightToUse: Record<string, CallerIdRightToUse> = {};
+		for (const e164 of input.verifiedCallerIds ?? []) {
+			const key = attestationKey(e164);
+			if (key !== "") {
+				rightToUse[key] = "verified";
+			}
+		}
+		for (const number of this.snapshot.phoneNumbers) {
+			const key = attestationKey(number.e164);
+			if (key !== "") {
+				rightToUse[key] = "owned";
+			}
+		}
+		const policy = input.unverifiedCallerIdPolicy ?? "allow";
+		return {
+			// A value the settings row carries that is NOT one of the three falls back to `allow`
+			// rather than to the strictest reading, for the reason `compileRecordingPolicy` drops an
+			// unknown consent policy to `none`: `org_setting` is jsonb, the value arrives as whatever
+			// was written, and a typo must not start refusing a tenant's calls.
+			unverifiedCallerIdPolicy: isUnverifiedCallerIdPolicy(policy) ? policy : "allow",
+			rightToUse,
+			kycApproved: input.kycApproved ?? false,
+			kycRequiredForOutbound: input.requireKycForOutbound ?? false,
+		};
+	}
+
+	/**
+	 * The organization's toll-fraud controls, or `undefined` when it has no policy row.
+	 *
+	 * Unlike {@link ArtifactCompiler.compileRecordingPolicy} this is NOT always written, and the
+	 * difference is what the absence means. An absent recording block is ambiguous — a tenant who
+	 * has configured nothing and an artifact compiled before the block existed look the same, and
+	 * the engine has to pick digits either way. An absent toll-fraud block is unambiguous: there is
+	 * nothing to enforce, which is exactly what an old artifact meant too. Writing an empty block
+	 * for every tenant would put a key in every artifact on the platform to say "no".
+	 *
+	 * Nothing here is a diagnostic. A ceiling that reached the database as a negative or a fraction
+	 * is DROPPED rather than reported, on the same reasoning
+	 * {@link ArtifactCompiler.concurrentCallCeiling} gives for warning instead of erroring: the
+	 * artifact is perfectly routable without that ceiling, and refusing the compile would take every
+	 * call in the tenant down to report a control nobody is currently hitting. Unlike that one it
+	 * does not warn either — these columns are integers with a DTO in front of them, so a bad value
+	 * cannot arrive from the ordinary path, and a warning per compile for a row nobody can produce
+	 * is noise in every diagnostic bag on the platform.
+	 */
+	private compileTollFraudPolicy(
+		input: TollFraudPolicyInput | null | undefined,
+	): CompiledTollFraudPolicy | undefined {
+		if (input === null || input === undefined) {
+			return undefined;
+		}
+		return compact({
+			// The only REQUIRED field, and it defaults to true: a row that exists is a tenant that
+			// asked for controls, and reading a missing flag as "off" would silently disarm them.
+			enabled: input.enabled ?? true,
+			maxConcurrentInternationalCalls: ceiling(input.maxConcurrentInternationalCalls),
+			maxInternationalMinutesPerHour: ceiling(input.maxInternationalMinutesPerHour),
+			maxInternationalMinutesPerDay: ceiling(input.maxInternationalMinutesPerDay),
+			allowedCountries: countryList(input.allowedCountries),
+			deniedCountries: countryList(input.deniedCountries),
+			// Written only when true, so a tenant that has never touched them keeps the same bytes.
+			holdFirstCallToNewCountry: input.holdFirstCallToNewCountry === true ? true : undefined,
+			offHoursInternationalLock: input.offHoursInternationalLock === true ? true : undefined,
+			// Carried only alongside the lock they configure. A window on an artifact whose lock is
+			// off is two keys the engine must read to learn nothing.
+			offHoursStartMinute:
+				input.offHoursInternationalLock === true
+					? minuteOfDay(input.offHoursStartMinute)
+					: undefined,
+			offHoursEndMinute:
+				input.offHoursInternationalLock === true ? minuteOfDay(input.offHoursEndMinute) : undefined,
+			offHoursTimezone:
+				input.offHoursInternationalLock === true && isKnownTimezone(input.offHoursTimezone ?? "")
+					? (input.offHoursTimezone ?? undefined)
+					: undefined,
+		}) as CompiledTollFraudPolicy;
+	}
+
+	/**
+	 * The organization's recording-consent block, fully defaulted.
+	 *
+	 * Always written, unlike every other optional field on the settings — the block is absent only in
+	 * an artifact compiled before it existed, and a fresh compile that omitted it would hand the
+	 * engine a settings object it could not tell apart from an old one. That costs nothing in
+	 * stability terms: the values are derived from the inputs alone, so two compiles of one snapshot
+	 * still produce the same bytes, and a tenant that has set none of the fields gets the same block
+	 * every time rather than a key that comes and goes.
+	 *
+	 * A policy string the settings row carries that is NOT one of the three is dropped to `"none"`
+	 * rather than compiled: `org_setting` is jsonb, so the value reaches here as whatever was
+	 * written, and `none` is the reading that leaves the tenant exactly where they were instead of
+	 * inventing an obligation from a typo.
+	 */
+	private compileRecordingPolicy(input: RoutingSettingsInput): CompiledRecordingPolicy {
+		const policy = input.recordingConsentPolicy ?? "none";
+		return compact({
+			consentPolicy: isRecordingConsentPolicy(policy) ? policy : "none",
+			consentPromptId: this.consentPromptRef(
+				input.recordingConsentPromptId,
+				undefined,
+				"settings.recordingConsentPromptId",
+			),
+			acceptDigit: consentDigit(input.recordingConsentAcceptDigit, "1"),
+			declineDigit: consentDigit(input.recordingConsentDeclineDigit, "2"),
+			// An explicitly empty array is a tenant switching the safety net off and is respected;
+			// absent is a tenant who has never seen the setting, and they get the seeded list.
+			allPartyRegions: input.recordingAllPartyRegions ?? [...DEFAULT_ALL_PARTY_REGIONS],
+			autoPauseOnDtmf: input.recordingAutoPauseOnDtmf ?? false,
+		}) as CompiledRecordingPolicy;
+	}
+
+	/**
+	 * A consent prompt id, carried through only when the prompt library actually has it.
+	 *
+	 * The one place a dangling prompt id is DROPPED rather than emitted, and the difference from
+	 * {@link promptRef} is the difference in what happens next. An IVR greeting that vanished has no
+	 * substitute, so the id is kept and the diagnostic is the whole remedy — dropping it would
+	 * silently change the menu's shape. A consent announcement does have a substitute: the engine
+	 * falls back to its seeded `sound:recording-consent` stem. Carrying a dead id here would replace
+	 * a working announcement with silence on exactly the calls the tenant switched the feature on to
+	 * protect, so the id goes and the warning stays.
+	 */
+	private consentPromptRef(
+		promptId: string | null | undefined,
+		subject: DiagnosticSubject | undefined,
+		path: string,
+	): string | undefined {
+		const id = this.promptRef(promptId, subject, path);
+		if (id === undefined) {
+			return undefined;
+		}
+		return this.snapshot.prompts !== undefined && !this.promptsById.has(id) ? undefined : id;
+	}
+
+	/**
+	 * The consent policy a DID or an inbound route overrides the organization's with.
+	 *
+	 * `null` and absent both mean inherit and both compile to no key at all, which is what keeps a
+	 * tenant that has set no override byte-identical across a loader that learns to select the
+	 * column. A value outside the vocabulary is dropped for the reason
+	 * {@link compileRecordingPolicy} gives — inheriting the org is the reading that changes nothing.
+	 */
+	private consentPolicyOverride(
+		policy: RecordingConsentPolicy | null | undefined,
+	): RecordingConsentPolicy | undefined {
+		return policy != null && isRecordingConsentPolicy(policy) ? policy : undefined;
+	}
+
+	/**
+	 * The organization's simultaneous-call ceiling, or `undefined` for unlimited.
+	 *
+	 * Four inputs collapse to unlimited and only one of them is a mistake. `undefined` is a loader
+	 * that does not select the column; `null` is a column with no ceiling set; a non-integer or a
+	 * negative is a value that reached the database some other way. Zero is the interesting one, and
+	 * it is read as UNLIMITED rather than as "refuse every call" — the same reading
+	 * `TrunkCapacityPort.reserve` gives `maxChannels`, and for the same reason: a tenant who typed a
+	 * zero into a quota field meant "no limit", and the alternative interpretation takes their phone
+	 * system down on a keystroke.
+	 *
+	 * A warning rather than an error for the malformed cases, because the artifact is still perfectly
+	 * routable without a ceiling — refusing the compile would take every call in the tenant down to
+	 * report a quota nobody is currently hitting.
+	 */
+	private concurrentCallCeiling(value: number | null | undefined): number | undefined {
+		if (value === undefined || value === null || value === 0) {
+			return undefined;
+		}
+		if (!Number.isInteger(value) || value < 0) {
+			this.bag.warning(
+				"invalid-org-limit",
+				`Organization simultaneous-call ceiling "${String(value)}" is not a whole number of calls; the ceiling was not applied.`,
+				undefined,
+				"settings.maxConcurrentCalls",
+			);
+			return undefined;
+		}
+		return value;
+	}
+
+	/**
+	 * A field that IS a phone number, canonicalised to E.164 before it reaches a table.
+	 *
+	 * `undefined` in, `undefined` out — an absent caller id is not a malformed one. A value that
+	 * cannot be read is compiled VERBATIM with a warning rather than dropped: see `non-e164-number`
+	 * for why the artifact is still the better half of that trade.
+	 */
+	private e164Field(
+		value: string | null | undefined,
+		what: string,
+		subject: DiagnosticSubject | undefined,
+		path: string,
+	): string | undefined {
+		if (value == null || value.trim().length === 0) {
+			return undefined;
+		}
+		const outcome = ingestE164(value, this.defaultCallingCode);
+		if (outcome.rejection !== null) {
+			this.bag.warning(
+				"non-e164-number",
+				`${what} "${value}" ${describeE164Rejection(outcome.rejection)}; it was compiled as written and will only match a caller who presents it the same way.`,
+				subject,
+				path,
+			);
+		}
+		return outcome.value;
+	}
+
+	/**
+	 * A DIAL STRING, canonicalised only when it already declares itself international.
+	 *
+	 * See `e164-ingest.ts`: an external target is matched against outbound patterns written the way
+	 * a handset dials, so a bare national number here is correct as it stands and is left alone.
+	 */
+	private dialTargetField(
+		value: string,
+		what: string,
+		subject: DiagnosticSubject | undefined,
+		path: string,
+	): string {
+		const outcome = ingestDialTarget(value, this.defaultCallingCode);
+		if (outcome.rejection !== null) {
+			this.bag.warning(
+				"non-e164-number",
+				`${what} "${value}" is written as an international number but ${describeE164Rejection(outcome.rejection)}; it was compiled as written.`,
+				subject,
+				path,
+			);
+		}
+		return outcome.value;
 	}
 
 	private trunkContinueOnCauses(): readonly HangupCause[] {
@@ -480,7 +920,10 @@ class Compiler {
 				);
 			}
 
-			if (rules.length === 0) {
+			// An overridden condition never reads its rules, so "no rules" is not the trap it usually
+			// is — a tenant who has forced a condition open has said what they want and does not need
+			// to be told the rule list is empty.
+			if (rules.length === 0 && (condition.override ?? "auto") === "auto") {
 				this.bag.warning(
 					"empty-time-condition",
 					`Time condition "${condition.name}" has no enabled rules, so it always takes its no-match branch.`,
@@ -488,12 +931,20 @@ class Compiler {
 				);
 			}
 
-			this.timeConditionsById.set(condition.id, {
-				id: condition.id,
-				name: condition.name,
-				timezone,
-				rules,
-			});
+			this.timeConditionsById.set(
+				condition.id,
+				compact({
+					id: condition.id,
+					name: condition.name,
+					timezone,
+					rules,
+					// `auto` is dropped rather than carried, so a condition nobody has overridden hashes
+					// exactly as it did before the column existed — which is what keeps this wave from
+					// moving every tenant's `snapshotHash` for a feature they are not using.
+					override: (condition.override ?? "auto") === "auto" ? undefined : condition.override,
+					overrideFeatureCode: condition.overrideFeatureCode ?? undefined,
+				}) as CompiledTimeCondition,
+			);
 		}
 	}
 
@@ -564,11 +1015,48 @@ class Compiler {
 				this.parkNode(lot);
 			}
 		}
+		for (const group of sortById(this.snapshot.pagingGroups ?? [])) {
+			if (group.enabled) {
+				this.pagingGroupNode(group);
+			}
+		}
+		for (const line of sortById(this.snapshot.sharedLines ?? [])) {
+			if (line.enabled) {
+				this.sharedLineNode(line);
+			}
+		}
 		for (const condition of sortById(this.snapshot.timeConditions)) {
 			if (condition.enabled) {
 				this.timeConditionNodeById(
 					condition.id,
 					{ kind: "time-condition", id: condition.id, name: condition.name },
+					"destination",
+				);
+			}
+		}
+		for (const flow of sortById(this.snapshot.callFlows ?? [])) {
+			if (flow.enabled) {
+				this.callFlowNode(flow);
+			}
+		}
+		for (const stream of sortById(this.snapshot.audioStreams ?? [])) {
+			if (stream.enabled) {
+				this.streamNode(stream);
+			}
+		}
+		for (const directory of sortById(this.snapshot.directories ?? [])) {
+			if (directory.enabled) {
+				this.dialByNameNode(directory);
+			}
+		}
+		// Aliases LAST among the entity passes, and only to validate them: an alias emits no node, so
+		// this walk exists purely so a dangling or looping alias that nothing points at is still
+		// reported. Half-built configuration is the normal state of an admin UI.
+		for (const alias of sortById(this.snapshot.destinationAliases ?? [])) {
+			if (alias.enabled) {
+				this.aliasNode(
+					alias.id,
+					{ kind: "destination-alias", id: alias.id, name: alias.name },
 					"destination",
 				);
 			}
@@ -631,7 +1119,10 @@ class Compiler {
 				return this.ringGroupNodeById(ref, subject, path);
 			}
 			case "queue": {
-				return this.queueNodeById(ref, subject, path);
+				// The only entity destination whose DATA changes the node it resolves to. See
+				// `queuePriorityOverride` for why, and for why the answer is a distinct node rather
+				// than a field the walk carries.
+				return this.queueNodeById(ref, destination, subject, path);
 			}
 			case "voicemail": {
 				return this.voicemailNodeById(ref, "leave", subject, path);
@@ -642,11 +1133,34 @@ class Compiler {
 			case "park": {
 				return this.parkNodeById(ref, subject, path);
 			}
+			case "paging-group": {
+				return this.pagingGroupNodeById(ref, subject, path);
+			}
 			case "time-condition": {
 				return this.timeConditionNodeById(ref, subject, path);
 			}
+			case "call-flow": {
+				return this.callFlowNodeById(ref, subject, path);
+			}
+			case "stream": {
+				return this.streamNodeById(ref, subject, path);
+			}
+			case "dial-by-name": {
+				return this.dialByNameNodeById(ref, subject, path);
+			}
+			case "alias": {
+				return this.aliasNode(ref, subject, path);
+			}
 			case "external": {
-				return this.externalNode(destination.destinationData?.value ?? "", true);
+				return this.externalNode(
+					this.dialTargetField(
+						destination.destinationData?.value ?? "",
+						"External destination",
+						subject,
+						path,
+					),
+					true,
+				);
 			}
 			case "application": {
 				return this.applicationNode(
@@ -731,12 +1245,22 @@ class Compiler {
 			extensionId: extension.id,
 			number: extension.number,
 			callerIdName: extension.callerIdName ?? undefined,
-			callerIdNumber: extension.callerIdNumber ?? undefined,
+			callerIdNumber: this.e164Field(
+				extension.callerIdNumber,
+				`Extension ${extension.number} caller id`,
+				subject,
+				"callerIdNumber",
+			),
 			tollClass: extension.tollClass,
 			recordPolicy: extension.recordPolicy,
 			timeoutSeconds: extension.callTimeoutSeconds,
 			doNotDisturb: extension.doNotDisturb,
 			pickupGroup: pickupGroupOf(extension),
+			// `compact` drops `undefined`, so an extension that has not asked for screening carries no
+			// key at all — which is what makes the field's absence and `false` the same artifact, and
+			// therefore what keeps the hash stable across a loader that learns to select the column.
+			callScreening: extension.callScreening ?? undefined,
+			recordAutoPauseOnDtmf: autoPauseFlag(extension.recordAutoPauseOnDtmf),
 			mohClassId: extension.mohClassId ?? undefined,
 			mohClass: this.mohClassName(extension.mohClassId, subject, "mohClassId"),
 			forwardAllNodeId: extension.forwardAllEnabled
@@ -821,7 +1345,13 @@ class Compiler {
 		if (internal !== undefined) {
 			return this.extensionNode(internal);
 		}
-		return this.externalNode(target, true);
+		// AFTER the internal lookup, so a bare extension number is never mistaken for a number to
+		// canonicalise — and `dialTargetField` leaves anything without an international prefix alone
+		// in any case, because the outbound patterns are written the way a handset dials.
+		return this.externalNode(
+			this.dialTargetField(target, "Forward destination", subject, path),
+			true,
+		);
 	}
 
 	// -------------------------------------------------------------------------------------------
@@ -925,7 +1455,12 @@ class Compiler {
 		subject: DiagnosticSubject,
 	): FollowMeDestination | undefined {
 		const path = `followMe.targets[${String(index)}]`;
-		const dialString = (target.destination ?? "").trim();
+		const dialString = this.dialTargetField(
+			(target.destination ?? "").trim(),
+			`Follow-me hop ${String(index + 1)} of extension ${extension.number}`,
+			subject,
+			path,
+		);
 		if (dialString.length === 0) {
 			this.bag.warning(
 				"unresolvable-follow-me",
@@ -971,8 +1506,10 @@ class Compiler {
 	 * which includes the emergency table and time gates, and neither belongs here. A follow-me hop
 	 * is never an emergency call, and a time gate is a fact about when the call arrives that a
 	 * compiler must not read a clock to evaluate. What is shared is everything that decides whether
-	 * the hop may be dialled at all — the rule order, the toll-class gate, the digit manipulation
-	 * and the call-block screen — because those are the fraud boundary.
+	 * the hop may be dialled at all — the rule order, the toll-class gate, the digit manipulation,
+	 * the route's translation ruleset and the call-block screen — because those are the fraud
+	 * boundary, and because a number the ruleset would normalise for the wire has to be normalised
+	 * here too or the carrier rejects the ladder's INVITE and nobody else's.
 	 */
 	private followMeTrunkTarget(
 		extension: ExtensionInput,
@@ -1019,7 +1556,19 @@ class Compiler {
 			if (dialedNumber === null) {
 				continue;
 			}
-			return { nodeId: rule.destinationNodeId, dialedNumber };
+			// The route's shared ruleset runs second, exactly as `resolveOutbound` runs it, so the
+			// same digits reach the trunk the same way whether a finger or the ladder dialled them.
+			// `applyTranslationRuleset` is pure and clock-free, so it is safe at compile time; an
+			// overflow keeps the untranslated number, which is what the resolver does too.
+			const ruleset = rule.translation;
+			const outcome =
+				ruleset === undefined || ruleset.rules.length === 0
+					? undefined
+					: applyTranslationRuleset(ruleset, dialedNumber);
+			return {
+				nodeId: rule.destinationNodeId,
+				dialedNumber: outcome === undefined || outcome.overflowed ? dialedNumber : outcome.value,
+			};
 		}
 
 		this.bag.warning(
@@ -1141,16 +1690,23 @@ class Compiler {
 			kind: "ivr-menu",
 			label: menu.name,
 			ivrMenuId: menu.id,
-			greetingPromptId: menu.greetingPromptId ?? undefined,
-			shortGreetingPromptId: menu.shortGreetingPromptId ?? undefined,
-			invalidPromptId: menu.invalidPromptId ?? undefined,
-			timeoutPromptId: menu.timeoutPromptId ?? undefined,
+			greetingPromptId: this.promptRef(menu.greetingPromptId, subject, "greetingPromptId"),
+			shortGreetingPromptId: this.promptRef(
+				menu.shortGreetingPromptId,
+				subject,
+				"shortGreetingPromptId",
+			),
+			invalidPromptId: this.promptRef(menu.invalidPromptId, subject, "invalidPromptId"),
+			timeoutPromptId: this.promptRef(menu.timeoutPromptId, subject, "timeoutPromptId"),
 			digitTimeoutMs: menu.digitTimeoutMs,
 			interDigitTimeoutMs: menu.interDigitTimeoutMs,
 			maxDigits: menu.maxDigits,
 			maxFailures: menu.maxFailures,
 			maxTimeouts: menu.maxTimeouts,
 			directDialEnabled: menu.directDialEnabled,
+			directDialMaxDigits: menu.directDialEnabled
+				? this.directDialDigits(menu, options, subject)
+				: undefined,
 			options,
 			timeoutNodeId: timeoutNodeId === id ? undefined : (timeoutNodeId ?? undefined),
 			invalidNodeId: invalidNodeId === id ? undefined : (invalidNodeId ?? undefined),
@@ -1158,6 +1714,60 @@ class Compiler {
 
 		this.nodes.set(id, node);
 		return id;
+	}
+
+	/**
+	 * How many digits a direct dial on this menu may need, and what the admin should know about it.
+	 *
+	 * The number is the longest EXTENSION number in the organization, because the extension
+	 * directory is the only thing direct dial resolves against — not ring groups, not queues, not
+	 * the internal number table. Widening it to every internal number would let a caller reach a
+	 * paging group from an auto-attendant, which is a decision an option is for.
+	 *
+	 * The diagnostics are about the collision between a menu's options and that directory. A digit
+	 * option and an extension number that starts with it are told apart at runtime ONLY by whether
+	 * the caller paused, so the admin is told which of their options that applies to — an exact
+	 * collision, where the extension can never be reached, separately from a prefix one, where it
+	 * can but the option costs the other caller an inter-digit timeout.
+	 */
+	private directDialDigits(
+		menu: OrgRoutingSnapshot["ivrMenus"][number],
+		options: readonly IvrOption[],
+		subject: DiagnosticSubject,
+	): number | undefined {
+		const numbers = [...this.extensionsByNumber.keys()];
+		if (numbers.length === 0) {
+			this.bag.warning(
+				"ivr-direct-dial-empty",
+				`IVR menu "${menu.name}" allows a caller to dial an extension, but this organization has no enabled extension; every direct dial takes the invalid branch.`,
+				subject,
+				"directDialEnabled",
+			);
+			return undefined;
+		}
+
+		for (const option of options) {
+			// Only a literal digit option can collide: a regex option is matched, not typed, and what
+			// it would shadow is not decidable from the pattern.
+			if (option.pattern.kind !== "exact") {
+				continue;
+			}
+			const shadowed = numbers.filter((number) => number.startsWith(option.matchValue));
+			if (shadowed.length === 0) {
+				continue;
+			}
+			const exact = shadowed.includes(option.matchValue);
+			this.bag.warning(
+				"ivr-direct-dial-ambiguous",
+				exact
+					? `IVR menu "${menu.name}" has an option "${option.matchValue}" that is also an extension number; the option wins, so that extension cannot be reached by direct dial from this menu.`
+					: `IVR menu "${menu.name}" has an option "${option.matchValue}" that ${shadowed.length === 1 ? `extension ${shadowed[0]} starts with` : `${String(shadowed.length)} extension numbers start with`}; a caller who wants the option waits ${String(menu.interDigitTimeoutMs)}ms before it is taken.`,
+				subject,
+				"options",
+			);
+		}
+
+		return Math.max(...numbers.map((number) => number.length));
 	}
 
 	private ringGroupNodeById(
@@ -1228,11 +1838,11 @@ class Compiler {
 			ringTimeoutSeconds: group.ringTimeoutSeconds,
 			ignoreBusy: group.ignoreBusy,
 			confirmEnabled: group.confirmEnabled,
-			confirmPromptId: group.confirmPromptId ?? undefined,
+			confirmPromptId: this.promptRef(group.confirmPromptId, subject, "confirmPromptId"),
 			callerIdNamePrefix: group.callerIdNamePrefix ?? undefined,
 			mohClassId: group.mohClassId ?? undefined,
 			mohClass: this.mohClassName(group.mohClassId, subject, "mohClassId"),
-			ringbackPromptId: group.ringbackPromptId ?? undefined,
+			ringbackPromptId: this.promptRef(group.ringbackPromptId, subject, "ringbackPromptId"),
 			members,
 			timeoutNodeId: this.namedDestinationNode(group, "timeout", subject) ?? undefined,
 		}) as PlanNode;
@@ -1241,7 +1851,12 @@ class Compiler {
 		return id;
 	}
 
-	private queueNodeById(ref: string, subject: DiagnosticSubject, path: string): PlanNodeId | null {
+	private queueNodeById(
+		ref: string,
+		from: Destination | null,
+		subject: DiagnosticSubject,
+		path: string,
+	): PlanNodeId | null {
 		const entry = this.queuesById.get(ref);
 		if (entry === undefined) {
 			return this.missingTarget("queue", ref, subject, path);
@@ -1249,16 +1864,184 @@ class Compiler {
 		if (!entry.enabled) {
 			return this.disabledTarget("queue", entry.name, subject, path);
 		}
-		return this.queueNode(entry);
+		return this.queueNode(
+			entry,
+			this.queuePriorityOverride(from, entry, subject, path),
+			this.queueSkillsOverride(from, entry, subject, path),
+		);
 	}
 
-	private queueNode(entry: OrgRoutingSnapshot["queues"][number]): PlanNodeId {
-		const id = `queue:${entry.id}`;
+	/**
+	 * The per-entry caller priority a `queue` destination may carry, as
+	 * `destination_data.args.priority`.
+	 *
+	 * ## Why `args` and not a column
+	 *
+	 * Because the fact belongs to the EDGE, not to either end of it. "Platinum customers reach
+	 * Support at priority 800" is a property of the IVR option, and it is different from what the
+	 * same option means when it points at the same queue from the after-hours menu. A column on
+	 * `queue` could only say one thing for the whole queue (which is `default_priority`, and it is
+	 * there), and a column on `ivr_menu_option` would have to be repeated on every other table that
+	 * can point at a queue — inbound routes, time conditions, call flows, ring-group failovers.
+	 * `destination_data` is the one place every one of those already has.
+	 *
+	 * ## Why an out-of-range value is a WARNING and not an error
+	 *
+	 * A malformed priority is a caller who waits their turn instead of jumping the line. That is the
+	 * queue working normally, which is a very different cost from refusing to compile the tenant's
+	 * whole artifact — and refusing would take every unrelated route down with it. The warning names
+	 * the value so the form that produced it can be fixed; the call still gets answered meanwhile.
+	 */
+	private queuePriorityOverride(
+		from: Destination | null,
+		entry: OrgRoutingSnapshot["queues"][number],
+		subject: DiagnosticSubject,
+		path: string,
+	): number | undefined {
+		const raw = from?.destinationData?.args?.priority;
+		if (raw === undefined) {
+			return undefined;
+		}
+		const value = typeof raw === "number" ? raw : Number(raw);
+		if (!Number.isInteger(value) || value < QUEUE_PRIORITY_MIN || value > QUEUE_PRIORITY_MAX) {
+			this.bag.warning(
+				"invalid-queue-priority",
+				`Queue "${entry.name}" was pointed at with a caller priority of ${JSON.stringify(raw)}, which is not a whole number between ${String(QUEUE_PRIORITY_MIN)} and ${String(QUEUE_PRIORITY_MAX)}. Callers arriving this way take the queue's default priority instead.`,
+				subject,
+				path,
+			);
+			return undefined;
+		}
+		return value;
+	}
+
+	/**
+	 * The per-entrance skill requirements a `queue` destination may carry, as
+	 * `destination_data.args.skills`.
+	 *
+	 * ## Why a STRING and not a list of objects
+	 *
+	 * Because `DestinationData.args` is `Record<string, string | number | boolean>` and that is not
+	 * an accident: `destinationKey` builds a node-dedup key by `String()`-ing every value, so a
+	 * value that is an object or an array keys as `[object Object]` and two entrances asking for
+	 * different skills would silently collapse into one node. Widening the type to fix the spelling
+	 * would break the deduplication, so the requirements are spelled in the vocabulary `args`
+	 * already has.
+	 *
+	 * The grammar is one comma-separated list of `skill[:minLevel[:relaxAfterSeconds]]` —
+	 * `"spanish:3:60,billing"` is "level 3 Spanish, coming down a level a minute, and any Billing at
+	 * all". A bare tag means level 1 and no relaxation, which is the reading an operator typing a
+	 * list of tags into a form intends and the shape a spreadsheet import produces.
+	 *
+	 * ## Why a malformed entry is a WARNING and not an error
+	 *
+	 * `queuePriorityOverride`'s argument, one step sharper. A dropped priority costs a caller their
+	 * place in the line; a dropped REQUIREMENT costs them the right agent, and a REFUSED compile
+	 * costs the tenant every route in the artifact. Between "this caller may reach an agent who does
+	 * not speak their language" and "nobody in this organization can be called at all", the first is
+	 * recoverable by the person reading the warning and the second is an outage. So the malformed
+	 * entry is dropped, named in the diagnostic, and the rest of the list still compiles.
+	 *
+	 * A list that is entirely unusable returns `undefined` rather than an empty array, so the node
+	 * is identical to one with no override at all and the queue's own requirements are what apply.
+	 */
+	private queueSkillsOverride(
+		from: Destination | null,
+		entry: OrgRoutingSnapshot["queues"][number],
+		subject: DiagnosticSubject,
+		path: string,
+	): readonly QueueSkillRequirementPlan[] | undefined {
+		const raw = from?.destinationData?.args?.skills;
+		if (raw === undefined) {
+			return undefined;
+		}
+		if (typeof raw !== "string") {
+			this.bag.warning(
+				"invalid-queue-skills",
+				`Queue "${entry.name}" was pointed at with ${JSON.stringify(raw)} as its skill requirements, which is not a "skill:level:relax,…" list. Callers arriving this way are matched against the queue's own requirements instead.`,
+				subject,
+				path,
+			);
+			return undefined;
+		}
+
+		const bySkill = new Map<string, QueueSkillRequirementPlan>();
+		for (const item of raw.split(",")) {
+			if (item.trim() === "") {
+				continue;
+			}
+			const parsed = parseSkillRequirement(item);
+			if (parsed === undefined) {
+				this.bag.warning(
+					"invalid-queue-skills",
+					`Queue "${entry.name}" was pointed at with ${JSON.stringify(item.trim())} among its skill requirements, which is not a skill tag optionally followed by \`:minLevel\` between ${String(QUEUE_SKILL_LEVEL_MIN)} and ${String(QUEUE_SKILL_LEVEL_MAX)} and \`:relaxAfterSeconds\`. That entry was dropped; the rest still apply.`,
+					subject,
+					path,
+				);
+				continue;
+			}
+			// Last write wins on a repeated tag rather than the higher level: a list that names one
+			// skill twice is a typo in one form, and picking the stricter half of a typo is a rule
+			// nobody can predict from reading their own configuration.
+			bySkill.set(parsed.skill, parsed);
+		}
+
+		if (bySkill.size === 0) {
+			return undefined;
+		}
+		return [...bySkill.values()].sort((left, right) => left.skill.localeCompare(right.skill));
+	}
+
+	/**
+	 * One queue, at one entry priority.
+	 *
+	 * ## Why the priority is in the node ID
+	 *
+	 * The node table is deduplicated by id, so two references to one queue must produce one node —
+	 * otherwise the artifact grows a node per reference and "every reference resolves" stops meaning
+	 * anything. But two references at DIFFERENT priorities are genuinely different behaviour, and
+	 * collapsing them would silently make the second one's priority disappear. Folding the override
+	 * into the id gives both properties: same override, same node; different override, different
+	 * node; and the id is still a pure function of its inputs, so a recompile of an unchanged
+	 * snapshot produces the same artifact hash.
+	 *
+	 * Every node minted this way carries the same `queueId`, which is what keeps them one queue
+	 * everywhere it matters — one roster, one waiting line, one set of events. A priority that
+	 * produced a second QUEUE rather than a second door into it would not be a priority at all.
+	 */
+	private queueNode(
+		entry: OrgRoutingSnapshot["queues"][number],
+		priorityOverride?: number,
+		skillsOverride?: readonly QueueSkillRequirementPlan[],
+	): PlanNodeId {
+		const priority = priorityOverride ?? entry.defaultPriority ?? QUEUE_PRIORITY_MIN;
+		const id = `queue:${entry.id}${
+			priorityOverride === undefined ? "" : `:p${String(priorityOverride)}`
+		}${skillsOverride === undefined ? "" : `:s${skillsKeyOf(skillsOverride)}`}`;
 		if (this.claimed.has(id)) {
 			return id;
 		}
 		this.claimed.add(id);
 		const subject: DiagnosticSubject = { kind: "queue", id: entry.id, name: entry.name };
+		const exitNodeId = this.namedDestinationNode(entry, "exit", subject) ?? undefined;
+		const exitKey = normalizeExitKey(entry.exitKey);
+		const rawExitKey = entry.exitKey?.trim() ?? "";
+		if (exitKey === undefined && rawExitKey.length > 0) {
+			this.bag.warning(
+				"queue-exit-key-without-destination",
+				`Queue "${entry.name}" has exit key ${JSON.stringify(rawExitKey)}, which is not a DTMF digit (${QUEUE_EXIT_KEYS.join(", ")}); the queue compiled with no exit key at all.`,
+				subject,
+				"exitKey",
+			);
+		}
+		if (exitKey !== undefined && exitNodeId === undefined) {
+			this.bag.warning(
+				"queue-exit-key-without-destination",
+				`Queue "${entry.name}" has exit key "${exitKey}" but no exit destination, so a caller who presses it is hung up rather than sent anywhere.`,
+				subject,
+				"exitKey",
+			);
+		}
 		const node: PlanNode = compact({
 			id,
 			kind: "queue",
@@ -1267,17 +2050,99 @@ class Compiler {
 			strategy: entry.strategy,
 			mohClassId: entry.mohClassId ?? undefined,
 			mohClass: this.mohClassName(entry.mohClassId, subject, "mohClassId"),
-			greetingPromptId: entry.greetingPromptId ?? undefined,
-			announcePromptId: entry.announcePromptId ?? undefined,
+			greetingPromptId: this.promptRef(entry.greetingPromptId, subject, "greetingPromptId"),
+			announcePromptId: this.promptRef(entry.announcePromptId, subject, "announcePromptId"),
+			// Carried as an id, exactly like the two prompts above it: a prompt is addressed by row id
+			// the whole way down, and only `mohClass` needs resolving because only a media server
+			// insists on the NAME.
+			agentWhisperPromptId: this.promptRef(
+				entry.agentWhisperPromptId,
+				subject,
+				"agentWhisperPromptId",
+			),
 			maxWaitSeconds: entry.maxWaitSeconds,
 			maxWaitNoAgentSeconds: entry.maxWaitNoAgentSeconds,
 			announcePositionEnabled: entry.announcePositionEnabled,
 			announceFrequencySeconds: entry.announceFrequencySeconds,
-			recordEnabled: entry.recordEnabled,
+			recordPolicy: entry.recordPolicy ?? "none",
+			recordAutoPauseOnDtmf: autoPauseFlag(entry.recordAutoPauseOnDtmf),
+			exitKey,
+			exitNodeId,
+			callback: this.queueCallback(entry, exitKey, subject),
+			priority,
+			requiredSkills: skillsOverride,
+			abandonedResumeAllowed: entry.abandonedResumeAllowed ?? false,
+			discardAbandonedAfterSeconds: entry.discardAbandonedAfterSeconds ?? 0,
 			timeoutNodeId: this.namedDestinationNode(entry, "timeout", subject) ?? undefined,
 		}) as PlanNode;
 		this.nodes.set(id, node);
 		return id;
+	}
+
+	/**
+	 * The queue's virtual-hold block, or `undefined` when it offers no callback.
+	 *
+	 * The bounds are applied HERE rather than being trusted from the row, for the reason
+	 * `concurrentCallCeiling` gives: a nonsensical number reaches the database from a migration or a
+	 * direct edit as easily as from the form, and the artifact is read by a process that cannot ask.
+	 * Every one of them is clamped to something the queue can actually execute, and only the
+	 * configurations that cannot work at all earn a diagnostic.
+	 */
+	private queueCallback(
+		entry: OrgRoutingSnapshot["queues"][number],
+		exitKey: string | undefined,
+		subject: DiagnosticSubject,
+	): QueueCallbackPlan | undefined {
+		if (entry.callbackEnabled !== true) {
+			return undefined;
+		}
+
+		const rawKey = entry.callbackKey?.trim() ?? "";
+		let key = normalizeExitKey(entry.callbackKey);
+		if (key === undefined && rawKey.length > 0) {
+			this.bag.warning(
+				"queue-callback-unusable",
+				`Queue "${entry.name}" offers a callback on ${JSON.stringify(rawKey)}, which is not a DTMF digit (${QUEUE_EXIT_KEYS.join(", ")}); the offer compiled with no key at all.`,
+				subject,
+				"callbackKey",
+			);
+		}
+		if (key !== undefined && key === exitKey) {
+			// One digit cannot mean two things. The EXIT key keeps it, because leaving the queue is
+			// the more destructive of the two and a caller who pressed it meant to go somewhere.
+			this.bag.warning(
+				"queue-callback-unusable",
+				`Queue "${entry.name}" uses "${key}" for both its exit key and its callback offer; the exit key keeps it and the callback compiled with no key.`,
+				subject,
+				"callbackKey",
+			);
+			key = undefined;
+		}
+
+		const offerAfterSeconds = wholeSeconds(entry.callbackOfferAfterSeconds ?? 0);
+		if (key === undefined && offerAfterSeconds === 0) {
+			this.bag.warning(
+				"queue-callback-unusable",
+				`Queue "${entry.name}" offers a callback with neither a key to accept it nor a wait after which to announce it, so no caller can ever be offered one.`,
+				subject,
+				"callbackEnabled",
+			);
+			return undefined;
+		}
+
+		return compact({
+			key,
+			offerAfterSeconds,
+			offerPromptId: this.promptRef(entry.callbackOfferPromptId, subject, "callbackOfferPromptId"),
+			confirmPromptId: this.promptRef(
+				entry.callbackConfirmPromptId,
+				subject,
+				"callbackConfirmPromptId",
+			),
+			maxAttempts: wholeCount(entry.callbackMaxAttempts, 3, 1, 10),
+			retryDelaySeconds: wholeCount(entry.callbackRetryDelaySeconds, 300, 30, 86_400),
+			expiresAfterSeconds: wholeCount(entry.callbackExpiresAfterSeconds, 3600, 60, 604_800),
+		}) as QueueCallbackPlan;
 	}
 
 	private voicemailNodeById(
@@ -1386,6 +2251,665 @@ class Compiler {
 	 * row the loader happened to return first. Sorting by id and keeping the FIRST makes the choice
 	 * deterministic whatever arrives.
 	 */
+
+	// -------------------------------------------------------------------------------------------
+	// The T2 admin block
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * Compiles the reusable rewrite pipelines, once, before anything can point at one.
+	 *
+	 * A ruleset with no usable rules is still compiled — as an empty pipeline — rather than dropped,
+	 * because a route that names it must not fall back to "no normalisation at all" silently. An
+	 * empty pipeline is a no-op the tenant can see in the artifact; a missing ruleset is a dangling
+	 * reference the compiler reports.
+	 */
+	private compileTranslationRulesets(): void {
+		for (const ruleset of sortById(this.snapshot.translationRulesets ?? [])) {
+			this.translationRulesetInputsById.set(ruleset.id, ruleset);
+			const rules: CompiledTranslationRule[] = [];
+			for (const rule of this.translationRulesByRuleset.get(ruleset.id) ?? []) {
+				if (!rule.enabled) {
+					continue;
+				}
+				const issues = validateTranslationRule(rule);
+				if (issues.length > 0) {
+					for (const issue of issues) {
+						this.bag.error(
+							"invalid-translation-rule",
+							issue.code === "unsafe-replacement"
+								? `Rule ${rule.ordinal} of ruleset "${ruleset.name}" has a replacement that could emit characters a dial string may not contain (${JSON.stringify(issue.value)}); only digits, +, * and # plus $n back-references are allowed.`
+								: `Rule ${rule.ordinal} of ruleset "${ruleset.name}" is not usable (${issue.code}).`,
+							{ kind: "translation-rule", id: rule.id },
+							issue.code === "unsafe-replacement" ? "replacement" : "matchPattern",
+						);
+					}
+					continue;
+				}
+				rules.push(
+					compact({
+						id: rule.id,
+						ordinal: rule.ordinal,
+						label: rule.label ?? undefined,
+						source: rule.matchPattern,
+						replacement: rule.replacement,
+					}) as CompiledTranslationRule,
+				);
+			}
+			this.translationRulesetsById.set(ruleset.id, {
+				id: ruleset.id,
+				name: ruleset.name,
+				rules,
+			});
+		}
+	}
+
+	/**
+	 * A ruleset reference, resolved.
+	 *
+	 * A dangling or disabled ruleset is a WARNING and not an error, for the reason a dangling
+	 * music-on-hold class is: the call still completes, it simply goes out with the digits the caller
+	 * dialed. Refusing to compile a tenant's whole routing because somebody deleted a normalisation
+	 * would take working calls down to fix cosmetics on the wire.
+	 */
+	private translationRuleset(
+		rulesetId: string | null | undefined,
+		subject: DiagnosticSubject,
+		path: string,
+	): CompiledTranslationRuleset | undefined {
+		const id = rulesetId ?? undefined;
+		if (id === undefined || id.trim() === "") {
+			return undefined;
+		}
+		if (this.snapshot.translationRulesets === undefined) {
+			// A loader that does not yet select the collection is a rollout state, not a dangling
+			// reference — the same rule `mohClassName` applies.
+			return undefined;
+		}
+		const compiled = this.translationRulesetsById.get(id);
+		const input = this.translationRulesetInputsById.get(id);
+		if (compiled === undefined || input === undefined) {
+			this.bag.warning(
+				"dangling-translation-ruleset",
+				`Translation ruleset "${id}" is not in this snapshot; numbers are used as dialed.`,
+				subject,
+				path,
+			);
+			return undefined;
+		}
+		if (!input.enabled) {
+			this.bag.warning(
+				"dangling-translation-ruleset",
+				`Translation ruleset "${input.name}" is disabled; numbers are used as dialed.`,
+				subject,
+				path,
+			);
+			return undefined;
+		}
+		return compiled;
+	}
+
+	/**
+	 * Compiles every phrase into the artifact's lookup table.
+	 *
+	 * A phrase is a `prompt` row of kind `phrase`, so this walks the prompt collection rather than a
+	 * table of its own — see `media-schema.ts` for why that is the shape.
+	 *
+	 * Two things are refused rather than tolerated. A step naming another PHRASE is an error: it
+	 * would make the media layer recurse, and `phrases-schema.ts` argues that composition is
+	 * expressible by listing the steps twice. A step naming a prompt that is not in the snapshot is
+	 * dropped with a warning — that is the shape of a half-built phrase, which an admin UI produces
+	 * on the way to a finished one.
+	 *
+	 * A phrase with no playable step is not written to the table at all, so a reader's MISS always
+	 * means "play this id as a single file" and never "play nothing".
+	 */
+	private compilePhrases(): Readonly<Record<string, CompiledPhrase>> {
+		const phrases: Record<string, CompiledPhrase> = {};
+		for (const entry of sortById(this.snapshot.prompts ?? [])) {
+			if (entry.kind !== "phrase" || !entry.enabled) {
+				continue;
+			}
+			const subject: DiagnosticSubject = { kind: "phrase", id: entry.id, name: entry.name };
+			const steps: string[] = [];
+			for (const step of this.phraseStepsByPhrase.get(entry.id) ?? []) {
+				if (!step.enabled) {
+					continue;
+				}
+				const target = this.promptsById.get(step.promptId);
+				if (target === undefined) {
+					this.bag.warning(
+						"dangling-phrase-step",
+						`Step ${step.ordinal} of phrase "${entry.name}" names prompt "${step.promptId}", which is not in this snapshot; it was skipped.`,
+						subject,
+						`steps[${step.ordinal}]`,
+					);
+					continue;
+				}
+				if (target.kind === "phrase") {
+					this.bag.error(
+						"invalid-phrase",
+						`Step ${step.ordinal} of phrase "${entry.name}" names another phrase ("${target.name}"). Phrases do not nest; list the steps directly.`,
+						subject,
+						`steps[${step.ordinal}]`,
+					);
+					continue;
+				}
+				if (!target.enabled) {
+					continue;
+				}
+				steps.push(step.promptId);
+			}
+			if (steps.length === 0) {
+				this.bag.warning(
+					"invalid-phrase",
+					`Phrase "${entry.name}" has no playable steps; anything that names it falls back to the deployment's own announcement.`,
+					subject,
+				);
+				continue;
+			}
+			phrases[entry.id] = { promptId: entry.id, name: entry.name, steps };
+		}
+		return sortRecordKeys(phrases);
+	}
+
+	/**
+	 * Compiles the prompt id → object-ref table.
+	 *
+	 * The resolution half of `dangling-prompt`. A plan node names a prompt by ROW id, the audio
+	 * lives in the object store under a DIFFERENT id minted at upload, and the engine has no
+	 * database handle — so without this table a tenant's prompt is unplayable no matter what the
+	 * media server is. The value is the same `object://` ref a voicemail greeting already carries
+	 * and takes the same path through the reader.
+	 *
+	 * Phrases are skipped: their audio is their steps', each of which is a row in here in its own
+	 * right. A row with no key is skipped rather than written empty, so a reader's MISS always means
+	 * "fall back", never "play nothing".
+	 */
+	private compilePrompts(): Readonly<Record<string, string>> {
+		const prompts: Record<string, string> = {};
+		for (const entry of sortById(this.snapshot.prompts ?? [])) {
+			if (entry.kind === "phrase" || !entry.enabled) {
+				continue;
+			}
+			const objectKey = (entry.objectKey ?? "").trim();
+			if (objectKey === "") {
+				continue;
+			}
+			prompts[entry.id] = objectMediaRef(objectKey);
+		}
+		return sortRecordKeys(prompts);
+	}
+
+	private callFlowNodeById(
+		ref: string,
+		subject: DiagnosticSubject,
+		path: string,
+	): PlanNodeId | null {
+		const flow = this.callFlowsById.get(ref);
+		if (flow === undefined) {
+			return this.missingTarget("call flow", ref, subject, path);
+		}
+		if (!flow.enabled) {
+			return this.disabledTarget("call flow", flow.name, subject, path);
+		}
+		return this.callFlowNode(flow);
+	}
+
+	/**
+	 * A day/night switch.
+	 *
+	 * BOTH branches are compiled whatever the mode says, and `planNodeReferences` reports both, so
+	 * the inactive one stays reachable. Emitting only the live branch would make flipping the switch
+	 * a jump to a node that is not in the table, and would leave a call-flow inspector unable to show
+	 * the tenant where the other position goes.
+	 *
+	 * A branch that does not resolve falls back to a hangup rather than dropping the node: a switch
+	 * with one working position is still a switch, and a caller who reaches the broken side should be
+	 * released with a cause rather than meeting an absent reference mid-call.
+	 */
+	private callFlowNode(flow: CallFlowInput): PlanNodeId {
+		const id = `call-flow:${flow.id}`;
+		if (this.claimed.has(id)) {
+			return id;
+		}
+		this.claimed.add(id);
+
+		const subject: DiagnosticSubject = { kind: "call-flow", id: flow.id, name: flow.name };
+		const dayNodeId =
+			this.destinationNode(
+				{
+					destinationType: flow.destinationType,
+					destinationRef: flow.destinationRef,
+					destinationData: flow.destinationData,
+				},
+				subject,
+				"destination",
+			) ?? this.hangupNode(DISABLED_TARGET_CAUSE);
+		const nightNodeId =
+			this.namedDestinationNode(flow, "night", subject) ?? this.hangupNode(DISABLED_TARGET_CAUSE);
+
+		this.nodes.set(
+			id,
+			compact({
+				id,
+				kind: "call-flow",
+				label: flow.name,
+				callFlowId: flow.id,
+				mode: flow.mode,
+				dayNodeId,
+				nightNodeId,
+				featureCode: flow.featureCode ?? undefined,
+				// The dialable string a BLF key is provisioned with. The code wins over the number:
+				// upstream provisions the code, and a flow that has both is watched at the code.
+				presenceKey: flow.featureCode ?? flow.extensionNumber ?? undefined,
+			}) as PlanNode,
+		);
+		return id;
+	}
+
+	private streamNodeById(ref: string, subject: DiagnosticSubject, path: string): PlanNodeId | null {
+		const stream = this.streamsById.get(ref);
+		if (stream === undefined) {
+			return this.missingTarget("audio stream", ref, subject, path);
+		}
+		if (!stream.enabled) {
+			return this.disabledTarget("audio stream", stream.name, subject, path);
+		}
+		return this.streamNode(stream);
+	}
+
+	/**
+	 * A remote audio source.
+	 *
+	 * The URL is re-checked here even though the DTO checked it, because the snapshot is DATA rather
+	 * than a database: a compiler that assumed the edge had validated would hand a media server a
+	 * `file:///etc/passwd` the moment anybody wrote a row by hand.
+	 *
+	 * The fallback is not optional — see `StreamPlanNode` — and a stream whose fallback does not
+	 * resolve gets a hangup rather than no node, so a driver that cannot play the source releases the
+	 * caller with a cause instead of leaving them on a silent line.
+	 */
+	private streamNode(stream: AudioStreamInput): PlanNodeId {
+		const id = `stream:${stream.id}`;
+		if (this.claimed.has(id)) {
+			return id;
+		}
+		this.claimed.add(id);
+
+		const subject: DiagnosticSubject = { kind: "audio-stream", id: stream.id, name: stream.name };
+		if (!isPlayableStreamUrl(stream.url)) {
+			this.bag.error(
+				"invalid-stream-url",
+				`Audio stream "${stream.name}" has URL ${JSON.stringify(stream.url)}, which is not an http(s) URL a media server may be asked to open.`,
+				subject,
+				"url",
+			);
+		}
+		const fallbackNodeId =
+			this.namedDestinationNode(stream, "fallback", subject) ??
+			this.hangupNode(DISABLED_TARGET_CAUSE);
+
+		this.nodes.set(
+			id,
+			compact({
+				id,
+				kind: "stream",
+				label: stream.name,
+				audioStreamId: stream.id,
+				url: stream.url,
+				answerFirst: stream.answerFirst,
+				maxSeconds: stream.maxSeconds,
+				fallbackNodeId,
+			}) as PlanNode,
+		);
+		return id;
+	}
+
+	private dialByNameNodeById(
+		ref: string,
+		subject: DiagnosticSubject,
+		path: string,
+	): PlanNodeId | null {
+		const directory = this.directoriesById.get(ref);
+		if (directory === undefined) {
+			return this.missingTarget("dial-by-name directory", ref, subject, path);
+		}
+		if (!directory.enabled) {
+			return this.disabledTarget("dial-by-name directory", directory.name, subject, path);
+		}
+		return this.dialByNameNode(directory);
+	}
+
+	/**
+	 * The digit map, built from the tenant's extensions and their recorded names.
+	 *
+	 * # Why an extension can be missing from its own tenant's directory
+	 *
+	 * There is no text-to-speech here, so the ONLY way to say "for Jane Smith, press one" is to play
+	 * the recording Jane made into her mailbox — the `name` greeting that `VOICEMAIL_GREETING_KINDS`
+	 * has always had and that, until this feature, nothing consumed. An extension whose mailbox has no
+	 * active `name` greeting therefore cannot be offered at all, and is dropped with a warning naming
+	 * it. See `directory-schema.ts` for why the two alternatives — a silent gap, or spelling the name
+	 * back letter by letter — are both worse.
+	 *
+	 * # The collision nobody would otherwise see
+	 *
+	 * Two people whose names map to the same digits produce a directory where a caller hears two
+	 * options and has no way to know which is which. It has no runtime symptom, so it is reported
+	 * here, where both entries are in hand.
+	 */
+	private dialByNameNode(directory: DialByNameDirectoryInput): PlanNodeId {
+		const id = `dial-by-name:${directory.id}`;
+		if (this.claimed.has(id)) {
+			return id;
+		}
+		this.claimed.add(id);
+
+		const subject: DiagnosticSubject = {
+			kind: "dial-by-name-directory",
+			id: directory.id,
+			name: directory.name,
+		};
+		const entries: DirectoryEntry[] = [];
+		const byDigits = new Map<string, string>();
+
+		for (const extension of sortById(this.snapshot.extensions)) {
+			if (!extension.enabled) {
+				continue;
+			}
+			const digits = directoryDigits(extension.label, directory.searchField);
+			if (digits.length === 0) {
+				continue;
+			}
+			const box = this.voicemailByExtension.get(extension.id);
+			const greeting =
+				box === undefined ? undefined : this.activeGreetings.get(greetingKey(box.id, "name"));
+			if (greeting === undefined || greeting.objectKey.trim().length === 0) {
+				this.bag.warning(
+					"directory-entry-skipped",
+					`Extension ${extension.number} ("${extension.label}") is not offered by directory "${directory.name}": its mailbox has no recorded name, and there is no way to speak the name without one.`,
+					subject,
+					"entries",
+				);
+				continue;
+			}
+			const clash = byDigits.get(digits);
+			if (clash !== undefined) {
+				this.bag.warning(
+					"directory-name-collision",
+					`Extensions ${clash} and ${extension.number} spell to the same digits (${digits}) in directory "${directory.name}"; a caller cannot tell the two options apart.`,
+					subject,
+					"entries",
+				);
+			} else {
+				byDigits.set(digits, extension.number);
+			}
+			entries.push({
+				digits,
+				extensionNumber: extension.number,
+				targetNodeId: this.extensionNode(extension),
+				nameMedia: objectMediaRef(greeting.objectKey),
+				...(extension.label.length === 0 ? {} : { label: extension.label }),
+			});
+		}
+
+		if (entries.length === 0) {
+			this.bag.warning(
+				"empty-directory",
+				`Directory "${directory.name}" can offer nobody: no enabled extension has a recorded name in its mailbox.`,
+				subject,
+			);
+		}
+
+		entries.sort(
+			(left, right) =>
+				(left.digits < right.digits ? -1 : left.digits > right.digits ? 1 : 0) ||
+				(left.extensionNumber < right.extensionNumber
+					? -1
+					: left.extensionNumber > right.extensionNumber
+						? 1
+						: 0),
+		);
+
+		this.nodes.set(
+			id,
+			compact({
+				id,
+				kind: "dial-by-name",
+				label: directory.name,
+				directoryId: directory.id,
+				minDigits: directory.minDigits,
+				maxFailures: directory.maxFailures,
+				greetingPromptId: this.promptRef(directory.greetingPromptId, subject, "greetingPromptId"),
+				invalidPromptId: this.promptRef(directory.invalidPromptId, subject, "invalidPromptId"),
+				entries,
+				timeoutNodeId: this.namedDestinationNode(directory, "timeout", subject) ?? undefined,
+			}) as PlanNode,
+		);
+		return id;
+	}
+
+	/**
+	 * Expands an alias to whatever its target resolved to.
+	 *
+	 * FLAT, which is the whole design: no `alias` node is ever written, so the artifact and the
+	 * call-flow inspector both show the real destination and the engine gains no node kind. See
+	 * `aliases-schema.ts` for why the feature is a macro rather than FusionPBX's raw dial string.
+	 *
+	 * The only thing flatness costs is this cycle guard. `claimed` cannot do the job — an alias
+	 * claims no id — so the expansion stack is walked explicitly and a repeat is an ERROR rather than
+	 * a warning: an alias that expands forever has no sound artifact to fall back to, which is
+	 * exactly the line this compiler's header draws between the two severities.
+	 */
+	private aliasNode(ref: string, subject: DiagnosticSubject, path: string): PlanNodeId | null {
+		const alias = this.aliasesById.get(ref);
+		if (alias === undefined) {
+			return this.missingTarget("destination alias", ref, subject, path);
+		}
+		if (!alias.enabled) {
+			return this.disabledTarget("destination alias", alias.name, subject, path);
+		}
+		if (this.aliasStack.includes(alias.id)) {
+			this.bag.error(
+				"alias-cycle",
+				`Destination alias "${alias.name}" is part of a loop (${[...this.aliasStack, alias.id].join(" -> ")}); an alias chain must end at a real destination.`,
+				{ kind: "destination-alias", id: alias.id, name: alias.name },
+				"destination",
+			);
+			return null;
+		}
+		if (this.aliasStack.length >= MAX_ALIAS_DEPTH) {
+			this.bag.error(
+				"alias-cycle",
+				`Destination alias "${alias.name}" is nested more than ${String(MAX_ALIAS_DEPTH)} deep; the chain was not expanded.`,
+				{ kind: "destination-alias", id: alias.id, name: alias.name },
+				"destination",
+			);
+			return null;
+		}
+
+		this.aliasStack.push(alias.id);
+		try {
+			return this.destinationNode(
+				{
+					destinationType: alias.destinationType,
+					destinationRef: alias.destinationRef,
+					destinationData: alias.destinationData,
+				},
+				{ kind: "destination-alias", id: alias.id, name: alias.name },
+				"destination",
+			);
+		} finally {
+			this.aliasStack.pop();
+		}
+	}
+
+	/**
+	 * The authorisation-code gate for one outbound route.
+	 *
+	 * Fails OPEN with a warning in every degraded case — a set that is missing, disabled, or whose
+	 * every digest this release cannot parse — and the reason is the same one `voicemailPinHash`
+	 * gives: refusing every call on a route because a digest format changed takes the tenant's phones
+	 * down to protect a gate they can re-create in a form. A set with SOME readable entries keeps
+	 * those and drops the rest, so a single corrupt row narrows the code list rather than removing it.
+	 */
+	private compilePinSet(
+		pinSetId: string | null | undefined,
+		subject: DiagnosticSubject,
+	): CompiledPinSet | undefined {
+		const id = pinSetId ?? undefined;
+		if (id === undefined || id.trim() === "") {
+			return undefined;
+		}
+		if (this.snapshot.pinSets === undefined) {
+			return undefined;
+		}
+		const set = this.pinSetsById.get(id);
+		if (set === undefined) {
+			this.bag.warning(
+				"unusable-pin-set",
+				`PIN set "${id}" is not in this snapshot; the route is NOT gated and calls go out unchallenged.`,
+				subject,
+				"pinSetId",
+			);
+			return undefined;
+		}
+		if (!set.enabled) {
+			this.bag.warning(
+				"unusable-pin-set",
+				`PIN set "${set.name}" is disabled; the route is NOT gated and calls go out unchallenged.`,
+				subject,
+				"pinSetId",
+			);
+			return undefined;
+		}
+
+		const entries: CompiledPinEntry[] = [];
+		for (const entry of this.pinEntriesBySet.get(set.id) ?? []) {
+			if (!entry.enabled) {
+				continue;
+			}
+			const issue = voicemailPinHashIssue(entry.pinHash);
+			if (issue !== undefined) {
+				this.bag.warning(
+					"invalid-pin-hash",
+					`Code ${entry.ordinal} of PIN set "${set.name}" has a digest this release cannot read (${issue}); that code will not be accepted.`,
+					subject,
+					"pinSetId",
+				);
+				continue;
+			}
+			entries.push(
+				compact({
+					pinSetEntryId: entry.id,
+					ordinal: entry.ordinal,
+					label: entry.label ?? undefined,
+					pinHash: entry.pinHash.trim(),
+				}) as CompiledPinEntry,
+			);
+		}
+
+		if (entries.length === 0) {
+			this.bag.warning(
+				"unusable-pin-set",
+				`PIN set "${set.name}" has no usable codes; the route is NOT gated and calls go out unchallenged.`,
+				subject,
+				"pinSetId",
+			);
+			return undefined;
+		}
+
+		return compact({
+			pinSetId: set.id,
+			name: set.name,
+			maxAttempts: set.maxAttempts,
+			digitTimeoutMs: set.digitTimeoutMs,
+			promptId: this.promptRef(set.promptId, subject, "promptId"),
+			failurePromptId: this.promptRef(set.failurePromptId, subject, "failurePromptId"),
+			entries,
+		}) as CompiledPinSet;
+	}
+
+	/**
+	 * Organization speed dials, and the two collisions that would otherwise be invisible.
+	 *
+	 * A code that a FEATURE CODE would swallow is dropped: `*0` is seeded as eavesdrop with a
+	 * required argument, so an unguarded `*01` would be consumed as "eavesdrop on extension 1" and
+	 * the tenant would see the wrong thing happen rather than nothing. A numeric code additionally
+	 * goes through `claimNumber`, the same duplicate check every dialable entity uses, so a speed dial
+	 * numbered `200` collides loudly with extension 200 instead of shadowing it.
+	 */
+	private compileSpeedDials(
+		featureCodes: readonly CompiledFeatureCode[],
+	): Readonly<Record<string, SpeedDialEntry>> {
+		const entries: Record<string, SpeedDialEntry> = {};
+		for (const dial of sortById(this.snapshot.speedDials ?? [])) {
+			if (!dial.enabled) {
+				continue;
+			}
+			const subject: DiagnosticSubject = { kind: "speed-dial", id: dial.id, name: dial.code };
+			if (!SPEED_DIAL_CODE_PATTERN.test(dial.code)) {
+				this.bag.error(
+					"conflicting-speed-dial",
+					`Speed dial "${dial.code}" is not dialable; a code is one to ten characters from 0-9, *, #.`,
+					subject,
+					"code",
+				);
+				continue;
+			}
+			const clash = featureCodeWouldConsume(featureCodes, dial.code);
+			if (clash !== undefined) {
+				this.bag.error(
+					"conflicting-speed-dial",
+					`Speed dial "${dial.code}" can never be dialed: feature code "${clash.code}" is matched first and would consume it.`,
+					subject,
+					"code",
+				);
+				continue;
+			}
+			if (entries[dial.code] !== undefined) {
+				this.bag.error(
+					"conflicting-speed-dial",
+					`Speed dial code "${dial.code}" is defined more than once.`,
+					subject,
+					"code",
+				);
+				continue;
+			}
+			const nodeId = this.destinationNode(
+				{
+					destinationType: dial.destinationType,
+					destinationRef: dial.destinationRef,
+					destinationData: dial.destinationData,
+				},
+				subject,
+				"destination",
+			);
+			if (nodeId === null) {
+				continue;
+			}
+			entries[dial.code] = {
+				speedDialId: dial.id,
+				code: dial.code,
+				label: dial.label,
+				nodeId,
+			};
+			// A bare-numeric code is dialable in the same space extensions are, so it is claimed the
+			// same way. A star-prefixed one is not, and claiming it would put a `*` into a map whose
+			// keys the resolver reads as extension numbers.
+			if (/^[0-9]+$/u.test(dial.code)) {
+				this.claimNumber(dial.code, {
+					kind: "speed-dial",
+					entityId: dial.id,
+					nodeId,
+					name: dial.label,
+				});
+			}
+		}
+		return sortRecordKeys(entries);
+	}
+
 	private indexVoicemailGreetings(): void {
 		for (const greeting of sortById(this.snapshot.voicemailGreetings ?? [])) {
 			if (!greeting.active) {
@@ -1452,6 +2976,58 @@ class Compiler {
 		return mohClass.name;
 	}
 
+	/**
+	 * A prompt id, carried through only when the prompt library actually has it.
+	 *
+	 * ## Why this check earns its place
+	 *
+	 * The compiler passes prompt ids to the engine unresolved — a prompt is addressed by row id the
+	 * whole way down — which means a plan naming a prompt that was deleted compiles, publishes and
+	 * routes perfectly. The caller is the one who finds out: the media plane refuses the playback,
+	 * the walker plays nothing, and an IVR falls to its timeout branch after forty-eight seconds of
+	 * silence. That is indistinguishable, in every log and every CDR, from a caller who put the
+	 * phone down.
+	 *
+	 * So the reference is checked where checking is cheap and the answer is actionable — at the
+	 * write, against the snapshot the write compiled. The id is still emitted: dropping it would
+	 * silently change the plan's SHAPE (an IVR with no greeting gathers digits immediately), and the
+	 * point here is to report the gap, not to route around it.
+	 *
+	 * Nothing to check against is not a miss: a loader that does not yet load `prompts` is a rollout
+	 * state, the same rule and the same reason as {@link mohClassName}.
+	 */
+	private promptRef(
+		promptId: string | null | undefined,
+		subject: DiagnosticSubject | undefined,
+		path: string,
+	): string | undefined {
+		const id = promptId ?? undefined;
+		if (id === undefined || id.trim() === "") {
+			return undefined;
+		}
+		if (this.snapshot.prompts !== undefined) {
+			const target = this.promptsById.get(id);
+			if (target === undefined) {
+				this.bag.warning(
+					"dangling-prompt",
+					`Prompt "${id}" is not in this snapshot, so nothing will play where it is named.`,
+					subject,
+					path,
+				);
+			} else if (target.kind !== "phrase" && target.objectKey === null) {
+				// `null` is the row saying it has no file; `undefined` is a loader that does not
+				// project the column, which is the rollout state and not a miss.
+				this.bag.warning(
+					"dangling-prompt",
+					`Prompt "${target.name}" has no audio in the object store, so nothing will play where it is named.`,
+					subject,
+					path,
+				);
+			}
+		}
+		return id;
+	}
+
 	private conferenceNodeById(
 		ref: string,
 		subject: DiagnosticSubject,
@@ -1485,7 +3061,20 @@ class Compiler {
 				requiresPin: room.requiresPin,
 				maxMembers: room.maxMembers,
 				waitForModerator: room.waitForModerator,
-				recordEnabled: room.recordEnabled,
+				// `?? "none"` and not `?? undefined`, unlike everything else in this object: the walker
+				// branches on the policy, and a missing field would make "the tenant asked for no
+				// recording" and "this artifact predates the column" the same value at the one place
+				// the difference is a compliance question. Same treatment as `queue`'s.
+				recordPolicy: room.recordPolicy ?? "none",
+				// Emitted only when switched OFF. The default is TRUE at every layer — a beep is what
+				// tells a room a third party has arrived — so `compact()` dropping a `true` and the
+				// reader defaulting an absent field to `true` are the same statement made twice.
+				entryToneEnabled: room.entryToneEnabled === false ? false : undefined,
+				exitToneEnabled: room.exitToneEnabled === false ? false : undefined,
+				// Until this was compiled, `conference.announce_join_leave` was a column a tenant could
+				// set, an API could write and NOTHING could read: the loader carried it nowhere and the
+				// artifact had no field for it.
+				announceJoinLeave: room.announceJoinLeave === false ? false : undefined,
 				mohClassId: room.mohClassId ?? undefined,
 				mohClass: this.mohClassName(room.mohClassId, subject, "mohClassId"),
 				pinHash: this.conferencePinHash(room, room.pinHash, "pinHash", subject),
@@ -1571,6 +3160,186 @@ class Compiler {
 				mohClassId: lot.mohClassId ?? undefined,
 				mohClass: this.mohClassName(lot.mohClassId, subject, "mohClassId"),
 				timeoutNodeId: this.namedDestinationNode(lot, "timeout", subject) ?? undefined,
+			}) as PlanNode,
+		);
+		return id;
+	}
+
+	private pagingGroupNodeById(
+		ref: string,
+		subject: DiagnosticSubject,
+		path: string,
+	): PlanNodeId | null {
+		const group = this.pagingGroupsById.get(ref);
+		if (group === undefined) {
+			return this.missingTarget("paging group", ref, subject, path);
+		}
+		if (!group.enabled) {
+			return this.disabledTarget("paging group", group.name, subject, path);
+		}
+		return this.pagingGroupNode(group);
+	}
+
+	/**
+	 * A paging group, compiled to the list of numbers the engine will announce to.
+	 *
+	 * Three ways a member leaves the compiled list, and they are deliberately not the same event:
+	 *
+	 * - the **member row** is disabled — silently. That is the operator saying "not this desk today",
+	 *   which is configuration working rather than configuration broken, and reporting it would put a
+	 *   warning on every group that has ever had somebody on leave.
+	 * - its **extension is not in the snapshot** — a `dangling-destination` warning naming the group
+	 *   and the id. A member pointing at nothing means the page reaches fewer handsets than whoever
+	 *   built the group believes, and that belief is only ever tested during an emergency.
+	 * - its **extension is disabled** — a `disabled-entity` warning, the same one every other
+	 *   destination raises. Told apart from the case above because the fix is different: one is
+	 *   "somebody deleted this desk", the other is "somebody switched it off".
+	 *
+	 * All warnings, never errors, and the group still compiles when it ends up EMPTY, because an
+	 * empty page is a configuration mistake and not an unsound artifact — exactly the line
+	 * `empty-ring-group` draws. Refusing to compile would take the tenant's working calls down to fix
+	 * an announcement nobody has made yet.
+	 */
+	private pagingGroupNode(group: PagingGroupInput): PlanNodeId {
+		const id = `paging:${group.id}`;
+		if (this.claimed.has(id)) {
+			return id;
+		}
+		this.claimed.add(id);
+
+		const subject: DiagnosticSubject = { kind: "paging-group", id: group.id, name: group.name };
+		const members: string[] = [];
+		for (const member of [...group.members].sort(
+			(left, right) =>
+				left.ordinal - right.ordinal ||
+				(left.extensionId < right.extensionId ? -1 : left.extensionId > right.extensionId ? 1 : 0),
+		)) {
+			if (!member.enabled) {
+				continue;
+			}
+			const extension = this.extensionsById.get(member.extensionId);
+			// `extensionsById` holds disabled extensions too — that is what makes the two misses below
+			// distinguishable at all, and the operator needs them distinguished because the fixes are
+			// not the same one.
+			if (extension === undefined) {
+				this.bag.warning(
+					"dangling-destination",
+					`Paging group "${group.name}" lists extension "${member.extensionId}", which is not in this organization's configuration; it was dropped from the page.`,
+					subject,
+					"members",
+				);
+				continue;
+			}
+			if (!extension.enabled) {
+				this.bag.warning(
+					"disabled-entity",
+					`Paging group "${group.name}" lists extension ${extension.number}, which is disabled; it was dropped from the page.`,
+					subject,
+					"members",
+				);
+				continue;
+			}
+			members.push(extension.number);
+		}
+
+		if (members.length === 0) {
+			this.bag.warning(
+				"empty-paging-group",
+				`Paging group "${group.name}" has no reachable members; a page to it announces to nobody.`,
+				subject,
+			);
+		}
+
+		this.nodes.set(
+			id,
+			compact({
+				id,
+				kind: "paging",
+				label: group.name,
+				pagingGroupId: group.id,
+				members,
+				duplex: group.duplex,
+				timeoutSeconds: group.timeoutSeconds,
+			}) as PlanNode,
+		);
+		return id;
+	}
+
+	/**
+	 * A shared line: its appearances resolved to real extension nodes, in appearance-index order.
+	 *
+	 * The same fan-out shape as a ring group — each appearance becomes an `extension:<id>` the engine
+	 * originates to — but the members carry a button INDEX rather than a delay, because on a shared
+	 * line the ordinal is the appearance the phone lights and the number sipd stamps into `Call-Info`,
+	 * not a stagger. A dangling or disabled appearance is dropped with the same two-way diagnostic
+	 * paging draws, and a line left with none warns rather than failing: refusing to compile would
+	 * take a tenant's working calls down to report a mistake on one line.
+	 */
+	private sharedLineNode(line: SharedLineInput): PlanNodeId {
+		const id = `shared-line:${line.id}`;
+		if (this.claimed.has(id)) {
+			return id;
+		}
+		this.claimed.add(id);
+
+		const subject: DiagnosticSubject = { kind: "shared-line", id: line.id, name: line.name };
+		const appearances: SharedLineAppearance[] = [];
+		for (const appearance of [...line.appearances].sort(
+			(left, right) =>
+				left.ordinal - right.ordinal ||
+				(left.extensionId < right.extensionId ? -1 : left.extensionId > right.extensionId ? 1 : 0),
+		)) {
+			if (!appearance.enabled) {
+				continue;
+			}
+			const extension = this.extensionsById.get(appearance.extensionId);
+			if (extension === undefined) {
+				this.bag.warning(
+					"dangling-destination",
+					`Shared line "${line.name}" lists extension "${appearance.extensionId}", which is not in this organization's configuration; its appearance was dropped.`,
+					subject,
+					"appearances",
+				);
+				continue;
+			}
+			if (!extension.enabled) {
+				this.bag.warning(
+					"disabled-entity",
+					`Shared line "${line.name}" lists extension ${extension.number}, which is disabled; its appearance was dropped.`,
+					subject,
+					"appearances",
+				);
+				continue;
+			}
+			appearances.push({
+				appearanceIndex: appearance.ordinal,
+				extensionId: extension.id,
+				extensionNumber: extension.number,
+				targetNodeId: this.extensionNode(extension),
+			});
+		}
+
+		if (appearances.length === 0) {
+			this.bag.warning(
+				"empty-shared-line",
+				`Shared line "${line.name}" has no reachable appearances; a call to it rings nobody.`,
+				subject,
+			);
+		}
+
+		this.nodes.set(
+			id,
+			compact({
+				id,
+				kind: "shared-line",
+				label: line.name,
+				sharedLineId: line.id,
+				number: line.extensionNumber ?? undefined,
+				strategy: line.strategy,
+				ringTimeoutSeconds: line.ringTimeoutSeconds,
+				holdRecallTimeoutSeconds: line.holdRecallTimeoutSeconds,
+				bargeInEnabled: line.bargeInEnabled,
+				appearances,
 			}) as PlanNode,
 		);
 		return id;
@@ -1700,6 +3469,10 @@ class Compiler {
 		const voicemailPrefixes = this.compileVoicemailPrefixes(featureCodes);
 
 		this.claimInternalNumbers();
+		// After `claimInternalNumbers`, so a numeric speed dial that collides with an extension is
+		// reported against the SPEED DIAL — the later claimant is the one somebody just added.
+		const speedDials = this.compileSpeedDials(featureCodes);
+		this.reportToggleCodeCollisions(featureCodes);
 		this.reportEmergencyShadowing(emergency);
 		const parkSlots = this.compileParkSlots();
 
@@ -1708,6 +3481,7 @@ class Compiler {
 			featureCodes,
 			voicemailPrefixes,
 			mailboxes: this.compileMailboxes(),
+			...(Object.keys(speedDials).length === 0 ? {} : { speedDials }),
 			numbers: Object.fromEntries(
 				[...this.internalNumbers.entries()].sort(([left], [right]) =>
 					left < right ? -1 : left > right ? 1 : 0,
@@ -1803,11 +3577,25 @@ class Compiler {
 					id: entry.id,
 					code: entry.code,
 					action: entry.action,
-					argumentMode: FEATURE_CODE_ARGUMENT_MODE[entry.action],
+					// From the action AND the row's own params: a `*81` with a group pinned takes no
+					// argument, and reading the action table alone made it unreachable when dialled bare.
+					argumentMode: featureCodeArgumentMode(entry.action, entry.params ?? undefined),
 					params: entry.params ?? undefined,
 					label: entry.label ?? undefined,
 					nodeId: id,
 				}) as CompiledFeatureCode,
+			);
+		}
+
+		this.compileToggleCodes(compiled);
+
+		const login = compiled.find((entry) => entry.action === "hotdesk-login");
+		if (login !== undefined && !compiled.some((entry) => entry.action === "hotdesk-logout")) {
+			this.bag.warning(
+				"hotdesk-logout-missing",
+				`Feature code "${login.code}" logs an agent into a shared handset and this organization has no hot-desk logout code, so a session can only end when it expires.`,
+				{ kind: "feature-code", id: login.id, name: login.code },
+				"action",
 			);
 		}
 
@@ -1820,18 +3608,98 @@ class Compiler {
 	}
 
 	/**
-	 * A few feature codes name a concrete entity in `params` — `call-park` may pin a lot. Resolving
-	 * it at compile time is what lets the engine treat "park in lot X" and "park anywhere" as the
-	 * same code with a different node.
+	 * The two star codes that live on an ENTITY rather than in the code catalogue.
+	 *
+	 * `call_flow.feature_code` flips a flow to night mode; `time_condition.override_feature_code`
+	 * cycles a condition's override. Both were validated on write, offered in the admin UI and
+	 * reachable by nothing: they never entered `internal.featureCodes` and they cannot enter
+	 * `internal.numbers`, whose keys are read as extension numbers and where a `*` is refused. A
+	 * tenant's `*65` therefore fell through the internal context and was answered by "no outbound
+	 * route matched" (`E2E-routing2.md`).
+	 *
+	 * So the compiler synthesises a catalogue entry for each. They are ordinary
+	 * {@link CompiledFeatureCode}s from the matcher's point of view — same longest-first walk, same
+	 * `featureCodeWouldConsume` checks for speed dials and voicemail prefixes — carrying the entity
+	 * id in `params`, which is what lets the engine act on ONE flow without a second lookup.
+	 *
+	 * Collisions are still reported by {@link reportToggleCodeCollisions}, which runs after this and
+	 * against the finished table, so a toggle code that a real feature code would swallow is an error
+	 * naming both. A toggle code that is not dialable is dropped here rather than compiled into a
+	 * table the matcher would never hit.
+	 */
+	private compileToggleCodes(compiled: CompiledFeatureCode[]): void {
+		for (const flow of sortById(this.snapshot.callFlows ?? [])) {
+			const code = flow.featureCode?.trim() ?? "";
+			if (!flow.enabled || code.length === 0 || !isWellFormedFeatureCode(code)) {
+				continue;
+			}
+			compiled.push(
+				this.toggleCode(`call-flow:${flow.id}`, code, "call-flow-toggle", flow.name, {
+					callFlowId: flow.id,
+				}),
+			);
+		}
+		for (const condition of sortById(this.snapshot.timeConditions)) {
+			const code = condition.overrideFeatureCode?.trim() ?? "";
+			if (!condition.enabled || code.length === 0 || !isWellFormedFeatureCode(code)) {
+				continue;
+			}
+			compiled.push(
+				this.toggleCode(
+					`time-condition:${condition.id}`,
+					code,
+					"time-condition-override",
+					condition.name,
+					{ timeConditionId: condition.id },
+				),
+			);
+		}
+	}
+
+	private toggleCode(
+		key: string,
+		code: string,
+		action: FeatureCodeAction,
+		label: string,
+		params: FeatureCodeParams,
+	): CompiledFeatureCode {
+		const id = `feature-code:${key}`;
+		if (!this.claimed.has(id)) {
+			this.claimed.add(id);
+			this.nodes.set(id, {
+				id,
+				kind: "feature-code",
+				label,
+				featureCodeId: id,
+				code,
+				action,
+				params,
+			} as PlanNode);
+		}
+		// No `targetNodeId`: a toggle is a WRITE, not a place to go. The walker's feature-code
+		// dispatch runs it, exactly as it runs `*78`.
+		return { id, code, action, argumentMode: "none", params, label, nodeId: id };
+	}
+
+	/**
+	 * A few feature codes name a concrete entity in `params` — `call-park` may pin a lot, `paging`
+	 * may pin a group. Resolving it at compile time is what lets the engine treat "park in lot X" and
+	 * "park anywhere" as the same code with a different node.
+	 *
+	 * `intercom` is deliberately NOT here. Its argument is the extension the caller dialed after the
+	 * code (`*80` + `1001`), which is a live keypress and not a stored parameter — there is nothing
+	 * for a compiler to resolve, and pinning one would turn a code that reaches any desk into a code
+	 * that reaches one.
 	 */
 	private featureCodeTarget(entry: OrgRoutingSnapshot["featureCodes"][number]): PlanNodeId | null {
+		const subject: DiagnosticSubject = { kind: "feature-code", id: entry.id, name: entry.code };
 		const lotId = entry.params?.lotId;
 		if (entry.action === "call-park" && typeof lotId === "string" && lotId.length > 0) {
-			return this.parkNodeById(
-				lotId,
-				{ kind: "feature-code", id: entry.id, name: entry.code },
-				"params.lotId",
-			);
+			return this.parkNodeById(lotId, subject, "params.lotId");
+		}
+		const groupId = entry.params?.groupId;
+		if (entry.action === "paging" && typeof groupId === "string" && groupId.length > 0) {
+			return this.pagingGroupNodeById(groupId, subject, "params.groupId");
 		}
 		return null;
 	}
@@ -1848,9 +3716,7 @@ class Compiler {
 			configured.push({ prefix: settings.voicemailCheckPrefix, mode: "check" });
 		}
 		for (const entry of configured) {
-			const clash = featureCodes.find(
-				(code) => code.code === entry.prefix || entry.prefix.startsWith(code.code),
-			);
+			const clash = featureCodeWouldConsume(featureCodes, entry.prefix);
 			if (clash !== undefined) {
 				this.bag.warning(
 					"conflicting-feature-code",
@@ -1909,6 +3775,34 @@ class Compiler {
 				name: entry.name,
 			});
 		}
+		for (const group of sortById(this.snapshot.pagingGroups ?? [])) {
+			if (!group.enabled || group.extensionNumber == null || group.extensionNumber.length === 0) {
+				continue;
+			}
+			// Through `claimNumber` like every other dialable entity, so a group numbered the same as an
+			// extension collides LOUDLY at compile time instead of quietly at dial time — where the
+			// tenant would discover it by paging the building when they meant to call a colleague.
+			this.claimNumber(group.extensionNumber, {
+				kind: "paging-group",
+				entityId: group.id,
+				nodeId: this.pagingGroupNode(group),
+				name: group.name,
+			});
+		}
+		for (const line of sortById(this.snapshot.sharedLines ?? [])) {
+			if (!line.enabled || line.extensionNumber == null || line.extensionNumber.length === 0) {
+				continue;
+			}
+			// A shared-key-only line has no number and is not claimed here; a numbered one is claimed
+			// through `claimNumber` like every dialable entity, so a line numbered the same as an
+			// extension collides loudly at compile time rather than at dial time.
+			this.claimNumber(line.extensionNumber, {
+				kind: "shared-line",
+				entityId: line.id,
+				nodeId: this.sharedLineNode(line),
+				name: line.name,
+			});
+		}
 		for (const room of sortById(this.snapshot.conferences)) {
 			if (!room.enabled) {
 				continue;
@@ -1919,6 +3813,98 @@ class Compiler {
 				nodeId: this.conferenceNode(room),
 				name: room.name,
 			});
+		}
+		for (const flow of sortById(this.snapshot.callFlows ?? [])) {
+			if (!flow.enabled || flow.extensionNumber == null || flow.extensionNumber.length === 0) {
+				continue;
+			}
+			this.claimNumber(flow.extensionNumber, {
+				kind: "call-flow",
+				entityId: flow.id,
+				nodeId: this.callFlowNode(flow),
+				name: flow.name,
+			});
+		}
+		for (const directory of sortById(this.snapshot.directories ?? [])) {
+			if (
+				!directory.enabled ||
+				directory.extensionNumber == null ||
+				directory.extensionNumber.length === 0
+			) {
+				continue;
+			}
+			this.claimNumber(directory.extensionNumber, {
+				kind: "dial-by-name",
+				entityId: directory.id,
+				nodeId: this.dialByNameNode(directory),
+				name: directory.name,
+			});
+		}
+	}
+
+	/**
+	 * Screens the per-row toggle codes against the feature-code catalogue.
+	 *
+	 * `call_flow.feature_code` and `time_condition.override_feature_code` are dialable strings that
+	 * are NOT `feature_code` rows — deliberately, because they are instance-specific toggles rather
+	 * than members of a closed catalogue of actions. The cost of that choice is exactly this: two
+	 * mechanisms answering the same digits, with no runtime symptom beyond the wrong one winning.
+	 * So the compiler reports the overlap rather than letting a tenant discover it by pressing a key
+	 * and watching a different thing happen.
+	 *
+	 * An ERROR, not a warning: unlike a shadowed route, there is no reading of this configuration
+	 * under which the tenant gets what they asked for.
+	 */
+	private reportToggleCodeCollisions(featureCodes: readonly CompiledFeatureCode[]): void {
+		// The CATALOGUE's own codes. The synthesised toggle entries are excluded because they ARE the
+		// codes being checked — asking whether `*65` is consumed by the entry `*65` compiled into
+		// would report every toggle code as colliding with itself. Toggle-against-toggle is still
+		// caught, by `seen` below, which is where it was caught before the entries existed.
+		const catalogue = featureCodes.filter(
+			(entry) => entry.action !== "call-flow-toggle" && entry.action !== "time-condition-override",
+		);
+		const seen = new Map<string, string>();
+		const check = (code: string | null | undefined, subject: DiagnosticSubject, path: string) => {
+			const value = code?.trim() ?? "";
+			if (value.length === 0) {
+				return;
+			}
+			const clash = featureCodeWouldConsume(catalogue, value);
+			if (clash !== undefined) {
+				this.bag.error(
+					"conflicting-feature-code",
+					`Toggle code "${value}" can never be dialed: feature code "${clash.code}" is matched first and would consume it.`,
+					subject,
+					path,
+				);
+				return;
+			}
+			const other = seen.get(value);
+			if (other !== undefined) {
+				this.bag.error(
+					"conflicting-feature-code",
+					`Toggle code "${value}" is claimed by both ${other} and ${subject.name ?? subject.id}.`,
+					subject,
+					path,
+				);
+				return;
+			}
+			seen.set(value, subject.name ?? subject.id);
+		};
+
+		for (const flow of sortById(this.snapshot.callFlows ?? [])) {
+			if (flow.enabled) {
+				check(flow.featureCode, { kind: "call-flow", id: flow.id, name: flow.name }, "featureCode");
+			}
+		}
+		for (const condition of sortById(this.snapshot.timeConditions)) {
+			if (condition.enabled) {
+				check(
+					condition.overrideFeatureCode,
+					{ kind: "time-condition", id: condition.id, name: condition.name },
+					"overrideFeatureCode",
+				);
+			}
 		}
 	}
 
@@ -2006,6 +3992,31 @@ class Compiler {
 	// Inbound context
 	// -------------------------------------------------------------------------------------------
 
+	/**
+	 * Caller-id normalisation per trunk, for the inbound resolver.
+	 *
+	 * Keyed by `trunk.id` rather than folded into the rules, because the rewrite happens BEFORE the
+	 * rule walk and before the call-block screen: the whole point is that a tenant's blocklist should
+	 * not have to know which carrier a call arrived on.
+	 */
+	private compileInboundTranslations(): Readonly<Record<string, CompiledTranslationRuleset>> {
+		const byTrunk: Record<string, CompiledTranslationRuleset> = {};
+		for (const trunk of sortById(this.snapshot.trunks)) {
+			if (!trunk.enabled) {
+				continue;
+			}
+			const ruleset = this.translationRuleset(
+				trunk.inboundTranslationRulesetId,
+				{ kind: "trunk", id: trunk.id, name: trunk.name },
+				"inboundTranslationRulesetId",
+			);
+			if (ruleset !== undefined) {
+				byTrunk[trunk.id] = ruleset;
+			}
+		}
+		return sortRecordKeys(byTrunk);
+	}
+
 	private compileInbound(): InboundMatchTable {
 		const rules: InboundRule[] = [];
 
@@ -2088,6 +4099,14 @@ class Compiler {
 					destinationNodeId,
 					failoverNodeId: failoverNodeId ?? undefined,
 					callerIdNamePrefix: did?.callerIdNamePrefix ?? undefined,
+					// Inherit-when-absent, so a route with no override carries no key and its tenant's
+					// artifact is the same bytes it was before the columns existed.
+					recordingConsentPolicy: this.consentPolicyOverride(route.recordingConsentPolicy),
+					recordingConsentPromptId: this.consentPromptRef(
+						route.recordingConsentPromptId,
+						subject,
+						"recordingConsentPromptId",
+					),
 				}) as InboundRule,
 			);
 		}
@@ -2101,7 +4120,7 @@ class Compiler {
 		this.reportInboundShadowing(ordered);
 
 		const didDefaults: Record<string, InboundDidDefault> = {};
-		for (const did of sortById(this.snapshot.phoneNumbers)) {
+		for (const did of sortById([...this.phoneNumbersById.values()])) {
 			if (!did.enabled || !did.voiceEnabled) {
 				continue;
 			}
@@ -2125,13 +4144,21 @@ class Compiler {
 				recordEnabled: did.recordEnabled,
 				callerIdNamePrefix: did.callerIdNamePrefix ?? undefined,
 				destinationNodeId,
+				recordingConsentPolicy: this.consentPolicyOverride(did.recordingConsentPolicy),
+				recordingConsentPromptId: this.consentPromptRef(
+					did.recordingConsentPromptId,
+					subject,
+					"recordingConsentPromptId",
+				),
 			}) as InboundDidDefault;
 		}
 
+		const inboundTranslations = this.compileInboundTranslations();
 		return {
 			rules: ordered,
 			didDefaults: sortRecordKeys(didDefaults),
 			noMatchNodeId: this.hangupNode(NO_MATCH_CAUSE),
+			...(Object.keys(inboundTranslations).length === 0 ? {} : { inboundTranslations }),
 		};
 	}
 
@@ -2144,7 +4171,8 @@ class Compiler {
 	 */
 	private reportInboundShadowing(rules: readonly InboundRule[]): void {
 		for (const [index, rule] of rules.entries()) {
-			for (const earlier of rules.slice(0, index)) {
+			for (let i = 0; i < index; i += 1) {
+				const earlier = rules[i] as InboundRule;
 				if (earlier.callerPattern !== undefined || earlier.timeGate !== undefined) {
 					continue;
 				}
@@ -2314,6 +4342,14 @@ class Compiler {
 
 			const failoverNodeId = this.namedDestinationNode(route, "failover", subject);
 			const trunkPlan = this.compileTrunkPlan(route, continueOnCauses, subject);
+			// Once, not once per copy: the same override rides both the node and the rule, and two
+			// calls would report the same bad number twice.
+			const routeCallerId = this.e164Field(
+				route.callerIdNumberOverride,
+				`Outbound route "${route.name}" caller id override`,
+				subject,
+				"callerIdNumberOverride",
+			);
 			const nodeId = `trunk-dial:${route.id}`;
 			if (!this.claimed.has(nodeId)) {
 				this.claimed.add(nodeId);
@@ -2328,8 +4364,11 @@ class Compiler {
 						attempts: trunkPlan.attempts,
 						continueOnCauses: trunkPlan.continueOnCauses,
 						recordEnabled: route.recordEnabled,
-						callerIdNumberOverride: route.callerIdNumberOverride ?? undefined,
+						callerIdNumberOverride: routeCallerId,
 						failoverNodeId: failoverNodeId ?? undefined,
+						// The gate travels on the NODE, because the node is what the engine walks — a
+						// resolver hands over an `ExecutionPlan`, not the rule it matched.
+						pinSet: this.compilePinSet(route.pinSetId, subject),
 					}) as PlanNode,
 				);
 			}
@@ -2345,7 +4384,15 @@ class Compiler {
 					prependDigits: route.prependDigits ?? undefined,
 					timeGate: this.routeTimeGate(route.timeConditionId, failoverNodeId, subject),
 					recordEnabled: route.recordEnabled,
-					callerIdNumberOverride: route.callerIdNumberOverride ?? undefined,
+					callerIdNumberOverride: routeCallerId,
+					// AFTER the inline strip/prepend, which the resolver applies first. The order and
+					// its argument are in `translations-schema.ts`: the inline pair turns what fingers
+					// did into the number meant, and the ruleset normalises that for the wire.
+					translation: this.translationRuleset(
+						route.translationRulesetId,
+						subject,
+						"translationRulesetId",
+					),
 					destinationNodeId: nodeId,
 				}) as OutboundRule,
 			);
@@ -2490,6 +4537,14 @@ class Compiler {
 	}
 
 	private reportInvalidEmergencyNumbers(): void {
+		for (const raw of cappedEmergencyNumbers(this.snapshot.settings?.emergencyNumbers)) {
+			this.bag.warning(
+				"invalid-emergency-number",
+				`Emergency number ${JSON.stringify(raw)} is past the ${String(MAX_EMERGENCY_NUMBERS)}-entry limit on settings.emergencyNumbers and was not compiled. The compiled-in emergency numbers are unaffected.`,
+				undefined,
+				"settings.emergencyNumbers",
+			);
+		}
 		for (const raw of invalidEmergencyNumbers(this.snapshot.settings?.emergencyNumbers)) {
 			this.bag.warning(
 				"invalid-emergency-number",
@@ -2519,7 +4574,7 @@ class Compiler {
 		let chosen: { readonly elin: string; readonly emergencyAddressId: string } | undefined;
 		const unassigned: DiagnosticSubject[] = [];
 
-		for (const did of [...this.snapshot.phoneNumbers].sort((left, right) =>
+		for (const did of [...this.phoneNumbersById.values()].sort((left, right) =>
 			left.e164 < right.e164 ? -1 : left.e164 > right.e164 ? 1 : 0,
 		)) {
 			if (!did.enabled || !did.voiceEnabled) {
@@ -2721,10 +4776,12 @@ class Compiler {
 
 	private compileExtensionIndex(): Readonly<Record<string, ExtensionIndexEntry>> {
 		const index: Record<string, ExtensionIndexEntry> = {};
+		const appearancesByExtension = this.buildSharedLineAppearanceIndex();
 		for (const extension of sortById(this.snapshot.extensions)) {
 			if (!extension.enabled) {
 				continue;
 			}
+			const sharedLineAppearances = appearancesByExtension.get(extension.id);
 			index[extension.number] = compact({
 				extensionId: extension.id,
 				number: extension.number,
@@ -2732,12 +4789,70 @@ class Compiler {
 				enabled: extension.enabled,
 				outboundCallerIdNumber: extension.outboundCallerIdNumber ?? undefined,
 				outboundCallerIdName: extension.outboundCallerIdName ?? undefined,
+				// Only the withhold is written. See `ExtensionIndexEntry.outboundCallerIdPresentation`.
+				outboundCallerIdPresentation:
+					extension.outboundCallerIdPresentation === "restricted" ? "restricted" : undefined,
 				emergencyCallerIdNumber: extension.emergencyCallerIdNumber ?? undefined,
 				pickupGroup: pickupGroupOf(extension),
+				// The DTMF handler reads it off this map, from the dialled number, before it has a node.
+				recordAutoPauseOnDtmf: autoPauseFlag(extension.recordAutoPauseOnDtmf),
+				sharedLineAppearances:
+					sharedLineAppearances !== undefined && sharedLineAppearances.length > 0
+						? sharedLineAppearances
+						: undefined,
 				nodeId: this.extensionNode(extension),
 			}) as ExtensionIndexEntry;
 		}
 		return sortRecordKeys(index);
+	}
+
+	/**
+	 * Which shared lines each extension appears on, keyed by extension id, in appearance-index order.
+	 *
+	 * Built once and read by {@link compileExtensionIndex}: this is the per-extension projection the
+	 * credential responder reads to tell a registering device its `Call-Info` appearance index, the
+	 * same idiom `pickupGroup` follows. Disabled lines, disabled appearances and appearances pointing
+	 * at a missing or disabled extension are dropped, so the projection carries only what the phone
+	 * can actually light. Sorted by appearance index so the responder projecting the FIRST entry gets
+	 * the lowest-ordinal line deterministically.
+	 */
+	private buildSharedLineAppearanceIndex(): Map<string, ExtensionSharedLineAppearance[]> {
+		const byExtension = new Map<string, ExtensionSharedLineAppearance[]>();
+		for (const line of sortById(this.snapshot.sharedLines ?? [])) {
+			if (!line.enabled) {
+				continue;
+			}
+			for (const appearance of line.appearances) {
+				if (!appearance.enabled) {
+					continue;
+				}
+				const extension = this.extensionsById.get(appearance.extensionId);
+				if (extension === undefined || !extension.enabled) {
+					continue;
+				}
+				const list = byExtension.get(appearance.extensionId) ?? [];
+				list.push(
+					compact({
+						sharedLineId: line.id,
+						number: line.extensionNumber ?? undefined,
+						appearanceIndex: appearance.ordinal,
+					}) as ExtensionSharedLineAppearance,
+				);
+				byExtension.set(appearance.extensionId, list);
+			}
+		}
+		for (const list of byExtension.values()) {
+			list.sort(
+				(left, right) =>
+					left.appearanceIndex - right.appearanceIndex ||
+					(left.sharedLineId < right.sharedLineId
+						? -1
+						: left.sharedLineId > right.sharedLineId
+							? 1
+							: 0),
+			);
+		}
+		return byExtension;
 	}
 
 	// -------------------------------------------------------------------------------------------
@@ -2849,12 +4964,45 @@ function allowFirst(action: CallBlockAction): number {
  * fractional timeout is a shape the database will happily hold. Clamping here means the engine
  * never has to defend against one on the call path.
  */
+/**
+ * A whole number inside a bound, or the default. Used for the callback block, where a value that
+ * reached the row from a migration or a direct edit is read by a process that cannot ask about it.
+ */
+function wholeCount(
+	value: number | null | undefined,
+	fallback: number,
+	min: number,
+	max: number,
+): number {
+	if (value == null || !Number.isFinite(value)) {
+		return fallback;
+	}
+	return Math.min(max, Math.max(min, Math.trunc(value)));
+}
+
 function wholeSeconds(value: number | undefined): number {
 	return Number.isFinite(value) ? Math.max(0, Math.trunc(value as number)) : 0;
 }
 
 function greetingKey(voicemailBoxId: string, kind: VoicemailGreetingKind): string {
 	return `${voicemailBoxId}:${kind}`;
+}
+
+/**
+ * The organization's SIP realm as the artifact carries it, or `undefined` when it has none.
+ *
+ * Trimmed, and a blank or `null` becomes ABSENT rather than a realm named `""`. The distinction is
+ * load-bearing: absent means "this tenant set no realm, use the fleet default", and a realm of `""`
+ * would compile `sip:{number}@` — a URI with no host, which the edge cannot resolve and which is a
+ * worse failure than dialling nothing. Not lower-cased: a realm is a host and the administrator who
+ * typed it chose its case. `compact` drops the key when this returns `undefined`.
+ */
+function normaliseRealm(value: string | null | undefined): string | undefined {
+	if (value === null || value === undefined) {
+		return undefined;
+	}
+	const trimmed = value.trim();
+	return trimmed.length === 0 ? undefined : trimmed;
 }
 
 /**
@@ -2930,6 +5078,165 @@ function sortRecordKeys<T>(record: Readonly<Record<string, T>>): Readonly<Record
  * Every artifact object goes through this, because `{ a: 1, b: undefined }` and `{ a: 1 }` are the
  * same value to a consumer but different to `JSON.stringify` — and therefore to the artifact hash.
  */
+/**
+ * One `skill[:minLevel[:relaxAfterSeconds]]` entry, parsed, or `undefined` when it is not usable.
+ *
+ * The tag is trimmed and lower-cased rather than refused, because `"Spanish "` from a spreadsheet
+ * import means the same skill as `spanish` and dropping it would leave the caller unmatched for a
+ * reason nobody can see in their own form. The SHAPE is still enforced: a tag with a space in the
+ * middle is a different tag from the one on any agent, so it fails the same check `pbx-db` applies
+ * at write time and is dropped with a warning.
+ */
+function parseSkillRequirement(value: string): QueueSkillRequirementPlan | undefined {
+	const [rawSkill, rawLevel, rawRelax, ...rest] = value.split(":");
+	if (rest.length > 0 || rawSkill === undefined) {
+		return undefined;
+	}
+	const skill = normalizeSkillTag(rawSkill);
+	if (skill === undefined) {
+		return undefined;
+	}
+	const minLevel = fieldOf(rawLevel, QUEUE_SKILL_LEVEL_MIN);
+	if (
+		minLevel === undefined ||
+		minLevel < QUEUE_SKILL_LEVEL_MIN ||
+		minLevel > QUEUE_SKILL_LEVEL_MAX
+	) {
+		return undefined;
+	}
+	const relax = fieldOf(rawRelax, 0);
+	if (relax === undefined || relax < 0 || relax > MAX_SKILL_RELAX_SECONDS) {
+		return undefined;
+	}
+	return { skill, minLevel, relaxAfterSeconds: relax };
+}
+
+/** An omitted or blank field takes the default; anything that is not a whole number is a refusal. */
+function fieldOf(raw: string | undefined, fallback: number): number | undefined {
+	if (raw === undefined || raw.trim() === "") {
+		return fallback;
+	}
+	const value = Number(raw);
+	return Number.isInteger(value) ? value : undefined;
+}
+
+/** The same tag shape `pbx-db`'s `queue_agent_skill_shape_check` enforces, applied to the artifact. */
+function normalizeSkillTag(value: string): string | undefined {
+	const tag = value.trim().toLowerCase();
+	return /^[a-z0-9][a-z0-9_-]{0,62}$/.test(tag) ? tag : undefined;
+}
+
+/** Matches `queue_skill_requirement_relax_range_check`. An hour of relaxation is already a queue that gave up. */
+const MAX_SKILL_RELAX_SECONDS = 3600;
+
+/**
+ * The node-id fragment a skills override folds into `queue:<id>`.
+ *
+ * Same property `queueNode`'s priority suffix needs and for the same reason: same override, same
+ * id; different override, different node. The list is already sorted by skill when it reaches here,
+ * so the fragment is a pure function of the requirement set and a recompile of an unchanged
+ * snapshot produces the same artifact hash.
+ */
+function skillsKeyOf(requirements: readonly QueueSkillRequirementPlan[]): string {
+	return requirements
+		.map((entry) => `${entry.skill}-${String(entry.minLevel)}-${String(entry.relaxAfterSeconds)}`)
+		.join("_");
+}
+
+/**
+ * A queue exit key, or `undefined` when the column says the queue has none.
+ *
+ * Upper-cased before the membership test so a tenant who typed `d` gets the DTMF `D` rather than a
+ * silently disabled exit key, and rejected outright otherwise. A value the database's own check
+ * constraint would have refused can still arrive here — from a fixture, from a loader that has not
+ * been taught the column, or from a snapshot built by hand for a diagnostic — and the engine
+ * compares this against a `DtmfEvent.digit` with `===`, so anything that would never match must not
+ * reach it wearing the costume of a configured feature. A rejected value is not silently gone:
+ * `queueNode` compares the raw column against this answer and warns, because a configured digit
+ * that does nothing is a thing nobody can debug.
+ */
+function normalizeExitKey(value: string | null | undefined): string | undefined {
+	const trimmed = value?.trim().toUpperCase();
+	if (trimmed === undefined || trimmed === "") {
+		return undefined;
+	}
+	return (QUEUE_EXIT_KEYS as readonly string[]).includes(trimmed) ? trimmed : undefined;
+}
+
+/**
+ * A consent accept/decline digit, falling back to the documented default.
+ *
+ * The same DTMF vocabulary a queue exit key is checked against, and it falls back silently rather
+ * than warning: the engine cannot wait for a keypress that no keypad can produce, and a tenant left
+ * with the documented `1`/`2` has a gate that works. A settings row is not a place a typo survives
+ * review the way a per-queue key is, which is why that one earns a diagnostic and this one does not.
+ */
+function consentDigit(value: string | null | undefined, fallback: string): string {
+	return normalizeExitKey(value) ?? fallback;
+}
+
+/**
+ * The PCI auto-pause flag, written only when it is on.
+ *
+ * `false`, `null` and absent all collapse to no key, and that is the point rather than tidiness: a
+ * `false` written into the artifact would make the snapshot of every tenant who never touched the
+ * setting differ from the one they had, which is a cache invalidation and a republished artifact for
+ * a behaviour that did not change. Absent already means "do not pause".
+ */
+function autoPauseFlag(value: boolean | null | undefined): true | undefined {
+	return value === true ? true : undefined;
+}
+
+/**
+ * A non-negative whole ceiling, or `undefined` for every other input.
+ *
+ * Zero is dropped along with NULL, and that reading is deliberate and matches
+ * {@link ArtifactCompiler.concurrentCallCeiling}: a tenant who typed a zero into a limit field meant
+ * "no limit", and the other interpretation — refuse every international call — takes their overseas
+ * calling down on a keystroke. An extension that genuinely may not call internationally is expressed
+ * by its toll class, which is the control designed to say so.
+ */
+function ceiling(value: number | null | undefined): number | undefined {
+	if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+		return undefined;
+	}
+	return value;
+}
+
+/** A minute-of-day offset, or `undefined`. Out-of-range values are dropped, not clamped. */
+function minuteOfDay(value: number | null | undefined): number | undefined {
+	if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > 1_439) {
+		return undefined;
+	}
+	return value;
+}
+
+/**
+ * ISO-3166 alpha-2 codes, upper-cased, de-duplicated and sorted; `undefined` when nothing survives.
+ *
+ * Sorted because the artifact is hashed: a tenant who reorders the same three countries in the UI
+ * must not produce a different artifact, republish it and invalidate every engine's cache for a
+ * change that is not one. An empty result collapses to absent for the reason the schema column
+ * records — an empty ALLOW list would refuse every international call, and clearing a field never
+ * meant that.
+ */
+function countryList(value: readonly string[] | null | undefined): readonly string[] | undefined {
+	if (!Array.isArray(value)) {
+		return undefined;
+	}
+	const codes = new Set<string>();
+	for (const entry of value) {
+		if (typeof entry !== "string") {
+			continue;
+		}
+		const code = entry.trim().toUpperCase();
+		if (/^[A-Z]{2}$/.test(code)) {
+			codes.add(code);
+		}
+	}
+	return codes.size === 0 ? undefined : [...codes].sort();
+}
+
 function compact<T extends Record<string, unknown>>(value: T): T {
 	const out: Record<string, unknown> = {};
 	for (const key of Object.keys(value)) {

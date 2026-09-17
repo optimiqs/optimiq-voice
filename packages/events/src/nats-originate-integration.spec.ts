@@ -85,6 +85,7 @@ async function connectAs(user: string, pass: string): Promise<NatsConnection> {
 	while (Date.now() < deadline) {
 		try {
 			return await connect({
+				inboxPrefix: `_INBOX.${user}`,
 				servers: `nats://127.0.0.1:${CONTAINER_PORT}`,
 				user,
 				pass,
@@ -141,6 +142,8 @@ describe.skipIf(!ENABLED)("rpc.engine.v1.originate over the real nats.conf (inte
 				);
 			}
 		})();
+
+		await engine.flush();
 
 		const originateId = createEntityId();
 		const reply = await api.request(

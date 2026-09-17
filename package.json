@@ -24,7 +24,7 @@
 		"db:generate": "pnpm --filter @optimiq-voice/db run db:generate && pnpm --filter @optimiq-voice/pbx-db run db:generate && pnpm --filter @optimiq-voice/cdr-db run db:generate && pnpm --filter @optimiq-voice/api run db:generate",
 		"db:migrate": "pnpm --filter @optimiq-voice/db run db:migrate && pnpm --filter @optimiq-voice/pbx-db run db:migrate && pnpm --filter @optimiq-voice/cdr-db run db:migrate && pnpm --filter @optimiq-voice/api run db:deploy",
 		"db:seed": "pnpm --filter @optimiq-voice/api run seed:pbx && pnpm --filter @optimiq-voice/api run seed:cdr",
-		"format": "oxfmt \"apps/**/src/**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}\" \"packages/**/src/**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}\"",
+		"format": "oxfmt \"apps/**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}\" \"packages/**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}\"",
 		"lint": "oxlint .",
 		"lint:fix": "oxlint . --fix",
 		"prepare": "husky",
@@ -33,22 +33,15 @@
 		"stop:services": "cross-env docker compose -f compose.yaml -f compose.dev.yaml down",
 		"pretest": ".scripts/check-preconditions.sh",
 		"test": "cross-env LOG_LEVEL=silent LOG_PRETTY=false LOGS_LEVEL=none NODE_ENV=development mocha --timeout 30000 --ignore 'apps/**/*.integration.test.ts' --ignore 'packages/**/*.integration.test.ts' 'apps/**/*.test.ts' 'packages/**/*.test.ts'",
+		"check:nats": "node .scripts/check-nats-grants.mjs",
 		"typecheck": "turbo run typecheck",
-		"format:check": "oxfmt --check \"apps/**/src/**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}\" \"packages/**/src/**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}\""
-	},
-	"nodemonConfig": {
-		"exec": "tsx",
-		"ext": "ts",
-		"ignore": "**/*.d.ts",
-		"watch": [
-			"apps/**",
-			"packages/**"
-		]
+		"format:check": "oxfmt --check \"apps/**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}\" \"packages/**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}\""
 	},
 	"devDependencies": {
 		"@commitlint/cli": "19.8.1",
 		"@commitlint/config-conventional": "19.8.1",
 		"@effect/language-service": "catalog:",
+		"@swc-node/register": "1.12.1",
 		"@types/chai": "5.2.3",
 		"@types/chai-as-promised": "8.0.2",
 		"@types/mocha": "10.0.10",
@@ -62,7 +55,6 @@
 		"husky": "9.1.7",
 		"lint-staged": "17.3.0",
 		"mocha": "11.7.6",
-		"nodemon": "3.1.14",
 		"oxfmt": "0.62.0",
 		"oxlint": "1.77.0",
 		"reflect-metadata": "catalog:",

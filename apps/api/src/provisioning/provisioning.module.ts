@@ -17,6 +17,8 @@ import { ProvisionController } from "./render/provision.controller";
 import { ProvisionEventPublisher } from "./render/provision.publisher";
 import { ProvisionRepository } from "./render/provision.repository";
 import { ProvisionService } from "./render/provision.service";
+import { SoftphoneController } from "./softphone/softphone.controller";
+import { SoftphoneCredentialsService } from "./softphone/softphone.service";
 import type { ProvisioningEnv } from "./provisioning-env";
 
 const logger = getLogger("api.provisioning");
@@ -64,6 +66,16 @@ const logger = getLogger("api.provisioning");
 		DeviceProfilesController,
 		ProvisioningCatalogController,
 		/**
+		 * `GET /api/v1/me/softphone` — self-service browser softphone credentials.
+		 *
+		 * Here rather than in the auth slice for a structural reason: it reads the telephony database
+		 * (`extension_user`, the extension's `sip_secret_ref`) and derives the SIP password with this
+		 * area's own `deriveSipPassword`, so it belongs where `PBX_DATABASE` and `PROVISIONING_ENV`
+		 * already live. The auth slice cannot host it without importing `PbxModule`, which imports the
+		 * auth slice back — a cycle. The route is still `@RequirePermissions()` (authenticated-only).
+		 */
+		SoftphoneController,
+		/**
 		 * The one controller in this application with a route that requires no session.
 		 *
 		 * Listed last and commented here so it is impossible to add a second one without noticing.
@@ -93,6 +105,7 @@ const logger = getLogger("api.provisioning");
 		DeviceKeysService,
 		DeviceProfilesService,
 		DeviceProfileKeysService,
+		SoftphoneCredentialsService,
 	],
 	exports: [DevicesService, DeviceProfilesService, ProvisionService],
 })

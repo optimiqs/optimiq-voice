@@ -1,4 +1,5 @@
 import { z } from "zod/v4";
+import { e164 } from "../shared/dto";
 
 /**
  * `POST /api/v1/calls` — the click-to-dial button.
@@ -46,7 +47,24 @@ export const originateCallDto = z.strictObject({
 	 * Advisory: the outbound routing may still override it, exactly as it does for a call the user
 	 * dialled by hand. Accepting it here does not bypass the tenant's CLI policy, and the contract
 	 * says so on the engine's side too.
+	 *
+	 * E.164, and normalised like every other number this platform stores. It was 128 characters of
+	 * free text, which the carrier either rejects or silently replaces with the account default —
+	 * so the tenant saw a presented number nobody in this system chose, and had no way to tell
+	 * which. `to` above stays unpatterned on purpose: that one is dialled through the tenant's plan
+	 * and is as likely to be an extension or a feature code as a number.
 	 */
-	callerIdNumber: z.string().trim().max(128).optional(),
+	callerIdNumber: e164.optional(),
 	callerIdName: z.string().trim().max(128).optional(),
 });
+
+/**
+ * `POST /api/v1/calls/:id/recording/{pause,resume}` take an empty body.
+ *
+ * The ACTION is in the path and the CALL is in the path, so there is nothing left for a body to
+ * say. Declared rather than skipped, on the `emptyConferenceModerationDto` argument: a
+ * `{"paused":false}` sent at `/pause` must be a 400 and not a request that looks like it chose
+ * something — on this surface the dropped value would be the difference between a card number
+ * reaching the recording and not.
+ */
+export const emptyCallControlDto = z.strictObject({});

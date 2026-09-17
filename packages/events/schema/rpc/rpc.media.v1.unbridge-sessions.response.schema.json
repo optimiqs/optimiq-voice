@@ -16,7 +16,7 @@
 		},
 		"sessionIds": {
 			"default": [],
-			"maxItems": 2,
+			"maxItems": 8,
 			"type": "array",
 			"items": {
 				"type": "string",

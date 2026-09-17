@@ -15,6 +15,7 @@ export {
 	jwks,
 	member,
 	organization,
+	rateLimit,
 	session,
 	twoFactor,
 	user,

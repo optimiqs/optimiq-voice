@@ -1,6 +1,7 @@
 import { apiKeyClient } from "@better-auth/api-key/client";
 import { adminClient, organizationClient, twoFactorClient } from "better-auth/client/plugins";
 import { createAuthClient } from "better-auth/react";
+import { ApiError } from "./api-client";
 
 /**
  * The better-auth browser client.
@@ -67,4 +68,23 @@ export function authErrorMessage(error: { message?: string; code?: string } | nu
 		return "Something went wrong. Try again.";
 	}
 	return error.message?.trim() || "Something went wrong. Try again.";
+}
+
+/**
+ * The same failure as an {@link ApiError}, so the query client's retry rule can see its status.
+ *
+ * `query-client.ts` refuses to retry a 4xx — "a 403 re-asks a question the permission guard has
+ * already answered" — but it recognizes that case by `instanceof ApiError`. A better-auth call site
+ * that threw a bare `Error` therefore fell through to the generic backoff and re-asked three times,
+ * which is what kept `/settings/api-keys` on its loading panel for seconds for any member whose
+ * role cannot read organization keys. Throwing this instead puts those calls under the same rule as
+ * every `apiFetch` one.
+ *
+ * The status defaults to 500 rather than 403: an error with no status is an unknown failure, and
+ * treating an unknown as a 4xx would silently disable retries for genuinely transient ones.
+ */
+export function authQueryError(
+	error: { message?: string; code?: string; status?: number } | null,
+): ApiError {
+	return new ApiError(error?.status ?? 500, authErrorMessage(error), error);
 }

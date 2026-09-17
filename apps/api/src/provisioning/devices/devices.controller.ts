@@ -29,6 +29,7 @@ import {
 	updateDeviceProfileKeyDto,
 } from "./devices.dto";
 import {
+	assertMayWriteDispatchableLocation,
 	DeviceKeysService,
 	DeviceLinesService,
 	DeviceProfileKeysService,
@@ -73,8 +74,15 @@ export class DevicesController {
 		@Inject(DeviceKeysService) private readonly keys: DeviceKeysService,
 	) {}
 
+	/**
+	 * `devices.read.own` and not `devices.read` — the `.own` fix, not a downgrade.
+	 *
+	 * An unscoped `devices.read` holder satisfies the scoped floor anyway; a `user` holding only
+	 * `devices.read.own` now clears the guard, and the service narrows the list to the devices that
+	 * carry a line bound to one of their extensions. Same pattern as extensions and voicemail.
+	 */
 	@Get()
-	@RequirePermissions("devices.read")
+	@RequirePermissions("devices.read.own")
 	async list(@Session() session: AppSession, @Query() query: unknown) {
 		return await this.devices.list(
 			session,
@@ -83,7 +91,7 @@ export class DevicesController {
 	}
 
 	@Get(":id")
-	@RequirePermissions("devices.read")
+	@RequirePermissions("devices.read.own")
 	async get(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
 		return await this.devices.get(session, id);
 	}
@@ -101,7 +109,9 @@ export class DevicesController {
 	@Post()
 	@RequirePermissions("devices.write")
 	async create(@Session() session: AppSession, @Body() body: unknown) {
-		return await this.devices.createWithProvisioningToken(session, parseDto(createDeviceDto, body));
+		const values = parseDto(createDeviceDto, body);
+		assertMayWriteDispatchableLocation(session, values);
+		return await this.devices.createWithProvisioningToken(session, values);
 	}
 
 	@Patch(":id")
@@ -111,7 +121,9 @@ export class DevicesController {
 		@Param("id", ParseUUIDPipe) id: string,
 		@Body() body: unknown,
 	) {
-		return await this.devices.update(session, id, parseDto(updateDeviceDto, body));
+		const values = parseDto(updateDeviceDto, body);
+		assertMayWriteDispatchableLocation(session, values);
+		return await this.devices.update(session, id, values);
 	}
 
 	@Delete(":id")
@@ -123,17 +135,34 @@ export class DevicesController {
 	/**
 	 * `POST /devices/:id/provisioning-token` — rotate, and reveal once.
 	 *
-	 * `devices.write` rather than a permission of its own. The registry is at its stated ceiling and
-	 * this is not a distinct capability: anybody who can edit a device can already re-point its lines
-	 * at another extension, which is a strictly larger change than rotating the URL that delivers
-	 * them. A separate `devices.rotate-token` would be a permission that no role could sensibly hold
-	 * without `devices.write` — see the report accompanying this change.
+	 * `provisioning.tokens`, and the previous `devices.write` was a real mis-guard rather than a
+	 * defensible ride.
+	 *
+	 * The argument this comment used to make was that the registry was at its ceiling and a
+	 * token-rotation grant would be one no role could hold without `devices.write` anyway. Both
+	 * halves were wrong. `provisioning.tokens` was already in the registry — its description is
+	 * literally "issue and revoke the per-device tokens that authenticate config pulls", which is
+	 * this endpoint and nothing else — and it was enforcing nothing anywhere, so the ceiling was
+	 * being spent on a permission that guarded a route guarded by something else.
+	 *
+	 * The second half was wrong in a way that mattered. `manager` holds `devices.write` and does
+	 * NOT hold `provisioning.tokens`, and the role's own description says why: "No carrier, secret
+	 * or provisioning-credential access." A provisioning token IS a credential — it is the secret a
+	 * phone presents to fetch a configuration file containing its SIP password — so the old guard
+	 * handed every manager exactly the class of access their role says they do not have. Naming the
+	 * right permission narrows it back.
+	 *
+	 * The neighbouring claim (editing a device is a larger change than rotating its token) is also
+	 * not true in the direction it needs to be: re-pointing a line changes where calls go and is
+	 * visible in the audit log the moment somebody looks; minting a fresh provisioning URL hands
+	 * out a working credential and looks, in the ledger, exactly like an ordinary maintenance
+	 * action.
 	 *
 	 * The configuration check runs FIRST. Handing somebody a URL that every phone will get a 503
 	 * from is a worse outcome than telling them which variable an operator has to set.
 	 */
 	@Post(":id/provisioning-token")
-	@RequirePermissions("devices.write")
+	@RequirePermissions("provisioning.tokens")
 	async regenerateToken(
 		@Session() session: AppSession,
 		@Param("id", ParseUUIDPipe) id: string,
@@ -147,7 +176,7 @@ export class DevicesController {
 	// --- lines -----------------------------------------------------------------------------------
 
 	@Get(":id/lines")
-	@RequirePermissions("devices.read")
+	@RequirePermissions("devices.read.own")
 	async listLines(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
 		return await this.lines.list(session, id);
 	}
@@ -186,7 +215,7 @@ export class DevicesController {
 	// --- keys ------------------------------------------------------------------------------------
 
 	@Get(":id/keys")
-	@RequirePermissions("devices.read")
+	@RequirePermissions("devices.read.own")
 	async listKeys(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
 		return await this.keys.list(session, id);
 	}
@@ -244,25 +273,25 @@ export class DeviceProfilesController {
 	) {}
 
 	@Get()
-	@RequirePermissions("devices.read")
+	@RequirePermissions("provisioning.read")
 	async list(@Session() session: AppSession, @Query() query: unknown) {
 		return await this.profiles.list(session, parseDto(listQuerySchema, query ?? {}));
 	}
 
 	@Get(":id")
-	@RequirePermissions("devices.read")
+	@RequirePermissions("provisioning.read")
 	async get(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
 		return await this.profiles.get(session, id);
 	}
 
 	@Post()
-	@RequirePermissions("devices.write")
+	@RequirePermissions("provisioning.write")
 	async create(@Session() session: AppSession, @Body() body: unknown) {
 		return await this.profiles.create(session, parseDto(createDeviceProfileDto, body));
 	}
 
 	@Patch(":id")
-	@RequirePermissions("devices.write")
+	@RequirePermissions("provisioning.write")
 	async update(
 		@Session() session: AppSession,
 		@Param("id", ParseUUIDPipe) id: string,
@@ -272,19 +301,19 @@ export class DeviceProfilesController {
 	}
 
 	@Delete(":id")
-	@RequirePermissions("devices.delete")
+	@RequirePermissions("provisioning.write")
 	async remove(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
 		return await this.profiles.remove(session, id);
 	}
 
 	@Get(":id/keys")
-	@RequirePermissions("devices.read")
+	@RequirePermissions("provisioning.read")
 	async listKeys(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
 		return await this.keys.list(session, id);
 	}
 
 	@Post(":id/keys")
-	@RequirePermissions("devices.write")
+	@RequirePermissions("provisioning.write")
 	async createKey(
 		@Session() session: AppSession,
 		@Param("id", ParseUUIDPipe) id: string,
@@ -294,7 +323,7 @@ export class DeviceProfilesController {
 	}
 
 	@Patch(":id/keys/:keyId")
-	@RequirePermissions("devices.write")
+	@RequirePermissions("provisioning.write")
 	async updateKey(
 		@Session() session: AppSession,
 		@Param("id", ParseUUIDPipe) id: string,
@@ -305,7 +334,7 @@ export class DeviceProfilesController {
 	}
 
 	@Delete(":id/keys/:keyId")
-	@RequirePermissions("devices.write")
+	@RequirePermissions("provisioning.write")
 	async removeKey(
 		@Session() session: AppSession,
 		@Param("id", ParseUUIDPipe) id: string,

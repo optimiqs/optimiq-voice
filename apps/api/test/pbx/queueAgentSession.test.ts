@@ -5,15 +5,15 @@ import {
 	type AgentSessionAction,
 } from "@optimiq-voice/events/schemas";
 import {
+	emptyAgentSessionDto,
+	pauseAgentSessionDto,
+} from "../../src/pbx/queues/queue-agent-session.dto";
+import {
 	AgentStateStoreUnavailableException,
 	AgentTransitionRefusedException,
 	QueueAgentNotFoundException,
 	QueueAgentSessionForbiddenException,
 } from "../../src/pbx/queues/queue-agent-session.errors";
-import {
-	emptyAgentSessionDto,
-	pauseAgentSessionDto,
-} from "../../src/pbx/queues/queue-agent-session.dto";
 import { QueueAgentSessionService } from "../../src/pbx/queues/queue-agent-session.service";
 import type { AgentStatePublisher } from "../../src/pbx/queues/agent-state.publisher";
 import type { AppSession } from "@optimiq-voice/auth";
@@ -32,6 +32,8 @@ const ORGANIZATION_ID = "019fd3c2-1111-76be-a6b3-b0f1914e39b6";
 const AGENT_ID = "019fd3c2-2222-76be-a6b3-b0f1914e39b6";
 const USER_ID = "019fd3c2-3333-76be-a6b3-b0f1914e39b6";
 const OTHER_USER_ID = "019fd3c2-4444-76be-a6b3-b0f1914e39b6";
+const CALL_ID = "019fd3c2-5555-76be-a6b3-b0f1914e39b6";
+const QUEUE_ID = "019fd3c2-6666-76be-a6b3-b0f1914e39b6";
 
 interface AgentRow {
 	id: string;
@@ -101,7 +103,11 @@ function fakeDatabaseWithTiers(row: AgentRow | undefined, queueIds: readonly str
 		select: (projection?: Record<string, unknown>) => ({
 			from: () => {
 				const isTierQuery = projection !== undefined && "queueId" in projection;
-				const rows = isTierQuery ? queueIds.map((queueId) => ({ queueId })) : row === undefined ? [] : [row];
+				const rows = isTierQuery
+					? queueIds.map((queueId) => ({ queueId }))
+					: row === undefined
+						? []
+						: [row];
 				const result = {
 					limit: async () => rows,
 					then: (resolve: (value: unknown) => void) => resolve(rows),
@@ -366,9 +372,8 @@ describe("QueueAgentSessionService transitions", () => {
 		const publisher = {
 			read: async () => undefined,
 			write: async () => {
-				const { AgentStateUnavailableError } = await import(
-					"../../src/pbx/queues/agent-state.publisher"
-				);
+				const { AgentStateUnavailableError } =
+					await import("../../src/pbx/queues/agent-state.publisher");
 				throw new AgentStateUnavailableError();
 			},
 		} as unknown as AgentStatePublisher;
@@ -383,6 +388,95 @@ describe("QueueAgentSessionService transitions", () => {
 		const view = await service.get(supervisor(), AGENT_ID);
 		expect(view.data.live).to.equal(false);
 		expect(view.data.status).to.equal("available");
+	});
+
+	/**
+	 * The wallboard's supervise button and the console's wrap-up panel both read these off the
+	 * `agent-state` socket. They have to work without it — a cold socket, or a browser that never
+	 * opened one — so the session view repeats what the bucket carries.
+	 */
+	it("carries the live call and disposition fields a wallboard and a wrap-up panel need", async () => {
+		const { database } = fakeDatabaseWithTiers(agentRow({ status: "wrap-up" }), []);
+		const live = {
+			orgId: ORGANIZATION_ID,
+			agentId: AGENT_ID,
+			status: "wrap-up",
+			since: "2026-09-10T09:00:00.000Z",
+			callId: CALL_ID,
+			queueId: QUEUE_ID,
+			dispositionCallId: CALL_ID,
+			dispositionCode: "sale",
+			dispositionRequired: true,
+		} as AgentStateEntry;
+		const service = new QueueAgentSessionService(database, fakePublisher(live).publisher);
+		const view = await service.get(
+			sessionFor(["queues.read", "queues.monitor"], OTHER_USER_ID),
+			AGENT_ID,
+		);
+		expect(view.data.callId).to.equal(CALL_ID);
+		expect(view.data.queueId).to.equal(QUEUE_ID);
+		expect(view.data.dispositionCallId).to.equal(CALL_ID);
+		expect(view.data.dispositionCode).to.equal("sale");
+		expect(view.data.dispositionRequired).to.equal(true);
+	});
+
+	it("answers nulls for the call fields when the agent is not on one", async () => {
+		const { database } = fakeDatabaseWithTiers(agentRow({ status: "available" }), []);
+		const service = new QueueAgentSessionService(database, fakePublisher(undefined).publisher);
+		const view = await service.get(sessionFor(["queues.read", "queues.monitor"]), AGENT_ID);
+		expect(view.data.callId).to.equal(null);
+		expect(view.data.dispositionCallId).to.equal(null);
+		expect(view.data.dispositionRequired).to.equal(false);
+	});
+
+	/**
+	 * The `agent-state` socket topic is gated on `queues.monitor`. Repeating the call it carries to
+	 * a caller who holds only `queues.read` would hand out over HTTP what the socket refuses.
+	 */
+	it("withholds another agent's live call from a caller without queues.monitor", async () => {
+		const { database } = fakeDatabaseWithTiers(agentRow({ status: "on-call" }), []);
+		const live = {
+			orgId: ORGANIZATION_ID,
+			agentId: AGENT_ID,
+			status: "on-call",
+			since: "2026-09-10T09:00:00.000Z",
+			callId: CALL_ID,
+			queueId: QUEUE_ID,
+		} as AgentStateEntry;
+		const service = new QueueAgentSessionService(database, fakePublisher(live).publisher);
+		const other = await service.get(sessionFor(["queues.read"], OTHER_USER_ID), AGENT_ID);
+		expect(other.data.status).to.equal("on-call");
+		expect(other.data.callId).to.equal(null);
+		expect(other.data.queueId).to.equal(null);
+
+		// The agent asking about their own seat still gets it — that is the wrap-up panel.
+		const own = await service.get(sessionFor(["queues.read"]), AGENT_ID);
+		expect(own.data.callId).to.equal(CALL_ID);
+	});
+
+	/**
+	 * `reason` is free text — "back at 3" is legitimate — so a supervisor cannot tell a person on a
+	 * break from a handset the distributor benched without this narrowing.
+	 */
+	it("names the distributor's bench reason and leaves a human's reason off it", async () => {
+		const { database } = fakeDatabaseWithTiers(agentRow({ status: "unavailable" }), []);
+		const benched = {
+			orgId: ORGANIZATION_ID,
+			agentId: AGENT_ID,
+			status: "unavailable",
+			since: "2026-09-10T09:00:00.000Z",
+			reason: "rona",
+		} as AgentStateEntry;
+		const service = new QueueAgentSessionService(database, fakePublisher(benched).publisher);
+		const view = await service.get(sessionFor(["queues.read", "queues.monitor"]), AGENT_ID);
+		expect(view.data.reason).to.equal("rona");
+		expect(view.data.unavailableReason).to.equal("rona");
+
+		const paused = { ...benched, reason: "Lunch" } as AgentStateEntry;
+		const human = new QueueAgentSessionService(database, fakePublisher(paused).publisher);
+		const humanView = await human.get(sessionFor(["queues.read", "queues.monitor"]), AGENT_ID);
+		expect(humanView.data.reason).to.equal("Lunch");
+		expect(humanView.data.unavailableReason).to.equal(null);
 	});
 
 	it("tells the caller what it may do, so a console renders only the buttons it holds", async () => {

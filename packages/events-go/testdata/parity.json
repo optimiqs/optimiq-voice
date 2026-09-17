@@ -4,10 +4,14 @@
 	"subjectRoots": {
 		"call": "calls.evt.v1",
 		"registration": "sip.reg.v1",
+		"sipDialog": "sip.evt.v1",
 		"queue": "queue.evt.v1",
 		"voicemail": "voicemail.evt.v1",
 		"media": "media.evt.v1",
+		"messaging": "messaging.evt.v1",
+		"trunk": "trunk.evt.v1",
 		"cdrLeg": "cdr.leg.v1",
+		"security": "security.evt.v1",
 		"audit": "audit.evt.v1",
 		"provision": "provision.evt.v1"
 	},
@@ -15,9 +19,28 @@
 		"routingResolve": "rpc.routing.v1.resolve",
 		"authzCheck": "rpc.authz.v1.check",
 		"voicemailList": "rpc.voicemail.v1.list",
+		"pbxAuthorizeOutbound": "rpc.pbx.v1.authorize-outbound",
+		"pbxExtensionFeature": "rpc.pbx.v1.extension-feature",
+		"pbxToggleFeature": "rpc.pbx.v1.toggle-feature",
+		"pbxHotDesk": "rpc.pbx.v1.hot-desk",
+		"pbxLastCaller": "rpc.pbx.v1.last-caller",
+		"pbxFileGreeting": "rpc.pbx.v1.file-greeting",
+		"pbxQueueDisposition": "rpc.pbx.v1.queue-disposition",
+		"pbxQueueSurvey": "rpc.pbx.v1.queue-survey",
 		"sipCredential": "rpc.sip.v1.credential",
+		"sipTrunkCredential": "rpc.sip.v1.trunk-credential",
 		"sipTransfer": "rpc.sip.v1.transfer",
+		"sipInvite": "rpc.sip.v1.invite",
+		"sipRing": "rpc.sip.v1.ring",
+		"sipAnswer": "rpc.sip.v1.answer",
+		"sipHangup": "rpc.sip.v1.hangup",
+		"sipReinvite": "rpc.sip.v1.reinvite",
+		"sipOriginate": "rpc.sip.v1.originate",
+		"sipResolveTarget": "rpc.sip.v1.resolve-target",
+		"engineRenegotiate": "rpc.engine.v1.renegotiate",
 		"mediaAllocateSession": "rpc.media.v1.allocate-session",
+		"mediaCreateOffer": "rpc.media.v1.create-offer",
+		"mediaAcceptAnswer": "rpc.media.v1.accept-answer",
 		"mediaBridgeSessions": "rpc.media.v1.bridge-sessions",
 		"mediaUnbridgeSessions": "rpc.media.v1.unbridge-sessions",
 		"mediaReleaseSession": "rpc.media.v1.release-session",
@@ -26,8 +49,18 @@
 		"mediaSendDtmf": "rpc.media.v1.send-dtmf",
 		"mediaStartRecording": "rpc.media.v1.start-recording",
 		"mediaStopRecording": "rpc.media.v1.stop-recording",
+		"mediaPauseRecording": "rpc.media.v1.pause-recording",
+		"mediaTapSession": "rpc.media.v1.tap-session",
+		"mediaUntapSession": "rpc.media.v1.untap-session",
+		"mediaMuteSession": "rpc.media.v1.mute-session",
+		"mediaHoldSession": "rpc.media.v1.hold-session",
 		"engineOriginate": "rpc.engine.v1.originate",
-		"engineParkHandoff": "rpc.engine.v1.park-handoff"
+		"engineQueueCallback": "rpc.engine.v1.queue-callback",
+		"engineParkHandoff": "rpc.engine.v1.park-handoff",
+		"engineSessionVerb": "rpc.engine.v1.session-verb",
+		"engineConferenceControl": "rpc.engine.v1.conference-control",
+		"engineCallControl": "rpc.engine.v1.call-control",
+		"sessionAnnounce": "rpc.session.v1.announce"
 	},
 	"queueScopeAll": "_all",
 	"aorSubjectTokens": [
@@ -58,6 +91,32 @@
 		{
 			"aor": "sip:a@b",
 			"token": "45d0e5cfd8660c7beff53cde59993ebd"
+		}
+	],
+	"instanceSubjectTokens": [
+		{
+			"instanceId": "sipd",
+			"token": "sipd"
+		},
+		{
+			"instanceId": "sipd-2",
+			"token": "sipd-2"
+		},
+		{
+			"instanceId": "engine-7d9f4c-xk2lp",
+			"token": "engine-7d9f4c-xk2lp"
+		},
+		{
+			"instanceId": "  sipd  ",
+			"token": "sipd"
+		},
+		{
+			"instanceId": "sipd.eu-west.internal",
+			"token": "8a3ed32acf85ae4ef218ac5cb23944d5"
+		},
+		{
+			"instanceId": "host name with spaces",
+			"token": "81d85f6559bf928d3971848b0b668f62"
 		}
 	],
 	"didIndexTokens": [
@@ -120,6 +179,24 @@
 			"subject": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.7b81c6319a152fcef543d42203656b77.expired"
 		},
 		{
+			"builder": "sipDialog",
+			"args": [
+				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d",
+				"dialog.answered"
+			],
+			"subject": "sip.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d.dialog.answered"
+		},
+		{
+			"builder": "sipDialog",
+			"args": [
+				"01930a11-2233-7445-8899-aabbccddeeff",
+				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d",
+				"dialog.terminated"
+			],
+			"subject": "sip.evt.v1.01930a11-2233-7445-8899-aabbccddeeff.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d.dialog.terminated"
+		},
+		{
 			"builder": "queue",
 			"args": [
 				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -168,6 +245,15 @@
 				"session.rtp-timeout"
 			],
 			"subject": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.session.rtp-timeout"
+		},
+		{
+			"builder": "trunk",
+			"args": [
+				"018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57",
+				"status.changed"
+			],
+			"subject": "trunk.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57.status.changed"
 		},
 		{
 			"builder": "cdrLeg",
@@ -232,6 +318,21 @@
 			"result": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.*.expired"
 		},
 		{
+			"filter": "allSipDialogs",
+			"args": [],
+			"result": "sip.evt.v1.>"
+		},
+		{
+			"filter": "sipDialogsInOrg",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
+			"result": "sip.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.>"
+		},
+		{
+			"filter": "sipDialog",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d"],
+			"result": "sip.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d.>"
+		},
+		{
 			"filter": "allQueues",
 			"args": [],
 			"result": "queue.evt.v1.>"
@@ -290,6 +391,21 @@
 			"filter": "mediaEventInOrg",
 			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "session.ended"],
 			"result": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.*.session.ended"
+		},
+		{
+			"filter": "allTrunks",
+			"args": [],
+			"result": "trunk.evt.v1.>"
+		},
+		{
+			"filter": "trunksInOrg",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
+			"result": "trunk.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.>"
+		},
+		{
+			"filter": "trunkStatusInOrg",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"],
+			"result": "trunk.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.*.status.changed"
 		},
 		{
 			"filter": "allCdrLegs",
@@ -379,6 +495,17 @@
 			}
 		},
 		{
+			"subject": "trunk.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57.status.changed",
+			"parsed": {
+				"kind": "trunk",
+				"family": "trunk",
+				"version": "v1",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"trunkId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57",
+				"event": "status.changed"
+			}
+		},
+		{
 			"subject": "cdr.leg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 			"parsed": {
 				"kind": "cdr-leg",
@@ -423,6 +550,28 @@
 				"version": "v1",
 				"service": "authz",
 				"method": "check"
+			}
+		},
+		{
+			"subject": "rpc.sip.v1.ring.sipd",
+			"parsed": {
+				"kind": "rpc",
+				"family": "rpc",
+				"version": "v1",
+				"service": "sip",
+				"method": "ring",
+				"target": "sipd"
+			}
+		},
+		{
+			"subject": "rpc.session.v1.announce.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.app-1",
+			"parsed": {
+				"kind": "rpc",
+				"family": "rpc",
+				"version": "v1",
+				"service": "session",
+				"method": "announce",
+				"target": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.app-1"
 			}
 		},
 		{
@@ -564,9 +713,34 @@
 			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"
 		},
 		{
+			"builder": "queueWaiting",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"],
+			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e"
+		},
+		{
 			"builder": "mediaSession",
 			"args": ["0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53"],
 			"key": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53"
+		},
+		{
+			"builder": "sipDialog",
+			"args": ["0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d"],
+			"key": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d"
+		},
+		{
+			"builder": "trunk",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57"],
+			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57"
+		},
+		{
+			"builder": "sipAcl",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "trunk", "203.0.113.0/24"],
+			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.trunk.203-0-113-0-24"
+		},
+		{
+			"builder": "sipAcl",
+			"args": ["018f4f5e-1c2a-7a3b-9c4d-5e6f70819293", "registration", "2001:db8::/32"],
+			"key": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.registration.2001-db8---32"
 		}
 	],
 	"streams": [
@@ -594,6 +768,20 @@
 			"maxAgeMs": 86400000,
 			"maxMsgs": -1,
 			"maxBytes": 1073741824,
+			"maxMsgsPerSubject": -1,
+			"duplicateWindowMs": 120000,
+			"numReplicas": 1
+		},
+		{
+			"name": "SIP",
+			"description": "SIP dialog lifecycle from apps/sipd (sipd-invite-design §3.3, §10.2).",
+			"subjects": ["sip.evt.v1.>"],
+			"retention": "limits",
+			"storage": "file",
+			"discard": "old",
+			"maxAgeMs": 604800000,
+			"maxMsgs": -1,
+			"maxBytes": 4294967296,
 			"maxMsgsPerSubject": -1,
 			"duplicateWindowMs": 120000,
 			"numReplicas": 1
@@ -641,6 +829,20 @@
 			"numReplicas": 1
 		},
 		{
+			"name": "TRUNKS",
+			"description": "Carrier trunk status transitions consumed durably by the pbx writer (audit 4.5).",
+			"subjects": ["trunk.evt.v1.>"],
+			"retention": "limits",
+			"storage": "file",
+			"discard": "old",
+			"maxAgeMs": 604800000,
+			"maxMsgs": -1,
+			"maxBytes": 1073741824,
+			"maxMsgsPerSubject": -1,
+			"duplicateWindowMs": 120000,
+			"numReplicas": 1
+		},
+		{
 			"name": "CDR",
 			"description": "Per-leg CDR writes consumed durably by the cdr-db writer (plan §3.5).",
 			"subjects": ["cdr.leg.v1.*"],
@@ -652,6 +854,20 @@
 			"maxBytes": 17179869184,
 			"maxMsgsPerSubject": -1,
 			"duplicateWindowMs": 600000,
+			"numReplicas": 1
+		},
+		{
+			"name": "SECURITY",
+			"description": "Control-plane security signals: toll-fraud detections and their auto-actions.",
+			"subjects": ["security.evt.v1.>"],
+			"retention": "limits",
+			"storage": "file",
+			"discard": "old",
+			"maxAgeMs": 2592000000,
+			"maxMsgs": -1,
+			"maxBytes": 1073741824,
+			"maxMsgsPerSubject": -1,
+			"duplicateWindowMs": 120000,
 			"numReplicas": 1
 		},
 		{
@@ -680,6 +896,20 @@
 			"maxBytes": 1073741824,
 			"maxMsgsPerSubject": -1,
 			"duplicateWindowMs": 120000,
+			"numReplicas": 1
+		},
+		{
+			"name": "MESSAGING",
+			"description": "SMS/MMS inbound and delivery-receipt events consumed durably by apps/api.",
+			"subjects": ["messaging.evt.v1.>"],
+			"retention": "limits",
+			"storage": "file",
+			"discard": "new",
+			"maxAgeMs": 2592000000,
+			"maxMsgs": -1,
+			"maxBytes": 2147483648,
+			"maxMsgsPerSubject": -1,
+			"duplicateWindowMs": 600000,
 			"numReplicas": 1
 		}
 	],
@@ -775,9 +1005,89 @@
 			"numReplicas": 1
 		},
 		{
+			"name": "shared-line-state",
+			"description": "Shared-line seizure ownership across engine instances, taken under compare-and-set.",
+			"ttlMs": 900000,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 4096,
+			"maxBytes": 134217728,
+			"numReplicas": 1
+		},
+		{
 			"name": "media-sessions",
 			"description": "RTP session -> owning mediad instance, for per-instance command routing.",
 			"ttlMs": 21600000,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 4096,
+			"maxBytes": 134217728,
+			"numReplicas": 1
+		},
+		{
+			"name": "media-owners",
+			"description": "Call placement and media resource ownership, with atomic first-owner claims.",
+			"ttlMs": 21600000,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 1024,
+			"maxBytes": 134217728,
+			"numReplicas": 1
+		},
+		{
+			"name": "queue-waiting",
+			"description": "Queue -> the leased waiting line and abandoned-resume tombstones, under CAS.",
+			"ttlMs": 21600000,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 262144,
+			"maxBytes": 268435456,
+			"numReplicas": 1
+		},
+		{
+			"name": "sip-dialogs",
+			"description": "SIP dialog -> owning sipd instance, under a heartbeated lease, for reaping.",
+			"ttlMs": 21600000,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 4096,
+			"maxBytes": 134217728,
+			"numReplicas": 1
+		},
+		{
+			"name": "sip-instances",
+			"description": "sipd instance -> liveness lease, so the engine can end legs whose edge died.",
+			"ttlMs": 15000,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 1024,
+			"maxBytes": 8388608,
+			"numReplicas": 1
+		},
+		{
+			"name": "engine-instances",
+			"description": "engine instance -> liveness lease, so a survivor can adopt a dead replica's calls.",
+			"ttlMs": 15000,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 1024,
+			"maxBytes": 8388608,
+			"numReplicas": 1
+		},
+		{
+			"name": "trunks",
+			"description": "Trunk -> its dialable SIP configuration, for the edge's outbound and registration.",
+			"ttlMs": 0,
+			"history": 1,
+			"storage": "file",
+			"maxValueSizeBytes": 8192,
+			"maxBytes": 134217728,
+			"numReplicas": 1
+		},
+		{
+			"name": "sip-acl",
+			"description": "Source network -> tenant, scope and action, for the SIP edge's trunk admission.",
+			"ttlMs": 0,
 			"history": 1,
 			"storage": "file",
 			"maxValueSizeBytes": 4096,
@@ -802,7 +1112,9 @@
 			"wrap-up",
 			"on-break",
 			"unavailable"
-		]
+		],
+		"TapMode": ["eavesdrop", "whisper", "barge"],
+		"TapEndReason": ["supervisor-ended", "target-ended", "escalated", "failed"]
 	},
 	"eventVocabularies": {
 		"call": [
@@ -821,14 +1133,28 @@
 			"channel.destroyed",
 			"conference.joined",
 			"conference.left",
+			"conference.participant.updated",
+			"conference.locked",
+			"conference.unlocked",
 			"call.parked",
 			"call.unparked",
 			"call.transferred",
 			"call.picked-up",
-			"call.emergency.dialed"
+			"call.emergency.dialed",
+			"call.tap.started",
+			"call.tap.ended",
+			"call.paging.started",
+			"call.paging.ended"
 		],
-		"registration": ["registered", "unregistered", "expired"],
-		"queue": ["caller.joined", "caller.answered", "caller.abandoned", "agent.state"],
+		"registration": ["registered", "unregistered", "expired", "auth-failed"],
+		"queue": [
+			"caller.joined",
+			"caller.answered",
+			"caller.abandoned",
+			"agent.state",
+			"callback.placed",
+			"callback.failed"
+		],
 		"voicemail": ["message.left", "mwi.updated"],
 		"media": [
 			"session.ended",
@@ -836,7 +1162,8 @@
 			"playback.finished",
 			"recording.finished",
 			"dtmf.received"
-		]
+		],
+		"trunk": ["status.changed"]
 	},
 	"eventTypes": [
 		{
@@ -916,6 +1243,21 @@
 		},
 		{
 			"family": "call",
+			"type": "conference.participant.updated",
+			"goType": "ConferenceParticipantUpdatedData"
+		},
+		{
+			"family": "call",
+			"type": "conference.locked",
+			"goType": "ConferenceLockedData"
+		},
+		{
+			"family": "call",
+			"type": "conference.unlocked",
+			"goType": "ConferenceUnlockedData"
+		},
+		{
+			"family": "call",
 			"type": "call.parked",
 			"goType": "CallParkedData"
 		},
@@ -940,6 +1282,26 @@
 			"goType": "CallEmergencyDialedData"
 		},
 		{
+			"family": "call",
+			"type": "call.tap.started",
+			"goType": "CallTapStartedData"
+		},
+		{
+			"family": "call",
+			"type": "call.tap.ended",
+			"goType": "CallTapEndedData"
+		},
+		{
+			"family": "call",
+			"type": "call.paging.started",
+			"goType": "CallPagingStartedData"
+		},
+		{
+			"family": "call",
+			"type": "call.paging.ended",
+			"goType": "CallPagingEndedData"
+		},
+		{
 			"family": "registration",
 			"type": "registered",
 			"goType": "RegistrationRegisteredData"
@@ -953,6 +1315,41 @@
 			"family": "registration",
 			"type": "expired",
 			"goType": "RegistrationExpiredData"
+		},
+		{
+			"family": "registration",
+			"type": "auth-failed",
+			"goType": "RegistrationAuthFailedData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.progressed",
+			"goType": "SIPDialogProgressedData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.answered",
+			"goType": "SIPDialogAnsweredData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.held",
+			"goType": "SIPDialogHeldData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.resumed",
+			"goType": "SIPDialogResumedData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.terminated",
+			"goType": "SIPDialogTerminatedData"
+		},
+		{
+			"family": "sipDialog",
+			"type": "dialog.dtmf",
+			"goType": "SIPDialogDTMFData"
 		},
 		{
 			"family": "queue",
@@ -973,6 +1370,16 @@
 			"family": "queue",
 			"type": "agent.state",
 			"goType": "QueueAgentStateData"
+		},
+		{
+			"family": "queue",
+			"type": "callback.placed",
+			"goType": "QueueCallbackPlacedData"
+		},
+		{
+			"family": "queue",
+			"type": "callback.failed",
+			"goType": "QueueCallbackFailedData"
 		},
 		{
 			"family": "voicemail",
@@ -1010,6 +1417,16 @@
 			"goType": "MediaDtmfReceivedData"
 		},
 		{
+			"family": "trunk",
+			"type": "status.changed",
+			"goType": "TrunkStatusChangedData"
+		},
+		{
+			"family": "security",
+			"type": "fraud-signal",
+			"goType": "SecurityFraudSignalData"
+		},
+		{
 			"family": "cdr",
 			"type": "cdr.leg.write",
 			"goType": "CDRLegWriteData"
@@ -1033,6 +1450,11 @@
 			"family": "provision",
 			"type": "device.rejected",
 			"goType": "ProvisionDeviceRejectedData"
+		},
+		{
+			"family": "provision",
+			"type": "credential.invalidated",
+			"goType": "ProvisionCredentialInvalidatedData"
 		}
 	],
 	"eventSamples": [
@@ -1121,10 +1543,92 @@
 			}
 		},
 		{
+			"name": "call.tap.started",
+			"goType": "CallTapStartedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0004",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.tap.started",
+				"type": "call.tap.started",
+				"source": "sipd",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b54",
+					"mode": "whisper",
+					"supervisorExtension": "1900",
+					"targetExtension": "1001",
+					"targetLegId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d",
+					"previousMode": "eavesdrop",
+					"supervisorCallId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b55"
+				}
+			}
+		},
+		{
+			"name": "call.tap.ended",
+			"goType": "CallTapEndedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0005",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.tap.ended",
+				"type": "call.tap.ended",
+				"source": "sipd",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b54",
+					"mode": "whisper",
+					"supervisorExtension": "1900",
+					"targetExtension": "1001",
+					"reason": "target-ended",
+					"durationMs": 42000
+				}
+			}
+		},
+		{
+			"name": "call.paging.started",
+			"goType": "CallPagingStartedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0006",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.paging.started",
+				"type": "call.paging.started",
+				"source": "sipd",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d",
+					"pagingGroupId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b56",
+					"pagingGroupName": "Warehouse",
+					"dialed": "*81300",
+					"pagerExtension": "1001",
+					"memberCount": 12,
+					"answeredCount": 10,
+					"oneWay": true
+				}
+			}
+		},
+		{
+			"name": "call.paging.ended",
+			"goType": "CallPagingEndedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0007",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.paging.ended",
+				"type": "call.paging.ended",
+				"source": "sipd",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d",
+					"pagingGroupId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b56",
+					"pagingGroupName": "Warehouse",
+					"durationMs": 9500,
+					"answeredCount": 10
+				}
+			}
+		},
+		{
 			"name": "registration.registered",
 			"goType": "RegistrationRegisteredData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0004",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0008",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.9c99510034b54c0217012ab2d10512d0.registered",
@@ -1147,7 +1651,7 @@
 			"name": "registration.unregistered",
 			"goType": "RegistrationUnregisteredData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0005",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0009",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.9c99510034b54c0217012ab2d10512d0.unregistered",
@@ -1166,7 +1670,7 @@
 			"name": "registration.expired",
 			"goType": "RegistrationExpiredData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0006",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000a",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "01930a11-2233-7445-8899-aabbccddeeff",
 				"subject": "sip.reg.v1.01930a11-2233-7445-8899-aabbccddeeff.b01d8d8fae1e7a2d85f57232951b4b2c.expired",
@@ -1182,10 +1686,31 @@
 			}
 		},
 		{
+			"name": "registration.auth-failed",
+			"goType": "RegistrationAuthFailedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000b",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.9c99510034b54c0217012ab2d10512d0.auth-failed",
+				"type": "auth-failed",
+				"source": "sipd",
+				"data": {
+					"aor": "sip:1001@acme.example.com",
+					"aorHash": "9c99510034b54c0217012ab2d10512d0",
+					"transport": "udp",
+					"sourceAddress": "203.0.113.9:5060",
+					"userAgent": "friendly-scanner",
+					"username": "1001",
+					"reason": "bad-credentials"
+				}
+			}
+		},
+		{
 			"name": "queue.caller.joined",
 			"goType": "QueueCallerJoinedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0007",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000c",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "queue.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e.caller.joined",
@@ -1204,7 +1729,7 @@
 			"name": "queue.agent.state",
 			"goType": "QueueAgentStateData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0008",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000d",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "queue.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293._all.agent.state",
@@ -1223,7 +1748,7 @@
 			"name": "voicemail.message.left",
 			"goType": "VoicemailMessageLeftData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0009",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000e",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51.message.left",
@@ -1249,7 +1774,7 @@
 			"name": "voicemail.mwi.updated",
 			"goType": "VoicemailMWIUpdatedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000a",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000f",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51.mwi.updated",
@@ -1268,7 +1793,7 @@
 			"name": "media.session.ended",
 			"goType": "MediaSessionEndedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000b",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0010",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.session.ended",
@@ -1291,7 +1816,7 @@
 			"name": "media.session.rtp-timeout",
 			"goType": "MediaSessionRTPTimeoutData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000c",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0011",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.session.rtp-timeout",
@@ -1310,10 +1835,28 @@
 			}
 		},
 		{
+			"name": "trunk.status.changed",
+			"goType": "TrunkStatusChangedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0012",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "trunk.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57.status.changed",
+				"type": "status.changed",
+				"source": "engine",
+				"data": {
+					"status": "down",
+					"reason": "Unreachable",
+					"latencyMs": 1240,
+					"endpoint": "carrier-a"
+				}
+			}
+		},
+		{
 			"name": "cdr.leg.write",
 			"goType": "CDRLegWriteData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000d",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0013",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "cdr.leg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -1352,7 +1895,7 @@
 			"name": "audit.recorded",
 			"goType": "AuditRecordedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000e",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0014",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "audit.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -1386,7 +1929,7 @@
 			"name": "provision.device.rejected",
 			"goType": "ProvisionDeviceRejectedData",
 			"envelope": {
-				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a000f",
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a0015",
 				"at": "2026-08-05T10:00:00.000Z",
 				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
 				"subject": "provision.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
@@ -1399,6 +1942,2336 @@
 					"reason": "invalid-token",
 					"detail": "token mismatch"
 				}
+			}
+		},
+		{
+			"name": "synthetic.call.channel.created",
+			"goType": "ChannelCreatedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1000",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.channel.created",
+				"type": "channel.created",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"leg": "a",
+					"direction": "inbound",
+					"from": {
+						"number": "1001",
+						"name": "1001"
+					},
+					"to": {
+						"number": "1001"
+					},
+					"originatingLegId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"sipCallId": "1001",
+					"routingContext": "1001",
+					"remoteAddress": "1001"
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.channel.ringing",
+			"goType": "ChannelRingingData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1001",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.channel.ringing",
+				"type": "channel.ringing",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.channel.early-media",
+			"goType": "ChannelEarlyMediaData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1002",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.channel.early-media",
+				"type": "channel.early-media",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.channel.answered",
+			"goType": "ChannelAnsweredData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1003",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.channel.answered",
+				"type": "channel.answered",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.channel.bridged",
+			"goType": "ChannelBridgedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1004",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.channel.bridged",
+				"type": "channel.bridged",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"peerLegId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"bridgeId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"mode": "media"
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.channel.unbridged",
+			"goType": "ChannelUnbridgedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1005",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.channel.unbridged",
+				"type": "channel.unbridged",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"peerLegId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"bridgeId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"reason": "1001"
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.channel.held",
+			"goType": "ChannelHeldData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1006",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.channel.held",
+				"type": "channel.held",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"mohClass": "1001"
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.channel.unheld",
+			"goType": "ChannelUnheldData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1007",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.channel.unheld",
+				"type": "channel.unheld",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.channel.dtmf",
+			"goType": "ChannelDTMFData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1008",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.channel.dtmf",
+				"type": "channel.dtmf",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"digit": "1",
+					"durationMs": 0,
+					"source": "rfc2833"
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.channel.record.started",
+			"goType": "ChannelRecordStartedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1009",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.channel.record.started",
+				"type": "channel.record.started",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"recordingId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"objectKey": "1001",
+					"kind": "call",
+					"stereo": true,
+					"consent": {
+						"outcome": "not-required",
+						"method": "none",
+						"policy": "none",
+						"at": "2026-08-05T10:00:00.000Z",
+						"parties": ["caller"],
+						"regions": ["1001"],
+						"promptId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+					}
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.channel.record.stopped",
+			"goType": "ChannelRecordStoppedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a100a",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.channel.record.stopped",
+				"type": "channel.record.stopped",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"recordingId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"objectKey": "1001",
+					"durationMs": 0,
+					"reason": "completed",
+					"bytes": 0,
+					"pauses": [
+						{
+							"startMs": 0,
+							"endMs": 0
+						}
+					]
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.channel.hangup",
+			"goType": "ChannelHangupData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a100b",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.channel.hangup",
+				"type": "channel.hangup",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"cause": "NORMAL_CLEARING",
+					"causeCode": 0,
+					"side": "caller"
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.channel.destroyed",
+			"goType": "ChannelDestroyedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a100c",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.channel.destroyed",
+				"type": "channel.destroyed",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"durationMs": 0
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.conference.joined",
+			"goType": "ConferenceJoinedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a100d",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.conference.joined",
+				"type": "conference.joined",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"conferenceId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"roomNumber": "1001",
+					"bridgeId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"moderator": true,
+					"memberCount": 1
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.conference.left",
+			"goType": "ConferenceLeftData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a100e",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.conference.left",
+				"type": "conference.left",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"conferenceId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"roomNumber": "1001",
+					"bridgeId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"moderator": true,
+					"memberCount": 0,
+					"durationMs": 0,
+					"reason": "hung-up",
+					"byUserId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.conference.participant.updated",
+			"goType": "ConferenceParticipantUpdatedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a100f",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.conference.participant.updated",
+				"type": "conference.participant.updated",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"conferenceId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"roomNumber": "1001",
+					"muted": true,
+					"deafened": true,
+					"moderator": true,
+					"talkGainPercent": 0,
+					"listenGainPercent": 0,
+					"byUserId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.conference.locked",
+			"goType": "ConferenceLockedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1010",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.conference.locked",
+				"type": "conference.locked",
+				"source": "codegen",
+				"data": {
+					"conferenceId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"roomNumber": "1001",
+					"memberCount": 0,
+					"byUserId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.conference.unlocked",
+			"goType": "ConferenceUnlockedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1011",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.conference.unlocked",
+				"type": "conference.unlocked",
+				"source": "codegen",
+				"data": {
+					"conferenceId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"roomNumber": "1001",
+					"memberCount": 0,
+					"byUserId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.call.parked",
+			"goType": "CallParkedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1012",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.parked",
+				"type": "call.parked",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"parkLotId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"slot": "1001",
+					"timeoutMs": 0,
+					"parkedByLegId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"mohClass": "1001"
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.call.unparked",
+			"goType": "CallUnparkedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1013",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.unparked",
+				"type": "call.unparked",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"parkLotId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"slot": "1001",
+					"reason": "retrieved",
+					"retrievedByLegId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"durationMs": 0
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.call.transferred",
+			"goType": "CallTransferredData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1014",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.transferred",
+				"type": "call.transferred",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"kind": "blind",
+					"destination": "1001",
+					"routingContext": "1001",
+					"transferorLegId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"targetLegId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.call.picked-up",
+			"goType": "CallPickedUpData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1015",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.picked-up",
+				"type": "call.picked-up",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"pickedUpLegId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"kind": "directed",
+					"extension": "1001",
+					"abandonedLegId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.call.emergency.dialed",
+			"goType": "CallEmergencyDialedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1016",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.emergency.dialed",
+				"type": "call.emergency.dialed",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"dialed": "1001",
+					"number": "1001",
+					"callerNumber": "1001",
+					"deviceId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"callerName": "1001",
+					"elin": "1001",
+					"emergencyAddressId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"trunkName": "1001"
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.call.tap.started",
+			"goType": "CallTapStartedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1017",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.tap.started",
+				"type": "call.tap.started",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"mode": "eavesdrop",
+					"supervisorExtension": "1001",
+					"targetExtension": "1001",
+					"targetLegId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"previousMode": "eavesdrop",
+					"supervisorCallId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.call.tap.ended",
+			"goType": "CallTapEndedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1018",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.tap.ended",
+				"type": "call.tap.ended",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"mode": "eavesdrop",
+					"supervisorExtension": "1001",
+					"targetExtension": "1001",
+					"reason": "supervisor-ended",
+					"durationMs": 0
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.call.paging.started",
+			"goType": "CallPagingStartedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1019",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.paging.started",
+				"type": "call.paging.started",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"pagingGroupId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"pagingGroupName": "1001",
+					"dialed": "1001",
+					"pagerExtension": "1001",
+					"memberCount": 0,
+					"answeredCount": 0,
+					"oneWay": true
+				}
+			}
+		},
+		{
+			"name": "synthetic.call.call.paging.ended",
+			"goType": "CallPagingEndedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a101a",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "calls.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4c.call.paging.ended",
+				"type": "call.paging.ended",
+				"source": "codegen",
+				"data": {
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"pagingGroupId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"pagingGroupName": "1001",
+					"durationMs": 0,
+					"answeredCount": 0
+				}
+			}
+		},
+		{
+			"name": "synthetic.registration.registered",
+			"goType": "RegistrationRegisteredData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a101b",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.9c99510034b54c0217012ab2d10512d0.registered",
+				"type": "registered",
+				"source": "codegen",
+				"data": {
+					"aor": "1001",
+					"aorHash": "0192c7a14b8e7f218b3c9d0e1f2a3c00",
+					"contact": "1001",
+					"transport": "udp",
+					"userAgent": "1001",
+					"sourceAddress": "1001",
+					"deviceId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"extensionId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"expiresInSeconds": 1,
+					"refreshed": true
+				}
+			}
+		},
+		{
+			"name": "synthetic.registration.unregistered",
+			"goType": "RegistrationUnregisteredData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a101c",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.9c99510034b54c0217012ab2d10512d0.unregistered",
+				"type": "unregistered",
+				"source": "codegen",
+				"data": {
+					"aor": "1001",
+					"aorHash": "0192c7a14b8e7f218b3c9d0e1f2a3c00",
+					"contact": "1001",
+					"transport": "udp",
+					"userAgent": "1001",
+					"sourceAddress": "1001",
+					"deviceId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"extensionId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"reason": "client"
+				}
+			}
+		},
+		{
+			"name": "synthetic.registration.expired",
+			"goType": "RegistrationExpiredData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a101d",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.9c99510034b54c0217012ab2d10512d0.expired",
+				"type": "expired",
+				"source": "codegen",
+				"data": {
+					"aor": "1001",
+					"aorHash": "0192c7a14b8e7f218b3c9d0e1f2a3c00",
+					"contact": "1001",
+					"transport": "udp",
+					"userAgent": "1001",
+					"sourceAddress": "1001",
+					"deviceId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"extensionId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"registeredForSeconds": 0
+				}
+			}
+		},
+		{
+			"name": "synthetic.registration.auth-failed",
+			"goType": "RegistrationAuthFailedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a101e",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "sip.reg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.9c99510034b54c0217012ab2d10512d0.auth-failed",
+				"type": "auth-failed",
+				"source": "codegen",
+				"data": {
+					"aor": "1001",
+					"aorHash": "0192c7a14b8e7f218b3c9d0e1f2a3c00",
+					"transport": "udp",
+					"sourceAddress": "1001",
+					"userAgent": "1001",
+					"username": "1001",
+					"reason": "bad-credentials",
+					"locked": true
+				}
+			}
+		},
+		{
+			"name": "synthetic.sipDialog.dialog.progressed",
+			"goType": "SIPDialogProgressedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a101f",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "sip.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d.dialog.progressed",
+				"type": "dialog.progressed",
+				"source": "codegen",
+				"data": {
+					"legId": "1001",
+					"callId": "1001",
+					"instanceId": "1001",
+					"role": "uas",
+					"identity": {
+						"sipCallId": "1001",
+						"localTag": "1001",
+						"remoteTag": "1001"
+					},
+					"status": 100,
+					"hasEarlyMedia": true,
+					"sdpAnswer": "1001"
+				}
+			}
+		},
+		{
+			"name": "synthetic.sipDialog.dialog.answered",
+			"goType": "SIPDialogAnsweredData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1020",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "sip.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d.dialog.answered",
+				"type": "dialog.answered",
+				"source": "codegen",
+				"data": {
+					"legId": "1001",
+					"callId": "1001",
+					"instanceId": "1001",
+					"role": "uas",
+					"identity": {
+						"sipCallId": "1001",
+						"localTag": "1001",
+						"remoteTag": "1001"
+					},
+					"sdpAnswer": "1001",
+					"setupMs": 0
+				}
+			}
+		},
+		{
+			"name": "synthetic.sipDialog.dialog.held",
+			"goType": "SIPDialogHeldData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1021",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "sip.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d.dialog.held",
+				"type": "dialog.held",
+				"source": "codegen",
+				"data": {
+					"legId": "1001",
+					"callId": "1001",
+					"instanceId": "1001",
+					"role": "uas",
+					"identity": {
+						"sipCallId": "1001",
+						"localTag": "1001",
+						"remoteTag": "1001"
+					},
+					"direction": "sendonly"
+				}
+			}
+		},
+		{
+			"name": "synthetic.sipDialog.dialog.resumed",
+			"goType": "SIPDialogResumedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1022",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "sip.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d.dialog.resumed",
+				"type": "dialog.resumed",
+				"source": "codegen",
+				"data": {
+					"legId": "1001",
+					"callId": "1001",
+					"instanceId": "1001",
+					"role": "uas",
+					"identity": {
+						"sipCallId": "1001",
+						"localTag": "1001",
+						"remoteTag": "1001"
+					},
+					"direction": "sendrecv"
+				}
+			}
+		},
+		{
+			"name": "synthetic.sipDialog.dialog.terminated",
+			"goType": "SIPDialogTerminatedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1023",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "sip.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d.dialog.terminated",
+				"type": "dialog.terminated",
+				"source": "codegen",
+				"data": {
+					"legId": "1001",
+					"callId": "1001",
+					"instanceId": "1001",
+					"role": "uas",
+					"identity": {
+						"sipCallId": "1001",
+						"localTag": "1001",
+						"remoteTag": "1001"
+					},
+					"reason": "bye",
+					"cause": 0,
+					"status": 300,
+					"causeFromReasonHeader": true,
+					"initiator": "local",
+					"answeredForSeconds": 0
+				}
+			}
+		},
+		{
+			"name": "synthetic.sipDialog.dialog.dtmf",
+			"goType": "SIPDialogDTMFData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1024",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "sip.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4d.dialog.dtmf",
+				"type": "dialog.dtmf",
+				"source": "codegen",
+				"data": {
+					"legId": "1001",
+					"callId": "1001",
+					"instanceId": "1001",
+					"role": "uas",
+					"identity": {
+						"sipCallId": "1001",
+						"localTag": "1001",
+						"remoteTag": "1001"
+					},
+					"digit": "1",
+					"durationMs": 0
+				}
+			}
+		},
+		{
+			"name": "synthetic.queue.caller.joined",
+			"goType": "QueueCallerJoinedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1025",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "queue.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e.caller.joined",
+				"type": "caller.joined",
+				"source": "codegen",
+				"data": {
+					"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"position": 1,
+					"priority": 0,
+					"callerNumber": "1001",
+					"resumed": true
+				}
+			}
+		},
+		{
+			"name": "synthetic.queue.caller.answered",
+			"goType": "QueueCallerAnsweredData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1026",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "queue.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e.caller.answered",
+				"type": "caller.answered",
+				"source": "codegen",
+				"data": {
+					"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"agentId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"waitMs": 0,
+					"strategy": "longest-idle"
+				}
+			}
+		},
+		{
+			"name": "synthetic.queue.caller.abandoned",
+			"goType": "QueueCallerAbandonedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1027",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "queue.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e.caller.abandoned",
+				"type": "caller.abandoned",
+				"source": "codegen",
+				"data": {
+					"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"waitMs": 0,
+					"position": 1,
+					"reason": "caller-hangup",
+					"exitKey": "a"
+				}
+			}
+		},
+		{
+			"name": "synthetic.queue.agent.state",
+			"goType": "QueueAgentStateData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1028",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "queue.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e.agent.state",
+				"type": "agent.state",
+				"source": "codegen",
+				"data": {
+					"agentId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"status": "logged-out",
+					"previousStatus": "logged-out",
+					"queueIds": ["0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"],
+					"reason": "1001"
+				}
+			}
+		},
+		{
+			"name": "synthetic.queue.callback.placed",
+			"goType": "QueueCallbackPlacedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1029",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "queue.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e.callback.placed",
+				"type": "callback.placed",
+				"source": "codegen",
+				"data": {
+					"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"originalCallId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"callerNumber": "1001",
+					"attempts": 0,
+					"heldMs": 0
+				}
+			}
+		},
+		{
+			"name": "synthetic.queue.callback.failed",
+			"goType": "QueueCallbackFailedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a102a",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "queue.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b4e.callback.failed",
+				"type": "callback.failed",
+				"source": "codegen",
+				"data": {
+					"callerNumber": "1001",
+					"attempts": 1,
+					"dropped": true,
+					"reason": "1001"
+				}
+			}
+		},
+		{
+			"name": "synthetic.voicemail.message.left",
+			"goType": "VoicemailMessageLeftData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a102b",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51.message.left",
+				"type": "message.left",
+				"source": "codegen",
+				"data": {
+					"messageId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"mailboxNumber": "1001",
+					"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"legId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"recordingId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"objectKey": "1001",
+					"durationMs": 0,
+					"sizeBytes": 0,
+					"callerIdNumber": "1001",
+					"callerIdName": "1001",
+					"receivedAt": "2026-08-05T10:00:00.000Z",
+					"transcriptionRequested": true
+				}
+			}
+		},
+		{
+			"name": "synthetic.voicemail.mwi.updated",
+			"goType": "VoicemailMWIUpdatedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a102c",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "voicemail.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51.mwi.updated",
+				"type": "mwi.updated",
+				"source": "codegen",
+				"data": {
+					"mailboxNumber": "1001",
+					"extensionNumber": "1001",
+					"newCount": 0,
+					"savedCount": 0,
+					"reason": "message-left"
+				}
+			}
+		},
+		{
+			"name": "synthetic.media.session.ended",
+			"goType": "MediaSessionEndedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a102d",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.session.ended",
+				"type": "session.ended",
+				"source": "codegen",
+				"data": {
+					"sessionId": "1001",
+					"instanceId": "1001",
+					"callId": "1001",
+					"legId": "1001",
+					"rtpPort": 1,
+					"packetsReceived": 0,
+					"packetsSent": 0,
+					"reason": "released",
+					"durationMs": 0,
+					"detail": "1001",
+					"quality": {
+						"inboundJitterMs": 0,
+						"reportedLossFraction": 0,
+						"reportedLossTotal": 0,
+						"reportedJitterMs": 0,
+						"roundTripMs": 0,
+						"reportsReceived": 0,
+						"reportsSent": 0,
+						"malformed": 0,
+						"lastReportUnixMs": 0
+					}
+				}
+			}
+		},
+		{
+			"name": "synthetic.media.session.rtp-timeout",
+			"goType": "MediaSessionRTPTimeoutData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a102e",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.session.rtp-timeout",
+				"type": "session.rtp-timeout",
+				"source": "codegen",
+				"data": {
+					"sessionId": "1001",
+					"instanceId": "1001",
+					"callId": "1001",
+					"legId": "1001",
+					"rtpPort": 1,
+					"packetsReceived": 0,
+					"packetsSent": 0,
+					"silentForMs": 0,
+					"remoteAddress": "1001"
+				}
+			}
+		},
+		{
+			"name": "synthetic.media.playback.finished",
+			"goType": "MediaPlaybackFinishedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a102f",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.playback.finished",
+				"type": "playback.finished",
+				"source": "codegen",
+				"data": {
+					"sessionId": "1001",
+					"instanceId": "1001",
+					"callId": "1001",
+					"legId": "1001",
+					"playbackRef": "1001",
+					"reason": "completed",
+					"playedMs": 0,
+					"detail": "1001"
+				}
+			}
+		},
+		{
+			"name": "synthetic.media.recording.finished",
+			"goType": "MediaRecordingFinishedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1030",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.recording.finished",
+				"type": "recording.finished",
+				"source": "codegen",
+				"data": {
+					"sessionId": "1001",
+					"instanceId": "1001",
+					"callId": "1001",
+					"legId": "1001",
+					"recordingRef": "1001",
+					"reason": "stopped",
+					"durationMs": 0,
+					"bytes": 0,
+					"objectKey": "1001",
+					"direction": "receive",
+					"pauses": [
+						{
+							"startMs": 0,
+							"endMs": 0
+						}
+					],
+					"detail": "1001"
+				}
+			}
+		},
+		{
+			"name": "synthetic.media.dtmf.received",
+			"goType": "MediaDtmfReceivedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1031",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "media.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53.dtmf.received",
+				"type": "dtmf.received",
+				"source": "codegen",
+				"data": {
+					"sessionId": "1001",
+					"instanceId": "1001",
+					"callId": "1001",
+					"legId": "1001",
+					"digit": "1",
+					"durationMs": 0
+				}
+			}
+		},
+		{
+			"name": "synthetic.trunk.status.changed",
+			"goType": "TrunkStatusChangedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1032",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "trunk.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293.0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57.status.changed",
+				"type": "status.changed",
+				"source": "codegen",
+				"data": {
+					"status": "unknown",
+					"reason": "1001",
+					"latencyMs": 0,
+					"endpoint": "1001"
+				}
+			}
+		},
+		{
+			"name": "synthetic.security.fraud-signal",
+			"goType": "SecurityFraudSignalData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1033",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "security.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293._org.fraud-signal",
+				"type": "fraud-signal",
+				"source": "codegen",
+				"data": {
+					"kind": "international-minutes-spike",
+					"severity": "info",
+					"action": "none",
+					"extensionId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"extensionNumber": "1001",
+					"destination": "1001",
+					"destinationCountry": "GB",
+					"observed": 0,
+					"threshold": 0,
+					"windowSeconds": 1,
+					"summary": "1001"
+				}
+			}
+		},
+		{
+			"name": "synthetic.cdr.cdr.leg.write",
+			"goType": "CDRLegWriteData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1034",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "cdr.leg.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"type": "cdr.leg.write",
+				"source": "codegen",
+				"data": {
+					"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"leg": "a",
+					"originatingLegId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"bridgeLegId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"direction": "inbound",
+					"fromNumber": "1001",
+					"fromName": "1001",
+					"toNumber": "1001",
+					"destinationType": "sipd",
+					"destinationRef": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"startedAt": "2026-08-05T10:00:00.000Z",
+					"answeredAt": "2026-08-05T10:00:00.000Z",
+					"endedAt": "2026-08-05T10:00:00.000Z",
+					"durationMs": 0,
+					"billsecMs": 0,
+					"hangupCause": "NORMAL_CLEARING",
+					"hangupCauseCode": 0,
+					"hangupSide": "caller",
+					"disposition": "sipd",
+					"queueRef": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"queueWaitMs": 0,
+					"queueOutcome": "answered",
+					"queueAgentRef": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"relatedCallId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"authPinOrdinal": 0,
+					"authPinLabel": "1001",
+					"sipAttestation": "A",
+					"sipVerstat": "1001",
+					"sipOrigId": "1001",
+					"recordingConsent": "not-required",
+					"recordingConsentMethod": "none",
+					"recordingConsentAt": "2026-08-05T10:00:00.000Z",
+					"recordingConsentRegions": ["1001"]
+				}
+			}
+		},
+		{
+			"name": "synthetic.audit.audit.recorded",
+			"goType": "AuditRecordedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1035",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "audit.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"type": "audit.recorded",
+				"source": "codegen",
+				"data": {
+					"actor": {
+						"type": "user",
+						"id": "1001",
+						"label": "1001",
+						"ip": "1001",
+						"userAgent": "1001"
+					},
+					"action": "acme.example.com",
+					"resource": {
+						"type": "sipd",
+						"id": "1001",
+						"label": "1001"
+					},
+					"outcome": "allowed",
+					"requestId": "1001",
+					"changes": {
+						"sample": {
+							"from": {},
+							"to": {}
+						}
+					},
+					"reason": "1001"
+				}
+			}
+		},
+		{
+			"name": "synthetic.provision.device.requested",
+			"goType": "ProvisionDeviceRequestedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1036",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "provision.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"type": "device.requested",
+				"source": "codegen",
+				"data": {
+					"sourceAddress": "1001",
+					"path": "1001",
+					"userAgent": "1001",
+					"macAddress": "805ec0000044",
+					"vendor": "1001",
+					"model": "1001"
+				}
+			}
+		},
+		{
+			"name": "synthetic.provision.device.rendered",
+			"goType": "ProvisionDeviceRenderedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1037",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "provision.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"type": "device.rendered",
+				"source": "codegen",
+				"data": {
+					"sourceAddress": "1001",
+					"path": "1001",
+					"userAgent": "1001",
+					"macAddress": "805ec0000044",
+					"vendor": "1001",
+					"model": "1001",
+					"deviceId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"templateId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"deviceProfileId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"bytes": 0
+				}
+			}
+		},
+		{
+			"name": "synthetic.provision.device.rejected",
+			"goType": "ProvisionDeviceRejectedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1038",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "provision.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"type": "device.rejected",
+				"source": "codegen",
+				"data": {
+					"sourceAddress": "1001",
+					"path": "1001",
+					"userAgent": "1001",
+					"macAddress": "805ec0000044",
+					"reason": "unknown-mac",
+					"detail": "1001"
+				}
+			}
+		},
+		{
+			"name": "synthetic.provision.credential.invalidated",
+			"goType": "ProvisionCredentialInvalidatedData",
+			"envelope": {
+				"id": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a1039",
+				"at": "2026-08-05T10:00:00.000Z",
+				"orgId": "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"subject": "provision.evt.v1.018f4f5e-1c2a-7a3b-9c4d-5e6f70819293",
+				"type": "credential.invalidated",
+				"source": "codegen",
+				"data": {
+					"reason": "1001",
+					"dropped": 0
+				}
+			}
+		}
+	],
+	"rpcSamples": [
+		{
+			"subject": "rpc.routing.v1.resolve",
+			"goType": "RoutingResolve",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"direction": "inbound",
+				"destinationNumber": "1001",
+				"callerNumber": "1001",
+				"callerName": "1001",
+				"routingContext": "1001",
+				"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"at": "2026-08-05T10:00:00.000Z"
+			},
+			"response": {
+				"matched": true,
+				"destinationType": "sipd",
+				"destinationRef": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"routingContext": "1001",
+				"artifact": {},
+				"cacheKey": "1001",
+				"ttlMs": 0,
+				"reason": "1001"
+			}
+		},
+		{
+			"subject": "rpc.authz.v1.check",
+			"goType": "AuthzCheck",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"subject": {
+					"type": "user",
+					"id": "1001"
+				},
+				"permissions": ["acme.example.com"],
+				"resource": {
+					"type": "1001",
+					"id": "1001"
+				}
+			},
+			"response": {
+				"allowed": true,
+				"granted": ["1001"],
+				"missing": ["1001"],
+				"reason": "1001"
+			}
+		},
+		{
+			"subject": "rpc.voicemail.v1.list",
+			"goType": "VoicemailList",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"voicemailBoxId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"mailboxNumber": "1001",
+				"folder": "new",
+				"limit": 1,
+				"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+			},
+			"response": {
+				"found": true,
+				"messages": [
+					{
+						"messageId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+						"folder": "new",
+						"objectKey": "1001",
+						"durationMs": 0,
+						"receivedAt": "2026-08-05T10:00:00.000Z",
+						"callerIdNumber": "1001",
+						"callerIdName": "1001"
+					}
+				],
+				"total": 0,
+				"newCount": 0,
+				"savedCount": 0,
+				"reason": "1001"
+			}
+		},
+		{
+			"subject": "rpc.pbx.v1.authorize-outbound",
+			"goType": "AuthorizeOutbound",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"extensionNumber": "1001",
+				"dialedNumber": "1001",
+				"at": "2026-08-05T10:00:00.000Z"
+			},
+			"response": {
+				"allowed": true,
+				"reason": "1001",
+				"detail": "1001"
+			}
+		},
+		{
+			"subject": "rpc.pbx.v1.extension-feature",
+			"goType": "ExtensionFeature",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"extensionNumber": "1001",
+				"feature": "forward-all",
+				"enabled": true,
+				"destination": "1001",
+				"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+			},
+			"response": {
+				"applied": true,
+				"feature": "forward-all",
+				"enabled": true,
+				"destination": "1001",
+				"reason": "1001"
+			}
+		},
+		{
+			"subject": "rpc.pbx.v1.toggle-feature",
+			"goType": "ToggleFeature",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"target": "call-flow",
+				"callFlowId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"timeConditionId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"extensionNumber": "1001",
+				"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+			},
+			"response": {
+				"applied": true,
+				"target": "call-flow",
+				"state": "1001",
+				"reason": "1001"
+			}
+		},
+		{
+			"subject": "rpc.pbx.v1.hot-desk",
+			"goType": "HotDesk",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"action": "login",
+				"deviceId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"extensionNumber": "1001",
+				"pin": "1001",
+				"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+			},
+			"response": {
+				"applied": true,
+				"action": "login",
+				"extensionNumber": "1001",
+				"expiresAt": "1001",
+				"reason": "1001"
+			}
+		},
+		{
+			"subject": "rpc.pbx.v1.last-caller",
+			"goType": "LastCaller",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"extensionNumber": "1001",
+				"withinHours": 1,
+				"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+			},
+			"response": {
+				"found": true,
+				"callerNumber": "1001",
+				"callerName": "1001",
+				"at": "2026-08-05T10:00:00.000Z",
+				"reason": "1001"
+			}
+		},
+		{
+			"subject": "rpc.pbx.v1.file-greeting",
+			"goType": "FileGreeting",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"voicemailBoxId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"mailboxNumber": "1001",
+				"greetingId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"kind": "unavailable",
+				"objectKey": "1001",
+				"recordingId": "1001",
+				"durationMs": 1,
+				"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+			},
+			"response": {
+				"applied": true,
+				"kind": "unavailable",
+				"active": true,
+				"greetingId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"objectKey": "1001",
+				"reason": "1001"
+			}
+		},
+		{
+			"subject": "rpc.pbx.v1.queue-disposition",
+			"goType": "QueueDisposition",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"queueId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"agentId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"code": "unset",
+				"auto": true
+			},
+			"response": {
+				"recorded": true,
+				"reason": "1001"
+			}
+		},
+		{
+			"subject": "rpc.pbx.v1.queue-survey",
+			"goType": "QueueSurvey",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"queueId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"agentId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"callId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"answers": [
+					{
+						"questionId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+						"digit": "1"
+					}
+				]
+			},
+			"response": {
+				"recorded": 0,
+				"reason": "1001"
+			}
+		},
+		{
+			"subject": "rpc.sip.v1.credential",
+			"goType": "SipCredential",
+			"request": {
+				"realm": "1001",
+				"username": "1001",
+				"sourceAddress": "1001",
+				"transport": "udp"
+			},
+			"response": {
+				"found": true,
+				"enabled": true,
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"username": "1001",
+				"realm": "1001",
+				"ha1": "0192c7a14b8e7f218b3c9d0e1f2a3c00",
+				"ha1Previous": "0192c7a14b8e7f218b3c9d0e1f2a3c00",
+				"deviceId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"extensionId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"maxRegistrations": 1,
+				"sharedLineNumber": "1001",
+				"appearanceIndex": 0,
+				"reason": "1001"
+			}
+		},
+		{
+			"subject": "rpc.sip.v1.trunk-credential",
+			"goType": "SipTrunkCredential",
+			"request": {
+				"orgId": "1001",
+				"trunkId": "1001",
+				"secretRef": "1001",
+				"username": "1001",
+				"realm": "1001",
+				"algorithm": "MD5"
+			},
+			"response": {
+				"ok": true,
+				"orgId": "1001",
+				"trunkId": "1001",
+				"username": "1001",
+				"realm": "1001",
+				"algorithm": "MD5",
+				"ha1": "0192c7a14b8e7f218b3c9d0e1f2a3c00",
+				"reason": "1001"
+			}
+		},
+		{
+			"subject": "rpc.sip.v1.transfer",
+			"goType": "SipTransfer",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"sipCallId": "1001",
+				"fromTag": "1001",
+				"toTag": "1001",
+				"referredBy": {
+					"aor": "1001",
+					"username": "1001",
+					"extensionId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"deviceId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+				},
+				"target": {
+					"user": "1001",
+					"host": "1001",
+					"uri": "1001"
+				},
+				"kind": "blind",
+				"replaces": {
+					"callId": "1001",
+					"toTag": "1001",
+					"fromTag": "1001",
+					"earlyOnly": true
+				},
+				"referCSeq": 0,
+				"sourceAddress": "1001",
+				"transport": "udp"
+			},
+			"response": {
+				"ok": true,
+				"sipCallId": "1001",
+				"instanceId": "1001",
+				"legId": "1001",
+				"callId": "1001",
+				"destination": "1001",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.sip.v1.invite",
+			"goType": "SipInvite",
+			"request": {
+				"legId": "1001",
+				"sipdInstanceId": "1001",
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"deviceId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"authentication": "digest",
+				"profile": "1001",
+				"routingContext": "1001",
+				"from": {
+					"number": "1001",
+					"name": "1001",
+					"aor": "1001",
+					"uri": "1001"
+				},
+				"to": {
+					"number": "1001",
+					"name": "1001",
+					"aor": "1001",
+					"uri": "1001"
+				},
+				"sipCallId": "1001",
+				"fromTag": "1001",
+				"trunkId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"sourceAddress": "1001",
+				"transport": "udp",
+				"hasOffer": true,
+				"sdpOffer": "1001",
+				"mediaHint": {
+					"signallingSource": "1001",
+					"advertisedMedia": "1001",
+					"mismatch": true,
+					"private": true
+				},
+				"attestation": {
+					"level": "A",
+					"verstat": "1001",
+					"assertedIdentity": "1001",
+					"origId": "1001",
+					"signed": true
+				},
+				"userAgent": "1001",
+				"replaces": {
+					"callId": "1001",
+					"toTag": "1001",
+					"fromTag": "1001",
+					"earlyOnly": true
+				},
+				"replacesLegId": "1001"
+			},
+			"response": {
+				"ok": true,
+				"legId": "1001",
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"callId": "1001",
+				"instanceId": "1001",
+				"routingContext": "1001",
+				"direction": "inbound",
+				"reason": "unattributed",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.sip.v1.ring",
+			"goType": "SipRing",
+			"request": {
+				"legId": "1001",
+				"status": 180,
+				"sdpAnswer": "1001"
+			},
+			"response": {
+				"ok": true,
+				"legId": "1001",
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.sip.v1.answer",
+			"goType": "SipAnswer",
+			"request": {
+				"legId": "1001",
+				"sdpAnswer": "1001"
+			},
+			"response": {
+				"ok": true,
+				"legId": "1001",
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001",
+				"sentAt": "2026-08-05T10:00:00.000Z"
+			}
+		},
+		{
+			"subject": "rpc.sip.v1.hangup",
+			"goType": "SipHangup",
+			"request": {
+				"legId": "1001",
+				"cause": 0,
+				"detail": "1001"
+			},
+			"response": {
+				"ok": true,
+				"legId": "1001",
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001",
+				"method": "bye"
+			}
+		},
+		{
+			"subject": "rpc.sip.v1.reinvite",
+			"goType": "SipReinvite",
+			"request": {
+				"legId": "1001",
+				"sdpOffer": "1001",
+				"intent": "hold"
+			},
+			"response": {
+				"ok": true,
+				"legId": "1001",
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001",
+				"sdpAnswer": "1001"
+			}
+		},
+		{
+			"subject": "rpc.sip.v1.originate",
+			"goType": "SipOriginate",
+			"request": {
+				"legId": "1001",
+				"engineInstanceId": "1001",
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"callId": "1001",
+				"target": {
+					"kind": "aor",
+					"aor": "1001",
+					"contactUri": "1001",
+					"trunkId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"number": "1001",
+					"uri": "1001"
+				},
+				"callerIdNumber": "1001",
+				"callerIdName": "1001",
+				"callerIdPresentation": "allowed",
+				"sdpOffer": "1001",
+				"ringTimeoutMs": 1000,
+				"headers": {
+					"sample": "1001"
+				}
+			},
+			"response": {
+				"ok": true,
+				"legId": "1001",
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001",
+				"requestUri": "1001",
+				"sipCallId": "1001"
+			}
+		},
+		{
+			"subject": "rpc.sip.v1.resolve-target",
+			"goType": "SipResolveTarget",
+			"request": {
+				"legId": "1001",
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"target": {
+					"kind": "aor",
+					"aor": "1001",
+					"contactUri": "1001",
+					"trunkId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+					"number": "1001",
+					"uri": "1001"
+				}
+			},
+			"response": {
+				"contacts": [
+					{
+						"requestUri": "1001",
+						"transport": "udp",
+						"instanceId": "1001",
+						"q": 0
+					}
+				],
+				"ok": true,
+				"legId": "1001",
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001",
+				"requestUri": "1001",
+				"transport": "udp"
+			}
+		},
+		{
+			"subject": "rpc.engine.v1.renegotiate",
+			"goType": "EngineRenegotiate",
+			"request": {
+				"legId": "1001",
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"callId": "1001",
+				"sipdInstanceId": "1001",
+				"sdpOffer": "1001"
+			},
+			"response": {
+				"ok": true,
+				"legId": "1001",
+				"sdpAnswer": "1001",
+				"reason": "bad_request"
+			}
+		},
+		{
+			"subject": "rpc.media.v1.allocate-session",
+			"goType": "MediaAllocateSession",
+			"request": {
+				"sessionId": "1001",
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"callId": "1001",
+				"legId": "1001",
+				"sdpOffer": "1001",
+				"direction": "sendrecv",
+				"srtpPolicy": "prefer"
+			},
+			"response": {
+				"ok": true,
+				"sessionId": "1001",
+				"sdpAnswer": "1001",
+				"instanceId": "1001",
+				"address": "1001",
+				"rtpPort": 1,
+				"rtcpPort": 1,
+				"ssrc": 0,
+				"codec": "PCMU",
+				"telephoneEventPayloadType": 0,
+				"mediaEncryption": "encrypted",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.media.v1.create-offer",
+			"goType": "MediaCreateOffer",
+			"request": {
+				"sessionId": "1001",
+				"transport": "rtp",
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"callId": "1001",
+				"legId": "1001",
+				"direction": "sendrecv",
+				"srtpPolicy": "prefer"
+			},
+			"response": {
+				"ok": true,
+				"sessionId": "1001",
+				"sdpOffer": "1001",
+				"instanceId": "1001",
+				"address": "1001",
+				"rtpPort": 1,
+				"rtcpPort": 1,
+				"ssrc": 0,
+				"telephoneEventPayloadType": 0,
+				"mediaEncryption": "encrypted",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.media.v1.accept-answer",
+			"goType": "MediaAcceptAnswer",
+			"request": {
+				"sessionId": "1001",
+				"sdpAnswer": "1001",
+				"srtpPolicy": "prefer"
+			},
+			"response": {
+				"ok": true,
+				"sessionId": "1001",
+				"codec": "PCMU",
+				"telephoneEventPayloadType": 0,
+				"mediaEncryption": "encrypted",
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.media.v1.bridge-sessions",
+			"goType": "MediaBridgeSessions",
+			"request": {
+				"bridgeId": "1001",
+				"sessionIds": ["1001", "1001"]
+			},
+			"response": {
+				"ok": true,
+				"bridgeId": "1001",
+				"sessionIds": ["1001"],
+				"mixed": true,
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.media.v1.unbridge-sessions",
+			"goType": "MediaUnbridgeSessions",
+			"request": {
+				"bridgeId": "1001"
+			},
+			"response": {
+				"ok": true,
+				"bridgeId": "1001",
+				"unbridged": true,
+				"sessionIds": ["1001"],
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.media.v1.release-session",
+			"goType": "MediaReleaseSession",
+			"request": {
+				"sessionId": "1001"
+			},
+			"response": {
+				"ok": true,
+				"sessionId": "1001",
+				"released": true,
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.media.v1.start-playback",
+			"goType": "MediaStartPlayback",
+			"request": {
+				"sessionId": "1001",
+				"playbackRef": "1001",
+				"media": ["1001"],
+				"language": "1001"
+			},
+			"response": {
+				"ok": true,
+				"sessionId": "1001",
+				"playbackRef": "1001",
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.media.v1.stop-playback",
+			"goType": "MediaStopPlayback",
+			"request": {
+				"playbackRef": "1001"
+			},
+			"response": {
+				"ok": true,
+				"playbackRef": "1001",
+				"stopped": true,
+				"sessionId": "1001",
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.media.v1.send-dtmf",
+			"goType": "MediaSendDtmf",
+			"request": {
+				"sessionId": "1001",
+				"digits": "1001",
+				"toneDurationMs": 40,
+				"gapMs": 0
+			},
+			"response": {
+				"ok": true,
+				"sessionId": "1001",
+				"digits": "1001",
+				"queuedMs": 0,
+				"telephoneEventPayloadType": 0,
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.media.v1.start-recording",
+			"goType": "MediaStartRecording",
+			"request": {
+				"sessionId": "1001",
+				"recordingRef": "1001",
+				"direction": "receive",
+				"format": "wav",
+				"maxDurationMs": 1000,
+				"maxSilenceMs": 500,
+				"beep": true,
+				"terminateOn": "1001"
+			},
+			"response": {
+				"ok": true,
+				"sessionId": "1001",
+				"recordingRef": "1001",
+				"objectKey": "1001",
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.media.v1.stop-recording",
+			"goType": "MediaStopRecording",
+			"request": {
+				"recordingRef": "1001"
+			},
+			"response": {
+				"ok": true,
+				"recordingRef": "1001",
+				"stopped": true,
+				"sessionId": "1001",
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.media.v1.pause-recording",
+			"goType": "MediaPauseRecording",
+			"request": {
+				"recordingRef": "1001",
+				"resume": true
+			},
+			"response": {
+				"ok": true,
+				"recordingRef": "1001",
+				"paused": true,
+				"applied": true,
+				"sessionId": "1001",
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.media.v1.tap-session",
+			"goType": "MediaTapSession",
+			"request": {
+				"tapId": "1001",
+				"tapSessionId": "1001",
+				"targetSessionId": "1001",
+				"targetSide": "a",
+				"hear": "a",
+				"speakTo": "a",
+				"mode": "eavesdrop"
+			},
+			"response": {
+				"ok": true,
+				"tapId": "1001",
+				"bridgeId": "1001",
+				"sessionIds": ["1001"],
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.media.v1.untap-session",
+			"goType": "MediaUntapSession",
+			"request": {
+				"tapId": "1001"
+			},
+			"response": {
+				"ok": true,
+				"tapId": "1001",
+				"untapped": true,
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.media.v1.mute-session",
+			"goType": "MediaMuteSession",
+			"request": {
+				"sessionId": "1001",
+				"direction": "in",
+				"unmute": true
+			},
+			"response": {
+				"ok": true,
+				"sessionId": "1001",
+				"mutedIn": true,
+				"mutedOut": true,
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.media.v1.hold-session",
+			"goType": "MediaHoldSession",
+			"request": {
+				"sessionId": "1001",
+				"unhold": true,
+				"music": "1001",
+				"musicRef": "1001"
+			},
+			"response": {
+				"ok": true,
+				"sessionId": "1001",
+				"held": true,
+				"musicRef": "1001",
+				"instanceId": "1001",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.engine.v1.originate",
+			"goType": "Originate",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"originateId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"fromExtension": "1001",
+				"to": "1001",
+				"ringTimeoutSeconds": 5,
+				"callerIdNumber": "1001",
+				"callerIdName": "1001",
+				"requestedBy": "1001"
+			},
+			"response": {
+				"ok": true,
+				"originateId": "1001",
+				"instanceId": "1001",
+				"callId": "1001",
+				"legId": "1001",
+				"endpoint": "1001",
+				"destination": "1001",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.engine.v1.queue-callback",
+			"goType": "QueueCallback",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"callbackId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"queueId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"to": "1001",
+				"queueNumber": "1001",
+				"callerIdNumber": "1001",
+				"callerIdName": "1001",
+				"ringTimeoutSeconds": 5,
+				"relatedCallId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+			},
+			"response": {
+				"ok": true,
+				"callbackId": "1001",
+				"instanceId": "1001",
+				"callId": "1001",
+				"legId": "1001",
+				"endpoint": "1001",
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.engine.v1.park-handoff",
+			"goType": "ParkHandoff",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"parkLotId": "1001",
+				"slot": 0,
+				"mediaChannelId": "1001",
+				"retrieverInstanceId": "1001",
+				"retrieverMediaChannelId": "1001",
+				"retrieverLegId": "1001",
+				"bridgeId": "1001"
+			},
+			"response": {
+				"ok": true,
+				"parkLotId": "1001",
+				"slot": 0,
+				"instanceId": "1001",
+				"bridgeId": "1001",
+				"legId": "1001",
+				"callId": "1001",
+				"parkedAtMs": 0,
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.engine.v1.session-verb",
+			"goType": "SessionVerb",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"sessionId": "1001",
+				"callId": "1001",
+				"legId": "1001",
+				"verb": "answer",
+				"arguments": {
+					"media": "1001",
+					"playbackRef": "1001",
+					"loop": 0,
+					"terminators": ["1"],
+					"maxDigits": 1,
+					"timeoutMs": 0,
+					"interDigitTimeoutMs": 0,
+					"regex": "1001",
+					"maxDurationMs": 0,
+					"silenceStopMs": 0,
+					"beep": true,
+					"format": "wav",
+					"targets": [
+						{
+							"destination": "1001",
+							"context": "internal"
+						}
+					],
+					"strategy": "sequential",
+					"continueOnCauses": ["NORMAL_CLEARING"],
+					"peerLegId": "1001",
+					"transferKind": "blind",
+					"destination": "1001",
+					"destinationContext": "1001",
+					"fallbackDestination": "1001",
+					"cancelKey": "1",
+					"musicOnHold": "1001",
+					"soft": true,
+					"lot": "1001",
+					"orbit": "1001",
+					"digits": ["1"],
+					"toneDurationMs": 0,
+					"direction": "in",
+					"durationMs": 0,
+					"name": "1001",
+					"value": "1001",
+					"scope": "channel",
+					"cause": "NORMAL_CLEARING"
+				}
+			},
+			"response": {
+				"ok": true,
+				"verb": "answer",
+				"instanceId": "1001",
+				"endReason": "completed",
+				"reason": "bad_request",
+				"error": "1001",
+				"playbackRef": "1001",
+				"elapsedMs": 0,
+				"digits": ["1"],
+				"recordingId": "1001",
+				"mediaRef": "1001",
+				"durationMs": 0,
+				"format": "1001",
+				"answeredTargetIndex": 0,
+				"cause": "NORMAL_CLEARING",
+				"bridgeId": "1001"
+			}
+		},
+		{
+			"subject": "rpc.engine.v1.conference-control",
+			"goType": "ConferenceControl",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"conferenceId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"action": "mute",
+				"memberRef": "1001",
+				"gainPercent": 0,
+				"gainScope": "talk",
+				"byUserId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+			},
+			"response": {
+				"ok": true,
+				"action": "mute",
+				"instanceId": "1001",
+				"memberCount": 0,
+				"locked": true,
+				"memberRef": "1001",
+				"muted": true,
+				"deafened": true,
+				"moderator": true,
+				"talkGainPercent": 0,
+				"listenGainPercent": 0,
+				"reason": "bad-request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.engine.v1.call-control",
+			"goType": "CallControl",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"callId": "1001",
+				"legId": "1001",
+				"verb": "pauseRecord",
+				"byUserId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00"
+			},
+			"response": {
+				"ok": true,
+				"verb": "pauseRecord",
+				"instanceId": "1001",
+				"legId": "1001",
+				"recording": true,
+				"paused": true,
+				"reason": "bad_request",
+				"error": "1001"
+			}
+		},
+		{
+			"subject": "rpc.session.v1.announce",
+			"goType": "SessionAnnounce",
+			"request": {
+				"orgId": "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00",
+				"application": "1001",
+				"callId": "1001",
+				"legId": "1001",
+				"instanceId": "1001",
+				"direction": "inbound",
+				"answered": true,
+				"callerIdNumber": "1001",
+				"callerIdName": "1001",
+				"dialedNumber": "1001",
+				"arguments": {
+					"sample": "1001"
+				},
+				"at": "2026-08-05T10:00:00.000Z"
+			},
+			"response": {
+				"accepted": true,
+				"sessionId": "1001",
+				"reason": "no-application",
+				"error": "1001"
 			}
 		}
 	]

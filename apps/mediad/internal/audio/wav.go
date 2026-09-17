@@ -7,17 +7,12 @@ import (
 )
 
 // The one sample rate v1 plays, and the frame geometry that follows from it.
-//
-// 8 kHz because G.711 is 8 kHz: rung 7 is where wideband arrives, and a resampler in front of a
-// passthrough codec would be the first DSP on the call path for no benefit anybody can hear.
 const (
 	// SampleRate is the only rate a clip may be stored at. A file at 44.1 kHz is REFUSED rather
 	// than resampled — see ErrUnsupportedRate.
 	SampleRate = 8000
-	// FrameSamples is 20 ms at 8 kHz, and therefore also the byte length of one G.711 frame.
-	//
-	// 20 ms is the ptime every SIP endpoint on earth defaults to. A media server that sent 30 ms
-	// frames would work and would add 10 ms of one-way latency to every prompt for nothing.
+	// FrameSamples is 20 ms at 8 kHz, and therefore also the byte length of one G.711 frame. 20 ms
+	// is the ptime every SIP endpoint defaults to.
 	FrameSamples = 160
 	// FrameDurationMs is how much audio one frame carries.
 	FrameDurationMs = 20
@@ -26,11 +21,8 @@ const (
 	FrameTimestampStep = FrameSamples
 )
 
-// MaxClipBytes bounds one decoded clip at roughly 17 minutes of G.711.
-//
-// A limit rather than no limit because a playback request names a path and the process reads
-// whatever is at it: a 2 GB file left in the prompt directory by a backup job must fail as a
-// refusal on one call, not as an out-of-memory on every call the instance is carrying.
+// MaxClipBytes bounds one decoded clip at roughly 17 minutes of G.711, so an oversized file in the
+// prompt directory fails one call rather than exhausting memory for every call on the instance.
 const MaxClipBytes = 8 << 20
 
 // WAVE format tags this parser recognises, from the RIFF specification.
@@ -41,10 +33,9 @@ const (
 	waveFormatExtensible = 0xFFFE
 )
 
-// Why each refusal is its own sentinel: the control surface maps them onto the wire's
-// machine-readable `reason`, and they do not all mean the same thing to the engine. A malformed
-// file is `bad_request` for the operator who installed it; a rate this build cannot serve is
-// `not_supported`, which is the honest per-capability answer and routes the leg to Asterisk.
+// Each refusal is its own sentinel because the control surface maps them onto the wire's
+// machine-readable `reason`: a malformed file is `bad_request`, a rate this build cannot serve is
+// `not_supported` and routes the leg to Asterisk.
 var (
 	// ErrNotRIFF means the bytes are not a RIFF/WAVE container at all.
 	ErrNotRIFF = errors.New("audio: not a RIFF/WAVE file")
@@ -61,16 +52,12 @@ var (
 	// ErrTooLarge means the file is over MaxClipBytes.
 	ErrTooLarge = errors.New("audio: the file is too large to play")
 	// ErrEmpty means a well-formed WAV whose data chunk holds no audio. Refused rather than played,
-	// because a playback that reports success and sends nothing is the silent failure this whole
-	// service is built to avoid.
+	// so a playback never reports success and sends nothing.
 	ErrEmpty = errors.New("audio: the file contains no audio")
 )
 
-// Clip is decoded audio, already in one companding law and already cut into frames.
-//
-// The conversion happens ONCE, here, at playback start. The packet path receives a slice of
-// ready-to-send payloads and does nothing per frame but copy a header onto one — which is what
-// keeps a 50-times-a-second goroutine free of anything that could take a lock or allocate.
+// Clip is decoded audio, already in one companding law and already cut into frames. The conversion
+// happens once, at playback start, so the packet path only copies a header onto a ready payload.
 type Clip struct {
 	// Encoding is the law the frames are in. It always matches what the leg negotiated.
 	Encoding Encoding
@@ -84,13 +71,8 @@ func (c *Clip) DurationMs() int { return len(c.Frames) * FrameDurationMs }
 
 // DecodeWAV parses a RIFF/WAVE file and returns its audio in the requested companding law.
 //
-// # Why the parser walks chunks instead of assuming the canonical 44-byte header
-//
-// Because real files are not canonical. Anything that has been through a tagging tool carries a
-// `LIST`/`INFO` chunk, µ-law files written by sox carry a `fact` chunk the standard requires for
-// non-PCM formats, and a WAV written by a Windows tool may be WAVE_FORMAT_EXTENSIBLE with the real
-// format tag buried in a GUID. A parser that seeks to byte 44 works on the files a developer makes
-// and fails on the ones a customer uploads.
+// It walks chunks rather than assuming the canonical 44-byte header, because real files carry
+// `LIST`/`INFO` and `fact` chunks and may be WAVE_FORMAT_EXTENSIBLE.
 func DecodeWAV(raw []byte, encoding Encoding) (*Clip, error) {
 	if len(raw) > MaxClipBytes {
 		return nil, fmt.Errorf("%w: %d bytes, limit %d", ErrTooLarge, len(raw), MaxClipBytes)
@@ -115,8 +97,7 @@ func DecodeWAV(raw []byte, encoding Encoding) (*Clip, error) {
 		size := int(binary.LittleEndian.Uint32(raw[offset+4 : offset+8]))
 		body := offset + 8
 		if size < 0 || body+size > len(raw) {
-			// A chunk claiming more than the file holds. For `data` this is the interrupted-upload
-			// case and is worth naming; for anything else the file is equally unusable.
+			// A chunk claiming more than the file holds; for `data` this is an interrupted upload.
 			return nil, fmt.Errorf("%w: chunk %q claims %d bytes past offset %d", ErrTruncated, id, size, body)
 		}
 
@@ -176,8 +157,7 @@ func parseFormatChunk(body []byte) (wavFormat, error) {
 
 	if format.tag == waveFormatExtensible {
 		// WAVE_FORMAT_EXTENSIBLE hides the real tag in the first two bytes of a 16-byte subformat
-		// GUID, which starts 8 bytes into the extension. Anything written by a modern Windows tool
-		// looks like this, so ignoring it would refuse ordinary 16-bit PCM.
+		// GUID, 8 bytes into the extension.
 		if len(body) < 40 {
 			return wavFormat{}, fmt.Errorf("%w: extensible fmt chunk is %d bytes, needs 40", ErrTruncated, len(body))
 		}
@@ -188,8 +168,7 @@ func parseFormatChunk(body []byte) (wavFormat, error) {
 
 func (f wavFormat) validate() error {
 	if f.channels != 1 {
-		// Refused rather than downmixed. A stereo prompt is a mistake in the library — every
-		// telephony format is mono — and mixing channels would be inventing audio nobody authored.
+		// Refused rather than downmixed: a stereo prompt is a mistake in the library.
 		return fmt.Errorf("%w: %d channels, mediad plays mono only", ErrUnsupportedChannels, f.channels)
 	}
 	if f.sampleRate != SampleRate {
@@ -212,10 +191,8 @@ func (f wavFormat) validate() error {
 	return nil
 }
 
-// toEncoding turns a validated data chunk into G.711 bytes in the target law.
-//
-// The passthrough case — a stored law that already matches the leg's — copies nothing and converts
-// nothing, which is design doc §7's passthrough rule holding for files as well as for packets.
+// toEncoding turns a validated data chunk into G.711 bytes in the target law. A stored law that
+// already matches the leg's converts nothing.
 func (f wavFormat) toEncoding(data []byte, target Encoding) ([]byte, error) {
 	switch f.tag {
 	case waveFormatULaw:
@@ -236,11 +213,8 @@ func (f wavFormat) toEncoding(data []byte, target Encoding) ([]byte, error) {
 	return encodeLinear(samples, target), nil
 }
 
-// framesOf cuts a G.711 stream into 20 ms frames, padding the last one with silence.
-//
-// Padding rather than truncating: dropping the tail would clip the final consonant off every prompt
-// whose length is not a multiple of 20 ms, and a sender that emits a short frame makes some
-// receivers' jitter buffers report loss for the samples that were never sent.
+// framesOf cuts a G.711 stream into 20 ms frames, padding the last one with silence. Padding rather
+// than truncating: a short frame makes some receivers' jitter buffers report loss.
 func framesOf(payload []byte, encoding Encoding) [][]byte {
 	count := (len(payload) + FrameSamples - 1) / FrameSamples
 	frames := make([][]byte, 0, count)

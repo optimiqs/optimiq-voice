@@ -14,11 +14,22 @@ import {
 	deletePbx,
 	deletePbxChild,
 	fetchFeatureCodeParamFields,
+	fetchKycRecord,
+	fetchOrgLimits,
+	fetchOrgUsage,
 	getPbx,
 	listPbx,
 	listPbxChildren,
+	MAX_PAGE_LIMIT,
+	PBX_RESOURCES,
+	reorderPbxChildren,
+	saveKycRecord,
+	setPinSetEntryPin,
+	setTimeConditionOverride,
+	toggleCallFlow,
 	updatePbx,
 	updatePbxChild,
+	writeOrgLimits,
 	type PbxChildDescriptor,
 	type PbxListQuery,
 	type PbxResourceDescriptor,
@@ -27,9 +38,18 @@ import { pbxErrorCode, pbxToastMessage } from "~/lib/pbx/errors";
 import { queryKeys } from "~/lib/query-keys";
 import { useActiveOrganization } from "../_context/session-context";
 import type {
+	CallFlowMode,
+	CallFlowRow,
 	FeatureCodeParamFields,
 	MutationEnvelope,
+	KycRecord,
+	KycRecordInput,
+	OrgLimits,
+	OrgUsageReport,
 	PagedEnvelope,
+	PinSetEntryRow,
+	TimeConditionOverride,
+	TimeConditionRow,
 	WireDiagnostic,
 } from "~/lib/pbx/contracts";
 
@@ -88,6 +108,62 @@ export function usePbxList<TRow>(
 		rows: result.data?.data ?? [],
 		total: result.data?.total ?? 0,
 		totalPages: result.data?.totalPages ?? 0,
+	};
+}
+
+/**
+ * The WHOLE list, for a lookup map rather than a table.
+ *
+ * Half a dozen screens hold an id and have to render a name — a queue tier's agent, a paging
+ * group's member, a shared line's appearance. Those built a `Map` from `{ page: 1, limit: 100 }`,
+ * which is the API's maximum page and not the API's maximum list: on a 150-extension tenant the
+ * rows past the hundredth rendered as a truncated UUID, with nothing on screen to say why.
+ *
+ * So this pages through instead. It is deliberately NOT what a table uses — a table pages because
+ * the user is reading it, and this exists because nobody is: the answer is a map, and a map that is
+ * missing entries is wrong rather than short. `MAX_ROSTER_PAGES` is the seatbelt: a roster past
+ * that size is a screen that needs a different design, and the map is honestly marked `complete:
+ * false` rather than silently truncated again.
+ *
+ * Filed under the same `pbxList` key prefix, so every mutation's resource-wide invalidation sweeps
+ * it exactly as it sweeps the paged reads.
+ */
+const MAX_ROSTER_PAGES = 20;
+
+export interface PbxRosterResult<TRow> {
+	readonly query: UseQueryResult<readonly TRow[]>;
+	readonly rows: readonly TRow[];
+	/** False when the list ran past `MAX_ROSTER_PAGES` and the map is missing rows. */
+	readonly complete: boolean;
+}
+
+export function usePbxRoster<TRow>(
+	resource: PbxResourceDescriptor<TRow>,
+	options: { readonly enabled?: boolean } = {},
+): PbxRosterResult<TRow> {
+	const organizationId = useOrganizationId();
+	const result = useQuery({
+		queryKey: queryKeys.pbxList(organizationId, resource.key, { purpose: "roster" }),
+		queryFn: async () => {
+			const rows: TRow[] = [];
+			let page = 1;
+			for (;;) {
+				const envelope = await listPbx(resource, { page, limit: MAX_PAGE_LIMIT });
+				rows.push(...envelope.data);
+				if (page >= envelope.totalPages || page >= MAX_ROSTER_PAGES) {
+					break;
+				}
+				page += 1;
+			}
+			return rows as readonly TRow[];
+		},
+		enabled: organizationId.length > 0 && options.enabled !== false,
+	});
+
+	return {
+		query: result,
+		rows: result.data ?? [],
+		complete: (result.data?.length ?? 0) < MAX_ROSTER_PAGES * MAX_PAGE_LIMIT,
 	};
 }
 
@@ -277,6 +353,35 @@ export function usePbxChildUpdate<TRow>(
 	});
 }
 
+/**
+ * Rewrites a child collection's order in ONE request.
+ *
+ * The mutation takes the COMPLETE list of ids in their new order, because that is what the server
+ * takes: it refuses anything that is not an exact permutation, which turns a stale editor's reorder
+ * into a recoverable 400 rather than a silent scramble. There is deliberately no optimistic update —
+ * the reply carries the collection as the server stored it, and the invalidation below is what puts
+ * it on screen. An optimistic swap would show an order that a refused permutation then reverted,
+ * which is the one moment a drag control must not lie.
+ */
+export function usePbxChildReorder<TRow>(
+	child: PbxChildDescriptor<TRow>,
+	parentResourceKey: string,
+	parentId: string | undefined,
+): UseMutationResult<MutationEnvelope<readonly TRow[]>, Error, readonly string[]> {
+	const invalidate = useInvalidatePbx(parentResourceKey, child.affectsRouting);
+
+	return useMutation({
+		mutationFn: (ids: readonly string[]) => reorderPbxChildren(child, parentId as string, ids),
+		onSuccess: async (result) => {
+			await invalidate();
+			announceSave(result.warnings, "Order saved");
+		},
+		onError: (error) => {
+			toast.error(pbxToastMessage(error, `Could not reorder the ${child.label} list`));
+		},
+	});
+}
+
 export function usePbxChildDelete<TRow>(
 	child: PbxChildDescriptor<TRow>,
 	parentResourceKey: string,
@@ -292,6 +397,168 @@ export function usePbxChildDelete<TRow>(
 		},
 		onError: (error) => {
 			toast.error(pbxToastMessage(error, `Could not remove the ${child.label}`));
+		},
+	});
+}
+
+// ---------------------------------------------------------------------------------------------
+// The T2 admin block's verbs — the writes that are not a PATCH
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Moves a call flow's switch.
+ *
+ * Invalidated exactly as an ordinary write is, through the SAME handle: a toggle is a routing write
+ * — `call_flow` is in `ROUTING_TABLE_TO_ENTITY` — so the compile view has to be evicted with the
+ * list, and the phones in the building have already been told (the server publishes the busy-lamp
+ * presence entry after the commit, never before).
+ *
+ * The toast says which way it went rather than "saved", because that is the entire content of the
+ * action and it is the thing somebody will want to confirm from across the room.
+ */
+export function useCallFlowToggle(): UseMutationResult<
+	MutationEnvelope<CallFlowRow>,
+	Error,
+	{ readonly id: string; readonly mode: CallFlowMode }
+> {
+	const resource = PBX_RESOURCES.callFlows;
+	const invalidate = useInvalidatePbx(resource.key, resource.affectsRouting);
+
+	return useMutation({
+		mutationFn: ({ id, mode }: { id: string; mode: CallFlowMode }) => toggleCallFlow(id, mode),
+		onSuccess: async (result) => {
+			await invalidate();
+			announceSave(result.warnings, `${result.data.name} is now in ${result.data.mode} mode`);
+		},
+		onError: (error) => {
+			toast.error(pbxToastMessage(error, "Could not move the switch"));
+		},
+	});
+}
+
+/**
+ * Forces a time condition open or closed, or hands it back to the clock.
+ *
+ * Invalidates the TIME-CONDITIONS resource even though the endpoint lives under `/call-flows`: the
+ * row that changed is a time condition, and the screen showing it is the one that has to refetch.
+ * The path is a fact about which grant guards the write, not about which cache holds the row.
+ */
+export function useTimeConditionOverride(): UseMutationResult<
+	MutationEnvelope<TimeConditionRow>,
+	Error,
+	{ readonly id: string; readonly override: TimeConditionOverride }
+> {
+	const resource = PBX_RESOURCES.timeConditions;
+	const invalidate = useInvalidatePbx(resource.key, resource.affectsRouting);
+
+	return useMutation({
+		mutationFn: ({ id, override }: { id: string; override: TimeConditionOverride }) =>
+			setTimeConditionOverride(id, override),
+		onSuccess: async (result) => {
+			await invalidate();
+			announceSave(
+				result.warnings,
+				result.data.override === "auto"
+					? `${result.data.name} is following its schedule again`
+					: `${result.data.name} is overridden`,
+			);
+		},
+		onError: (error) => {
+			toast.error(pbxToastMessage(error, "Could not change the override"));
+		},
+	});
+}
+
+/**
+ * Replaces one authorisation code's digits.
+ *
+ * The success message deliberately does not echo anything: the value was hashed on the way in and
+ * the reply carries the row without it, so there is nothing to confirm except that it happened.
+ */
+export function useSetPinSetEntryPin(
+	pinSetId: string | undefined,
+): UseMutationResult<
+	MutationEnvelope<PinSetEntryRow>,
+	Error,
+	{ readonly entryId: string; readonly pin: string }
+> {
+	const resource = PBX_RESOURCES.pinSets;
+	const invalidate = useInvalidatePbx(resource.key, resource.affectsRouting);
+
+	return useMutation({
+		mutationFn: ({ entryId, pin }: { entryId: string; pin: string }) =>
+			setPinSetEntryPin(pinSetId as string, entryId, pin),
+		onSuccess: async (result) => {
+			await invalidate();
+			announceSave(result.warnings, "Code set");
+		},
+		onError: (error) => {
+			if (!isFieldAddressable(error)) {
+				toast.error(pbxToastMessage(error, "Could not set the code"));
+			}
+		},
+	});
+}
+
+// ---------------------------------------------------------------------------------------------
+// Organization limits
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The organization's quotas, and what it is using against them.
+ *
+ * The usage query is the ONE read in this module that is not held indefinitely: the counts move
+ * whenever anybody anywhere creates an extension or uploads audio, and no mutation in this app can
+ * be relied on to have been the one that did it (another admin, an API key, a voicemail left five
+ * minutes ago). So it refetches on mount, which is the whole lifetime of the page it serves.
+ *
+ * A caller without `org-limits.read` gets a 403 — the page is gated on that grant, so this is only
+ * reachable by somebody who holds it, and a failure here is a real failure worth showing.
+ */
+export function useOrgLimits(): UseQueryResult<OrgLimits> {
+	const organizationId = useOrganizationId();
+	return useQuery({
+		queryKey: queryKeys.orgLimits(organizationId),
+		queryFn: fetchOrgLimits,
+		enabled: organizationId.length > 0,
+	});
+}
+
+export function useOrgUsage(): UseQueryResult<OrgUsageReport> {
+	const organizationId = useOrganizationId();
+	return useQuery({
+		queryKey: queryKeys.orgUsage(organizationId),
+		queryFn: fetchOrgUsage,
+		enabled: organizationId.length > 0,
+		refetchOnMount: "always",
+	});
+}
+
+/**
+ * Sets them.
+ *
+ * Invalidates `orgLimits`, which takes the usage report with it by key hierarchy — raising a ceiling
+ * changes every ratio on screen, and a bar still reading "48 of 50" beside a limit somebody has just
+ * moved to 100 is the exact confusion this page exists to remove.
+ *
+ * No routing invalidation: `org_limit` is not in `ROUTING_TABLE_TO_ENTITY` and the compiler has no
+ * quota input. `maxConcurrentCalls` IS enforced by the engine at admission, but through the org
+ * settings the artifact already carries rather than through this table.
+ */
+export function useOrgLimitsSave(): UseMutationResult<OrgLimits, Error, OrgLimits> {
+	const queryClient = useQueryClient();
+	const organizationId = useOrganizationId();
+
+	return useMutation({
+		mutationFn: (limits: OrgLimits) => writeOrgLimits(limits),
+		onSuccess: async () => {
+			await queryClient.invalidateQueries({ queryKey: queryKeys.orgLimits(organizationId) });
+			toast.success("Limits saved");
+		},
+		onError: (error) => {
+			if (!isFieldAddressable(error)) {
+				toast.error(pbxToastMessage(error, "Could not save the limits"));
+			}
 		},
 	});
 }
@@ -332,4 +599,55 @@ function isFieldAddressable(error: unknown): boolean {
 
 function capitalize(value: string): string {
 	return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Carrier compliance — the KYC record
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The organization's KYC record.
+ *
+ * A singleton read rather than a list, because the API is one: `GET /compliance/kyc` answers with
+ * the record or 404s when nothing has been submitted yet, and the screen renders the form empty in
+ * that case rather than treating it as an error.
+ */
+export function useKycRecord(): UseQueryResult<KycRecord> {
+	const organizationId = useOrganizationId();
+	return useQuery({
+		queryKey: queryKeys.complianceKyc(organizationId),
+		queryFn: fetchKycRecord,
+		enabled: organizationId.length > 0,
+		retry: false,
+	});
+}
+
+/**
+ * Submits it.
+ *
+ * No routing invalidation: the compiler has no KYC input, and the record reaches an outbound call
+ * through the signing decision rather than through the artifact.
+ *
+ * The toast does not say "approved". A `PUT` that succeeds means the record was STORED, and a
+ * submission that resets the decision to `pending` — which it does, because a changed legal entity
+ * is a new question for the reviewer — must not read as an outcome.
+ */
+export function useKycRecordSave(): UseMutationResult<KycRecord, Error, KycRecordInput> {
+	const queryClient = useQueryClient();
+	const organizationId = useOrganizationId();
+
+	return useMutation({
+		mutationFn: async (input: KycRecordInput) => (await saveKycRecord(input)).data,
+		onSuccess: async () => {
+			await queryClient.invalidateQueries({ queryKey: queryKeys.complianceKyc(organizationId) });
+			toast.success("Compliance record submitted", {
+				description: "A reviewer decides on it. The decision shows on this page when it changes.",
+			});
+		},
+		onError: (error) => {
+			if (!isFieldAddressable(error)) {
+				toast.error(pbxToastMessage(error, "Could not save the compliance record"));
+			}
+		},
+	});
 }

@@ -7,6 +7,7 @@ import {
 	CDR_PARTITION_KEYS,
 	createMonthlyPartition,
 	defaultPartitionName,
+	droppablePartitionsQuery,
 	monthlyPartitionName,
 	monthlyPartitionRange,
 	monthsInHorizon,
@@ -127,5 +128,31 @@ describe("partitioned table allow-list", () => {
 		expect(JSON.stringify(chunks)).toContain("cdr_ensure_monthly_partition");
 		// The month is a bound parameter, never string-interpolated.
 		expect(chunks.some((chunk) => JSON.stringify(chunk).includes("2026-09-01"))).toBe(true);
+	});
+});
+
+describe("droppablePartitionsQuery", () => {
+	it("previews the same set the drop function would take", () => {
+		const chunks = JSON.stringify(
+			droppablePartitionsQuery("call_legs", new Date("2026-09-14Z")).queryChunks,
+		);
+
+		// The same catalogue join and the same upper-bound extraction as
+		// `cdr_drop_partitions_before`, so the preview cannot answer a different question.
+		expect(chunks).toContain("pg_inherits");
+		expect(chunks).toContain("relpartbound");
+		expect(chunks).toContain("DEFAULT");
+		// Month-normalized, and a bound parameter rather than interpolated text.
+		expect(chunks).toContain("2026-09-01");
+		// A preview must not be able to destroy anything.
+		expect(chunks).not.toContain("drop table");
+		expect(chunks).not.toContain("DROP TABLE");
+	});
+
+	it("takes the table name as a parameter, so an unchecked name cannot become DDL", () => {
+		const chunks = JSON.stringify(
+			droppablePartitionsQuery("call_events", new Date("2026-01-01Z")).queryChunks,
+		);
+		expect(chunks).toContain("call_events");
 	});
 });

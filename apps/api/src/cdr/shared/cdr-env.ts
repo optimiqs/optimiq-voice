@@ -154,7 +154,8 @@ export const cdrEnvSchema = z.object({
 	CDR_RECORDING_ROOT: z.string().min(1).default("/opt/optimiq-voice/recordings"),
 
 	/**
-	 * How long a call recording is kept before it is purged, in days.
+	 * How long a call recording is kept before it is purged, in days — the PLATFORM's answer,
+	 * used when an organization has not given its own.
 	 *
 	 * Stamped onto `recordings.retention_until` when the row is written, because that is the only
 	 * moment the policy in force is unambiguous: applying today's window retroactively to a row
@@ -166,15 +167,17 @@ export const cdrEnvSchema = z.object({
 	 * indefinitely: `retention_until` stays null and the sweeper never sees the row. That remains
 	 * the default because deleting a tenant's audio is not a thing to start doing on an upgrade.
 	 *
-	 * ## Why this is a platform setting and not (yet) a per-organization one
+	 * ## Where the per-organization window comes from
 	 *
-	 * The natural home for a tenant's own window is `org_setting`, which lives in `pbx-db` — a
-	 * different database with a different pool, deliberately never shared with this one
-	 * (`cdr.module.ts`). Reading it here would put a cross-database round trip on the recording
-	 * write path for every recording, and a `PbxDatabaseClient` into a module that has been
-	 * self-contained on purpose. A per-org window belongs on the event or in a cached policy
-	 * projection; until one of those exists, this is a platform-wide floor rather than a promise
-	 * the column cannot keep.
+	 * The tenant's own window is the `recordings.retentionDays` org setting (`org-settings.catalog.ts`,
+	 * guarded by `recordings.configure`), and it reaches this area WITHOUT the cross-database import
+	 * an earlier version of this comment refused: the CDR area owns a port
+	 * (`recordings/retention-policy.ts`), the PBX side implements it over a per-organization TTL
+	 * cache, and `recording-writer.service.ts` injects it `@Optional()`. The org value — including
+	 * an explicit `0` — wins whenever it exists; this variable decides for the three absences (no
+	 * PBX area mounted, no window ever set, the policy read failing). The refusal's grounds were
+	 * real and are still honoured — no `PbxDatabaseClient` in this module, and the cache keeps the
+	 * write path at one foreign query per organization per minute rather than one per recording.
 	 */
 	CDR_RECORDING_RETENTION_DAYS: z.coerce.number().int().min(0).max(3_650).default(0),
 
@@ -198,6 +201,159 @@ export const cdrEnvSchema = z.object({
 
 	/** Recordings purged in one pass. Bounded so one sweep cannot hold the pool for minutes. */
 	CDR_RECORDING_SWEEP_BATCH: z.coerce.number().int().min(1).max(1_000).default(200),
+
+	/**
+	 * Where CDR export objects live.
+	 *
+	 * A root of its own rather than a sub-prefix of `CDR_RECORDING_ROOT`, and the reason is a
+	 * property no other object class in this API has: **Asterisk never touches an export.** Every
+	 * other root here is on a volume the media server shares — which is exactly why
+	 * `object-store.factory.ts` has no branch that returns a bare `S3ObjectStore`, and why the S3
+	 * driver mirrors rather than replaces the filesystem. An export is written by this process and
+	 * read by this process, so it is the one class that could legitimately live only in a bucket.
+	 *
+	 * It still goes through `createObjectStore`, so today it mirrors like the rest. Separating the
+	 * root now is what makes moving it later a configuration change rather than a code change, and
+	 * it means an operator can put reports on a different volume from audio — different sizes,
+	 * different retention, different backup policy.
+	 *
+	 * Unset, it defaults to `<CDR_RECORDING_ROOT>/exports` rather than to a sibling of it. The
+	 * deployment pins `CDR_RECORDING_ROOT` to the mounted object volume (`compose.voice.yaml`) and
+	 * pins nothing for exports, so a literal default was a path the runtime image's uid 1001 cannot
+	 * write — an `EACCES` on the first export somebody clicks, hours after boot. Deriving it means
+	 * the writable volume is inherited by construction, and an operator who wants exports elsewhere
+	 * still just sets the variable. See `withRecordingRootFallback` below.
+	 */
+	CDR_EXPORT_ROOT: z.string().min(1).default("/opt/optimiq-voice/recordings/exports"),
+
+	/**
+	 * How often the export worker looks for a queued job. `0` disables it.
+	 *
+	 * Fifteen seconds, which is a latency budget rather than a load one: the poll is an index scan
+	 * over a partial index that is empty almost all of the time, and the number is chosen so a
+	 * person who clicks "Export" sees the job start moving before they wonder whether it worked.
+	 *
+	 * It runs under `CDR_WRITER_ENABLED` with the durable consumers and the recording sweep. Unlike
+	 * those, N replicas polling would still be CORRECT — the claim is a `skip locked` compare-and-set
+	 * — so this switch is about cost, and an operator who wants export throughput enables the writer
+	 * in more than one place on purpose.
+	 */
+	CDR_EXPORT_POLL_INTERVAL_MS: z.coerce.number().int().min(0).max(3_600_000).default(15_000),
+
+	/**
+	 * How long a claimed export may go quiet before another worker may take it.
+	 *
+	 * The claim commits immediately rather than holding a transaction across the export, so a worker
+	 * that dies mid-write leaves a row stuck in `running` that nothing would otherwise touch. This
+	 * is what unsticks it. Ten minutes: comfortably longer than the largest export a bounded row
+	 * count can produce, and short enough that a crash is not an outage.
+	 */
+	CDR_EXPORT_LEASE_MS: z.coerce.number().int().min(60_000).max(86_400_000).default(600_000),
+
+	/**
+	 * The most rows one export may contain before it is failed.
+	 *
+	 * FAILED, never truncated — a truncated CSV is a plausible-looking file with no marker saying
+	 * where it stopped, and somebody will total a column in it. The ceiling is really about memory:
+	 * `ObjectStore.put` takes a `Buffer`, so the whole file is assembled before it is stored, and a
+	 * hundred thousand legs is roughly 25 MB. Raising this far beyond that means growing a streaming
+	 * `upload` path on `MirroredObjectStore.put`, which names itself as the method that would.
+	 */
+	CDR_EXPORT_MAX_ROWS: z.coerce.number().int().min(1_000).max(2_000_000).default(100_000),
+
+	/**
+	 * How long a finished export stays downloadable, in hours.
+	 *
+	 * Expiring by DEFAULT, which is the opposite of `recordings.retention_until` (null, keep for
+	 * ever, until a policy says otherwise). The asymmetry is deliberate: a recording is the primary
+	 * record of a conversation and deleting it destroys something; an export is a derived copy of
+	 * the ledger sitting outside the ledger's own access controls, and a report nobody fetched in a
+	 * week is a liability rather than an asset. Seven days is long enough for a monthly reporting
+	 * cycle to be re-run rather than re-requested.
+	 *
+	 * Only the FILE expires. The job row — who asked, for what window, with what filters — survives,
+	 * because that is the record an audit of "who extracted the call history" reads.
+	 */
+	CDR_EXPORT_TTL_HOURS: z.coerce.number().int().min(1).max(8_760).default(168),
+
+	/**
+	 * How many months of call records the PLATFORM keeps, `0` to keep them for ever.
+	 *
+	 * ## Twenty-four months by default, and why the default moved off `0`
+	 *
+	 * This used to default to `0` — keep for ever — on the reasoning that no upgrade may start
+	 * destroying a deployment's call history because a release shipped a scheduler for it. The
+	 * caution was right and the default was wrong, because `0` is not neutral: a never-expiring
+	 * default silently makes every deployment an indefinite store of call metadata — who called
+	 * whom, from where, for how long, for the life of the installation — which is precisely what
+	 * GDPR's storage-limitation principle and CCPA's minimisation duty exist to prevent. "We kept
+	 * it because nobody set a number" is not a retention policy anyone can defend; it is the
+	 * absence of one, shipped as a default and inherited by every operator who never read this
+	 * file.
+	 *
+	 * Twenty-four months is the shortest window that does not break the two things call metadata
+	 * is legitimately needed for after the fact: a billing dispute, which follows an invoice cycle
+	 * and can reasonably reach back a year or more, and a regulatory traceback on a suspected
+	 * illegal-call campaign, whose industry practice is likewise measured in months rather than
+	 * years. Past that, a call leg from two years ago answers no operational question and is only
+	 * a liability in a breach.
+	 *
+	 * ## The safety the old default was really providing has not been removed
+	 *
+	 * `CDR_RETENTION_DRY_RUN` still defaults to TRUE, and that — not the zero — is the interlock
+	 * that stops an upgrade destroying anything. With this window set and the dry run on, the
+	 * sweep computes the plan, logs the partitions and the per-organization row counts, and drops
+	 * nothing; an operator reads that artefact and clears the flag deliberately. So the change
+	 * here alters what a deployment is DEFAULTED TO INTEND, which is the part that was wrong,
+	 * without altering what it does before somebody looks.
+	 *
+	 * A deployment that genuinely must keep call records for ever — an escrow obligation, a
+	 * jurisdiction that mandates it — sets `CDR_LEG_RETENTION_MONTHS=0` and gets exactly the old
+	 * behaviour. `0` still means "keep indefinitely"; it just has to be asked for now.
+	 *
+	 * Months rather than days because the unit of deletion is a monthly PARTITION —
+	 * `packages/cdr-db`'s `DEFAULT_CDR_RETENTION_MONTHS` is 13 for the reason it states, a full
+	 * year plus the current partial month. A window expressed in days would round to the same
+	 * partition boundary anyway and would only invite the belief that it does not.
+	 *
+	 * ## It is the platform's window and cannot be a tenant's
+	 *
+	 * A partition holds every tenant's legs for that month, so the drop is all-or-nothing across
+	 * the deployment. `leg-retention-sweeper.service.ts` sets out why a shorter per-organization
+	 * window would be a different storage layout rather than a flag, and why a longer one is not
+	 * expressible at all. The per-tenant window that DOES exist is `recordings.retentionDays`,
+	 * which governs the audio, is stamped per row, and is enforced by the recording sweep.
+	 */
+	CDR_LEG_RETENTION_MONTHS: z.coerce.number().int().min(0).max(240).default(24),
+
+	/**
+	 * Whether the retention sweep only REPORTS what it would drop. Default true.
+	 *
+	 * The safety interlock on an irreversible operation: with the window set and this still true,
+	 * every pass computes the plan, lists the partitions and their sizes, tallies the rows per
+	 * organization and logs all of it, and drops nothing. That is the artifact an operator approves
+	 * a first real pass from.
+	 */
+	CDR_RETENTION_DRY_RUN: z
+		.stringbool({ truthy: ["true", "1"], falsy: ["false", "0"] })
+		.default(true),
+
+	/**
+	 * How often the retention sweep runs in this process. `0` disables it.
+	 *
+	 * Daily. A window measured in months has nothing to gain from a finer interval, and the pass
+	 * takes a brief `ACCESS EXCLUSIVE` lock on the parent table for each `DROP TABLE` — cheap, but
+	 * not something to do every hour for no reason.
+	 *
+	 * Under `CDR_WRITER_ENABLED` with the other singleton workloads: N replicas racing on the same
+	 * `DROP TABLE` would have N-1 of them report a failure that is really somebody else's success.
+	 */
+	CDR_RETENTION_SWEEP_INTERVAL_MS: z.coerce
+		.number()
+		.int()
+		.min(0)
+		.max(604_800_000)
+		.default(86_400_000),
 });
 
 export type CdrEnv = z.infer<typeof cdrEnvSchema>;
@@ -214,8 +370,27 @@ export function isCdrSliceConfigured(source: NodeJS.ProcessEnv = process.env): b
  * request can arrive. A 20-character signing secret must stop the process at boot, not surface as
  * a download URL somebody can forge.
  */
+/**
+ * Fills `CDR_EXPORT_ROOT` from `CDR_RECORDING_ROOT` when the deployment set only the latter.
+ *
+ * The same overlay-before-parse shape `pbx-env.ts` uses for its media roots, and for the same
+ * reason: an orchestrator that wants a variable off sets it to `""`, so an empty string counts as
+ * "not set" rather than as a root of length zero.
+ */
+function withRecordingRootFallback(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const own = source.CDR_EXPORT_ROOT;
+	if (typeof own === "string" && own.trim().length > 0) {
+		return source;
+	}
+	const recordings = source.CDR_RECORDING_ROOT;
+	if (typeof recordings !== "string" || recordings.trim().length === 0) {
+		return source;
+	}
+	return { ...source, CDR_EXPORT_ROOT: `${recordings.trim().replace(/\/+$/u, "")}/exports` };
+}
+
 export function loadCdrEnv(source: NodeJS.ProcessEnv = process.env): CdrEnv {
-	const parsed = cdrEnvSchema.safeParse(source);
+	const parsed = cdrEnvSchema.safeParse(withRecordingRootFallback(source));
 	if (!parsed.success) {
 		const detail = parsed.error.issues
 			.map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)

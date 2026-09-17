@@ -54,10 +54,50 @@ export const registrationExpiredDataSchema = z.object({
 	registeredForSeconds: z.int().min(0).optional(),
 });
 
+/**
+ * `auth-failed` — a REGISTER was refused because the credential did not verify.
+ *
+ * Not a binding transition, so it carries no `contact`: nothing was bound. It exists because the
+ * registrar is the ONLY process that sees a digest, so `sip_auth_event.bad-credentials` has no
+ * other possible writer — the credential API answers with an ha1 and never learns whether the
+ * device computed the right response from it.
+ *
+ * Every member of the reason vocabulary is raised AFTER the account has been resolved, because the
+ * subject needs an organization and an unresolved account has none. An attempt against an account
+ * that exists nowhere is filed by `apps/api` from the credential lookup instead.
+ *
+ * `username` is the account the attacker named. Never a credential, never a digest, never a nonce.
+ */
+export const registrationAuthFailedDataSchema = z.object({
+	aor: aorSchema,
+	/** Always equals the subject's token; carried so a replayed file is self-describing. */
+	aorHash: z.string().regex(/^[0-9a-f]{32}$/),
+	transport: sipTransportSchema,
+	/** Signalling source, `host:port`. The address a firewall rule would be written against. */
+	sourceAddress: z.string().max(64).optional(),
+	userAgent: z.string().max(256).optional(),
+	/** The `username` the Authorization header claimed. */
+	username: z.string().max(128),
+	/**
+	 * `bad-credentials` is a wrong password (or a digest bound to the wrong request URI, algorithm
+	 * or qop); `stale-nonce` is a correct digest replaying a nonce count already spent, which is a
+	 * captured credential being re-sent rather than an honest expiry.
+	 */
+	reason: z.enum(["bad-credentials", "stale-nonce"]),
+	/**
+	 * True when the edge had already locked this (source, account) pair out and refused without
+	 * asking the credential directory at all. Distinguishes "somebody is guessing" from "somebody
+	 * has been guessing long enough that we stopped listening", which is the row an operator wants
+	 * when deciding whether a firewall rule is still needed.
+	 */
+	locked: z.boolean().optional(),
+});
+
 export const REGISTRATION_EVENT_DEFINITIONS = {
 	registered: defineEvent("registration", "registered", registrationRegisteredDataSchema),
 	unregistered: defineEvent("registration", "unregistered", registrationUnregisteredDataSchema),
 	expired: defineEvent("registration", "expired", registrationExpiredDataSchema),
+	"auth-failed": defineEvent("registration", "auth-failed", registrationAuthFailedDataSchema),
 } as const;
 
 export type RegistrationEventDefinitions = typeof REGISTRATION_EVENT_DEFINITIONS;
@@ -75,6 +115,7 @@ export const registrationEventSchema = z.discriminatedUnion("type", [
 	REGISTRATION_EVENT_DEFINITIONS.registered.envelope,
 	REGISTRATION_EVENT_DEFINITIONS.unregistered.envelope,
 	REGISTRATION_EVENT_DEFINITIONS.expired.envelope,
+	REGISTRATION_EVENT_DEFINITIONS["auth-failed"].envelope,
 ]);
 
 export type RegistrationEventEnvelope = z.infer<typeof registrationEventSchema>;

@@ -1,0 +1,50 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"ok": {
+			"type": "boolean"
+		},
+		"legId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"instanceId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"reason": {
+			"type": "string",
+			"enum": [
+				"bad_request",
+				"unknown_dialog",
+				"wrong_instance",
+				"dialog_gone",
+				"invalid_state",
+				"unregistered_target",
+				"unknown_trunk",
+				"no_route",
+				"capacity",
+				"shutting_down",
+				"not_supported",
+				"internal"
+			]
+		},
+		"error": {
+			"type": "string",
+			"maxLength": 512
+		},
+		"requestUri": {
+			"type": "string",
+			"maxLength": 1024
+		},
+		"sipCallId": {
+			"type": "string",
+			"maxLength": 256
+		}
+	},
+	"required": ["ok", "legId"],
+	"additionalProperties": false
+}

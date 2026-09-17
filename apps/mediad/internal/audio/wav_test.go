@@ -9,11 +9,8 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 )
 
-// buildWAV writes a RIFF/WAVE file with the given fmt fields and data body.
-//
-// Hand-built rather than fixture files on disk, for the same reason the sdp suite builds its offers
-// in-process: a truncated file and a 44.1 kHz file are inputs a test must be able to state, and a
-// binary fixture makes "what exactly is wrong with this one" invisible in review.
+// buildWAV writes a RIFF/WAVE file with the given fmt fields and data body. Hand-built rather than
+// a binary fixture so a truncated or wrong-rate input is legible in review.
 func buildWAV(tag, channels uint16, sampleRate uint32, bits uint16, data []byte, extra ...wavChunk) []byte {
 	fmtChunk := make([]byte, 16)
 	binary.LittleEndian.PutUint16(fmtChunk[0:2], tag)
@@ -61,7 +58,7 @@ type wavChunk struct {
 // pcm16 builds n samples of a value, little-endian.
 func pcm16(sample int16, count int) []byte {
 	out := make([]byte, count*2)
-	for index := 0; index < count; index++ {
+	for index := range count {
 		binary.LittleEndian.PutUint16(out[index*2:index*2+2], uint16(sample))
 	}
 	return out
@@ -85,8 +82,8 @@ func TestDecodeWAVLinearPCM(t *testing.T) {
 		if len(frame) != audio.FrameSamples {
 			t.Fatalf("frame %d is %d bytes, want %d", index, len(frame), audio.FrameSamples)
 		}
-		// A zero linear sample encodes to 0xFF in µ-law, never to 0x00. Asserting the value rather
-		// than the length is what catches an encoder that "works" by emitting zeros.
+		// A zero linear sample encodes to 0xFF in µ-law, never 0x00, so assert the value not the
+		// length.
 		for _, encoded := range frame {
 			if encoded != 0xFF {
 				t.Fatalf("frame %d holds %#02x, want µ-law silence 0xFF", index, encoded)
@@ -111,8 +108,7 @@ func TestDecodeWAVEncodesToTheLegsLaw(t *testing.T) {
 }
 
 func TestDecodeWAVPassesG711Through(t *testing.T) {
-	// A µ-law WAV played to a µ-law leg must be the SAME BYTES: this is design doc §7's passthrough
-	// rule holding for files, and it is what makes a curated library free to serve.
+	// A µ-law WAV played to a µ-law leg must be the same bytes: passthrough holds for files too.
 	payload := []byte{0x01, 0x7F, 0xFF, 0x80}
 	raw := buildWAV(7, 1, 8000, 8, payload)
 
@@ -135,24 +131,21 @@ func TestDecodeWAVPassesG711Through(t *testing.T) {
 }
 
 func TestDecodeWAVRecodesBetweenCompandingLaws(t *testing.T) {
-	// An A-law file on a µ-law leg. Refusing this would mean a library stored in one law is unusable
-	// on half the world's trunks; see the package doc for why it is not the transcoding §7 refuses.
+	// An A-law file on a µ-law leg: recoding a stored file is not the packet transcoding that is
+	// refused elsewhere.
 	raw := buildWAV(6, 1, 8000, 8, []byte{audio.LinearToALaw(0)})
 
 	clip, err := audio.DecodeWAV(raw, audio.EncodingULaw)
 	if err != nil {
 		t.Fatalf("DecodeWAV: %v", err)
 	}
-	// NOT byte-equal to µ-law silence, and that is correct rather than a bug worth papering over:
-	// A-law has no exact zero — its smallest magnitude is 8 — so A-law silence decodes to +8 and
-	// re-encodes to the µ-law step next to silence. The assertion is therefore on the AUDIO, which
-	// is what a caller hears: the recoded sample is inaudibly close to zero.
+	// Not byte-equal to µ-law silence: A-law has no exact zero (smallest magnitude 8), so A-law
+	// silence decodes to +8 and re-encodes to the µ-law step beside silence. Assert on the audio.
 	if magnitude := audio.ULawToLinear(clip.Frames[0][0]); magnitude < -16 || magnitude > 16 {
 		t.Errorf("recoded A-law silence decodes to %d, want a sample next to zero", magnitude)
 	}
 
-	// A full-scale sample must survive the same trip with its sign and rough magnitude intact,
-	// which is what catches an inverted mask in either direction of the conversion.
+	// A full-scale sample must survive with its sign and rough magnitude intact.
 	loud := buildWAV(6, 1, 8000, 8, []byte{audio.LinearToALaw(-20000)})
 	loudClip, err := audio.DecodeWAV(loud, audio.EncodingULaw)
 	if err != nil {
@@ -164,8 +157,8 @@ func TestDecodeWAVRecodesBetweenCompandingLaws(t *testing.T) {
 }
 
 func TestDecodeWAVSkipsUnknownChunks(t *testing.T) {
-	// LIST/INFO from a tagging tool and `fact` from sox both sit between `fmt ` and `data`. A parser
-	// that assumed the canonical 44-byte header would read the tag as audio.
+	// LIST/INFO and `fact` chunks sit between `fmt ` and `data`; a 44-byte-header parser would read
+	// the tag as audio.
 	raw := buildWAV(7, 1, 8000, 8, []byte{0xFF},
 		wavChunk{id: "LIST", body: []byte("INFOISFT\x05\x00\x00\x00sox\x00")},
 		wavChunk{id: "fact", body: []byte{1, 0, 0, 0}},
@@ -230,8 +223,7 @@ func TestDecodeWAVRefusals(t *testing.T) {
 			want: audio.ErrNotRIFF,
 		},
 		{
-			// 44.1 kHz is what a prompt exported from a desktop tool looks like, and it is the single
-			// most likely thing to be dropped into a prompt directory by mistake.
+			// 44.1 kHz is what a prompt exported from a desktop tool looks like.
 			name: "wrong sample rate",
 			raw:  buildWAV(1, 1, 44100, 16, pcm16(0, 160)),
 			want: audio.ErrUnsupportedRate,
@@ -302,9 +294,8 @@ func TestDecodeWAVTruncatedFmtChunk(t *testing.T) {
 }
 
 func TestG711RoundTripIsMonotonic(t *testing.T) {
-	// Not an equality round trip — G.711 is lossy by construction — but the ordering must survive,
-	// because an encoder with a sign or segment bug fails this and passes a "decodes to something"
-	// assertion.
+	// G.711 is lossy, so this asserts ordering rather than equality: a sign or segment bug fails it
+	// where a "decodes to something" assertion would not.
 	previous := audio.ULawToLinear(audio.LinearToULaw(-32000))
 	for sample := int32(-31000); sample <= 32000; sample += 1000 {
 		got := audio.ULawToLinear(audio.LinearToULaw(int16(sample)))
@@ -325,8 +316,8 @@ func TestG711RoundTripIsMonotonic(t *testing.T) {
 }
 
 func TestG711RoundTripStaysCloseToTheOriginal(t *testing.T) {
-	// G.711's quantisation error is bounded relative to the magnitude. A loose bound is enough to
-	// catch a table transcription error, which is the failure this guards.
+	// G.711's quantisation error is bounded relative to the magnitude; a loose bound catches a
+	// table transcription error.
 	for sample := int32(-30000); sample <= 30000; sample += 137 {
 		got := int32(audio.ULawToLinear(audio.LinearToULaw(int16(sample))))
 		if delta := abs(got - sample); delta > abs(sample)/8+256 {

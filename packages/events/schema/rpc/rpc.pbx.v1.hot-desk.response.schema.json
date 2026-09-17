@@ -1,0 +1,27 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"applied": {
+			"type": "boolean"
+		},
+		"action": {
+			"type": "string",
+			"enum": ["login", "logout"]
+		},
+		"extensionNumber": {
+			"type": "string",
+			"maxLength": 32
+		},
+		"expiresAt": {
+			"type": "string",
+			"maxLength": 32
+		},
+		"reason": {
+			"type": "string",
+			"maxLength": 256
+		}
+	},
+	"required": ["applied", "action"],
+	"additionalProperties": false
+}

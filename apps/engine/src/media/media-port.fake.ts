@@ -1,3 +1,4 @@
+import { MediaOperationNotSupportedError } from "./media-not-supported.error";
 import type {
 	BridgeHandle,
 	CreateBridgeRequest,
@@ -11,6 +12,8 @@ import type {
 	RecordingHandle,
 	SendDtmfRequest,
 	SnoopRequest,
+	TapHandle,
+	TapRequest,
 } from "./media-port";
 import type { BridgeMode, HangupCause } from "@optimiq-voice/telephony";
 
@@ -64,6 +67,19 @@ export interface FakeMediaPortOptions {
 	readonly onSnoop?: (request: SnoopRequest) => void;
 	readonly snoopFails?: boolean;
 	/**
+	 * Called after a successful `tap`, so a spec can deliver the tap's `StasisStart`.
+	 *
+	 * Synchronous for the same reason as {@link onSnoop}: on the real driver a tap is a snoop
+	 * channel, it reaches the application before the HTTP response does, and the supervision runtime
+	 * subscribes first. A fake that delivered it later would let a runtime that forgot to subscribe
+	 * first pass its specs and hang in production.
+	 */
+	readonly onTap?: (request: TapRequest) => void;
+	/** Makes `tap` refuse, which is how a media plane that cannot tap (`mediad`) is exercised. */
+	readonly tapFails?: boolean;
+	/** Makes `echo` refuse, which is how a media plane that cannot echo (`mediad`) is exercised. */
+	readonly echoFails?: boolean;
+	/**
 	 * Called after `answer`, so a spec can deliver the `Up` state change a real media server sends.
 	 *
 	 * `answer` is a REQUEST: the leg only gains a media path when the far end's `200 OK` has been
@@ -72,6 +88,14 @@ export interface FakeMediaPortOptions {
 	 */
 	readonly onAnswer?: (channelId: string) => void;
 	readonly bridgeFails?: boolean;
+	/**
+	 * Lets a spec make ONE bridge refuse a member.
+	 *
+	 * Keyed on the bridge rather than a flag, because the paths that have to survive a refusal are
+	 * the ones that then put the leg back where it was — and a fake that refused every bridge would
+	 * let a runtime with no restore step pass.
+	 */
+	readonly addToBridgeFails?: (bridgeId: string) => Error | undefined;
 	readonly recordFails?: boolean;
 	/** Makes the music class unavailable, which every hold path has to survive. */
 	readonly musicOnHoldFails?: boolean;
@@ -92,7 +116,11 @@ export interface FakeMediaPort extends MediaPort {
 	/** Method names in call order — the shape most assertions read. */
 	readonly methods: () => string[];
 	readonly originated: () => OriginateRequest[];
+	/** Every tap opened, in order — what an eavesdrop/whisper/barge spec actually asserts on. */
+	readonly taps: () => TapRequest[];
 	readonly hungUp: () => { channelId: string; cause: HangupCause }[];
+	/** Every channel answered, in order. Which legs a feature answers is part of what it means. */
+	readonly answered: () => string[];
 }
 
 export function makeFakeMediaPort(options: FakeMediaPortOptions = {}): FakeMediaPort {
@@ -113,6 +141,8 @@ export function makeFakeMediaPort(options: FakeMediaPortOptions = {}): FakeMedia
 			calls
 				.filter((call) => call.method === "originate")
 				.map((call) => call.args[0] as OriginateRequest),
+		taps: () =>
+			calls.filter((call) => call.method === "tap").map((call) => call.args[0] as TapRequest),
 		hungUp: () =>
 			calls
 				.filter((call) => call.method === "hangup")
@@ -120,6 +150,8 @@ export function makeFakeMediaPort(options: FakeMediaPortOptions = {}): FakeMedia
 					channelId: call.args[0] as string,
 					cause: call.args[1] as HangupCause,
 				})),
+		answered: () =>
+			calls.filter((call) => call.method === "answer").map((call) => call.args[0] as string),
 
 		answer: async (channelId: string): Promise<void> => {
 			record("answer", channelId);
@@ -127,6 +159,9 @@ export function makeFakeMediaPort(options: FakeMediaPortOptions = {}): FakeMedia
 		},
 		ring: async (channelId: string): Promise<void> => {
 			record("ring", channelId);
+		},
+		earlyMedia: async (channelId: string): Promise<void> => {
+			record("earlyMedia", channelId);
 		},
 		play: async (channelId: string, request: PlayRequest): Promise<PlaybackHandle> => {
 			// The WHOLE request, not just the media list: `playbackRef` is what barge-in stops, and a
@@ -169,6 +204,10 @@ export function makeFakeMediaPort(options: FakeMediaPortOptions = {}): FakeMedia
 		},
 		addToBridge: async (bridgeId: string, channelIds: readonly string[]): Promise<void> => {
 			record("addToBridge", bridgeId, [...channelIds]);
+			const failure = options.addToBridgeFails?.(bridgeId);
+			if (failure !== undefined) {
+				throw failure;
+			}
 		},
 		removeFromBridge: async (bridgeId: string, channelIds: readonly string[]): Promise<void> => {
 			record("removeFromBridge", bridgeId, [...channelIds]);
@@ -183,6 +222,9 @@ export function makeFakeMediaPort(options: FakeMediaPortOptions = {}): FakeMedia
 			}
 			options.onRecord?.(channelId, request);
 			return { name: request.name, format: request.format };
+		},
+		pauseRecording: async (name: string, paused: boolean): Promise<void> => {
+			record("pauseRecording", name, paused);
 		},
 		stopRecording: async (name: string): Promise<void> => {
 			record("stopRecording", name);
@@ -212,6 +254,33 @@ export function makeFakeMediaPort(options: FakeMediaPortOptions = {}): FakeMedia
 		sendDtmf: async (channelId: string, request: SendDtmfRequest): Promise<void> => {
 			record("sendDtmf", channelId, request);
 		},
+		echo: async (channelId: string): Promise<void> => {
+			record("echo", channelId);
+			if (options.echoFails === true) {
+				throw new MediaOperationNotSupportedError("echo", "Asterisk's Echo() application", "fake");
+			}
+		},
+		tap: async (request: TapRequest): Promise<TapHandle> => {
+			record("tap", request);
+			if (options.tapFails === true) {
+				throw new MediaOperationNotSupportedError(
+					"tap",
+					"asymmetric bridge participation (rung 6)",
+					"fake",
+				);
+			}
+			options.onTap?.(request);
+			return {
+				tapId: request.tapId,
+				tapChannelId: request.tapChannelId,
+				bridgeId: request.bridgeId,
+			};
+		},
+
+		stopTap: async (tap: TapHandle): Promise<void> => {
+			record("stopTap", tap);
+		},
+
 		snoop: async (request: SnoopRequest): Promise<OriginatedChannel> => {
 			record("snoop", request);
 			if (options.snoopFails === true) {

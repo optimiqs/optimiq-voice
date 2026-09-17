@@ -124,13 +124,44 @@ interface CallPathOptions {
 	/** Absent leaves the optional pre-flight check off, which is a supported call path. */
 	readonly dialable?: boolean;
 	readonly dialableThrows?: boolean;
+	/** Whether this call path can broker an attended transfer at all. Off is a supported state. */
+	readonly attended?: boolean;
+	readonly replacedResolved?: string | undefined;
+	readonly replacedResolveThrows?: boolean;
+	readonly consultationLeg?: ControlledLeg | undefined;
+	readonly attendedResult?: CallControlResult;
+	readonly attendedThrows?: boolean;
+}
+
+/** The transferor's OTHER leg: the consultation the phone placed on its second line. */
+const CONSULTATION_MEDIA_CHANNEL_ID = "media-consult";
+
+function consultationLeg(overrides: Partial<ControlledLeg> = {}): ControlledLeg {
+	return leg({
+		mediaChannelId: CONSULTATION_MEDIA_CHANNEL_ID,
+		legId: "leg-consult",
+		callId: "call-2",
+		bridgeId: "bridge-2",
+		peerMediaChannelId: "media-3",
+		...overrides,
+	});
 }
 
 function callPath(options: CallPathOptions = {}): {
 	readonly path: SipTransferCallPath;
 	readonly transfers: { leg: ControlledLeg; request: TransferRequest }[];
+	readonly joins: {
+		transferor: ControlledLeg;
+		consultation: ControlledLeg;
+		destination: string;
+	}[];
 } {
 	const transfers: { leg: ControlledLeg; request: TransferRequest }[] = [];
+	const joins: {
+		transferor: ControlledLeg;
+		consultation: ControlledLeg;
+		destination: string;
+	}[] = [];
 	const path: SipTransferCallPath = {
 		resolveDialog: async () => {
 			if (options.resolveThrows === true) {
@@ -138,7 +169,12 @@ function callPath(options: CallPathOptions = {}): {
 			}
 			return "resolved" in options ? options.resolved : "media-1";
 		},
-		legFor: () => ("leg" in options ? options.leg : leg()),
+		legFor: (mediaChannelId) => {
+			if (mediaChannelId === CONSULTATION_MEDIA_CHANNEL_ID) {
+				return "consultationLeg" in options ? options.consultationLeg : consultationLeg();
+			}
+			return "leg" in options ? options.leg : leg();
+		},
 		...(options.dialable === undefined && options.dialableThrows !== true
 			? {}
 			: {
@@ -149,6 +185,25 @@ function callPath(options: CallPathOptions = {}): {
 						return options.dialable ?? true;
 					},
 				}),
+		...(options.attended === true
+			? {
+					resolveReplacedDialog: async () => {
+						if (options.replacedResolveThrows === true) {
+							throw new Error("the registry is on fire");
+						}
+						return "replacedResolved" in options
+							? options.replacedResolved
+							: CONSULTATION_MEDIA_CHANNEL_ID;
+					},
+					completeAttendedTransfer: async (transferor, consultation, destination) => {
+						joins.push({ transferor, consultation, destination });
+						if (options.attendedThrows === true) {
+							throw new Error("the media server is on fire");
+						}
+						return options.attendedResult ?? { ok: true, detail: "transferred" };
+					},
+				}
+			: {}),
 		transfer: async (target, transferRequest) => {
 			transfers.push({ leg: target, request: transferRequest });
 			if (options.transferThrows === true) {
@@ -157,7 +212,18 @@ function callPath(options: CallPathOptions = {}): {
 			return options.result ?? { ok: true, detail: "transferred" };
 		},
 	};
-	return { path, transfers };
+	return { path, transfers, joins };
+}
+
+/** A REFER carrying the `Replaces` of a consultation the phone completed itself. */
+function attendedRequest(
+	replaces: Partial<SipTransferRequest["replaces"]> = {},
+): SipTransferRequest {
+	return request({
+		kind: "attended",
+		target: { user: "1003", host: "acme.example.com" },
+		replaces: { callId: "aa11@1.2.3.4", toTag: "b2", fromTag: "c3", earlyOnly: false, ...replaces },
+	});
 }
 
 function service(
@@ -242,6 +308,42 @@ describe("executing a transfer", () => {
 		expect(path.transfers).toHaveLength(1);
 	});
 
+	it("joins the two dialogs a Replaces names, and never dials the Refer-To", async () => {
+		const fake = fakeConnection();
+		const path = callPath({ attended: true });
+		service(fake, path.path);
+
+		await fake.deliver(JSON.stringify(attendedRequest()));
+
+		expect(fake.replies[0]).toEqual({
+			ok: true,
+			sipCallId: CALL_ID,
+			instanceId: "engine-1",
+			legId: "leg-1",
+			callId: "call-1",
+			destination: "1003",
+		});
+		expect(path.joins).toHaveLength(1);
+		expect(path.joins[0]?.transferor.mediaChannelId).toBe("media-1");
+		expect(path.joins[0]?.consultation.mediaChannelId).toBe(CONSULTATION_MEDIA_CHANNEL_ID);
+		expect(path.joins[0]?.destination).toBe("1003");
+		// A blind transfer would hang the transferor up and re-route the transferee, which is the one
+		// thing an attended transfer must not do: the target is already answered and talking.
+		expect(path.transfers).toHaveLength(0);
+	});
+
+	it("does not ask the dial plan about a target that is already on the phone", async () => {
+		const fake = fakeConnection();
+		const path = callPath({ attended: true, dialable: false });
+		service(fake, path.path);
+
+		await fake.deliver(JSON.stringify(attendedRequest()));
+
+		// `unknown_target` would refuse a legitimate transfer to anything reachable but not dialable.
+		expect(fake.replies[0]).toMatchObject({ ok: true, destination: "1003" });
+		expect(path.joins).toHaveLength(1);
+	});
+
 	it("accepts a REFER from the extension that ANSWERED the call, not only the one that placed it", async () => {
 		const fake = fakeConnection();
 		const path = callPath({
@@ -265,23 +367,131 @@ describe("refusing a transfer", () => {
 		expect(fake.replies[0]).toMatchObject({ ok: false, reason: "bad_request", sipCallId: "" });
 	});
 
-	it("refuses an attended transfer by name, without downgrading it to a blind one", async () => {
+	it("refuses an attended transfer a call path cannot broker, without downgrading it", async () => {
 		const fake = fakeConnection();
 		const path = callPath();
 		service(fake, path.path);
 
-		await fake.deliver(
-			JSON.stringify(
-				request({
-					kind: "attended",
-					replaces: { callId: "aa11@1.2.3.4", toTag: "b2", fromTag: "c3", earlyOnly: false },
-				}),
-			),
-		);
+		await fake.deliver(JSON.stringify(attendedRequest()));
 
 		// A downgrade would drop the consultation leg the user is currently talking to.
 		expect(fake.replies[0]).toMatchObject({ ok: false, reason: "attended_unsupported" });
 		expect(path.transfers).toHaveLength(0);
+	});
+
+	it("refuses an attended transfer that names no consultation at all", async () => {
+		const fake = fakeConnection();
+		const path = callPath({ attended: true });
+		service(fake, path.path);
+
+		await fake.deliver(JSON.stringify(request({ kind: "attended" })));
+
+		expect(fake.replies[0]).toMatchObject({ ok: false, reason: "bad_request" });
+		expect(path.joins).toHaveLength(0);
+	});
+
+	it("refuses when the Replaces resolves to no live call on this instance", async () => {
+		const fake = fakeConnection();
+		const path = callPath({ attended: true, replacedResolved: undefined });
+		service(fake, path.path);
+
+		await fake.deliver(JSON.stringify(attendedRequest()));
+
+		expect(fake.replies[0]).toMatchObject({ ok: false, reason: "unknown_dialog", legId: "leg-1" });
+		expect(path.joins).toHaveLength(0);
+	});
+
+	it("refuses when the consultation ended between the REFER and the join", async () => {
+		const fake = fakeConnection();
+		const path = callPath({ attended: true, consultationLeg: undefined });
+		service(fake, path.path);
+
+		await fake.deliver(JSON.stringify(attendedRequest()));
+
+		// The original call is untouched, so the phone can consult again.
+		expect(fake.replies[0]).toMatchObject({ ok: false, reason: "channel_gone" });
+		expect(path.joins).toHaveLength(0);
+	});
+
+	it("refuses a Replaces that resolves into another tenant", async () => {
+		const fake = fakeConnection();
+		const path = callPath({
+			attended: true,
+			consultationLeg: consultationLeg({ organizationId: OTHER_ORG }),
+		});
+		service(fake, path.path);
+
+		await fake.deliver(JSON.stringify(attendedRequest()));
+
+		expect(fake.replies[0]).toMatchObject({ ok: false, reason: "not_permitted" });
+		expect(path.joins).toHaveLength(0);
+	});
+
+	it("refuses a referrer who is not a party to the consultation they named", async () => {
+		const fake = fakeConnection();
+		const path = callPath({
+			attended: true,
+			consultationLeg: consultationLeg({ callerIdNumber: "2001", destinationNumber: "2002" }),
+		});
+		service(fake, path.path);
+
+		// The engine cannot match the Replaces tags; being on BOTH calls is what authorises this.
+		await fake.deliver(JSON.stringify(attendedRequest()));
+
+		expect(fake.replies[0]).toMatchObject({ ok: false, reason: "not_permitted" });
+		expect(path.joins).toHaveLength(0);
+	});
+
+	it("honours early-only against a dialog that is already confirmed", async () => {
+		const fake = fakeConnection();
+		const path = callPath({ attended: true });
+		service(fake, path.path);
+
+		await fake.deliver(JSON.stringify(attendedRequest({ earlyOnly: true })));
+
+		// RFC 3891 §3: a lost race must not cut somebody out of a live conversation.
+		expect(fake.replies[0]).toMatchObject({ ok: false, reason: "not_permitted" });
+		expect(path.joins).toHaveLength(0);
+	});
+
+	it("reports a refused join as transfer_failed, leaving both calls up", async () => {
+		const fake = fakeConnection();
+		const path = callPath({
+			attended: true,
+			attendedResult: { ok: false, reason: "the consultation is not in a bridge" },
+		});
+		service(fake, path.path);
+
+		await fake.deliver(JSON.stringify(attendedRequest()));
+
+		expect(fake.replies[0]).toMatchObject({
+			ok: false,
+			reason: "transfer_failed",
+			error: "the consultation is not in a bridge",
+			legId: "leg-1",
+		});
+		expect(path.transfers).toHaveLength(0);
+	});
+
+	it("answers internal when resolving the Replaces throws", async () => {
+		const fake = fakeConnection();
+		const path = callPath({ attended: true, replacedResolveThrows: true });
+		service(fake, path.path);
+
+		await fake.deliver(JSON.stringify(attendedRequest()));
+
+		expect(fake.replies[0]).toMatchObject({ ok: false, reason: "internal" });
+		expect(path.joins).toHaveLength(0);
+	});
+
+	it("answers internal when the join throws", async () => {
+		const fake = fakeConnection();
+		const path = callPath({ attended: true, attendedThrows: true });
+		service(fake, path.path);
+
+		await fake.deliver(JSON.stringify(attendedRequest()));
+
+		expect(fake.replies[0]).toMatchObject({ ok: false, reason: "internal", legId: "leg-1" });
 	});
 
 	it("refuses with correlation_unavailable when no call path is attached", async () => {

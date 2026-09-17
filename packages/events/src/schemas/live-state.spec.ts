@@ -1,13 +1,26 @@
 import { describe, expect, it } from "bun:test";
-import { CHANNELS_KV, kvKeyFor, PRESENCE_KV, REGISTRATIONS_KV } from "../streams";
+import {
+	CHANNELS_KV,
+	ENGINE_INSTANCES_KV,
+	kvKeyFor,
+	PRESENCE_KV,
+	REGISTRATIONS_KV,
+	SIP_INSTANCES_KV,
+} from "../streams";
 import {
 	extensionPresenceSchema,
+	LIVE_CHANNEL_RECORDING_FLAGS,
+	recordingStateOf,
 	isLiveChannel,
 	isRegistrationLapsed,
+	isSipInstanceLeaseExpired,
 	LIVE_CHANNEL_TEARDOWN_STATES,
 	liveChannelSchema,
 	PRESENCE_DEVICE_STATES,
 	registrationBindingSchema,
+	engineInstanceLeaseSchema,
+	isEngineInstanceLeaseExpired,
+	sipInstanceLeaseSchema,
 } from "./live-state";
 
 /**
@@ -196,5 +209,117 @@ describe("extensionPresenceSchema", () => {
 
 	it("is the value shape of the bucket it names", () => {
 		expect(PRESENCE_KV.name).toBe("presence");
+	});
+});
+
+describe("sipInstanceLeaseSchema", () => {
+	const NOW = 1_785_000_000_000;
+	const lease = (overrides: Record<string, unknown> = {}) => ({
+		instanceId: "sipd-7c9f",
+		startedAt: NOW - 60_000,
+		renewedAt: NOW,
+		expiresAt: NOW + 15_000,
+		...overrides,
+	});
+
+	it("accepts a renewed lease and keys by the instance id alone", () => {
+		const parsed = sipInstanceLeaseSchema.parse(lease());
+		expect(kvKeyFor.sipInstance(parsed.instanceId)).toBe("sipd-7c9f");
+		expect(SIP_INSTANCES_KV.name).toBe("sip-instances");
+	});
+
+	/**
+	 * The predicate a reaper acts on. Exactly at the expiry the instance is gone: a reader that
+	 * treated the boundary as live would keep a stranded call up for one more sweep, which is the
+	 * failure the bucket exists to end.
+	 */
+	it("expires at the instant the lease names, not after it", () => {
+		expect(isSipInstanceLeaseExpired(sipInstanceLeaseSchema.parse(lease()), NOW)).toBe(false);
+		expect(isSipInstanceLeaseExpired(sipInstanceLeaseSchema.parse(lease()), NOW + 15_000)).toBe(
+			true,
+		);
+	});
+
+	it("keeps a field this reader has not heard of", () => {
+		const parsed = sipInstanceLeaseSchema.parse(lease({ dialogs: 3, build: "abc123" }));
+		expect(parsed.dialogs).toBe(3);
+		expect((parsed as Record<string, unknown>).build).toBe("abc123");
+	});
+});
+
+describe("engineInstanceLeaseSchema", () => {
+	const NOW = 1_785_000_000_000;
+	const lease = (overrides: Record<string, unknown> = {}) => ({
+		instanceId: "engine-2",
+		startedAt: NOW - 60_000,
+		renewedAt: NOW,
+		expiresAt: NOW + 15_000,
+		...overrides,
+	});
+
+	it("accepts a renewed lease and keys by the instance id alone", () => {
+		const parsed = engineInstanceLeaseSchema.parse(lease());
+		expect(kvKeyFor.engineInstance(parsed.instanceId)).toBe("engine-2");
+		expect(ENGINE_INSTANCES_KV.name).toBe("engine-instances");
+	});
+
+	/**
+	 * The predicate a survivor acts on. Exactly at the expiry the instance is gone: treating the
+	 * boundary as live costs one more sweep of a call nobody is holding, which is the whole window
+	 * this bucket exists to close.
+	 */
+	it("expires at the instant the lease names, not after it", () => {
+		expect(isEngineInstanceLeaseExpired(engineInstanceLeaseSchema.parse(lease()), NOW)).toBe(false);
+		expect(
+			isEngineInstanceLeaseExpired(engineInstanceLeaseSchema.parse(lease()), NOW + 15_000),
+		).toBe(true);
+	});
+
+	/**
+	 * The two instance buckets must not drift apart: an operator reads one horizon for "a process is
+	 * dead", and a survivor that adopted on a different clock from the one that ends legs would
+	 * either contest a live replica's calls or leave a dead one's stranded.
+	 */
+	it("shares the sip edge's lease horizon", () => {
+		expect(ENGINE_INSTANCES_KV.ttlMs).toBe(SIP_INSTANCES_KV.ttlMs);
+		expect(ENGINE_INSTANCES_KV.storage).toBe("file");
+	});
+
+	it("keeps a field this reader has not heard of", () => {
+		const parsed = engineInstanceLeaseSchema.parse(lease({ channels: 4, build: "abc123" }));
+		expect(parsed.channels).toBe(4);
+		expect((parsed as Record<string, unknown>).build).toBe("abc123");
+	});
+});
+
+describe("recordingStateOf", () => {
+	it("reads the recorder off the snapshot's flags", () => {
+		expect(recordingStateOf(liveChannelSchema.parse(channel({ flags: [] })))).toEqual({
+			active: false,
+			paused: false,
+		});
+		expect(
+			recordingStateOf(liveChannelSchema.parse(channel({ flags: ["answered", "recording"] }))),
+		).toEqual({ active: true, paused: false });
+		expect(
+			recordingStateOf(
+				liveChannelSchema.parse(channel({ flags: ["recording", "recording-paused"] })),
+			),
+		).toEqual({ active: true, paused: true });
+	});
+
+	it("ignores a paused flag with no recording behind it", () => {
+		// The one wrong answer that matters on a PCI control: "Recording paused" for a call nothing
+		// is recording tells an agent a card number is safe from a recorder that is not running.
+		expect(
+			recordingStateOf(liveChannelSchema.parse(channel({ flags: ["recording-paused"] }))),
+		).toEqual({ active: false, paused: false });
+	});
+
+	it("names the flags the engine writes", () => {
+		expect(LIVE_CHANNEL_RECORDING_FLAGS).toEqual({
+			active: "recording",
+			paused: "recording-paused",
+		});
 	});
 });

@@ -2,6 +2,7 @@ node_modules/
 .env*
 !.env.example
 !.env.example.dev
+!.env.voice.example
 *.log
 reporting/*
 out/*
@@ -18,3 +19,9 @@ config/assistant*
 next-env.d.ts
 .npmrc
 .turbo
+
+# Go build outputs when `go build` is run inside an app module
+/apps/mediad/mediad
+/apps/sipd/sipd
+*.test
+*.prof

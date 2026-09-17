@@ -1,3 +1,4 @@
+import type { SipTransport } from "@optimiq-voice/events";
 import type { BridgeMode, HangupCause } from "@optimiq-voice/telephony";
 
 /**
@@ -46,6 +47,35 @@ export interface PlayRequest {
 }
 
 /**
+ * Where a `sipd`-driven originate should place its INVITE, in the domain's own vocabulary.
+ *
+ * Mirrors `sipDialTargetSchema` in `@optimiq-voice/events` exactly — a tagged object rather than a
+ * discriminated union so it survives the Go border, the same shape the wire carries. It exists
+ * because a template like `PJSIP/{trunk}` hides everything that makes a trunk dialable (its proxy,
+ * credentials and transport), per `plans/sipd-invite-design.md` §5.1: `endpoint` stays for the ARI
+ * adapter, and this rides alongside it for the composite.
+ */
+export type DialTarget =
+	| {
+			readonly kind: "aor";
+			readonly aor: string;
+			readonly contactUri?: string;
+			/**
+			 * What `rpc.sip.v1.resolve-target` said about THIS contact, when a resolution has already
+			 * happened. ENGINE-LOCAL and never on the wire — `SplitPlaneMediaPort.originate` strips it
+			 * when it builds the request, because `sipDialTargetSchema` is the shape the Go side reads.
+			 *
+			 * It exists so the dial does not re-resolve what the walk resolved milliseconds earlier.
+			 * The edge answers `resolve-target` in ~2 ms idle and ~90 ms at a hundred concurrent calls,
+			 * so the second lookup was a whole round trip in the middle of a call setup that could only
+			 * ever produce the answer already in hand.
+			 */
+			readonly resolvedEdge?: { readonly instanceId: string; readonly transport: SipTransport };
+	  }
+	| { readonly kind: "trunk"; readonly trunkId: string; readonly number: string }
+	| { readonly kind: "uri"; readonly uri: string };
+
+/**
  * A leg the engine asks the media server to create.
  *
  * `channelId` is CLIENT-assigned and required, not optional: the plan walker has to be able to
@@ -67,6 +97,26 @@ export interface OriginateRequest {
 	readonly originatorChannelId?: string;
 	/** Variables set BEFORE the leg is dialled — the export seam onto the B-leg. */
 	readonly variables?: Readonly<Record<string, string>>;
+	/**
+	 * Where to dial, in the domain's vocabulary — the `sipd` composite's input.
+	 *
+	 * ADDITIVE and optional, per `plans/sipd-invite-design.md` §5.1. The composite reads it and
+	 * refuses `bad_request` when it is absent; `AriMediaAdapter` and `MediadMediaPort` ignore it and
+	 * dial {@link endpoint}, so adding it breaks neither. `endpoint` is a media-server template string
+	 * that hides a trunk's proxy and credentials; this carries them structurally instead.
+	 */
+	readonly target?: DialTarget;
+	/**
+	 * Whether {@link callerId} may be shown to the called party — CLIP/CLIR for this call.
+	 *
+	 * ADDITIVE and optional on the same contract {@link target} states: the `sipd` composite forwards
+	 * it and the edge writes the headers, while `AriMediaAdapter` and `MediadMediaPort` ignore it and
+	 * dial as before. Absent means `allowed`, so nothing that never sets it changes behaviour.
+	 *
+	 * The engine says only what it INTENDS. Anonymising is the edge's to do because only the edge
+	 * knows the trunk it is leaving on — see `sipOriginateRequestSchema.callerIdPresentation`.
+	 */
+	readonly callerIdPresentation?: "allowed" | "restricted";
 }
 
 export interface OriginatedChannel {
@@ -146,6 +196,111 @@ export interface SnoopRequest {
 }
 
 /**
+ * Which side of a monitored conversation a tap listens to, or speaks to.
+ *
+ * The same `a`/`b` leg roles `packages/telephony` names — the originating side and the side
+ * originated for it — rather than the `in`/`out` of {@link MediaDirection}. That is the whole
+ * distinction this vocabulary exists to draw: a DIRECTION is a property of one channel, and a SIDE
+ * is a party in a conversation. A supervisor coaching "the agent" is making a statement about a
+ * party, and only the adapter below this seam should have to know that on Asterisk the party is
+ * reached by injecting into one direction of one channel.
+ *
+ * `none` is only ever meaningful on `speakTo`.
+ */
+export type TapSide = "a" | "b" | "both" | "none";
+
+/**
+ * A supervisor joining a conversation they are not part of — `*0`, and eavesdrop/whisper/barge.
+ *
+ * ## Why this is not {@link SnoopRequest} with extra fields
+ *
+ * A snoop is a listener glued to ONE leg, because on ARI everything is addressed by channel id and
+ * a tap therefore has to BE a channel. That constraint is Asterisk's, not the domain's, and
+ * `plans/mediad-design.md` §10 question 4 records the decision it forced: `mediad` refuses `snoop`
+ * PERMANENTLY, so a supervision feature built on it would either be built twice or would pin `*0`
+ * to `ENGINE_MEDIA_DRIVER=ari` forever.
+ *
+ * So a tap is specified as what it actually is: an ASYMMETRIC BRIDGE PARTICIPANT. {@link hear} says
+ * which parties reach the supervisor, {@link speakTo} says which parties the supervisor reaches,
+ * and the three features in every PBX brochure are three argument combinations with no branch
+ * between them:
+ *
+ * ```text
+ * eavesdrop   hear: "both"   speakTo: "none"
+ * whisper     hear: "both"   speakTo: <the coached leg>
+ * barge       hear: "both"   speakTo: "both"
+ * ```
+ *
+ * That shape is also, exactly, a mix-minus participant — which is what rung 6 builds — so the day
+ * `mediad` can serve this, it serves it by arriving rather than by renegotiating a contract that
+ * already shipped.
+ *
+ * ## Every id is client-assigned, for the reason they always are here
+ *
+ * On the ARI driver the tap materialises as a snoop CHANNEL that enters the engine's own Stasis
+ * application, and a channel the orchestrator has never heard of is filed as a new inbound call.
+ * So {@link tapChannelId} must be watchable before it exists — the same rule
+ * {@link OriginateRequest.channelId} and {@link SnoopRequest.snoopChannelId} follow, for the same
+ * race. {@link bridgeId} follows from that: the tap and the supervisor's own leg have to meet
+ * somewhere, and a bridge the engine did not name is one it cannot tear down after a restart.
+ *
+ * A driver with no channel concept simply ignores both. That is not a wasted field — it is the
+ * adapter absorbing a difference between two media planes, which is what `MediadMediaPort` already
+ * does for `createBridge` (recorded locally, no round trip, because a relay with no members is
+ * nothing on the wire).
+ */
+export interface TapRequest {
+	/** Client-assigned handle for the tap itself; {@link MediaPort.stopTap} names it. */
+	readonly tapId: string;
+	/** Any leg in the conversation being joined. On ARI this is the leg that is snooped. */
+	readonly targetChannelId: string;
+	/**
+	 * Which side of that conversation {@link targetChannelId} IS.
+	 *
+	 * The datum that makes the side vocabulary implementable on a plane that addresses one channel
+	 * at a time: "speak to the agent" is a direction on this channel only once you know whether
+	 * this channel is the agent. The supervision runtime taps the extension it was asked to
+	 * monitor, so this is `b` on an inbound call and `a` on one that extension placed.
+	 */
+	readonly targetSide: "a" | "b";
+	/** The supervisor's own leg. Whatever the tap hears is joined to THIS. */
+	readonly supervisorChannelId: string;
+	/** Client-assigned identity for the tap participant. See the note above. */
+	readonly tapChannelId: string;
+	/** Client-assigned id for the bridge the tap and the supervisor's leg meet in. */
+	readonly bridgeId: string;
+	/** The application the tap is handed to. Must match the engine's own. */
+	readonly application: string;
+	/** Which parties the supervisor hears. `both` for all three features. */
+	readonly hear: TapSide;
+	/** Which parties hear the supervisor. `none` is the silent case, and is the default one. */
+	readonly speakTo: TapSide;
+	/**
+	 * The feature's own name for this combination — `eavesdrop`, `whisper`, `barge`.
+	 *
+	 * For LOGS only, and deliberately not authoritative: {@link hear} and {@link speakTo} are the
+	 * contract, and a driver that branched on this instead would be able to disagree with them.
+	 * It is carried because "opened a barge on channel X" is a line an operator can read at three
+	 * in the morning and `hear=both speakTo=both` is one they have to decode.
+	 */
+	readonly mode?: string;
+}
+
+/**
+ * A live tap, and everything {@link MediaPort.stopTap} needs to take it down.
+ *
+ * The handle carries the ids rather than the driver remembering them, so `AriMediaAdapter` stays
+ * stateless — a stopTap keyed only by `tapId` would force every driver to hold a map that an engine
+ * restart loses, on a feature whose failure mode is a supervisor silently still listening.
+ */
+export interface TapHandle {
+	readonly tapId: string;
+	/** The media-plane object the tap runs as. Equal to the request's on every driver today. */
+	readonly tapChannelId: string;
+	readonly bridgeId: string;
+}
+
+/**
  * Everything the engine asks a media server to do.
  *
  * Still deliberately small, and still domain-shaped. `transfer` and `park` are absent and will stay
@@ -156,6 +311,17 @@ export interface SnoopRequest {
  * decisions on the far side of this seam.
  */
 export interface MediaPort {
+	/**
+	 * Live contacts grouped by decreasing SIP preference; used before creating outbound legs.
+	 *
+	 * `legId` is the leg the resolution is being done FOR — the A-leg the walker is planning — so a
+	 * refusal is attributed to a real leg rather than to the lookup itself.
+	 */
+	resolveTargets?(
+		orgId: string,
+		target: DialTarget,
+		legId: string,
+	): Promise<readonly (readonly DialTarget[])[]>;
 	/**
 	 * The mode this driver's bridges actually run in.
 	 *
@@ -171,12 +337,38 @@ export interface MediaPort {
 	 * re-deriving what its media plane can do and one of them getting it wrong.
 	 */
 	readonly bridgeMode: BridgeMode;
+	/** Sample-level supervision can be supported by a relay that decodes audio on demand. */
+	readonly supportsSupervision?: boolean;
+	/** Records both parties directly when the driver does not need an auxiliary snoop channel. */
+	recordConversation?(channelId: string, request: RecordRequest): Promise<RecordingHandle>;
 
 	/** SIP 200 OK. Starts billing. */
 	answer(channelId: string): Promise<void>;
 
 	/** SIP 180. Alerting, no media. */
 	ring(channelId: string): Promise<void>;
+
+	/**
+	 * SIP 183 with an answer. Alerting WITH media, and still not billable.
+	 *
+	 * Separate from {@link ring} rather than an argument on it because the two differ in what the
+	 * driver must produce, not just in the status number: a 180 is a status line, while a 183 commits
+	 * this leg's offer/answer exchange and therefore needs a real SDP answer from the media plane
+	 * before it can be sent. A driver whose signalling and media are the same server (`AriMediaAdapter`)
+	 * has no way to say "answer the offer but do not answer the call" and refuses with
+	 * {@link import("./media-not-supported.error").MediaOperationNotSupportedError}, which is the same refusal `verb-executor.ts` already
+	 * makes for the `earlyMedia` verb on ARI.
+	 *
+	 * Idempotent by contract: a carrier that sends `183` several times must not re-negotiate the
+	 * caller's media or re-send the response on each one.
+	 *
+	 * `relayFrom` is the leg whose early media this is — the callee's. A driver whose media plane
+	 * only carries audio between legs it has been told about needs it: on a split plane the two
+	 * sessions have no path between them until they are bridged, so the `183` alone reaches the
+	 * caller as signalling and never as sound. Optional, and ignored by a driver that is already in
+	 * both media paths.
+	 */
+	earlyMedia(channelId: string, relayFrom?: string): Promise<void>;
 
 	/** Start audio. Returns the handle the engine will stop it with. */
 	play(channelId: string, request: PlayRequest): Promise<PlaybackHandle>;
@@ -240,6 +432,27 @@ export interface MediaPort {
 	/** Finalise a recording started by {@link record}. Already-finished is a no-op. */
 	stopRecording(name: string): Promise<void>;
 
+	/**
+	 * Stop capturing audio into a live recording WITHOUT ending its file. PCI.
+	 *
+	 * A caller reads a card number, the agent pauses, and the recording stays ONE artifact with
+	 * silence where the number was. That is the whole reason this is not
+	 * {@link stopRecording} followed by {@link record}: a stop ends the object, publishes the
+	 * "it is safe to archive" event for half a call, and gives the rest a different object key —
+	 * so the CDR row that names the recording names half of it, and the boundary falls exactly
+	 * where a compliance reviewer is looking.
+	 *
+	 * Idempotent in both directions, and pausing a recording that has already finished is a no-op
+	 * for the same reason stopping one is: it may have hit its own limit first.
+	 *
+	 * The intervals themselves ride the driver's own "recording finished" event, because only the
+	 * process that wrote the audio knows where in the file the silence landed.
+	 *
+	 * @throws {import("./media-not-supported.error").MediaOperationNotSupportedError} when the
+	 * driver cannot pause a live recording.
+	 */
+	pauseRecording(name: string, paused: boolean): Promise<void>;
+
 	/** Start music on hold from a configured class. Separate from hold, which is signalling. */
 	startMusicOnHold(channelId: string, mohClass?: string): Promise<void>;
 
@@ -278,4 +491,53 @@ export interface MediaPort {
 	 * before calling this — see {@link SnoopRequest}.
 	 */
 	snoop(request: SnoopRequest): Promise<OriginatedChannel>;
+
+	/**
+	 * Join a conversation on asymmetric terms — eavesdrop, whisper and barge.
+	 *
+	 * The tap enters the engine's own application on drivers that materialise it as a channel, so
+	 * the caller MUST watch {@link TapRequest.tapChannelId} before calling this. See
+	 * {@link TapRequest} for the whole argument about why this is not `snoop`.
+	 *
+	 * @throws {import("./media-not-supported.error").MediaOperationNotSupportedError} when the
+	 * selected media plane cannot route one participant's audio per peer. The caller ANNOUNCES —
+	 * a supervisor who dialled `*0` and got silence would assume they were listening.
+	 */
+	tap(request: TapRequest): Promise<TapHandle>;
+
+	/**
+	 * Take a tap down, leaving the monitored conversation running.
+	 *
+	 * The one invariant worth stating out loud: this must never end the call being monitored. A
+	 * supervisor hanging up has to leave the customer talking to the agent, and getting that wrong
+	 * would drop live customer calls every time somebody stopped listening.
+	 *
+	 * Idempotent. Stopping a tap that is already gone is a no-op, because the engine retries this
+	 * on teardown and a monitored call that outlived the retry is not a failure.
+	 */
+	stopTap(tap: TapHandle): Promise<void>;
+
+	/**
+	 * Loop this leg's own audio back to it — `*43`, the echo test.
+	 *
+	 * ## Why it is a port operation and not a composition of the ones above
+	 *
+	 * There is no arrangement of `play`, `record`, `snoop` and `addToBridge` that echoes a caller to
+	 * themselves. A mixing bridge deliberately does NOT feed a member its own audio (that is what
+	 * makes conferences usable), a snoop hears the leg but has nowhere to put what it hears, and
+	 * record/play is a file round trip measured in seconds. Echo is a primitive of the media plane,
+	 * so it belongs on the media plane's interface.
+	 *
+	 * ## The leg leaves the engine's application, and that is the point
+	 *
+	 * An echo test has no routing left in it: there is nothing to decide, nothing to bridge, and no
+	 * next node. The Asterisk driver therefore hands the channel to `Echo()` in the dialplan and the
+	 * caller stays there until they hang up. The walk that called this is OVER — it reports
+	 * `bridged`, the walk status that means "the walk is finished and the call is up", exactly as a
+	 * parked call does. `watchChannel` keeps the CDR arriving after the channel leaves Stasis.
+	 *
+	 * @throws {import("./media-not-supported.error").MediaOperationNotSupportedError} when the
+	 * selected media plane cannot echo. The caller announces rather than leaving the line silent.
+	 */
+	echo(channelId: string): Promise<void>;
 }

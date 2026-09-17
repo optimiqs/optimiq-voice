@@ -1,6 +1,6 @@
 import { CALL_DIRECTIONS } from "@optimiq-voice/events";
 import { hangupCauseCode, hangupCauseFromCode } from "@optimiq-voice/telephony";
-import type { MediaChannelSnapshot, MediaEvent } from "../media/media-event";
+import type { MediaChannelSnapshot, MediaEvent, TrunkEndpointStatus } from "../media/media-event";
 import type { CallDirection, HangupSide, LegSide } from "@optimiq-voice/events";
 import type { AriChannel, AriEvent } from "@optimiq-voice/media-ari";
 import type { CallState, HangupCause } from "@optimiq-voice/telephony";
@@ -199,6 +199,45 @@ function mediaChannelSnapshot(channel: AriChannel): MediaChannelSnapshot {
 }
 
 /**
+ * ARI's qualify vocabulary → the domain's observable trunk statuses.
+ *
+ * `Reachable` and `Unreachable` are the two words PJSIP's OPTIONS pinger actually produces;
+ * `Lagged` belongs to the drivers that measure a threshold and is mapped to `degraded` so a
+ * carrier that answers slowly reads differently from one that does not answer. Everything else —
+ * `Unknown` (qualify disabled), `Created`, `Removed`, an empty rider, and whatever a future
+ * Asterisk invents — is `unknown`, because the honest reading of all of them is "the pinger has
+ * no verdict". The raw word travels beside the mapping (`reason`), so nothing is lost when a new
+ * word appears.
+ */
+export function trunkEndpointStatusFrom(peerStatus: string): TrunkEndpointStatus {
+	switch (peerStatus) {
+		case "Reachable":
+			return "up";
+		case "Unreachable":
+			return "down";
+		case "Lagged":
+			return "degraded";
+		default:
+			return "unknown";
+	}
+}
+
+/**
+ * The qualify round-trip, when the driver reported one.
+ *
+ * ARI's `peer.time` is a STRING, milliseconds, and only some channel drivers fill it in. A value
+ * that is not a non-negative number is treated as absent rather than published as zero: a lie
+ * about latency is worse than no latency, because an alerting rule diffs it.
+ */
+export function trunkQualifyLatencyMs(time: string | undefined): number | undefined {
+	if (time === undefined || time.trim() === "") {
+		return undefined;
+	}
+	const parsed = Number(time);
+	return Number.isFinite(parsed) && parsed >= 0 ? Math.round(parsed) : undefined;
+}
+
+/**
  * The Q.850 cause a bare hangup REQUEST is read as when the far end sent none.
  *
  * 16, "normal clearing": the request arrived, so somebody deliberately ended the call, and the only
@@ -290,6 +329,28 @@ export function toMediaEvent(event: AriEvent): MediaEvent | undefined {
 			};
 		case "ChannelUnhold":
 			return { type: "leg-unheld", channelId: event.channel.id };
+		case "PlaybackFinished": {
+			// The one playback event with a consumer: `CallControl.announceConsent` counts a party as
+			// announced to only when the media plane says the prompt was delivered. ARI addresses a
+			// playback's target by URI rather than by carrying the channel, so the id is parsed back
+			// out of `channel:<id>`; a playback aimed at a BRIDGE (`bridge:<id>`) belongs to no leg and
+			// drops here rather than being credited to one.
+			const channelId = ariPlaybackChannelId(event.playback.target_uri);
+			if (channelId === undefined) {
+				return undefined;
+			}
+			return {
+				type: "playback-finished",
+				channelId,
+				playbackRef: event.playback.id,
+				// NO `playedMs`. Asterisk reports a playback's STATE and never how much audio it wrote,
+				// and inventing a duration here would be exactly the ARI-shaped fiction this seam
+				// exists to keep out. The union's field is optional so a consumer can tell "nothing was
+				// delivered" from "this media plane does not measure delivery" — see the member's own
+				// documentation, and `announceConsent`, which refuses only on the first.
+				reason: event.playback.state === "" ? UNKNOWN_PLAYBACK_END_REASON : event.playback.state,
+			};
+		}
 		case "RecordingStarted":
 			return { type: "recording-started", recordingName: event.recording.name };
 		case "RecordingFinished":
@@ -305,6 +366,26 @@ export function toMediaEvent(event: AriEvent): MediaEvent | undefined {
 				recordingName: event.recording.name,
 				reason: event.recording.cause ?? UNKNOWN_RECORDING_FAILURE_REASON,
 			};
+		case "PeerStatusChange": {
+			// The qualify loop's transition — the ONE event on this seam that is not about a call.
+			// An event with no endpoint has nothing a trunk row could ever be resolved from, and a
+			// non-PJSIP technology is not a trunk on this platform, so both drop here rather than
+			// making the publisher reason about frames that cannot name a carrier.
+			const endpoint = event.endpoint;
+			if (endpoint === undefined || endpoint.technology !== "PJSIP") {
+				return undefined;
+			}
+			const latencyMs = trunkQualifyLatencyMs(event.peer.time);
+			return {
+				type: "trunk-endpoint-status",
+				endpoint: endpoint.resource,
+				status: trunkEndpointStatusFrom(event.peer.peer_status),
+				// The verbatim word, because the four-member status is a projection and the raw
+				// string is the only evidence left when a future Asterisk invents a fifth.
+				reason: event.peer.peer_status === "" ? "unknown" : event.peer.peer_status,
+				...(latencyMs === undefined ? {} : { latencyMs }),
+			};
+		}
 		default:
 			return undefined;
 	}
@@ -312,3 +393,22 @@ export function toMediaEvent(event: AriEvent): MediaEvent | undefined {
 
 /** What a recording failure is reported as when the media server volunteered no reason. */
 export const UNKNOWN_RECORDING_FAILURE_REASON = "unknown";
+
+/** What a playback's end is reported as when the media server volunteered no state. */
+export const UNKNOWN_PLAYBACK_END_REASON = "unknown";
+
+/**
+ * The leg a playback was aimed at, out of ARI's `target_uri`.
+ *
+ * `channel:<id>` and `bridge:<id>` are the two forms Asterisk emits. Only the first names a leg,
+ * and a consumer that wants to know whether ONE PARTY heard something cannot use the second: a
+ * bridge playback reaches everyone in the bridge and nobody in particular.
+ */
+function ariPlaybackChannelId(targetUri: string): string | undefined {
+	const [kind, ...rest] = targetUri.split(":");
+	if (kind !== "channel") {
+		return undefined;
+	}
+	const id = rest.join(":");
+	return id === "" ? undefined : id;
+}

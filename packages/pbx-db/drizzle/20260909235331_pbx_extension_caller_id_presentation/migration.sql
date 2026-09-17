@@ -1,0 +1,2 @@
+ALTER TABLE "extension" ADD COLUMN "outbound_caller_id_presentation" text DEFAULT 'allowed' NOT NULL;--> statement-breakpoint
+ALTER TABLE "extension" ADD CONSTRAINT "extension_outbound_caller_id_presentation_check" CHECK (outbound_caller_id_presentation in ('allowed', 'restricted'));

@@ -1,6 +1,9 @@
 import { Reflector } from "@nestjs/core";
 import { expect } from "chai";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import { getSystemRoleTemplate } from "@optimiq-voice/auth";
+import { makeTestModuleRuntime } from "@optimiq-voice/effect-runtime";
 import { APP_SESSION_REQUEST_KEY } from "../../src/auth/app-session";
 import { MissingPermissionException } from "../../src/auth/auth.errors";
 import { REQUIRE_PERMISSIONS_METADATA } from "../../src/auth/require-permissions.decorator";
@@ -8,9 +11,14 @@ import { RequirePermissionsGuard } from "../../src/auth/require-permissions.guar
 import { SipAclEntriesController } from "../../src/pbx/security/sip-acl.controller";
 import { createSipAclEntryDto, updateSipAclEntryDto } from "../../src/pbx/security/sip-acl.dto";
 import { SIP_ACL_ENTRY_RESOURCE } from "../../src/pbx/security/sip-acl.resource";
+import { SipAclEntriesService } from "../../src/pbx/security/sip-acl.service";
+import { PbxRepository } from "../../src/pbx/shared/pbx.repository";
 import type { AuthService, ResolvedAccess } from "../../src/auth/auth.service";
+import type { OrganizationSuspensionService } from "../../src/auth/organization-suspension.service";
+import type { PbxRepositoryInterface } from "../../src/pbx/shared/pbx.repository";
 import type { ExecutionContext } from "@nestjs/common";
 import type { AppSession, Permission } from "@optimiq-voice/auth";
+import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
 /**
  * The `sip_acl_entry` CRUD surface — `/api/v1/sip-acl-entries`.
@@ -32,6 +40,7 @@ import type { AppSession, Permission } from "@optimiq-voice/auth";
 
 const ORG = "019fd3c2-1111-76be-a6b3-b0f1914e39b6";
 const USER = "019fd3c2-9999-76be-a6b3-b0f1914e39b6";
+const TRUNK = "019fd3c2-3333-76be-a6b3-b0f1914e39b6";
 
 function sessionFor(): AppSession {
 	return {
@@ -70,7 +79,10 @@ function guardFor(
 		permissions: [...getSystemRoleTemplate(role).permissions],
 	};
 	const authService = { resolveAccess: async () => access } as unknown as AuthService;
-	return { guard: new RequirePermissionsGuard(new Reflector(), authService), context };
+	return {
+		guard: new RequirePermissionsGuard(new Reflector(), authService, notSuspended()),
+		context,
+	};
 }
 
 async function caught(run: () => Promise<unknown>): Promise<unknown> {
@@ -158,6 +170,52 @@ describe("sip ACL entry DTOs", () => {
 		expect(updateSipAclEntryDto.safeParse({ enabled: false }).success).to.equal(true);
 		expect(updateSipAclEntryDto.safeParse({ network: "10.0.0.1/24" }).success).to.equal(false);
 	});
+
+	/**
+	 * The per-trunk binding — `plans/sipd-invite-design.md` §8.2's open question, closed as a column
+	 * on this table rather than a `trunk_acl` child table because one ACL evaluator is worth more
+	 * than the shape.
+	 */
+	it("carries a trunk binding through create", () => {
+		const parsed = createSipAclEntryDto.parse({
+			network: "203.0.113.0/24",
+			scope: "trunk",
+			trunkId: TRUNK,
+		});
+		expect(parsed.trunkId).to.equal(TRUNK);
+	});
+
+	/**
+	 * Absent means the entry applies to the whole organization, which is what every row meant before
+	 * the column existed. Omitting it must therefore stay legal, or the migration would have been
+	 * backward-incompatible at the API rather than at the database.
+	 */
+	it("leaves the binding out when nothing was said, which means the whole organization", () => {
+		const parsed = createSipAclEntryDto.parse({ network: "203.0.113.0/24", scope: "trunk" });
+		expect(parsed.trunkId).to.equal(undefined);
+	});
+
+	/**
+	 * `null` CLEARS it and `undefined` leaves it alone. Without the first, an entry bound to the
+	 * wrong trunk could only be un-bound by deleting the row and retyping the CIDR — and retyping a
+	 * CIDR to fix a dropdown is how the wrong network gets allowed.
+	 */
+	it("tells 'clear the binding' apart from 'do not touch it' on PATCH", () => {
+		expect(updateSipAclEntryDto.parse({ trunkId: null }).trunkId).to.equal(null);
+		expect(Object.hasOwn(updateSipAclEntryDto.parse({ enabled: false }), "trunkId")).to.equal(
+			false,
+		);
+	});
+
+	it("refuses a binding that is not an id", () => {
+		expect(
+			createSipAclEntryDto.safeParse({
+				network: "203.0.113.0/24",
+				scope: "trunk",
+				trunkId: "Telnyx",
+			}).success,
+		).to.equal(false);
+	});
 });
 
 describe("the sip ACL resource declaration", () => {
@@ -216,5 +274,110 @@ describe("the sip ACL controller's guard", () => {
 		expect(await caught(async () => agent.guard.canActivate(agent.context))).to.be.instanceOf(
 			MissingPermissionException,
 		);
+	});
+});
+
+/** A suspension service that says no organization is suspended. See `RequirePermissionsGuard`. */
+function notSuspended(): OrganizationSuspensionService {
+	return { isSuspended: async () => false } as unknown as OrganizationSuspensionService;
+}
+
+/**
+ * The `trunk_id` binding, across two tenants.
+ *
+ * The DTO validates the id's SHAPE and the column's foreign key proves it names a trunk — but an FK
+ * check runs as the system and therefore sees every organization's trunks, so neither of those stops
+ * tenant A binding an entry to tenant B's trunk. That is not an inert mistake: the column is
+ * `on delete cascade`, so B deleting the trunk silently deletes A's allowlist row.
+ */
+describe("sip ACL entry trunk bindings", () => {
+	const ORG_A = ORG;
+	const ORG_B = "019fd3c2-2222-76be-a6b3-b0f1914e39b6";
+	const B_TRUNK = "019fd3c2-4444-76be-a6b3-b0f1914e39b6";
+
+	/** Trunks keyed by the tenant that owns them; the scope is what the fake filters on. */
+	function databaseWithTrunks(owned: Readonly<Record<string, readonly string[]>>) {
+		let scope = "";
+		let wanted = "";
+		const chain = (): Record<string, unknown> => {
+			const self: Record<string, unknown> = {};
+			self.from = () => self;
+			self.where = () => self;
+			self.limit = async () =>
+				(owned[scope] ?? []).includes(wanted) ? [{ id: wanted }] : ([] as unknown[]);
+			return self;
+		};
+		return {
+			seek(id: string) {
+				wanted = id;
+			},
+			client: {
+				withTenantScope: async <T>(organizationId: string, work: (t: never) => Promise<T>) => {
+					scope = organizationId;
+					return await work({ select: () => chain() } as never);
+				},
+			} as unknown as PbxDatabaseClient,
+		};
+	}
+
+	function serviceFor(database: PbxDatabaseClient): {
+		readonly service: SipAclEntriesService;
+		readonly created: unknown[][];
+	} {
+		const created: unknown[][] = [];
+		const repository = {
+			create: (...args: unknown[]) => {
+				created.push(args);
+				return Effect.succeed({ row: { id: "row" }, warnings: [] });
+			},
+			update: (...args: unknown[]) => {
+				created.push(args);
+				return Effect.succeed({ row: { id: "row" }, warnings: [] });
+			},
+		} as unknown as PbxRepositoryInterface;
+		const layer = Layer.effect(PbxRepository)(Effect.sync(() => PbxRepository.of(repository)));
+		const runtime = makeTestModuleRuntime(PbxRepository, layer);
+		return { service: new SipAclEntriesService(runtime, database), created };
+	}
+
+	function sessionIn(organizationId: string): AppSession {
+		const base = sessionFor();
+		return {
+			...base,
+			session: { ...base.session, activeOrganizationId: organizationId },
+		} as AppSession;
+	}
+
+	it("accepts a trunk the writer's own organization owns", async () => {
+		const database = databaseWithTrunks({ [ORG_A]: [TRUNK], [ORG_B]: [B_TRUNK] });
+		database.seek(TRUNK);
+		const { service, created } = serviceFor(database.client);
+
+		await service.create(sessionIn(ORG_A), { network: "203.0.113.0/24", trunkId: TRUNK });
+		expect(created).to.have.lengthOf(1);
+	});
+
+	it("refuses a trunk that belongs to another tenant, and writes nothing", async () => {
+		const database = databaseWithTrunks({ [ORG_A]: [TRUNK], [ORG_B]: [B_TRUNK] });
+		database.seek(B_TRUNK);
+		const { service, created } = serviceFor(database.client);
+
+		const error = await caught(async () => {
+			await service.create(sessionIn(ORG_A), { network: "203.0.113.0/24", trunkId: B_TRUNK });
+		});
+		// A 404 rather than a 403: the id came off a row the caller cannot see, so "no such trunk in
+		// this organization" is both the honest answer and the one that leaks nothing.
+		expect((error as { getStatus?: () => number }).getStatus?.()).to.equal(404);
+		expect(created).to.have.lengthOf(0);
+	});
+
+	it("leaves an absent binding alone and lets a null one through", async () => {
+		const database = databaseWithTrunks({ [ORG_A]: [TRUNK] });
+		const { service, created } = serviceFor(database.client);
+
+		await service.update(sessionIn(ORG_A), "entry", { priority: 10 });
+		// `null` CLEARS the binding — there is no reference left to prove.
+		await service.update(sessionIn(ORG_A), "entry", { trunkId: null });
+		expect(created).to.have.lengthOf(2);
 	});
 });

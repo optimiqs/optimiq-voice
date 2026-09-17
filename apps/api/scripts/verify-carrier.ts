@@ -979,6 +979,7 @@ async function main(): Promise<void> {
 				PBX_DATABASE_URL: pbxDatabaseUrl,
 				PBX_DATABASE_MAX_CONNECTIONS: 2,
 				PBX_ENSURE_KV_BUCKETS: false,
+				PBX_ENSURE_SYSTEM_MEDIA: false,
 				// Unused by a cleanup handle — it only ever runs DELETEs — but the env type is total on
 				// purpose, so a new field is a compile error at every construction site rather than an
 				// `undefined` that reaches a dial string.
@@ -1007,7 +1008,18 @@ async function main(): Promise<void> {
 				PBX_WEBHOOK_FAILURE_LIMIT: 20,
 				PBX_WEBHOOK_CACHE_TTL_MS: 30_000,
 				PBX_WEBHOOK_ALLOW_INSECURE_URLS: false,
+				// Hot-desk sessions, unused here for the same reason: the sweep interval is the disabling
+				// `0` so a cleanup handle can never start a timer.
+				PBX_HOT_DESK_SESSION_SECONDS: 9 * 3600,
+				PBX_HOT_DESK_SWEEP_INTERVAL_MS: 0,
+				AUDIT_LOG_RETENTION_DAYS: 0,
+				AUDIT_LOG_SWEEP_INTERVAL_MS: 0,
+				AUDIT_LOG_SWEEP_BATCH: 1_000,
+				PBX_VOICEMAIL_RETENTION_SWEEP_INTERVAL_MS: 0,
+				PBX_VOICEMAIL_RETENTION_SWEEP_BATCH: 200,
 				PBX_ORIGINATE_RATE_LIMIT_PER_MINUTE: 60,
+				// No timer in a verification script: the process must be able to exit.
+				PBX_FRAUD_DETECTOR_INTERVAL_MS: 0,
 			});
 			if (organizationId.length > 0) {
 				await pbx.withTenantScope(organizationId, async (transaction) => {

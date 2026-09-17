@@ -1,22 +1,9 @@
-// Package audio turns a file on disk into G.711 frames the packet path can put on the wire.
+// Package audio turns a file on disk into G.711 frames the packet path can put on the wire. It knows
+// nothing about sockets, sessions or RTP: it reads bytes, validates them, converts them to the
+// companding law a leg negotiated, and cuts them into 20 ms frames.
 //
-// Rung 1 of plans/mediad-design.md §2: "playback is a session sourcing frames from a file instead
-// of from a socket". This package is the FILE half of that sentence and knows nothing about
-// sockets, sessions or RTP — it reads bytes, validates them, converts them to the companding law a
-// leg negotiated, and cuts them into 20 ms frames. internal/rtp does the rest.
-//
-// # Why there is a converter here at all, given design doc §7 says "no transcoding"
-//
-// §7's rule is about the RELAY: two live legs, packet by packet, on the call path. Refusing to
-// resample there is what makes rung 2 achievable with no DSP and no CPU cliff. This is a different
-// operation with a different cost profile — a static file, converted ONCE when a playback starts,
-// before a single frame is sent, off the packet path entirely. Without it a leg that answered A-law
-// could never hear a prompt, because prompt libraries are stored in one format and phones negotiate
-// whichever they like. A µ-law table lookup per sample on a file already in memory is not the thing
-// §7 is protecting the call path from.
-//
-// A file whose stored format already matches the leg's is passed through with no conversion at all,
-// which is the common case for a library curated for a deployment.
+// Converting a stored file once, before playback starts, is off the packet path entirely and is not
+// the live relay transcoding the design forbids; a file already in the leg's format is passed through.
 package audio
 
 // Encoding is a G.711 companding law — the two payload formats v1 puts on the wire.
@@ -39,9 +26,8 @@ func (e Encoding) String() string {
 
 // Silence is the encoded byte for a zero sample.
 //
-// It is NOT zero in either law, and that is the whole reason this is a named function: padding a
-// short final frame with 0x00 puts a loud click at the end of every prompt whose length is not a
-// multiple of 20 ms, which is most of them.
+// It is NOT zero in either law: padding a short final frame with 0x00 puts a loud click at the end
+// of the prompt.
 func (e Encoding) Silence() byte {
 	if e == EncodingALaw {
 		return 0xD5
@@ -49,9 +35,8 @@ func (e Encoding) Silence() byte {
 	return 0xFF
 }
 
-// The ITU-T G.711 segment end points, from the reference implementation (Sun's g711.c, the same
-// tables Asterisk, FreeSWITCH and every softphone use). They are the upper bound of each of the
-// eight logarithmic segments, so a linear search over them IS the segment number.
+// The ITU-T G.711 segment end points, from the reference implementation (Sun's g711.c). They are the
+// upper bound of each of the eight logarithmic segments, so a linear search over them IS the segment.
 var (
 	uLawSegmentEnd = [8]int32{0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF, 0x1FFF}
 	aLawSegmentEnd = [8]int32{0x1F, 0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF}
@@ -109,9 +94,8 @@ func ULawToLinear(encoded byte) int16 {
 // LinearToALaw encodes one 16-bit linear sample as A-law.
 func LinearToALaw(sample int16) byte {
 	value := int32(sample) >> 3 // A-law works in a 13-bit domain.
-	// 0xD5 is A-law's alternating-bit inversion applied to a positive sample; 0x55 to a negative
-	// one. The inversion is in the standard to keep the encoded bit stream free of long runs of
-	// zeros, which is a line-coding concern that predates packet networks and is still normative.
+	// A-law's normative alternating-bit inversion: 0xD5 for a positive sample, 0x55 for a negative
+	// one, which keeps the encoded bit stream free of long runs of zeros.
 	var mask int32 = 0xD5
 	if value < 0 {
 		mask = 0x55
@@ -152,7 +136,16 @@ func ALawToLinear(encoded byte) int16 {
 
 // encodeLinear converts linear samples to one companding law.
 func encodeLinear(samples []int16, encoding Encoding) []byte {
-	out := make([]byte, len(samples))
+	return encodeLinearInto(nil, samples, encoding)
+}
+
+// encodeLinearInto is encodeLinear writing into a caller-supplied buffer; a wrong-sized buffer is
+// ignored and a new one allocated, so a caller can pass whatever it has.
+func encodeLinearInto(dst []byte, samples []int16, encoding Encoding) []byte {
+	out := dst
+	if len(out) != len(samples) {
+		out = make([]byte, len(samples))
+	}
 	if encoding == EncodingALaw {
 		for index, sample := range samples {
 			out[index] = LinearToALaw(sample)
@@ -165,10 +158,8 @@ func encodeLinear(samples []int16, encoding Encoding) []byte {
 	return out
 }
 
-// recode converts between the two companding laws through the linear domain.
-//
-// One pass, two table lookups per byte, and only when a file's stored law differs from the one the
-// leg answered. A deployment whose prompt library matches its trunks never reaches this.
+// recode converts between the two companding laws through the linear domain, and is a no-op when a
+// file's stored law already matches the one the leg answered.
 func recode(payload []byte, from, to Encoding) []byte {
 	if from == to {
 		return payload

@@ -4,11 +4,25 @@ import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import { queueMembershipSchema } from "@optimiq-voice/events/schemas";
 import { ensureKvBuckets, kvKeyFor, QUEUE_MEMBERSHIP_KV } from "@optimiq-voice/events/streams";
 import { getLogger } from "@optimiq-voice/logging";
-import { extension, queue, queueAgent, queueTier } from "@optimiq-voice/pbx-db";
+import {
+	eq,
+	extension,
+	inArray,
+	queue,
+	queueAgent,
+	queueAgentSkill,
+	queueDispositionCode,
+	queueSkillRequirement,
+	queueSurveyQuestion,
+	queueTier,
+} from "@optimiq-voice/pbx-db";
 import { PBX_DATABASE, PBX_ENV } from "../shared/pbx.tokens";
 import {
 	projectQueueMemberships,
+	type QueueRosterDispositionCodeRow,
 	type QueueRosterQueueRow,
+	type QueueRosterSkillRequirementRow,
+	type QueueRosterSurveyQuestionRow,
 	type QueueRosterTierRow,
 	type UnreachableSeat,
 } from "./queue-membership.projection";
@@ -41,7 +55,7 @@ const logger = getLogger("api.pbx");
  * `on delete cascade`, so deleting ONE agent silently changes the roster of every queue they served
  * — and the delete statement does not say which. Working out the affected set would mean reading
  * the tiers before the write and diffing, in a transaction this publisher deliberately runs after.
- * Reading four unjoined tables for the tenant and reconciling every key is one round trip more and
+ * Reading the tenant's roster tables unjoined and reconciling every key is one round trip more and
  * cannot miss a queue. Same trade `did-index` makes with its full key scan, and the same ceiling:
  * at ten thousand queues per tenant this becomes a per-queue projection with a tier-level trigger.
  *
@@ -153,7 +167,7 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 	 */
 	async syncOrganization(organizationId: string): Promise<QueueMembershipSyncResult> {
 		if (this.bucket === undefined) {
-			return { published: 0, deleted: 0, unchanged: 0, unreachable: [], skipped: true };
+			return { published: 0, deleted: 0, unchanged: 0, unreachable: [], failed: 0, skipped: true };
 		}
 		const rows = await this.database.withTenantScope(
 			organizationId,
@@ -176,13 +190,15 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 	): Promise<QueueMembershipSyncResult> {
 		const bucket = this.bucket;
 		if (bucket === undefined) {
-			return { published: 0, deleted: 0, unchanged: 0, unreachable: [], skipped: true };
+			return { published: 0, deleted: 0, unchanged: 0, unreachable: [], failed: 0, skipped: true };
 		}
 
 		const existing = await this.readOrganization(bucket, organizationId);
 		const previousRevisions = new Map<string, number>();
 		for (const [, entry] of existing) {
-			previousRevisions.set(entry.queueId, entry.revision ?? 0);
+			if (entry !== undefined) {
+				previousRevisions.set(entry.queueId, entry.revision ?? 0);
+			}
 		}
 
 		const { memberships, unreachable } = projectQueueMemberships(
@@ -192,6 +208,9 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 			{
 				extensionDialTemplate: this.env.PBX_EXTENSION_DIAL_TEMPLATE,
 				previousRevisions,
+				dispositionCodes: rows.dispositionCodes,
+				skillRequirements: rows.skillRequirements,
+				surveyQuestions: rows.surveyQuestions,
 			},
 		);
 
@@ -204,6 +223,7 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 			);
 		}
 
+		let failed = 0;
 		let published = 0;
 		let deleted = 0;
 		let unchanged = 0;
@@ -244,6 +264,7 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 				published += 1;
 			} catch (error) {
 				this.failed += 1;
+				failed += 1;
 				logger.error({ key, organizationId, error }, "failed to write a queue-membership entry");
 			}
 		}
@@ -258,11 +279,12 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 				deleted += 1;
 			} catch (error) {
 				this.failed += 1;
+				failed += 1;
 				logger.error({ key, organizationId, error }, "failed to delete a queue-membership entry");
 			}
 		}
 
-		return { published, deleted, unchanged, unreachable, skipped: false };
+		return { published, deleted, unchanged, unreachable, failed, skipped: false };
 	}
 
 	/** One queue's published roster. Used by verification and by the rebuild script's report. */
@@ -290,8 +312,10 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 	private async readOrganization(
 		bucket: KV,
 		organizationId: string,
-	): Promise<Map<string, QueueMembership>> {
-		const found = new Map<string, QueueMembership>();
+	): Promise<Map<string, QueueMembership | undefined>> {
+		// `undefined` is a key that exists in the bucket but could not be parsed. Present so the
+		// delete loop can reclaim it; never compared against as a roster.
+		const found = new Map<string, QueueMembership | undefined>();
 		let keys: string[];
 		try {
 			keys = await collect(await bucket.keys(`${organizationId}.*`));
@@ -299,11 +323,19 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 			logger.warn({ organizationId, error }, "could not list queue-membership keys");
 			return found;
 		}
-		for (const key of keys) {
-			const entry = await readEntry(bucket, key);
-			// An unreadable entry is treated as absent so the next write repairs it, rather than as a
-			// roster to preserve — the alternative is a queue pinned to a value nothing can parse.
-			if (entry !== undefined && entry.orgId === organizationId) {
+		// In parallel: the reads are independent, and serially a tenant with 200 queues paid 200
+		// round trips of latency per membership write before anything was published.
+		const entries = await Promise.all(keys.map(async (key) => await readEntry(bucket, key)));
+		for (const [index, entry] of entries.entries()) {
+			const key = keys[index];
+			if (key === undefined) {
+				continue;
+			}
+			// An unreadable entry is treated as absent for the WRITE — the next write repairs it — but
+			// it is still carried into `existing`, because a key nothing can parse whose queue has since
+			// been deleted would otherwise never reach the delete loop and would leak forever. The key
+			// is prefix-scoped to this organization, so ownership is not in doubt.
+			if (entry === undefined || entry.orgId === organizationId) {
 				found.set(key, entry);
 			}
 		}
@@ -311,30 +343,113 @@ export class QueueMembershipPublisher implements OnModuleInit, OnApplicationShut
 	}
 }
 
-/** The four tables a roster is built from, read unjoined per `snapshot-loader.ts`'s rule. */
+/** The tables a roster is built from, read unjoined per `snapshot-loader.ts`'s rule. */
 export interface QueueRosterRows {
 	readonly queues: readonly QueueRosterQueueRow[];
 	readonly tiers: readonly QueueRosterTierRow[];
+	/** Enabled codes only — a retired one is history, not a button. */
+	readonly dispositionCodes: readonly QueueRosterDispositionCodeRow[];
+	readonly skillRequirements: readonly QueueRosterSkillRequirementRow[];
+	/** Every question in the tenant; the projection narrows to the queues whose survey is on. */
+	readonly surveyQuestions: readonly QueueRosterSurveyQuestionRow[];
 }
 
 /**
  * Reads the roster inputs for the tenant the transaction is scoped to.
  *
- * Four unjoined selects and an in-memory join, following the loader convention: RLS is the filter,
+ * Unjoined selects and an in-memory join, following the loader convention: RLS is the filter,
  * so no query here carries an `organization_id` predicate, and the join stays in TypeScript where
  * it is testable without a database.
  */
 export async function readRosterRows(
 	transaction: PbxDatabaseTransaction,
 ): Promise<QueueRosterRows> {
-	const [queues, agents, tiers, extensions] = await Promise.all([
+	const [queues, tiers, dispositionCodes, skillRequirements, surveyQuestions] = await Promise.all([
 		transaction.select().from(queue),
-		transaction.select().from(queueAgent),
 		transaction.select().from(queueTier),
-		transaction.select().from(extension),
+		// The `enabled` predicate is in the query rather than in the projection because a disabled
+		// code must not reach the roster at all: the console offers what it is given, and a retired
+		// code that stayed in the list would keep being picked long after somebody retired it.
+		transaction
+			.select({
+				queueId: queueDispositionCode.queueId,
+				id: queueDispositionCode.id,
+				code: queueDispositionCode.code,
+				label: queueDispositionCode.label,
+				position: queueDispositionCode.position,
+			})
+			.from(queueDispositionCode)
+			.where(eq(queueDispositionCode.enabled, true)),
+		transaction
+			.select({
+				queueId: queueSkillRequirement.queueId,
+				skill: queueSkillRequirement.skill,
+				minLevel: queueSkillRequirement.minLevel,
+				relaxAfterSeconds: queueSkillRequirement.relaxAfterSeconds,
+			})
+			.from(queueSkillRequirement),
+		transaction
+			.select({
+				queueId: queueSurveyQuestion.queueId,
+				id: queueSurveyQuestion.id,
+				position: queueSurveyQuestion.position,
+				promptId: queueSurveyQuestion.promptId,
+				label: queueSurveyQuestion.label,
+			})
+			.from(queueSurveyQuestion),
 	]);
 
+	// The two supporting reads are narrowed to what the tiers actually reference. Selecting every
+	// `queue_agent` and every `extension` in the tenant transferred thousands of rows per tier edit
+	// to build a lookup for a handful of seats — and this runs on every membership mutation,
+	// including an agent login. The whole-org re-projection above is unchanged and deliberate; only
+	// these two joins are narrowed.
+	const agentIds = [...new Set(tiers.map((tier) => tier.queueAgentId))];
+	const agents =
+		agentIds.length === 0
+			? []
+			: await transaction.select().from(queueAgent).where(inArray(queueAgent.id, agentIds));
+
 	const agentsById = new Map(agents.map((row) => [row.id, row]));
+
+	// Narrowed to the seats the tiers reference, for the reason the agent read above is: this runs on
+	// every membership mutation including an agent login, and a tenant's whole skill matrix is not
+	// needed to project the handful of agents actually on a queue.
+	const skillsByAgent = new Map<string, { skill: string; level: number }[]>();
+	if (agentIds.length > 0) {
+		const skillRows = await transaction
+			.select({
+				queueAgentId: queueAgentSkill.queueAgentId,
+				skill: queueAgentSkill.skill,
+				level: queueAgentSkill.level,
+			})
+			.from(queueAgentSkill)
+			.where(inArray(queueAgentSkill.queueAgentId, agentIds));
+		for (const row of skillRows) {
+			const bucket = skillsByAgent.get(row.queueAgentId);
+			if (bucket === undefined) {
+				skillsByAgent.set(row.queueAgentId, [{ skill: row.skill, level: row.level }]);
+			} else {
+				bucket.push({ skill: row.skill, level: row.level });
+			}
+		}
+		// Ordered once per agent here rather than once per TIER in the projection: an agent on four
+		// queues would otherwise have the same list sorted four times, and the order is part of the
+		// published value — an unrelated write must not reshuffle it.
+		for (const bucket of skillsByAgent.values()) {
+			bucket.sort((a, b) => a.skill.localeCompare(b.skill));
+		}
+	}
+	const extensionIds = [
+		...new Set(agents.flatMap((row) => (row.extensionId === null ? [] : [row.extensionId]))),
+	];
+	const extensions =
+		extensionIds.length === 0
+			? []
+			: await transaction
+					.select({ id: extension.id, number: extension.number })
+					.from(extension)
+					.where(inArray(extension.id, extensionIds));
 	const extensionNumbersById = new Map(extensions.map((row) => [row.id, row.number]));
 
 	const joined: QueueRosterTierRow[] = [];
@@ -356,12 +471,14 @@ export async function readRosterRows(
 				agent.extensionId === null ? null : (extensionNumbersById.get(agent.extensionId) ?? null),
 			level: tier.level,
 			position: tier.position,
+			announcePromptId: tier.announcePromptId,
 			wrapUpSeconds: agent.wrapUpSeconds,
 			maxNoAnswer: agent.maxNoAnswer,
 			noAnswerDelaySeconds: agent.noAnswerDelaySeconds,
 			busyDelaySeconds: agent.busyDelaySeconds,
 			rejectDelaySeconds: agent.rejectDelaySeconds,
 			enabled: agent.enabled,
+			skills: skillsByAgent.get(agent.id) ?? [],
 		});
 	}
 
@@ -373,8 +490,15 @@ export async function readRosterRows(
 			tierRulesApply: row.tierRulesApply,
 			tierRuleWaitSeconds: row.tierRuleWaitSeconds,
 			tierRuleNoAgentNoWait: row.tierRuleNoAgentNoWait,
+			ronaEnabled: row.ronaEnabled,
+			dispositionRequired: row.dispositionRequired,
+			surveyEnabled: row.surveyEnabled,
+			surveyIntroPromptId: row.surveyIntroPromptId,
 		})),
 		tiers: joined,
+		dispositionCodes,
+		skillRequirements,
+		surveyQuestions,
 	};
 }
 
@@ -383,6 +507,11 @@ export interface QueueMembershipSyncResult {
 	readonly deleted: number;
 	readonly unchanged: number;
 	readonly unreachable: readonly UnreachableSeat[];
+	/**
+	 * KV writes and deletes that threw. Non-zero means the reconcile is incomplete, so the caller
+	 * must leave the outbox obligation owed and let the sweeper republish.
+	 */
+	readonly failed: number;
 	/** True when there is no broker and nothing was attempted. */
 	readonly skipped: boolean;
 }

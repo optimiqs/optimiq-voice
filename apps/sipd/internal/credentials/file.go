@@ -9,11 +9,12 @@ import (
 	"sync"
 )
 
-// FileStore is the development / test-rig credential store: a JSON file, loaded into memory.
+// FileStore is the development / test-rig credential store: a JSON file, loaded into memory, so
+// sipd can be run and SIPp-tested without apps/api or a database. Production uses NATSStore.
 //
-// It exists so sipd can be run and SIPp-tested without apps/api or a database. Production uses
-// NATSStore. The file format accepts either a precomputed ha1 or a plaintext password (converted at
-// load and then dropped), because a fixture nobody can read is a fixture nobody maintains.
+// The format accepts a precomputed ha1, a plaintext password (converted at load, then dropped), or
+// a `secretRef` derived through the shared provisioning contract (derive.go) from
+// FileStoreOptions.ProvisionSecretKey.
 //
 //	{
 //	  "realm": "acme.example.com",
@@ -30,18 +31,9 @@ import (
 //	  ]
 //	}
 //
-// The top-level realm is a default for accounts that do not state their own.
-//
-// # The derived form
-//
-// The third account above states neither a password nor an ha1, only the `secretRef` that
-// apps/api's provisioning renderer would have used. The password is then DERIVED with the shared
-// contract (derive.go) from SIPD_PROVISION_SECRET_KEY, which means a development or SIPp-rig
-// fixture gets byte-for-byte the credential a real provisioned phone was handed, instead of a
-// literal somebody copied out of a config once and that silently stopped matching.
-//
-// It requires the root key, which is exactly why it is confined to the file store: production runs
-// on the RPC, where apps/api derives and the edge holds no key at all.
+// The top-level realm is a default for accounts that do not state their own. The derived form is
+// confined to this store because it needs the root key; production runs on the RPC, where apps/api
+// derives and the edge holds no key at all.
 type FileStore struct {
 	path string
 	opts FileStoreOptions
@@ -77,7 +69,7 @@ type fileDocument struct {
 	Accounts []fileAccount `json:"accounts"`
 }
 
-// NewFileStore loads the file immediately so a bad fixture fails at boot, not at first REGISTER.
+// NewFileStore loads the file immediately, so a bad fixture fails at boot, not at first REGISTER.
 func NewFileStore(path string, opts FileStoreOptions) (*FileStore, error) {
 	store := &FileStore{path: path, opts: opts}
 	if err := store.Reload(); err != nil {
@@ -164,7 +156,7 @@ func (s *FileStore) Lookup(_ context.Context, realm, username string) (Credentia
 	return credential, nil
 }
 
-// Len reports how many accounts are loaded. Used by the boot log and by tests.
+// Len reports how many accounts are loaded.
 func (s *FileStore) Len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

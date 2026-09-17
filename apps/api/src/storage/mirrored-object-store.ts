@@ -1,4 +1,5 @@
 import { getLogger } from "@optimiq-voice/logging";
+import { objectContentType } from "./object-content-type";
 import { ObjectNotFoundError } from "./object-store";
 import type {
 	ArchivingObjectStore,
@@ -173,7 +174,13 @@ export class MirroredObjectStore implements ArchivingObjectStore {
 		for await (const chunk of stream) {
 			chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as ArrayBufferLike));
 		}
-		await this.mirror.put(objectKey, Buffer.concat(chunks), { contentType: local.contentType });
+		// Derived from the key, not read from `local`: the origin is always a `LocalObjectStore` (the
+		// only shape `createObjectStore` builds) and its `head` reports size and mtime only, so
+		// `local.contentType` was always undefined and every archived recording landed in the bucket
+		// as `binary/octet-stream`.
+		await this.mirror.put(objectKey, Buffer.concat(chunks), {
+			contentType: local.contentType ?? objectContentType(objectKey),
+		});
 		return true;
 	}
 

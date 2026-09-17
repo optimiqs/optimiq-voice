@@ -136,3 +136,98 @@ export async function provisionTrunk(
 		{ method: "POST", body: JSON.stringify(body) },
 	);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Porting in (LNP)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A port-in as the API describes it. No carrier field names, per the header — `supportKey` is the
+ * one carrier-side string that survives, because it is what the losing carrier's support desk asks
+ * for when a port stalls and hiding it would make the stall unresolvable from inside this product.
+ */
+export interface PortingOrder {
+	readonly id: string;
+	readonly status: string;
+	readonly supportKey: string | null;
+	readonly e164s: readonly string[];
+	readonly numberCount: number;
+	readonly focDatetime: string | null;
+	readonly createdAt: string | null;
+	readonly updatedAt: string | null;
+}
+
+/** Matches `createPortingOrderDto`'s ceiling. Asking for more is a 400. */
+export const MAX_PORT_NUMBERS = 100;
+
+export interface CreatePortingOrderBody {
+	readonly e164s: readonly string[];
+}
+
+/**
+ * Files the port. Answers with an ARRAY, because the carrier splits a request into one order per
+ * losing carrier — a UI that rendered "your porting order" would hide every order but the first,
+ * and the numbers in the hidden ones would simply never port.
+ */
+export async function createPortingOrder(
+	body: CreatePortingOrderBody,
+): Promise<{ readonly data: readonly PortingOrder[] }> {
+	return await apiFetch<{ data: PortingOrder[] }>("/carrier/porting-orders", {
+		method: "POST",
+		body: JSON.stringify(body),
+	});
+}
+
+export async function fetchPortingOrders(): Promise<{
+	readonly data: readonly PortingOrder[];
+	readonly total: number;
+}> {
+	return await apiFetch<{ data: PortingOrder[]; total: number }>("/carrier/porting-orders");
+}
+
+// ---------------------------------------------------------------------------------------------
+// CNAM
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The caller-ID name a called party sees.
+ *
+ * Two switches rather than one, because the carrier holds two: `enabled` presents a name on
+ * outbound calls at all, `listingEnabled` is the listing record itself. One combined toggle would
+ * be friendlier and would flip the wrong half.
+ */
+export interface CnamListing {
+	readonly phoneNumberId: string;
+	readonly e164: string;
+	readonly enabled: boolean;
+	readonly listingEnabled: boolean;
+	readonly listingDetails: string | null;
+}
+
+/** The NANP CNAM field width. The API refuses anything longer, so the form does too. */
+export const MAX_CNAM_DETAILS_LENGTH = 15;
+
+export interface UpdateCnamListingBody {
+	readonly enabled?: boolean;
+	readonly listingEnabled?: boolean;
+	readonly details?: string;
+}
+
+/** Addressed by the LOCAL phone-number id, never the carrier's — see the API's route comment. */
+export async function fetchCnamListing(phoneNumberId: string): Promise<CnamListing> {
+	const { data } = await apiFetch<ItemEnvelope<CnamListing>>(
+		`/carrier/numbers/${encodeURIComponent(phoneNumberId)}/cnam`,
+	);
+	return data;
+}
+
+export async function updateCnamListing(
+	phoneNumberId: string,
+	body: UpdateCnamListingBody,
+): Promise<CnamListing> {
+	const { data } = await apiFetch<ItemEnvelope<CnamListing>>(
+		`/carrier/numbers/${encodeURIComponent(phoneNumberId)}/cnam`,
+		{ method: "PATCH", body: JSON.stringify(body) },
+	);
+	return data;
+}

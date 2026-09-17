@@ -1,8 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
+import { toast } from "~/components/ui/toast";
 import type { ProvisioningTokenResult } from "~/lib/provisioning/contracts";
 
 /**
@@ -35,6 +36,16 @@ export function ProvisioningUrlPanel({
 	onDismiss?: () => void;
 }) {
 	const [copied, setCopied] = useState(false);
+	// The revert timer, cleared on unmount: the panel is routinely dismissed inside its two seconds.
+	const revert = useRef<ReturnType<typeof setTimeout> | null>(null);
+	useEffect(
+		() => () => {
+			if (revert.current !== null) {
+				clearTimeout(revert.current);
+			}
+		},
+		[],
+	);
 	const url = provisioning.configUrl;
 
 	return (
@@ -80,12 +91,19 @@ export function ProvisioningUrlPanel({
 							size="sm"
 							variant="secondary"
 							onClick={() => {
-								void navigator.clipboard?.writeText(url).then(() => {
-									setCopied(true);
-									// Reverts on its own: a button stuck on "Copied" is a button that lies the
-									// second time it is used.
-									setTimeout(() => setCopied(false), 2000);
-								});
+								void navigator.clipboard
+									?.writeText(url)
+									.then(() => {
+										setCopied(true);
+										// Reverts on its own: a button stuck on "Copied" is a button that lies the
+										// second time it is used.
+										revert.current = setTimeout(() => setCopied(false), 2000);
+									})
+									// `writeText` rejects on an insecure origin, an unfocused document or a denied
+									// permission. Saying nothing would leave the administrator believing they hold a
+									// credential that exists nowhere else, so the failure has to be loud and has to
+									// point at the `select-all` fallback above.
+									.catch(() => toast.error("Could not copy. Select the URL and copy it manually."));
 							}}
 						>
 							{copied ? "Copied" : "Copy URL"}

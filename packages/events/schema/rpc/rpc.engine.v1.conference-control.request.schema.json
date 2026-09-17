@@ -1,0 +1,41 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"orgId": {
+			"type": "string",
+			"format": "uuid",
+			"pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+		},
+		"conferenceId": {
+			"type": "string",
+			"format": "uuid",
+			"pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+		},
+		"action": {
+			"type": "string",
+			"enum": ["mute", "unmute", "deaf", "undeaf", "kick", "volume", "lock", "unlock"]
+		},
+		"memberRef": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"gainPercent": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 400
+		},
+		"gainScope": {
+			"type": "string",
+			"enum": ["talk", "listen", "both"]
+		},
+		"byUserId": {
+			"type": "string",
+			"format": "uuid",
+			"pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+		}
+	},
+	"required": ["orgId", "conferenceId", "action"],
+	"additionalProperties": false
+}

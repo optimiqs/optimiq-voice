@@ -1,0 +1,1 @@
+ALTER TABLE "call_legs" ADD COLUMN "queue_disposition_code" text;

@@ -132,6 +132,18 @@ describe("@auth/apiKeySession", function () {
 		expect(session?.session.expiresAt.toISOString()).to.equal(expiresAt.toISOString());
 	});
 
+	it("rejects a key whose stored expiry has passed", async function () {
+		// The synthesised session's `expiresAt` is read by nothing downstream, so freshness cannot be
+		// left to `verifyApiKey` calling a stale key valid.
+		const { platform } = platformWith(async () => ({
+			valid: true,
+			key: { ...validKey.key, expiresAt: new Date(Date.now() - 1_000) },
+		}));
+		expect(
+			await createApiKeySessionResolver(platform)(request({ [API_KEY_HEADER]: "ovk_secret" })),
+		).to.equal(null);
+	});
+
 	it("takes the first value of a repeated header", async function () {
 		const { platform, calls } = platformWith(async () => validKey);
 		await createApiKeySessionResolver(platform)(request({ [API_KEY_HEADER]: ["first", "second"] }));

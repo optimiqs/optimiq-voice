@@ -7,6 +7,7 @@
 
 export interface EnvInvariantConfig {
 	NODE_ENV: string;
+	OPTIMIQ_SERVICE?: "api" | "engine";
 	DATABASE_URL?: string;
 	API_DATABASE_URL?: string;
 	NATS_URL?: string;
@@ -27,6 +28,7 @@ export interface EnvInvariantConfig {
 	NATS_MEDIAD_PASS?: string;
 	NATS_SIPD_USER?: string;
 	NATS_SIPD_PASS?: string;
+	PLATFORM_SECRET_ENCRYPTION_KEY?: string;
 	AUTH_SECRET?: string;
 	AUTH_URL?: string;
 	AUTH_COOKIE_DOMAIN?: string;
@@ -207,12 +209,16 @@ function assertProductionNatsCredentials(config: EnvInvariantConfig): void {
 	// credentials passes only the pair its own service needs, so demanding `NATS_USER` here would
 	// refuse to boot exactly the configuration this check wants people to reach.
 	//
-	// Any WHOLE pair satisfies it. A half-set pair does not, and is left to `natsCredentials` to
-	// name precisely at the connection site.
-	const hasServicePair = PER_SERVICE_NATS_PASSWORDS.some(
-		([passKey, userKey]) => isSet(config[passKey]) && isSet(config[userKey]),
-	);
-	if (hasServicePair) {
+	// Only THIS process's own pair satisfies it. Some other service's pair being present in the
+	// environment — a shared secret bundle, a copy-pasted compose block — proves nothing: this
+	// container would still fall back to `NATS_USER`/`NATS_PASS`, and if those are unset it
+	// connects unauthenticated. A half-set pair does not satisfy it either, and is left to
+	// `natsCredentials` to name precisely at the connection site.
+	const ownPair =
+		config.OPTIMIQ_SERVICE === "engine"
+			? (["NATS_ENGINE_PASS", "NATS_ENGINE_USER"] as const)
+			: (["NATS_API_PASS", "NATS_API_USER"] as const);
+	if (isSet(config[ownPair[0]]) && isSet(config[ownPair[1]])) {
 		return;
 	}
 
@@ -251,7 +257,7 @@ function assertProductionTelephonyHosts(config: EnvInvariantConfig): void {
 	const hostKeys = [["ASTERISK_SIPPROXY_HOST", config.ASTERISK_SIPPROXY_HOST]] as const;
 
 	for (const [key, value] of hostKeys) {
-		if (isUnsetHost(value)) {
+		if (value !== undefined && isUnsetHost(value)) {
 			throw new Error(`${key} must be a reachable address in production.`);
 		}
 	}
@@ -264,18 +270,21 @@ export function assertEnvInvariants(config: EnvInvariantConfig): void {
 		return;
 	}
 
-	requirePresent("DATABASE_URL", config.DATABASE_URL ?? config.API_DATABASE_URL);
 	requirePresent("NATS_URL", config.NATS_URL ?? config.API_NATS_URL);
-	requirePresent("AUTH_SECRET", config.AUTH_SECRET);
-
-	if ((config.AUTH_SECRET?.trim().length ?? 0) < MINIMUM_SECRET_LENGTH) {
-		throw new Error(`AUTH_SECRET must be at least ${MINIMUM_SECRET_LENGTH} characters.`);
-	}
-
-	requireHttpsUrl("AUTH_URL", config.AUTH_URL);
-
-	if (config.API_APP_URL?.trim()) {
-		requireHttpsUrl("API_APP_URL", config.API_APP_URL);
+	if (config.OPTIMIQ_SERVICE !== "engine") {
+		requirePresent("DATABASE_URL", config.DATABASE_URL ?? config.API_DATABASE_URL);
+		requirePresent("AUTH_SECRET", config.AUTH_SECRET);
+		if ((config.AUTH_SECRET?.trim().length ?? 0) < MINIMUM_SECRET_LENGTH) {
+			throw new Error(`AUTH_SECRET must be at least ${MINIMUM_SECRET_LENGTH} characters.`);
+		}
+		requireHttpsUrl("AUTH_URL", config.AUTH_URL);
+		// Without it, SSO client secrets would be stored in plaintext.
+		requirePresent("PLATFORM_SECRET_ENCRYPTION_KEY", config.PLATFORM_SECRET_ENCRYPTION_KEY);
+		if (config.API_APP_URL?.trim()) requireHttpsUrl("API_APP_URL", config.API_APP_URL);
+	} else {
+		// The engine owns no database or browser authentication. It authenticates only to NATS.
+		requirePresent("NATS_ENGINE_USER", config.NATS_ENGINE_USER);
+		requirePresent("NATS_ENGINE_PASS", config.NATS_ENGINE_PASS);
 	}
 
 	assertProductionSecrets(config);

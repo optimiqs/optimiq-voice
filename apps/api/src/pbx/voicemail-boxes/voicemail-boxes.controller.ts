@@ -37,14 +37,21 @@ export class VoicemailBoxesController {
 		@Inject(VoicemailPinService) private readonly pins: VoicemailPinService,
 	) {}
 
+	/**
+	 * `voicemail.read.own` and not `voicemail.read` — the `.own` fix, not a downgrade.
+	 *
+	 * An unscoped `voicemail.read` holder satisfies the scoped floor anyway (a grant covers its own
+	 * scopes), while a `user` holding only `voicemail.read.own` now clears the guard and the service
+	 * narrows the boxes to those whose extension is linked to them. See `shared/self-ownership.ts`.
+	 */
 	@Get()
-	@RequirePermissions("voicemail.read")
+	@RequirePermissions("voicemail.read.own")
 	async list(@Session() session: AppSession, @Query() query: unknown) {
 		return await this.boxes.list(session, parseDto(listQuerySchema, query ?? {}));
 	}
 
 	@Get(":id")
-	@RequirePermissions("voicemail.read")
+	@RequirePermissions("voicemail.read.own")
 	async get(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
 		return await this.boxes.get(session, id);
 	}

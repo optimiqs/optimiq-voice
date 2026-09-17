@@ -50,7 +50,13 @@ export type LegSignal =
 /** What can happen to a recording the walker started. */
 export type RecordingSignal =
 	| { readonly kind: "recording-started" }
-	| { readonly kind: "recording-finished"; readonly durationMs: number }
+	| {
+			readonly kind: "recording-finished";
+			readonly durationMs: number;
+			readonly bytes?: number;
+			/** PCI pause intervals, `[startMs, endMs)` against the file. Absent when none. */
+			readonly pauses?: readonly { readonly startMs: number; readonly endMs: number }[];
+	  }
 	| { readonly kind: "recording-failed"; readonly reason: string };
 
 export type CallSignal = LegSignal | RecordingSignal;

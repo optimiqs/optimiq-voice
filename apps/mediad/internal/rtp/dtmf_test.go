@@ -12,9 +12,9 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 )
 
-// The DTMF suite drives REAL sockets and a hand-driven clock, for the same reasons the playback
-// suite does: a digit is four bytes with a header on them at a defined cadence, and a test that
-// asserted a method was called would stay green with the E bit in the wrong place.
+// The DTMF suite drives real sockets and a hand-driven clock: a digit is four bytes with a header
+// on them at a defined cadence, and a mocked path would stay green with the E bit in the wrong
+// place.
 
 // The three fields of an RFC 4733 payload, pulled back out of the wire bytes.
 type telephoneEvent struct {
@@ -52,8 +52,7 @@ func sendDigits(t *testing.T, rig *playbackRig, sessionID, digits string) {
 }
 
 func TestDtmfEventCodesCoverEveryKeypadSymbol(t *testing.T) {
-	// The codes are RFC 4733 §3.2 and they are not arbitrary: a receiver looks the number up in the
-	// same table, so an off-by-one here is a caller who pressed 8 and an IVR that heard 9.
+	// RFC 4733 §3.2 codes: an off-by-one is a caller who pressed 8 and an IVR that heard 9.
 	for digit, want := range map[rune]byte{
 		'0': 0, '5': 5, '9': 9, '*': 10, '#': 11, 'A': 12, 'D': 15, 'b': 13,
 	} {
@@ -69,8 +68,7 @@ func TestDtmfEventCodesCoverEveryKeypadSymbol(t *testing.T) {
 }
 
 func TestDtmfValidatesTheWholeStringBeforeSendingAnything(t *testing.T) {
-	// Failing halfway would leave a far-end IVR holding a prefix of what was asked for, under a
-	// reply that said the request succeeded.
+	// Failing halfway would leave the far end holding a prefix under a reply that said success.
 	if _, err := rtp.ValidateDigits("12X4"); !errors.Is(err, rtp.ErrUnsendableDigit) {
 		t.Errorf("ValidateDigits(12X4) error = %v, want ErrUnsendableDigit", err)
 	}
@@ -88,9 +86,8 @@ func TestDtmfSendsOneDigitAsAGrowingEventWithThreeEndPackets(t *testing.T) {
 	rig.latch(t)
 	sendDigits(t, rig, rig.aID, "5")
 
-	// 100 ms of tone is five 20 ms packets, and each one reports the duration SO FAR: that growing
-	// number is how a receiver reconstructs one tone from several packets, and a constant one would
-	// make every digit look 20 ms long.
+	// 100 ms of tone is five 20 ms packets, each reporting the duration so far — which is how a
+	// receiver reconstructs one tone from several packets.
 	var first pionrtp.Packet
 	for index := 1; index <= 5; index++ {
 		rig.tick(t)
@@ -116,8 +113,8 @@ func TestDtmfSendsOneDigitAsAGrowingEventWithThreeEndPackets(t *testing.T) {
 		if want := uint16(index * audio.FrameTimestampStep); event.duration != want {
 			t.Errorf("packet %d duration = %d, want %d samples so far", index, event.duration, want)
 		}
-		// Every packet of one digit carries the timestamp the DIGIT started at. It is a span of the
-		// clock, not a point, and a timestamp that advanced per packet would be five separate tones.
+		// Every packet of one digit carries the timestamp the digit started at: a span of the clock,
+		// not a point. A timestamp advancing per packet would be five separate tones.
 		if packet.Timestamp != first.Timestamp {
 			t.Errorf("packet %d timestamp = %d, want the digit's start %d",
 				index, packet.Timestamp, first.Timestamp)
@@ -128,9 +125,8 @@ func TestDtmfSendsOneDigitAsAGrowingEventWithThreeEndPackets(t *testing.T) {
 		}
 	}
 
-	// Three copies of the END packet, back to back. Losing the only one that says "the digit is
-	// over" leaves the far end holding a tone open until its own timeout, which an IVR reads as one
-	// very long keypress or as two digits where the caller pressed one.
+	// Three copies of the END packet, back to back: losing the only one that says "the digit is
+	// over" leaves the far end holding the tone open until its own timeout.
 	for copyIndex := 1; copyIndex <= 3; copyIndex++ {
 		packet, ok := rig.aPhone.receive(t)
 		if !ok {
@@ -151,9 +147,8 @@ func TestDtmfSendsOneDigitAsAGrowingEventWithThreeEndPackets(t *testing.T) {
 }
 
 func TestDtmfKeepsTheSessionsOwnSSRCAndSequenceSpace(t *testing.T) {
-	// A digit is not a second stream. Giving it its own SSRC would make the endpoint see one sender
-	// stop and another start around every keypress, which is the click the relay's header rewrite
-	// exists to avoid; a sequence space of its own would look like catastrophic loss.
+	// A digit is not a second stream: its own SSRC would make the endpoint see a sender stop and
+	// start around every keypress, and its own sequence space would look like catastrophic loss.
 	rig := newPlaybackRig(t, 57420, 57439)
 	rig.latch(t)
 	sendDigits(t, rig, rig.aID, "1")
@@ -164,7 +159,7 @@ func TestDtmfKeepsTheSessionsOwnSSRCAndSequenceSpace(t *testing.T) {
 	}
 
 	var previousSeq uint16
-	for index := 0; index < 8; index++ { // 5 tone packets + 3 end copies
+	for index := range 8 { // 5 tone packets + 3 end copies
 		if index < 5 {
 			rig.tick(t)
 		}
@@ -184,8 +179,8 @@ func TestDtmfKeepsTheSessionsOwnSSRCAndSequenceSpace(t *testing.T) {
 }
 
 func TestDtmfAdvancesTheClockAcrossToneAndGapForTheNextDigit(t *testing.T) {
-	// The second digit must start where the first one's span ended, gap included. A second digit
-	// that reused the first's timestamp would be one tone to a receiver, not two.
+	// The second digit starts where the first's span ended, gap included; reusing the first's
+	// timestamp would be one tone to a receiver, not two.
 	rig := newPlaybackRig(t, 57440, 57459)
 	rig.latch(t)
 	err := rig.manager.SendDtmf(rig.aID, rtp.DtmfOptions{
@@ -216,7 +211,7 @@ func TestDtmfAdvancesTheClockAcrossToneAndGapForTheNextDigit(t *testing.T) {
 func drainDigit(t *testing.T, rig *playbackRig, tonePackets int, event byte) uint32 {
 	t.Helper()
 	var start uint32
-	for index := 0; index < tonePackets+3; index++ {
+	for index := range tonePackets + 3 {
 		if index < tonePackets {
 			rig.tick(t)
 		}
@@ -235,9 +230,8 @@ func drainDigit(t *testing.T, rig *playbackRig, tonePackets int, event byte) uin
 }
 
 func TestDtmfSuppressesRelayedAudioForTheLengthOfTheString(t *testing.T) {
-	// A digit occupies a SPAN of the outbound clock. An audio frame let out in the middle of it puts
-	// a second, unrelated clock inside the digit, and the receiver either regenerates a tone of the
-	// wrong length or drops it.
+	// A digit occupies a span of the outbound clock: an audio frame let out mid-span puts a second
+	// clock inside the digit.
 	rig := newPlaybackRig(t, 57460, 57479)
 	rig.latch(t)
 	if err := rig.manager.Bridge("bridge-1", rig.aID, rig.bID); err != nil {
@@ -256,7 +250,7 @@ func TestDtmfSuppressesRelayedAudioForTheLengthOfTheString(t *testing.T) {
 		Payload: make([]byte, audio.FrameSamples),
 	})
 
-	// The next thing leg A hears is the next TONE packet, never the peer's audio.
+	// The next thing leg A hears is the next tone packet, never the peer's audio.
 	rig.tick(t)
 	packet, ok := rig.aPhone.receive(t)
 	if !ok {
@@ -269,9 +263,8 @@ func TestDtmfSuppressesRelayedAudioForTheLengthOfTheString(t *testing.T) {
 }
 
 func TestDtmfRefusesALegThatNegotiatedNoTelephoneEventType(t *testing.T) {
-	// `not_supported`, never a silently synthesised tone. The far end said it does not expect RFC
-	// 4733; sending under a type it never agreed to produces digits it drops, and an inband tone
-	// needs a generator mediad does not have.
+	// `not_supported`, never a silently synthesised tone: sending under a payload type the far end
+	// never agreed to produces digits it drops.
 	rig := newBridgeRig(t, 57480, 57499)
 	descriptor, err := rig.manager.Allocate(rtp.AllocateOptions{
 		SessionID: "leg-plain", OrgID: testOrg, CallID: testCall,
@@ -296,8 +289,8 @@ func TestDtmfRefusesALegThatNegotiatedNoTelephoneEventType(t *testing.T) {
 }
 
 func TestDtmfRefusesALegThatHasNotBeenLatchedYet(t *testing.T) {
-	// Symmetric RTP learns the far end from its first packet, so a leg that has not sent has taught
-	// us nowhere to send. A digit that "started" into that would report success and go nowhere.
+	// Symmetric RTP learns the far end from its first packet, so a digit started on a leg that has
+	// not sent would report success and go nowhere.
 	rig := newPlaybackRig(t, 57500, 57519)
 	if err := rig.manager.SendDtmf(rig.aID, rtp.DtmfOptions{Digits: "1"}); !errors.Is(err, rtp.ErrNoRemote) {
 		t.Errorf("SendDtmf before a latch = %v, want ErrNoRemote", err)
@@ -312,14 +305,12 @@ func TestDtmfRefusesAnUnknownSession(t *testing.T) {
 }
 
 func TestDtmfQueuedDurationCountsToneAndGapPerDigit(t *testing.T) {
-	// The reply is sent when injection STARTS, so this is the only number that tells the caller when
-	// the far end will have heard the last digit.
+	// The reply is sent when injection starts, so this is what says when the last digit lands.
 	opts := rtp.DtmfOptions{Digits: "123", ToneDuration: 80 * time.Millisecond, Gap: 20 * time.Millisecond}
 	if got, want := opts.QueuedDuration(), 300*time.Millisecond; got != want {
 		t.Errorf("QueuedDuration = %v, want %v", got, want)
 	}
-	// Defaults are ARI's, so a request that names neither puts the same thing on the wire on either
-	// driver.
+	// Defaults are ARI's, so a request naming neither is identical on either driver.
 	if got, want := (rtp.DtmfOptions{Digits: "1"}).QueuedDuration(), 200*time.Millisecond; got != want {
 		t.Errorf("QueuedDuration with defaults = %v, want %v", got, want)
 	}

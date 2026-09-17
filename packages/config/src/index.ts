@@ -1,4 +1,4 @@
-export { env, getEnvEntries, getEnvVar } from "./env";
+export { env, getEnvVar } from "./env";
 export {
 	assertResolvedSecret,
 	MINIMUM_SECRET_LENGTH,

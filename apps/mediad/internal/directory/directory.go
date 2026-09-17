@@ -1,27 +1,17 @@
 // Package directory maintains the `media-sessions` KV bucket: which mediad instance holds which
 // RTP session.
 //
-// # The problem it solves, in one paragraph
+// `rpc.media.v1.*` is served by a QUEUE GROUP, so NATS hands each request to whichever mediad is
+// free. That is right for `allocate-session` and wrong for every command after it, because a
+// session lives on exactly ONE instance — its sockets are bound there. Without a directory, an
+// instance handed a `bridge-sessions` for somebody else's session cannot tell "this never existed"
+// from "this belongs to my neighbour", and those need opposite recoveries.
 //
-// `rpc.media.v1.*` is served by a QUEUE GROUP, so NATS hands each request to whichever mediad
-// happens to be free. That is right for `allocate-session` — any instance with a free port will do
-// — and wrong for every command after it, because a session lives on exactly ONE instance: its
-// sockets are bound there and its relay goroutines run there. Without a directory, an instance
-// handed a `bridge-sessions` for somebody else's session cannot tell "this never existed" from
-// "this belongs to my neighbour", and those need opposite recoveries: give up, versus re-issue
-// against the instance that owns it.
+// The alternative — the allocate reply carrying an instance-specific subject — puts routing state in
+// the engine, where a restart loses it and every live call becomes uncommandable.
 //
-// This is plans/mediad-design.md open question 2, answered. The alternative — the allocate reply
-// carrying an instance-specific subject the engine uses thereafter — is simpler and needs no
-// lookup, but it puts routing state in the engine, where an engine restart loses it and every live
-// call becomes uncommandable. It is also the substrate open question 3 (real graceful drain) will
-// need, because draining means MOVING sessions and you cannot move what you cannot enumerate.
-//
-// # What is deliberately NOT here
-//
-// Drain and migration (design doc open question 3). The directory records where a session is; it
-// does not move one, and moving one needs a re-INVITE from the signalling plane to repoint the far
-// end. Writing half of that now would be a mechanism nobody can finish a call with.
+// The directory records where a session IS; it does not MOVE one, because moving one needs a
+// re-INVITE from the signalling plane to repoint the far end.
 package directory
 
 import (
@@ -40,11 +30,8 @@ import (
 // shape mediad writes cannot drift.
 type Entry = contract.MediaSessionDirectoryEntry
 
-// Store is what the control surface needs from the directory.
-//
-// An interface so the control handlers are testable against an in-memory fake with no broker
-// anywhere near them — the same line sipd draws with its credentials.Store, and the reason the unit
-// suite runs in milliseconds.
+// Store is what the control surface needs from the directory. An interface so the control handlers
+// are testable against an in-memory fake with no broker anywhere near them.
 type Store interface {
 	// Put records (or overwrites) a session's owner.
 	Put(ctx context.Context, entry Entry) error
@@ -64,11 +51,10 @@ var _ Store = (*KVStore)(nil)
 
 // Open binds to the `media-sessions` bucket, creating it if it is absent.
 //
-// Creating rather than requiring it to exist, unlike sipd's stream publisher: a KV bucket's
-// definition is idempotent and comes from the shared contract package, so two processes creating it
-// with the same definition is not a race with a wrong outcome. The alternative — refusing to boot
-// until the control plane has run — would make the media plane depend on the control plane's
-// startup order for no safety in return.
+// Creating rather than requiring it to exist: a KV bucket's definition is idempotent and comes from
+// the shared contract package, so two processes creating it with the same definition is not a race
+// with a wrong outcome. Refusing to boot until the control plane has run would make the media plane
+// depend on the control plane's startup order for no safety in return.
 func Open(ctx context.Context, js jetstream.JetStream, log *slog.Logger) (*KVStore, error) {
 	definition := contract.MediaSessionsKV
 	kv, err := js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
@@ -121,9 +107,9 @@ func (s *KVStore) Get(ctx context.Context, sessionID string) (Entry, bool, error
 	}
 	var entry Entry
 	if err := json.Unmarshal(revision.Value(), &entry); err != nil {
-		// A value this process cannot parse is treated as absent rather than as fatal. The bucket
-		// is shared and additive-evolution is the rule everywhere else on this backbone; a strict
-		// reader here would turn a contract addition into an outage on the OLD instances.
+		// A value this process cannot parse is treated as absent rather than as fatal: the bucket is
+		// shared and additive evolution is the rule, so a strict reader would turn a contract addition
+		// into an outage on the OLD instances.
 		s.log.Warn("ignoring an unreadable session directory entry", "key", key, "error", err)
 		return Entry{}, false, nil
 	}
@@ -148,7 +134,7 @@ func (s *KVStore) Delete(ctx context.Context, sessionID string) error {
 // Timeout is the deadline every directory operation runs under.
 //
 // Short, and on the call path for a reason: an allocate that has already bound its ports is not
-// going to be abandoned because a KV write is slow, so the caller logs a failed write and carries
-// on with a session that works but is invisible to its neighbours. A long deadline here would turn
-// a degraded broker into slow call setup, which the caller hears as silence.
+// abandoned because a KV write is slow, so the caller logs and carries on with a session that works
+// but is invisible to its neighbours. A long deadline would turn a degraded broker into slow call
+// setup, which the caller hears as silence.
 const Timeout = 500 * time.Millisecond

@@ -1,9 +1,16 @@
-import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
+import {
+	Inject,
+	Injectable,
+	Optional,
+	type OnApplicationShutdown,
+	type OnModuleInit,
+} from "@nestjs/common";
 import { connect, type NatsConnection } from "nats";
 import { callLegs, withCdrWriterScope } from "@optimiq-voice/cdr-db";
 import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
 import { getLogger } from "@optimiq-voice/logging";
 import { CDR_DATABASE, CDR_ENV } from "../shared/cdr.tokens";
+import { CDR_ATTESTATION_STAMP } from "./attestation-stamp.port";
 import { mapCdrLegWrite } from "./cdr-leg-mapping";
 import { CdrPartitionCache } from "./cdr-partition-cache";
 import { quarantineMessage } from "./cdr-quarantine";
@@ -15,6 +22,7 @@ import {
 	type DurableMessage,
 } from "./durable-consumer";
 import type { CdrEnv } from "../shared/cdr-env";
+import type { AttestationStamp } from "./attestation-stamp.port";
 import type { CdrDatabaseClient } from "@optimiq-voice/cdr-db";
 
 const logger = getLogger("api.cdr");
@@ -94,6 +102,16 @@ export class CdrLegWriter implements OnModuleInit, OnApplicationShutdown {
 	constructor(
 		@Inject(CDR_ENV) private readonly env: CdrEnv,
 		@Inject(CDR_DATABASE) private readonly database: CdrDatabaseClient,
+		/**
+		 * The compliance area's attestation reconstruction, when it is mounted.
+		 *
+		 * `@Optional()` for the reason every port in `pbx-cdr-ports.module.ts` is: this module boots on
+		 * `CDR_DATABASE_URL` alone, and the stamp needs `pbx-db`. Absent, legs are filed exactly as the
+		 * payload described them. See `attestation-stamp.port.ts`.
+		 */
+		@Optional()
+		@Inject(CDR_ATTESTATION_STAMP)
+		private readonly attestation?: AttestationStamp,
 	) {
 		this.partitions = new CdrPartitionCache(database);
 	}
@@ -295,9 +313,11 @@ export class CdrLegWriter implements OnModuleInit, OnApplicationShutdown {
 			);
 		}
 
+		const values = await this.stamp(envelope.orgId, mapped.values);
+
 		try {
-			await this.partitions.ensureFor(mapped.values.startedAt);
-			const inserted = await this.insert(envelope.orgId, mapped.values);
+			await this.partitions.ensureFor(values.startedAt);
+			const inserted = await this.insert(envelope.orgId, values);
 			if (inserted) {
 				this.written += 1;
 			} else {
@@ -327,6 +347,68 @@ export class CdrLegWriter implements OnModuleInit, OnApplicationShutdown {
 			);
 			message.nak(redeliveryDelayMs(deliveries));
 		}
+	}
+
+	/**
+	 * The compliance columns, filled in when the payload did not carry them.
+	 *
+	 * Applied to the MAPPED values rather than to the payload, and only when the mapper produced no
+	 * `expectedAttestation` of its own — the engine is the authority when it has an answer, and this
+	 * is the backfill for the legs it does not.
+	 *
+	 * ## Which legs, and why it is not simply `direction === "outbound"`
+	 *
+	 * An attestation is a claim about the number PRESENTED to a carrier, so the leg it belongs on is
+	 * the one that reached a trunk. That leg is not reliably labelled `outbound`: a call a registered
+	 * handset places arrives at the platform as an INVITE, so the engine labels the A-leg `internal`
+	 * and the B-leg it dials toward the carrier `inbound`, while `destination_type` on both is
+	 * `trunk`. Keying on the direction label would therefore stamp nothing at all for the ordinary
+	 * case, which is a compliance column that is empty for exactly the calls it exists for.
+	 *
+	 * ## And why the caller id has to already BE an E.164
+	 *
+	 * `from_number` on a trunk leg is whatever the producer put there, and for a handset-originated
+	 * call that is often the EXTENSION number — `2001`, not the DID the carrier saw. Looking `2001`
+	 * up in the right-to-use table would miss, and a miss reads as C: the platform would stamp
+	 * "gateway attestation" onto a call it had actually attested A. A wrong level in a compliance
+	 * ledger is worse than an absent one, because an absent one is visibly absent. So this backfill
+	 * only acts when `from_number` is already an E.164, and the engine remains the authority for
+	 * every leg where the presented number is a fact only it holds (see "Cross-area" in
+	 * `GAP2026-compliance.md`).
+	 *
+	 * Failure is swallowed and the leg is filed unstamped. A billing ledger write must never be
+	 * quarantined because a compliance lookup could not reach `pbx-db`; the columns are nullable and a
+	 * NULL there reads as "nothing consulted the policy", which is exactly what happened.
+	 */
+	private async stamp(organizationId: string, values: CallLegValues): Promise<CallLegValues> {
+		// Read through a record view rather than off the mapped type: the two compliance columns are
+		// owned by `cdr-leg-mapping.ts`, and this file must not be the thing that breaks when that
+		// mapper's shape changes.
+		const current = values as unknown as Record<string, unknown>;
+		const reachedACarrier =
+			current.direction === "outbound" ||
+			current.destinationType === "trunk" ||
+			current.destinationType === "external";
+		if (
+			this.attestation === undefined ||
+			!reachedACarrier ||
+			(current.expectedAttestation !== undefined && current.expectedAttestation !== null)
+		) {
+			return values;
+		}
+		const presented = typeof current.fromNumber === "string" ? current.fromNumber : "";
+		if (!presented.startsWith("+")) {
+			return values;
+		}
+		const stamped = await this.attestation.stampOutbound(organizationId, presented);
+		if (stamped === undefined) {
+			return values;
+		}
+		return {
+			...values,
+			expectedAttestation: stamped.expectedAttestation ?? current.expectedAttestation ?? null,
+			callerIdRightToUse: stamped.callerIdRightToUse ?? current.callerIdRightToUse ?? null,
+		} as unknown as CallLegValues;
 	}
 
 	/**

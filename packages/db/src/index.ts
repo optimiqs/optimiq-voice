@@ -68,3 +68,55 @@ export {
 	uuidV7EntityId,
 	uuidV7PrimaryKey,
 } from "./schema/primitives";
+export {
+	organizationBranding,
+	organizationHierarchy,
+	organizationSsoProvider,
+} from "./schema/platform/organization-platform-schema";
+export {
+	type BrandingPatch,
+	type BrandingRow,
+	readBranding,
+	readBrandingByCustomDomain,
+	upsertBranding,
+} from "./platform-branding";
+export {
+	type ChildOrganizationRow,
+	createChildOrganization,
+	hasChildren,
+	type HierarchyRow,
+	listChildOrganizations,
+	listResellerOrganizationIds,
+	readHierarchy,
+	setChildSuspended,
+	upsertHierarchy,
+	userExists,
+} from "./platform-hierarchy";
+export {
+	listMailTemplates,
+	type MailTemplateRow,
+	readMailTemplate,
+	upsertMailTemplate,
+} from "./platform-mail-templates";
+export {
+	createSsoProvider,
+	deleteSsoProvider,
+	listEnabledSsoProvidersWithSecrets,
+	listSsoProviders,
+	readSsoProvider,
+	type SsoProviderInput,
+	type SsoProviderRow,
+	type SsoProviderSecretRow,
+	updateSsoProvider,
+} from "./platform-sso";
+export {
+	decryptSecret,
+	encryptSecret,
+	isEncryptedSecret,
+	loadSecretKey,
+	openStoredSecret,
+	SECRET_ENCRYPTION_KEY_VARIABLE,
+	SecretCipherError,
+	requireSecretKey,
+	secretsEqual,
+} from "./secret-cipher";

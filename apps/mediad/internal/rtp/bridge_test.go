@@ -6,20 +6,19 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
 	pionrtp "github.com/pion/rtp"
 
+	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
 )
 
-// The bridge suite drives REAL sockets over loopback rather than a mocked packet path.
-//
-// A relay is three things — a peer pointer, a header rewrite and a WriteToUDP — and two of them are
-// only observable on the wire. A test with a fake socket would assert that we called a method,
-// which is precisely the assertion that stays green when the bytes are wrong.
+// The bridge suite drives real sockets over loopback: a relay is a peer pointer, a header rewrite
+// and a WriteToUDP, and two of those are only observable on the wire.
 
 // bridgeRig is two sessions on one manager, each with a far end standing in for a phone.
 type bridgeRig struct {
@@ -63,10 +62,24 @@ func (p *phone) send(t *testing.T, packet pionrtp.Packet) {
 	}
 }
 
+// sendRaw puts arbitrary bytes on the wire, for what an open UDP port really receives.
+func (p *phone) sendRaw(t *testing.T, payload []byte) {
+	t.Helper()
+	if _, err := p.conn.WriteToUDP(payload, p.session); err != nil {
+		t.Fatalf("sending to the session: %v", err)
+	}
+}
+
 // receive waits for one packet, or reports that none arrived.
 func (p *phone) receive(t *testing.T) (pionrtp.Packet, bool) {
 	t.Helper()
-	if err := p.conn.SetReadDeadline(time.Now().Add(bridgeReadTimeout)); err != nil {
+	return p.receiveWithin(t, bridgeReadTimeout)
+}
+
+// receiveWithin is receive on a caller's deadline, for asserting that nothing arrives.
+func (p *phone) receiveWithin(t *testing.T, within time.Duration) (pionrtp.Packet, bool) {
+	t.Helper()
+	if err := p.conn.SetReadDeadline(time.Now().Add(within)); err != nil {
 		t.Fatalf("setting a read deadline: %v", err)
 	}
 	buf := make([]byte, 1500)
@@ -141,25 +154,34 @@ func newBridgeRigWithTypes(
 	}
 }
 
-// latch makes both sessions learn their far ends, which is a precondition for any forwarding: a
-// session with no latched remote has nowhere to send. One packet each side, exactly as a real call
-// starts.
+// latch makes both sessions learn their far ends, a precondition for any forwarding. One packet
+// each side, exactly as a real call starts.
+//
+// Waiting on Remote() alone is NOT enough to say the latch packet is spent: handlePacket latches
+// first and decides whether to relay last, so a bridge established inside that window relays the
+// latch frame, and the first thing the far end hears is 0xff at timestamp 0 instead of the audio
+// under test. A session reads its socket on ONE goroutine, so a second packet counted is proof the
+// first is finished with. The barrier is deliberately unparseable rather than audio: it is refused
+// before it could reach a peer, and it moves a counter (Malformed) no rig here reads, so the
+// arrival counts the recording rigs wait on still mean "the frame I just spoke".
 func (r *bridgeRig) latch(t *testing.T) {
 	t.Helper()
-	r.aPhone.send(t, pionrtp.Packet{
-		Header:  pionrtp.Header{Version: 2, PayloadType: rtp.PayloadTypePCMU, SSRC: 111},
-		Payload: []byte{0xff},
-	})
-	r.bPhone.send(t, pionrtp.Packet{
-		Header:  pionrtp.Header{Version: 2, PayloadType: rtp.PayloadTypePCMU, SSRC: 222},
-		Payload: []byte{0xff},
-	})
-	// Both packets arrive before the bridge exists, so neither is forwarded; they exist purely to
-	// teach each session where its own phone is.
-	waitFor(t, "both sessions latched onto their far ends", func() bool {
+	for _, leg := range []struct {
+		phone *phone
+		ssrc  uint32
+	}{{r.aPhone, 111}, {r.bPhone, 222}} {
+		leg.phone.send(t, pionrtp.Packet{
+			Header:  pionrtp.Header{Version: 2, PayloadType: rtp.PayloadTypePCMU, SSRC: leg.ssrc},
+			Payload: []byte{0xff},
+		})
+		leg.phone.sendRaw(t, []byte("not rtp"))
+	}
+	waitFor(t, "both sessions latched onto their far ends and spent the latch packet", func() bool {
 		a, aOK := r.manager.Get(r.aID)
 		b, bOK := r.manager.Get(r.bID)
-		return aOK && bOK && a.Remote() != nil && b.Remote() != nil
+		return aOK && bOK &&
+			a.Remote() != nil && b.Remote() != nil &&
+			a.Stats().Malformed >= 1 && b.Stats().Malformed >= 1
 	})
 }
 
@@ -169,6 +191,19 @@ func TestBridgeRelaysAudioBothWays(t *testing.T) {
 
 	if err := rig.manager.Bridge("bridge-1", rig.aID, rig.bID); err != nil {
 		t.Fatalf("Bridge: %v", err)
+	}
+
+	// Nothing that arrived before the bridge existed may cross it. This is the assertion the suite
+	// was missing: a relayed latch frame is a well-formed packet on the right leg, so every header
+	// check below passed on it and only the payload comparison noticed.
+	for _, leg := range []struct {
+		name  string
+		phone *phone
+	}{{"A", rig.aPhone}, {"B", rig.bPhone}} {
+		if stray, heard := leg.phone.receiveWithin(t, 50*time.Millisecond); heard {
+			t.Fatalf("leg %s heard %v before any bridged audio was sent: a pre-bridge packet was relayed",
+				leg.name, stray.Payload)
+		}
 	}
 
 	// A → B.
@@ -184,13 +219,12 @@ func TestBridgeRelaysAudioBothWays(t *testing.T) {
 		t.Errorf("payload = %v, want the sender's bytes verbatim: v1 is passthrough", got.Payload)
 	}
 	if got.Timestamp != 160 {
-		// A relay does not resample, so the sampling instant is still true. Rewriting it would be
-		// inventing a clock.
+		// A relay does not resample, so the sender's sampling instant is still true.
 		t.Errorf("Timestamp = %d, want the original 160", got.Timestamp)
 	}
 	if got.SequenceNumber == 7 {
-		// Passing the sender's numbers through would make the sequence space jump on a re-bridge,
-		// which a jitter buffer reads as catastrophic loss.
+		// Passing the sender's numbers through would jump the sequence space on a re-bridge, which
+		// a jitter buffer reads as catastrophic loss.
 		t.Error("SequenceNumber was passed through; it must be the outgoing session's own")
 	}
 	if got.SSRC == 111 {
@@ -211,8 +245,8 @@ func TestBridgeRelaysAudioBothWays(t *testing.T) {
 	}
 }
 
-// Each leg must see ONE synchronisation source for its whole life, and consecutive sequence
-// numbers. This is the property an endpoint's jitter buffer is built around.
+// Each leg must see one synchronisation source for its whole life and consecutive sequence numbers,
+// which is the property an endpoint's jitter buffer is built around.
 func TestBridgeGivesEachLegOneStableStream(t *testing.T) {
 	rig := newBridgeRig(t, 56020, 56039)
 	rig.latch(t)
@@ -222,7 +256,7 @@ func TestBridgeGivesEachLegOneStableStream(t *testing.T) {
 
 	var ssrc uint32
 	var previous uint16
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		rig.aPhone.send(t, pionrtp.Packet{
 			// The sender's own numbers jump around; the relay's must not.
 			Header:  pionrtp.Header{Version: 2, PayloadType: rtp.PayloadTypePCMU, SSRC: 111, SequenceNumber: uint16(1000 * i)},
@@ -246,8 +280,8 @@ func TestBridgeGivesEachLegOneStableStream(t *testing.T) {
 	}
 }
 
-// DTMF is the reason rung 3 is nearly free: a telephone-event payload is bytes to a relay. What is
-// NOT free is the payload-type number, which the two legs routinely negotiate differently.
+// A telephone-event payload is bytes to a relay; what is not free is the payload-type number, which
+// the two legs routinely negotiate differently.
 func TestBridgeTranslatesTheTelephoneEventPayloadType(t *testing.T) {
 	rig := newBridgeRigWithTypes(t, 56040, 56059,
 		rtp.PayloadTypePCMU, 101, // leg A negotiated 101
@@ -279,8 +313,8 @@ func TestBridgeTranslatesTheTelephoneEventPayloadType(t *testing.T) {
 	}
 }
 
-// A leg that never negotiated telephone-event has no number to send DTMF under. Dropping is the
-// only safe answer: an RFC 4733 payload rendered as G.711 is a loud click.
+// A leg that never negotiated telephone-event has no number to send DTMF under, and an RFC 4733
+// payload rendered as G.711 is a loud click.
 func TestBridgeDropsDTMFWhenThePeerNegotiatedNone(t *testing.T) {
 	rig := newBridgeRigWithTypes(t, 56060, 56079,
 		rtp.PayloadTypePCMU, 101,
@@ -323,8 +357,7 @@ func TestUnbridgeStopsTheRelayAndLeavesBothSessionsAlive(t *testing.T) {
 		t.Errorf("Unbridge returned %v, want both session ids", sessions)
 	}
 
-	// Separating legs is NOT hanging them up: an attended transfer takes a leg out of one bridge
-	// and puts it in another.
+	// Separating legs is not hanging them up: an attended transfer moves a leg between bridges.
 	if _, ok := rig.manager.Get(rig.aID); !ok {
 		t.Error("leg A was torn down by an unbridge")
 	}
@@ -341,8 +374,7 @@ func TestUnbridgeStopsTheRelayAndLeavesBothSessionsAlive(t *testing.T) {
 	}
 }
 
-// Idempotent, for the same reason allocate is: the engine's retry after a timeout is
-// indistinguishable from a fresh request at this layer.
+// Idempotent: a retry after a timeout is indistinguishable from a fresh request at this layer.
 func TestUnbridgeIsIdempotent(t *testing.T) {
 	rig := newBridgeRig(t, 56100, 56119)
 	if err := rig.manager.Bridge("bridge-1", rig.aID, rig.bID); err != nil {
@@ -360,8 +392,8 @@ func TestUnbridgeIsIdempotent(t *testing.T) {
 	}
 }
 
-// Re-bridging a session that is already in a bridge MOVES it. That is an attended transfer, and
-// refusing it would force the engine to unbridge first, which the caller hears as a gap.
+// Re-bridging a session that is already in a bridge moves it — an attended transfer. Refusing would
+// force the engine to unbridge first, which the caller hears as a gap.
 func TestBridgeRepointsASessionAndDetachesTheOldPeer(t *testing.T) {
 	rig := newBridgeRig(t, 56120, 56159)
 	rig.latch(t)
@@ -406,9 +438,8 @@ func TestBridgeRepointsASessionAndDetachesTheOldPeer(t *testing.T) {
 	}
 }
 
-// Releasing one half of a bridge stops the relay and leaves the survivor ALLOCATED. That is the
-// shape of "one party hung up": the engine decides whether the survivor hears a prompt, is
-// re-bridged, or is released in turn.
+// Releasing one half of a bridge stops the relay and leaves the survivor allocated: the engine
+// decides what happens to the party who did not hang up.
 func TestReleasingOneLegTearsDownTheRelayAndKeepsTheOther(t *testing.T) {
 	rig := newBridgeRig(t, 56160, 56179)
 	rig.latch(t)
@@ -440,15 +471,39 @@ func TestBridgeRefusals(t *testing.T) {
 		}
 	})
 
-	t.Run("codec mismatch", func(t *testing.T) {
-		// design doc §7: a mismatch is resolved by REFUSING, never by resampling in the media path.
-		// Relaying µ-law bytes to a leg expecting A-law would deliver audible noise.
+	t.Run("a codec mismatch is now TRANSLATED rather than refused", func(t *testing.T) {
+		// A codec mismatch is no longer a refusal: the bridge is accepted and a translation is
+		// installed on each direction.
 		rig := newBridgeRigWithTypes(t, 56200, 56219,
 			rtp.PayloadTypePCMU, 101,
 			rtp.PayloadTypePCMA, 101)
-		err := rig.manager.Bridge("bridge-1", rig.aID, rig.bID)
-		if !errors.Is(err, rtp.ErrCodecMismatch) {
-			t.Errorf("Bridge error = %v, want ErrCodecMismatch", err)
+		if err := rig.manager.Bridge("bridge-1", rig.aID, rig.bID); err != nil {
+			t.Fatalf("Bridge: %v", err)
+		}
+
+		a, _ := rig.manager.Get(rig.aID)
+		b, _ := rig.manager.Get(rig.bID)
+		if a.Transcoder() == nil || b.Transcoder() == nil {
+			t.Fatal("a mismatched bridge installed no translation, so one party would hear noise")
+		}
+		if got := a.Transcoder().To(); got != audio.FormatULaw {
+			t.Errorf("the A leg is fed %s, want PCMU: a transcoder is installed on its DESTINATION", got)
+		}
+		if got := b.Transcoder().To(); got != audio.FormatALaw {
+			t.Errorf("the B leg is fed %s, want PCMA", got)
+		}
+	})
+
+	t.Run("two legs that agreed keep the passthrough fast path", func(t *testing.T) {
+		// Transcoding must not slow the passthrough path down: a nil transcoder is what makes
+		// `forward` copy the payload byte for byte.
+		rig := newBridgeRig(t, 56260, 56279)
+		if err := rig.manager.Bridge("bridge-1", rig.aID, rig.bID); err != nil {
+			t.Fatalf("Bridge: %v", err)
+		}
+		a, _ := rig.manager.Get(rig.aID)
+		if a.Transcoder() != nil {
+			t.Error("two agreeing legs installed a transcoder; passthrough is the fast path")
 		}
 	})
 
@@ -470,8 +525,8 @@ func TestBridgeRefusals(t *testing.T) {
 	})
 }
 
-// A session with a peer but NO latched far end on the peer's side has nowhere to send. It must drop
-// rather than panic, and it must self-correct the moment that side speaks.
+// A session whose peer has no latched far end has nowhere to send: it must drop rather than panic,
+// and self-correct the moment that side speaks.
 func TestRelayWaitsForThePeerToLatch(t *testing.T) {
 	rig := newBridgeRig(t, 56260, 56279)
 
@@ -568,21 +623,21 @@ func (l *recordingLifecycle) DtmfReceived(_ rtp.SessionSummary, digit rtp.DtmfDi
 func (l *recordingLifecycle) detectedDigits() []rtp.DtmfDigit {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return append([]rtp.DtmfDigit(nil), l.digits...)
+	return slices.Clone(l.digits)
 }
 
 // recordingSummaries copies out what the packet path announced about finished recordings.
 func (l *recordingLifecycle) recordingSummaries() []rtp.RecordingSummary {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return append([]rtp.RecordingSummary(nil), l.recordings...)
+	return slices.Clone(l.recordings)
 }
 
 // playbackSummaries copies out what the packet path announced about finished prompts.
 func (l *recordingLifecycle) playbackSummaries() []rtp.PlaybackSummary {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return append([]rtp.PlaybackSummary(nil), l.playbacks...)
+	return slices.Clone(l.playbacks)
 }
 
 func (l *recordingLifecycle) endedReasons() []rtp.EndReason {
@@ -630,14 +685,14 @@ func newLifecycleManager(
 	return manager, lifecycle
 }
 
-// The two silences are DIFFERENT events, and conflating them would make every abandoned call setup
-// look like a media failure.
+// The two silences are different events; conflating them would make every abandoned call setup look
+// like a media failure.
 func TestReaperSeparatesRTPTimeoutFromAnIdleLeak(t *testing.T) {
 	clock := time.Now()
 	manager, lifecycle := newLifecycleManager(t, 56300, 56339,
 		time.Minute, 30*time.Second, func() time.Time { return clock })
 
-	// A session that HEARD something and then stopped: a media failure on a live call.
+	// A session that heard something and then stopped: a media failure on a live call.
 	talked, err := manager.Allocate(rtp.AllocateOptions{
 		SessionID: "talked", OrgID: testOrg, CallID: testCall,
 		AudioPayloadType: rtp.PayloadTypePCMU,
@@ -687,7 +742,7 @@ func TestReaperSeparatesRTPTimeoutFromAnIdleLeak(t *testing.T) {
 		t.Error("the never-latched session was reaped before its own, longer deadline")
 	}
 
-	// Past the idle backstop, the silent one goes too — as a LEAK, not as a media failure.
+	// Past the idle backstop, the silent one goes too — as a leak, not as a media failure.
 	clock = clock.Add(30 * time.Second)
 	if reaped := manager.ReapIdle(); reaped != 1 {
 		t.Fatalf("ReapIdle reaped %d sessions on the second pass, want 1", reaped)
@@ -722,7 +777,7 @@ func TestReleaseAndDrainAnnounceTheirOwnReasons(t *testing.T) {
 
 	manager.Release("released")
 
-	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
+	ctx, cancel := context.WithTimeout(t.Context(), readTimeout)
 	defer cancel()
 	if err := manager.Drain(ctx); err != nil {
 		t.Fatalf("Drain: %v", err)
@@ -736,13 +791,13 @@ func TestReleaseAndDrainAnnounceTheirOwnReasons(t *testing.T) {
 		t.Errorf("first reason = %q, want released", reasons[0])
 	}
 	if reasons[1] != rtp.EndReasonDrained {
-		// "calls on this instance lose audio" is the honest description of a drain, and the event
-		// says so rather than pretending the engine asked.
+		// A drain loses audio on this instance, and the event says so rather than pretending the
+		// engine asked.
 		t.Errorf("second reason = %q, want drained", reasons[1])
 	}
 }
 
-// The summary a Lifecycle receives must be the session's FINAL state, taken before the close.
+// The summary a Lifecycle receives must be the session's final state, taken before the close.
 func TestSessionSummaryCarriesTheFinalCounters(t *testing.T) {
 	manager, lifecycle := newLifecycleManager(t, 56380, 56399, 0, 0, nil)
 
@@ -783,5 +838,34 @@ func TestSessionSummaryCarriesTheFinalCounters(t *testing.T) {
 	}
 	if summary.RemoteAddr == "" {
 		t.Error("RemoteAddr is empty; the latched far end is what tells one silence from another")
+	}
+}
+
+func TestReaperKeepsNegotiatedHoldAndAllowsAudioToResume(t *testing.T) {
+	clock := time.Now()
+	manager, _ := newLifecycleManager(t, 56600, 56639, time.Minute, 30*time.Second, func() time.Time { return clock })
+	descriptor, err := manager.Allocate(rtp.AllocateOptions{SessionID: "held", OrgID: testOrg, CallID: testCall, AudioPayloadType: rtp.PayloadTypePCMU})
+	if err != nil {
+		t.Fatal(err)
+	}
+	phone := newPhone(t, descriptor.RTPPort)
+	phone.send(t, pionrtp.Packet{Header: pionrtp.Header{Version: 2, PayloadType: rtp.PayloadTypePCMU, SSRC: 111}, Payload: []byte{0xff}})
+	waitFor(t, "first audio packet", func() bool { session, ok := manager.Get("held"); return ok && session.Stats().PacketsReceived == 1 })
+	if err := manager.ApplyDirection("held", false, true); err != nil {
+		t.Fatal(err)
+	}
+	clock = clock.Add(2 * time.Minute)
+	if manager.ReapIdle() != 0 {
+		t.Fatal("negotiated hold was treated as a network failure")
+	}
+	if err := manager.ApplyDirection("held", false, false); err != nil {
+		t.Fatal(err)
+	}
+	if manager.ReapIdle() != 0 {
+		t.Fatal("resumed leg was reaped before audio could restart")
+	}
+	clock = clock.Add(31 * time.Second)
+	if manager.ReapIdle() != 1 {
+		t.Fatal("resumed leg that never recovered audio was not reaped")
 	}
 }

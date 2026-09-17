@@ -4,6 +4,7 @@ import {
 	ariPlaybackSchema,
 	ariVariableSchema,
 } from "../models";
+import { encodeSegment } from "../url";
 import type { AriHttpClient } from "../http-client";
 import type { AriChannel, AriLiveRecording, AriPlayback } from "../models";
 
@@ -103,7 +104,7 @@ export class AriChannels {
 	/** `GET /channels/{id}` — `undefined` when the channel is already gone. */
 	async get(channelId: string): Promise<AriChannel | undefined> {
 		return await this.http.requestParsedOptional(
-			{ method: "GET", path: `/channels/${encodeURIComponent(channelId)}` },
+			{ method: "GET", path: `/channels/${encodeSegment(channelId)}` },
 			ariChannelSchema,
 		);
 	}
@@ -120,7 +121,7 @@ export class AriChannels {
 	async answer(channelId: string): Promise<void> {
 		await this.http.requestVoid({
 			method: "POST",
-			path: `/channels/${encodeURIComponent(channelId)}/answer`,
+			path: `/channels/${encodeSegment(channelId)}/answer`,
 		});
 	}
 
@@ -128,7 +129,7 @@ export class AriChannels {
 	async ring(channelId: string): Promise<void> {
 		await this.http.requestVoid({
 			method: "POST",
-			path: `/channels/${encodeURIComponent(channelId)}/ring`,
+			path: `/channels/${encodeSegment(channelId)}/ring`,
 		});
 	}
 
@@ -136,7 +137,7 @@ export class AriChannels {
 	async ringStop(channelId: string): Promise<void> {
 		await this.http.requestVoid({
 			method: "DELETE",
-			path: `/channels/${encodeURIComponent(channelId)}/ring`,
+			path: `/channels/${encodeSegment(channelId)}/ring`,
 		});
 	}
 
@@ -149,7 +150,7 @@ export class AriChannels {
 	async hangup(channelId: string, options: HangupOptions = {}): Promise<void> {
 		await this.http.requestVoid({
 			method: "DELETE",
-			path: `/channels/${encodeURIComponent(channelId)}`,
+			path: `/channels/${encodeSegment(channelId)}`,
 			query: { reason: options.reason, reason_code: options.causeCode },
 			tolerateNotFound: true,
 		});
@@ -166,7 +167,7 @@ export class AriChannels {
 	): Promise<void> {
 		await this.http.requestVoid({
 			method: "POST",
-			path: `/channels/${encodeURIComponent(channelId)}/continue`,
+			path: `/channels/${encodeSegment(channelId)}/continue`,
 			query: {
 				context: options.context,
 				extension: options.extension,
@@ -180,7 +181,7 @@ export class AriChannels {
 		return await this.http.requestParsed(
 			{
 				method: "POST",
-				path: `/channels/${encodeURIComponent(channelId)}/play`,
+				path: `/channels/${encodeSegment(channelId)}/play`,
 				query: {
 					media: options.media,
 					lang: options.lang,
@@ -198,7 +199,7 @@ export class AriChannels {
 		return await this.http.requestParsed(
 			{
 				method: "POST",
-				path: `/channels/${encodeURIComponent(channelId)}/record`,
+				path: `/channels/${encodeSegment(channelId)}/record`,
 				query: {
 					name: options.name,
 					format: options.format,
@@ -223,7 +224,7 @@ export class AriChannels {
 		const result = await this.http.requestParsedOptional(
 			{
 				method: "GET",
-				path: `/channels/${encodeURIComponent(channelId)}/variable`,
+				path: `/channels/${encodeSegment(channelId)}/variable`,
 				query: { variable },
 			},
 			ariVariableSchema,
@@ -235,7 +236,7 @@ export class AriChannels {
 	async setVariable(channelId: string, variable: string, value: string): Promise<void> {
 		await this.http.requestVoid({
 			method: "POST",
-			path: `/channels/${encodeURIComponent(channelId)}/variable`,
+			path: `/channels/${encodeSegment(channelId)}/variable`,
 			query: { variable, value },
 		});
 	}
@@ -278,7 +279,7 @@ export class AriChannels {
 	): Promise<void> {
 		await this.http.requestVoid({
 			method: "POST",
-			path: `/channels/${encodeURIComponent(channelId)}/dial`,
+			path: `/channels/${encodeSegment(channelId)}/dial`,
 			query: { caller: options.caller, timeout: options.timeoutSeconds },
 		});
 	}
@@ -287,7 +288,7 @@ export class AriChannels {
 	async redirect(channelId: string, endpoint: string): Promise<void> {
 		await this.http.requestVoid({
 			method: "POST",
-			path: `/channels/${encodeURIComponent(channelId)}/redirect`,
+			path: `/channels/${encodeSegment(channelId)}/redirect`,
 			query: { endpoint },
 		});
 	}
@@ -296,7 +297,7 @@ export class AriChannels {
 	async sendDtmf(channelId: string, options: DtmfOptions): Promise<void> {
 		await this.http.requestVoid({
 			method: "POST",
-			path: `/channels/${encodeURIComponent(channelId)}/dtmf`,
+			path: `/channels/${encodeSegment(channelId)}/dtmf`,
 			query: {
 				dtmf: options.digits,
 				before: options.beforeMs,
@@ -311,7 +312,7 @@ export class AriChannels {
 	async mute(channelId: string, direction: AriMuteDirection = "both"): Promise<void> {
 		await this.http.requestVoid({
 			method: "POST",
-			path: `/channels/${encodeURIComponent(channelId)}/mute`,
+			path: `/channels/${encodeSegment(channelId)}/mute`,
 			query: { direction },
 		});
 	}
@@ -320,7 +321,7 @@ export class AriChannels {
 	async unmute(channelId: string, direction: AriMuteDirection = "both"): Promise<void> {
 		await this.http.requestVoid({
 			method: "DELETE",
-			path: `/channels/${encodeURIComponent(channelId)}/mute`,
+			path: `/channels/${encodeSegment(channelId)}/mute`,
 			query: { direction },
 		});
 	}
@@ -329,7 +330,7 @@ export class AriChannels {
 	async hold(channelId: string): Promise<void> {
 		await this.http.requestVoid({
 			method: "POST",
-			path: `/channels/${encodeURIComponent(channelId)}/hold`,
+			path: `/channels/${encodeSegment(channelId)}/hold`,
 		});
 	}
 
@@ -337,7 +338,7 @@ export class AriChannels {
 	async unhold(channelId: string): Promise<void> {
 		await this.http.requestVoid({
 			method: "DELETE",
-			path: `/channels/${encodeURIComponent(channelId)}/hold`,
+			path: `/channels/${encodeSegment(channelId)}/hold`,
 		});
 	}
 
@@ -350,7 +351,7 @@ export class AriChannels {
 	async startMoh(channelId: string, mohClass?: string): Promise<void> {
 		await this.http.requestVoid({
 			method: "POST",
-			path: `/channels/${encodeURIComponent(channelId)}/moh`,
+			path: `/channels/${encodeSegment(channelId)}/moh`,
 			query: { mohClass },
 		});
 	}
@@ -359,7 +360,7 @@ export class AriChannels {
 	async stopMoh(channelId: string): Promise<void> {
 		await this.http.requestVoid({
 			method: "DELETE",
-			path: `/channels/${encodeURIComponent(channelId)}/moh`,
+			path: `/channels/${encodeSegment(channelId)}/moh`,
 		});
 	}
 
@@ -371,7 +372,7 @@ export class AriChannels {
 		return await this.http.requestParsed(
 			{
 				method: "POST",
-				path: `/channels/${encodeURIComponent(channelId)}/snoop`,
+				path: `/channels/${encodeSegment(channelId)}/snoop`,
 				query: {
 					spy: options.spy,
 					whisper: options.whisper,

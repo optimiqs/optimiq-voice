@@ -5,13 +5,18 @@ import { makeAuditEvent } from "./schemas/audit-events";
 import { makeCallEvent } from "./schemas/call-events";
 import { makeCdrLegWriteEvent } from "./schemas/cdr-events";
 import { makeMediaEvent } from "./schemas/media-events";
+import { makeMessagingEvent } from "./schemas/messaging-events";
 import { makeProvisionEvent } from "./schemas/provision-events";
 import { makeQueueEvent } from "./schemas/queue-events";
 import { makeRegistrationEvent } from "./schemas/registration-events";
+import { makeSecurityEvent } from "./schemas/security-events";
+import { makeSipDialogEvent } from "./schemas/sip-dialog-events";
+import { makeTrunkEvent } from "./schemas/trunk-events";
 import { makeVoicemailEvent } from "./schemas/voicemail-events";
-import { EVENT_FAMILIES, RPC_SUBJECTS, subjectFor } from "./subjects";
+import { EVENT_FAMILIES, RPC_SUBJECTS, SECURITY_SCOPE_ORG, subjectFor } from "./subjects";
 import {
 	anyEventSchema,
+	assertEventSubjectMatches,
 	EVENT_SCHEMAS_BY_FAMILY,
 	eventSchemaForSubject,
 	safeValidateEvent,
@@ -26,6 +31,7 @@ const LEG = createEntityId();
 const QUEUE = createEntityId();
 const MAILBOX = createEntityId();
 const SESSION = createEntityId();
+const CONVERSATION = createEntityId();
 
 const callEvent = makeCallEvent("channel.answered", {
 	orgId: ORG,
@@ -46,6 +52,21 @@ const samples = {
 			contact: "sip:1001@10.0.0.5",
 			transport: "udp",
 			expiresInSeconds: 300,
+		},
+	}),
+	sipDialog: makeSipDialogEvent("dialog.terminated", {
+		orgId: ORG,
+		source: "sipd",
+		data: {
+			legId: LEG,
+			callId: CALL,
+			instanceId: "sipd-7c9f",
+			role: "uas",
+			identity: { sipCallId: "a84b4c76e66710@pc33", localTag: "9f2a", remoteTag: "31c8" },
+			reason: "bye",
+			cause: 16,
+			causeFromReasonHeader: false,
+			initiator: "remote",
 		},
 	}),
 	queue: makeQueueEvent("caller.abandoned", {
@@ -84,6 +105,26 @@ const samples = {
 			durationMs: 30_000,
 		},
 	}),
+	messaging: makeMessagingEvent("message.received", {
+		orgId: ORG,
+		conversationId: CONVERSATION,
+		source: "api",
+		data: {
+			messageId: createEntityId(),
+			messagingNumberId: createEntityId(),
+			fromE164: "+15551230000",
+			toE164: "+15559990000",
+			kind: "SMS",
+			body: "are you open on saturday?",
+			receivedAt: "2026-08-05T10:00:00.000Z",
+		},
+	}),
+	trunk: makeTrunkEvent("status.changed", {
+		orgId: ORG,
+		trunkId: createEntityId(),
+		source: "engine",
+		data: { status: "down", reason: "Unreachable", latencyMs: 900, endpoint: "carrier-a" },
+	}),
 	cdr: makeCdrLegWriteEvent({
 		orgId: ORG,
 		source: "engine",
@@ -101,6 +142,20 @@ const samples = {
 			hangupCause: "NORMAL_CLEARING",
 			hangupCauseCode: 16,
 			disposition: "answered",
+		},
+	}),
+	security: makeSecurityEvent("fraud-signal", {
+		orgId: ORG,
+		subjectRef: SECURITY_SCOPE_ORG,
+		source: "api",
+		data: {
+			kind: "international-minutes-spike",
+			severity: "warning",
+			action: "none",
+			observed: 240,
+			threshold: 60,
+			windowSeconds: 3_600,
+			summary: "240 international minutes in the last hour against a 60-minute ceiling.",
 		},
 	}),
 	audit: makeAuditEvent({
@@ -210,6 +265,39 @@ describe("subject cross-check", () => {
 		expect(result.error.message).toContain("does not match the subject's org token");
 	});
 
+	it("does not carry the payload in the issue it raises", () => {
+		// `issues` is public and a consumer may log the error object rather than `.summary`; the
+		// envelope here is a whole call event.
+		const moved = {
+			...overTheWire(callEvent),
+			subject: subjectFor.call(ORG, CALL, "channel.held"),
+		};
+		const result = safeValidateEvent(subjectFor.call(ORG, CALL, "channel.answered"), moved);
+		if (result.success) throw new Error("unreachable");
+		const error = result.error;
+		if (!(error instanceof EventValidationError)) throw new Error("unreachable");
+		expect(JSON.stringify(error.issues)).not.toContain(LEG);
+	});
+
+	it("is available on its own for a producer that just built the envelope", () => {
+		// The publisher's path: `makeCallEvent` has already parsed the envelope against this very
+		// schema, so re-parsing it is the half of `validateEvent` that buys nothing. This is the
+		// half that does — and it must still catch both mistakes.
+		expect(() => {
+			assertEventSubjectMatches(callEvent.subject, callEvent);
+		}).not.toThrow();
+
+		const moved = { ...callEvent, subject: subjectFor.call(ORG, CALL, "channel.held") };
+		expect(() => {
+			assertEventSubjectMatches(subjectFor.call(ORG, CALL, "channel.answered"), moved);
+		}).toThrow(/does not match the delivery subject/);
+
+		const crossTenant = { ...callEvent, orgId: OTHER_ORG };
+		expect(() => {
+			assertEventSubjectMatches(callEvent.subject, crossTenant);
+		}).toThrow(/does not match the subject's org token/);
+	});
+
 	it("can be disabled for a replay from a file", () => {
 		const crossTenant = { ...overTheWire(samples.audit), orgId: OTHER_ORG };
 		expect(
@@ -265,5 +353,34 @@ describe("forward compatibility", () => {
 		expect(() =>
 			validateEvent(subjectFor.call(ORG, CALL, "channel.teleported"), unknownType),
 		).toThrow(EventValidationError);
+	});
+});
+
+describe("messaging events", () => {
+	it("derives the conversation subject from the input", () => {
+		const event = makeMessagingEvent("message.delivered", {
+			orgId: ORG,
+			conversationId: CONVERSATION,
+			source: "api",
+			data: {
+				messageId: createEntityId(),
+				messagingNumberId: createEntityId(),
+				fromE164: "+15559990000",
+				toE164: "+15551230000",
+				status: "failed",
+				errorReason: "handset unreachable",
+				occurredAt: "2026-08-05T10:00:01.000Z",
+			},
+		});
+		expect(event.subject).toBe(subjectFor.messaging(ORG, CONVERSATION, "message.delivered"));
+		expect(validateEvent(event.subject, overTheWire(event))).toEqual(event);
+	});
+
+	it("rejects a type outside the family union", () => {
+		const stray = {
+			...overTheWire(samples.messaging),
+			type: "message.failed",
+		};
+		expect(EVENT_SCHEMAS_BY_FAMILY.messaging.safeParse(stray).success).toBe(false);
 	});
 });

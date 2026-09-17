@@ -1,7 +1,14 @@
 import { expect } from "chai";
 import * as schema from "@optimiq-voice/pbx-db";
 import { DESTINATION_TARGET_TABLES, DESTINATION_TYPES, getTableName } from "@optimiq-voice/pbx-db";
+import { CALL_FLOW_RESOURCE } from "../../src/pbx/call-flows/call-flows.resource";
 import { CONFERENCE_RESOURCE } from "../../src/pbx/conferences/conferences.resource";
+import {
+	AUDIO_STREAM_RESOURCE,
+	DESTINATION_ALIAS_RESOURCE,
+	DIAL_BY_NAME_DIRECTORY_RESOURCE,
+	SPEED_DIAL_RESOURCE,
+} from "../../src/pbx/dial-plan/dial-plan.resource";
 import { EXTENSION_RESOURCE } from "../../src/pbx/extensions/extensions.resource";
 import { FEATURE_CODE_RESOURCE } from "../../src/pbx/feature-codes/feature-codes.resource";
 import { INBOUND_ROUTE_RESOURCE } from "../../src/pbx/inbound-routes/inbound-routes.resource";
@@ -10,8 +17,13 @@ import {
 	IVR_MENU_RESOURCE,
 } from "../../src/pbx/ivr-menus/ivr-menus.resource";
 import { OUTBOUND_ROUTE_RESOURCE } from "../../src/pbx/outbound-routes/outbound-routes.resource";
+import {
+	PAGING_GROUP_MEMBER_RESOURCE,
+	PAGING_GROUP_RESOURCE,
+} from "../../src/pbx/paging-groups/paging-groups.resource";
 import { PARK_LOT_RESOURCE } from "../../src/pbx/park-lots/park-lots.resource";
 import { PHONE_NUMBER_RESOURCE } from "../../src/pbx/phone-numbers/phone-numbers.resource";
+import { PIN_SET_ENTRY_RESOURCE, PIN_SET_RESOURCE } from "../../src/pbx/pin-sets/pin-sets.resource";
 import {
 	QUEUE_AGENT_RESOURCE,
 	QUEUE_RESOURCE,
@@ -26,6 +38,10 @@ import {
 	TIME_CONDITION_RESOURCE,
 	TIME_CONDITION_RULE_RESOURCE,
 } from "../../src/pbx/time-conditions/time-conditions.resource";
+import {
+	TRANSLATION_RULE_RESOURCE,
+	TRANSLATION_RULESET_RESOURCE,
+} from "../../src/pbx/translations/translations.resource";
 import { TRUNK_RESOURCE } from "../../src/pbx/trunks/trunks.resource";
 import { VOICEMAIL_BOX_RESOURCE } from "../../src/pbx/voicemail-boxes/voicemail-boxes.resource";
 import type { PbxChildResource, PbxResource } from "../../src/pbx/shared/pbx-resource";
@@ -76,6 +92,8 @@ const RESOURCES: readonly PbxResource[] = [
 	IVR_MENU_OPTION_RESOURCE,
 	RING_GROUP_RESOURCE,
 	RING_GROUP_DESTINATION_RESOURCE,
+	PAGING_GROUP_RESOURCE,
+	PAGING_GROUP_MEMBER_RESOURCE,
 	QUEUE_RESOURCE,
 	QUEUE_AGENT_RESOURCE,
 	QUEUE_TIER_RESOURCE,
@@ -83,13 +101,26 @@ const RESOURCES: readonly PbxResource[] = [
 	PARK_LOT_RESOURCE,
 	FEATURE_CODE_RESOURCE,
 	VOICEMAIL_BOX_RESOURCE,
+	// The T2 admin block.
+	CALL_FLOW_RESOURCE,
+	PIN_SET_RESOURCE,
+	PIN_SET_ENTRY_RESOURCE,
+	TRANSLATION_RULESET_RESOURCE,
+	TRANSLATION_RULE_RESOURCE,
+	DESTINATION_ALIAS_RESOURCE,
+	AUDIO_STREAM_RESOURCE,
+	DIAL_BY_NAME_DIRECTORY_RESOURCE,
+	SPEED_DIAL_RESOURCE,
 ];
 
 /** The collections whose order is semantic, and therefore have a `PUT …/reorder`. */
 const CHILD_RESOURCES: readonly PbxChildResource[] = [
+	PIN_SET_ENTRY_RESOURCE,
+	TRANSLATION_RULE_RESOURCE,
 	TIME_CONDITION_RULE_RESOURCE,
 	IVR_MENU_OPTION_RESOURCE,
 	RING_GROUP_DESTINATION_RESOURCE,
+	PAGING_GROUP_MEMBER_RESOURCE,
 	QUEUE_TIER_RESOURCE,
 ];
 
@@ -210,7 +241,10 @@ describe("PBX resource declarations", () => {
 			}
 			expect(scanned.size, `no destination sites declared`).to.be.greaterThan(0);
 		}
-		// Every table that owns a trio is scanned exactly as often as it owns one.
-		expect(DESTINATION_SITES.length).to.equal(14);
+		// Every table that owns a trio is scanned exactly as often as it owns one. Fourteen before the
+		// T2 admin block, twenty after it: call flows own TWO (a switch's dead half must refuse a
+		// delete as loudly as its live half), and aliases, streams, directories and speed dials own
+		// one each.
+		expect(DESTINATION_SITES.length).to.equal(20);
 	});
 });

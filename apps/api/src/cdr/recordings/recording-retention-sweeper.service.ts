@@ -1,4 +1,10 @@
-import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
+import {
+	Inject,
+	Injectable,
+	Optional,
+	type OnApplicationShutdown,
+	type OnModuleInit,
+} from "@nestjs/common";
 import {
 	expiredRecordingsSelectQuery,
 	purgedRecordingSoftDeleteQuery,
@@ -7,8 +13,10 @@ import {
 } from "@optimiq-voice/cdr-db";
 import { getLogger } from "@optimiq-voice/logging";
 import { CDR_DATABASE, CDR_ENV, CDR_RECORDING_STORE } from "../shared/cdr.tokens";
+import { RECORDING_PURGE_AUDIT } from "./purge-audit";
 import type { ObjectStore } from "../../storage";
 import type { CdrEnv } from "../shared/cdr-env";
+import type { RecordingPurgeAudit } from "./purge-audit";
 import type { CdrDatabaseClient } from "@optimiq-voice/cdr-db";
 
 const logger = getLogger("api.cdr");
@@ -27,7 +35,7 @@ const DAY_MS = 24 * 60 * 60 * 1_000;
  * ran the sweep, and nothing had ever written the column, so every recording was "keep for ever"
  * and the retention policy in the product was a date in a table nobody read.
  *
- * ## Objects first, row second
+ * ## Objects first, row second, ledger third
  *
  * The order is the whole design. A row tombstoned before its object is gone is a recording the API
  * refuses to play (`recordings.service.ts` returns 410 on `deleted_at`) while the audio is still
@@ -68,6 +76,14 @@ export class CdrRecordingRetentionSweeper implements OnModuleInit, OnApplication
 		@Inject(CDR_ENV) private readonly env: CdrEnv,
 		@Inject(CDR_DATABASE) private readonly database: CdrDatabaseClient,
 		@Inject(CDR_RECORDING_STORE) private readonly store: ObjectStore,
+		/**
+		 * The purge ledger, implemented on the PBX side of the port and therefore OPTIONAL: a
+		 * deployment without the PBX area has no `audit_log` to write, and the sweep must keep
+		 * purging on schedule regardless — see `purge-audit.ts`.
+		 */
+		@Optional()
+		@Inject(RECORDING_PURGE_AUDIT)
+		private readonly purgeAudit?: RecordingPurgeAudit,
 	) {}
 
 	get stats(): {
@@ -175,6 +191,8 @@ export class CdrRecordingRetentionSweeper implements OnModuleInit, OnApplication
 			await this.database.adminDb.execute(purgedRecordingSoftDeleteQuery(now, removed)),
 		).length;
 
+		await this.auditPurged(due, removed);
+
 		// The second half: rows whose object went long enough ago that the tombstone itself has
 		// served its purpose. Independent of the batch above, and cheap when there is nothing to do.
 		const purgedTombstones = rowsOf(
@@ -200,6 +218,44 @@ export class CdrRecordingRetentionSweeper implements OnModuleInit, OnApplication
 			);
 		}
 		return { purged: removed.length, tombstoned };
+	}
+
+	/**
+	 * The audit row on delete — one ledger entry per recording whose OBJECT actually went, written
+	 * through the optional port after the tombstone so the ledger never claims a purge the next
+	 * pass will retry. AFTER the tombstone rather than inside anything: the purge is already
+	 * irreversible by then (the bytes are gone), so the honest failure mode of a ledger outage is
+	 * a purge that happened and was not recorded — logged loudly here — never a record of a purge
+	 * that did not happen. The failure is swallowed for the same reason the port is optional: the
+	 * sweep enforcing the retention window must not be hostage to the OTHER database's uptime.
+	 */
+	private async auditPurged(
+		due: readonly ExpiredRecordingRow[],
+		removed: readonly string[],
+	): Promise<void> {
+		if (this.purgeAudit === undefined || removed.length === 0) {
+			return;
+		}
+		const removedSet = new Set(removed);
+		const byOrganization = new Map<string, { recordingId: string; objectKey: string }[]>();
+		for (const row of due) {
+			if (!removedSet.has(row.id)) {
+				continue;
+			}
+			const entries = byOrganization.get(row.organization_id) ?? [];
+			entries.push({ recordingId: row.id, objectKey: row.object_key });
+			byOrganization.set(row.organization_id, entries);
+		}
+		for (const [organizationId, entries] of byOrganization) {
+			try {
+				await this.purgeAudit.recordAudit(organizationId, entries);
+			} catch (error) {
+				logger.error(
+					{ organizationId, purged: entries.length, err: String(error) },
+					"purged recordings could not be recorded in the audit ledger",
+				);
+			}
+		}
 	}
 }
 

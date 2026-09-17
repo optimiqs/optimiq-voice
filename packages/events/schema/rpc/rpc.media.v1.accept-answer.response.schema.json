@@ -1,0 +1,50 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"ok": {
+			"type": "boolean"
+		},
+		"sessionId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"codec": {
+			"type": "string",
+			"enum": ["PCMU", "PCMA"]
+		},
+		"telephoneEventPayloadType": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 127
+		},
+		"mediaEncryption": {
+			"type": "string",
+			"enum": ["encrypted", "plaintext"]
+		},
+		"instanceId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"reason": {
+			"type": "string",
+			"enum": [
+				"bad_request",
+				"capacity",
+				"shutting_down",
+				"unknown_session",
+				"wrong_instance",
+				"not_supported",
+				"internal"
+			]
+		},
+		"error": {
+			"type": "string",
+			"maxLength": 512
+		}
+	},
+	"required": ["ok", "sessionId"],
+	"additionalProperties": false
+}

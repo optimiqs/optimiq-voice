@@ -7,9 +7,12 @@ import {
 	ServiceUnavailableException,
 } from "@nestjs/common";
 import * as Schema from "effect/Schema";
+import { getLogger } from "@optimiq-voice/logging";
 import { getTableConfig } from "@optimiq-voice/pbx-db";
 import type { PgTable } from "@optimiq-voice/pbx-db";
 import type { Diagnostic } from "@optimiq-voice/routing";
+
+const logger = getLogger("api.pbx");
 
 /**
  * The PBX area's failure taxonomy.
@@ -244,10 +247,16 @@ export class PbxDatabaseFailure extends Schema.TaggedErrorClass<PbxDatabaseFailu
 	{ operation: Schema.String, detail: Schema.String },
 ) {
 	toHttpException(): HttpException {
+		// `detail` is the raw Postgres message and stays OUT of the body. This is the fallback arm —
+		// it fires for the SQLSTATEs nobody anticipated — and those messages routinely carry table,
+		// column and constraint names, the failing literal, and for a connection failure the host and
+		// port. Every other failure in this file is careful about disclosure (`PLATFORM_WIDE_CONSTRAINTS`
+		// exists so a cross-tenant unique violation says nothing about the other tenant); the default
+		// must not be the one that undoes it. `toPbxFailure` logs the detail with the operation.
 		return new ServiceUnavailableException({
 			statusCode: HttpStatus.SERVICE_UNAVAILABLE,
 			code: "PBX_DATABASE_UNAVAILABLE",
-			message: `The telephony database refused "${this.operation}": ${this.detail}`,
+			message: `The telephony database refused "${this.operation}".`,
 		});
 	}
 }
@@ -302,10 +311,22 @@ const UNIQUE_VIOLATION = "23505";
  * "contact the owner": the existence of the claim is already the minimum this constraint has to
  * disclose in order to be enforceable at all.
  */
-const PLATFORM_WIDE_CONSTRAINTS: Readonly<Record<string, string>> = {
-	phone_number_e164_global_key:
-		"That number is already provisioned on this platform. A DID has exactly one owner, so it " +
-		"has to be released from wherever it is configured before it can be added here.",
+const PLATFORM_WIDE_CONSTRAINTS: Readonly<
+	Record<string, { readonly detail: string; readonly field?: string }>
+> = {
+	org_setting_sip_realm_global_key: {
+		detail: "This SIP domain is already assigned to another organization.",
+		// `field` is stated rather than derived: the index is on the EXPRESSION
+		// `lower(btrim(value #>> '{}'))`, so `constraintField` finds no column and would answer "",
+		// leaving the settings form with a 409 it cannot attach to an input. The name is the
+		// catalogue's (`sip`/`realm`), which is the key the patch body carries.
+		field: "realm",
+	},
+	phone_number_e164_global_key: {
+		detail:
+			"That number is already provisioned on this platform. A DID has exactly one owner, so it " +
+			"has to be released from wherever it is configured before it can be added here.",
+	},
 };
 /** Postgres `check_violation` — a table-level invariant the row broke. */
 const CHECK_VIOLATION = "23514";
@@ -366,11 +387,12 @@ export function toPbxFailure(
 	const error = asPostgresError(cause);
 	if (error?.code === UNIQUE_VIOLATION) {
 		const constraint = error.constraint_name ?? "unique index";
+		const platformWide = PLATFORM_WIDE_CONSTRAINTS[constraint];
 		return new PbxConflictFailure({
 			kind,
-			field: constraintField(constraint, table),
+			field: platformWide?.field ?? constraintField(constraint, table),
 			detail:
-				PLATFORM_WIDE_CONSTRAINTS[constraint] ??
+				platformWide?.detail ??
 				`Another ${kind} in this organization already uses that value (${constraint}).`,
 		});
 	}
@@ -384,10 +406,13 @@ export function toPbxFailure(
 			detail: `The values are not a valid ${kind}: they break ${constraint}.`,
 		});
 	}
-	return new PbxDatabaseFailure({
-		operation: `${kind}.${operation}`,
-		detail: error?.message ?? String(cause),
-	});
+	const detail = error?.message ?? String(cause);
+	// Logged here because the 503 body deliberately does not carry it — see `toHttpException`.
+	logger.error(
+		{ operation: `${kind}.${operation}`, detail },
+		"the telephony database refused a statement",
+	);
+	return new PbxDatabaseFailure({ operation: `${kind}.${operation}`, detail });
 }
 
 /**

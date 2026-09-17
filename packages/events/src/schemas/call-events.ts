@@ -15,6 +15,8 @@ import {
 	pickupKindSchema,
 	recordingKindSchema,
 	recordingStopReasonSchema,
+	tapEndReasonSchema,
+	tapModeSchema,
 	transferKindSchema,
 } from "./telephony";
 
@@ -90,6 +92,41 @@ export const channelDtmfDataSchema = z.object({
 	source: dtmfSourceSchema,
 });
 
+/**
+ * What the platform asked of the caller before it started recording, and what they answered.
+ *
+ * ## Why the literals are written out here
+ *
+ * This mirrors `RecordingConsentRecord` in `packages/routing`, which is where the vocabulary is
+ * declared — the compiler bakes the POLICY into the artifact and the engine stamps the OUTCOME onto
+ * the leg, so both ends have to speak the same three words. It is mirrored and not imported because
+ * `packages/events` depends on nothing but `telephony`: every producer and every consumer on the bus
+ * imports this package, and making the wire contract depend on the routing compiler would drag the
+ * compiler into processes that never route a call. The mirror is checked by the tests on both sides;
+ * an import would be a dependency nobody can remove later.
+ *
+ * ## Why it travels whole
+ *
+ * The four facts are only meaningful together. `declined` with no `method` cannot be told apart from
+ * a producer that forgot the field, and an `at` with no outcome dates nothing. `regions` is the one
+ * that answers the question an auditor actually asks — why a call whose tenant configured no
+ * announcement was announced anyway — and it is bounded at 16 for the same reason `parties` is
+ * bounded at 4: a jurisdiction list is a handful of entries, and an unbounded array on a bus message
+ * is a memory budget nobody set.
+ */
+export const recordingConsentSchema = z.object({
+	outcome: z.enum(["not-required", "announced", "accepted", "declined"]),
+	method: z.enum(["none", "announcement", "keypress"]),
+	policy: z.enum(["none", "announce", "announce-and-require-keypress"]),
+	/** When the outcome was decided — not when the recording started; a decline starts none. */
+	at: z.iso.datetime(),
+	parties: z.array(z.enum(["caller", "callee"])).max(4),
+	/** The jurisdictions that forced all-party treatment. Absent when none did. */
+	regions: z.array(z.string().max(16)).max(16).optional(),
+	/** The prompt row that was played. Absent when the engine used its seeded stem. */
+	promptId: z.uuid().optional(),
+});
+
 /** `channel.record.started` — a media bug is now writing to `objectKey`. */
 export const channelRecordStartedDataSchema = z.object({
 	legId: z.uuid(),
@@ -99,6 +136,17 @@ export const channelRecordStartedDataSchema = z.object({
 	kind: recordingKindSchema,
 	/** True when each leg is written to its own channel (per-leg stereo). */
 	stereo: z.boolean().optional(),
+	/**
+	 * The consent that authorised this recording, landing on `cdr-db` `recordings.consent`.
+	 *
+	 * It rides the START and not the stop because it is the fact that made the start legitimate, and
+	 * a recording that is still running is exactly when somebody may ask. Absent means a producer
+	 * that predates consent handling, or a media plane that cannot announce — never "consent was
+	 * refused", because a refusal starts no recording and therefore publishes no `record.started` at
+	 * all. Optional for that reason, and because an old consumer that ignores the key writes the row
+	 * it always wrote.
+	 */
+	consent: recordingConsentSchema.optional(),
 });
 
 /** `channel.record.stopped` — the object is final; the CDR's `recordingKey` can be set. */
@@ -109,6 +157,18 @@ export const channelRecordStoppedDataSchema = z.object({
 	durationMs: z.int().min(0),
 	reason: recordingStopReasonSchema,
 	bytes: z.int().min(0).optional(),
+	/**
+	 * Every stretch a PCI pause silenced, `[startMs, endMs)` against the object's own timeline.
+	 *
+	 * The recording is ONE object with quiet in the middle of it, and nothing in the audio says
+	 * whether the quiet was the agent pausing or the caller thinking. This is what tells a
+	 * compliance reviewer which, so it lands on `recordings` beside the duration. Absent when
+	 * nothing was paused, and absent on a media plane that cannot pause.
+	 */
+	pauses: z
+		.array(z.object({ startMs: z.int().min(0), endMs: z.int().min(0) }))
+		.max(256)
+		.optional(),
 });
 
 /**
@@ -146,6 +206,19 @@ export const conferenceJoinedDataSchema = z.object({
 	memberCount: z.int().min(1),
 });
 
+/**
+ * Why a participant left a room.
+ *
+ * `hung-up` is the ordinary end and covers every departure the participant chose. `kicked` is a
+ * moderator's decision and is the whole reason this field exists: a report that could not tell the
+ * two apart would show a meeting where four people left early and no evidence that somebody removed
+ * them. `room-ended` is the room going away underneath a member — the last moderator left a room
+ * that requires one, or the bridge was torn down.
+ */
+export const CONFERENCE_LEAVE_REASONS = ["hung-up", "kicked", "room-ended"] as const;
+export const conferenceLeaveReasonSchema = z.enum(CONFERENCE_LEAVE_REASONS);
+export type ConferenceLeaveReason = (typeof CONFERENCE_LEAVE_REASONS)[number];
+
 /** `conference.left` — the leg is out of the room. Paired with a `conference.joined`. */
 export const conferenceLeftDataSchema = z.object({
 	legId: z.uuid(),
@@ -156,6 +229,73 @@ export const conferenceLeftDataSchema = z.object({
 	/** Members remaining AFTER this one left. Zero means the bridge was torn down. */
 	memberCount: z.int().min(0),
 	durationMs: z.int().min(0).optional(),
+	/**
+	 * Why they left. OPTIONAL, and absent is read as `hung-up`: an artifact of a release that
+	 * predates moderation is not a room where everybody was kicked. See
+	 * {@link conferenceLeaveReasonSchema}.
+	 */
+	reason: conferenceLeaveReasonSchema.optional(),
+	/** The control-plane user who kicked them. Present only with `reason: "kicked"`. */
+	byUserId: z.uuid().optional(),
+});
+
+/**
+ * `conference.participant.updated` — a member's state inside the room changed.
+ *
+ * ## The whole state, every time
+ *
+ * Every mutable field is REQUIRED and carries the value AFTER the change, rather than the schema
+ * modelling a delta with one optional field set. A participant list is rebuilt from these, and a
+ * consumer that applied a delta to a row it had drawn from a frame it missed would show a mute
+ * button that disagrees with the mixer — which is the one failure a moderation panel cannot
+ * tolerate, because the operator's next action is based on what it says.
+ *
+ * ## Not published on join or leave
+ *
+ * Those are `conference.joined` and `conference.left`, which already carry the member. Publishing
+ * this alongside them would make every arrival two events and every departure two, and a consumer
+ * counting participants would have to know which of the pair to ignore.
+ */
+export const conferenceParticipantUpdatedDataSchema = z.object({
+	legId: z.uuid(),
+	conferenceId: z.uuid(),
+	roomNumber: dialStringSchema,
+	/** Whether the ROOM hears this member. */
+	muted: z.boolean(),
+	/** Whether this member hears the room. Independent of {@link muted}; both can be true. */
+	deafened: z.boolean(),
+	moderator: z.boolean(),
+	/**
+	 * The member's gain, in percent of unity, as the mixer is applying it.
+	 *
+	 * Percent for the reason `conferenceControlRequestSchema.gainPercent` gives, and REQUIRED
+	 * rather than optional-when-unchanged: 100 is a real, renderable answer ("this member is at
+	 * normal volume") and an absent field is not.
+	 *
+	 * On a media plane with no per-participant gain both stay at 100 forever, which is honest — the
+	 * mixer is applying unity because it can apply nothing else — and the refusal the operator sees
+	 * when they move the slider comes from the command, not from this event.
+	 */
+	talkGainPercent: z.int().min(0).max(400),
+	listenGainPercent: z.int().min(0).max(400),
+	/** The control-plane user who made the change. Absent when the member did it themselves (`*6`). */
+	byUserId: z.uuid().optional(),
+});
+
+/**
+ * `conference.locked` / `conference.unlocked` — the room stopped, or resumed, admitting people.
+ *
+ * `legId` is deliberately absent, unlike every other event on this root: a lock is a fact about the
+ * ROOM and the leg that happens to be publishing it is an implementation detail of which instance
+ * served the command. Carrying one would invite a consumer to attribute the lock to a participant.
+ */
+export const conferenceLockChangedDataSchema = z.object({
+	conferenceId: z.uuid(),
+	roomNumber: dialStringSchema,
+	/** Members in the room, cluster-wide, when the lock changed. */
+	memberCount: z.int().min(0),
+	/** The control-plane user who locked or unlocked it. */
+	byUserId: z.uuid().optional(),
 });
 
 /**
@@ -249,6 +389,18 @@ export const callEmergencyDialedDataSchema = z.object({
 	number: dialStringSchema,
 	/** The calling station, when there is one. An API-originated leg may have none. */
 	callerNumber: dialStringSchema.optional(),
+	/**
+	 * The registered device the call was placed FROM, when the edge knew which one it was.
+	 *
+	 * This is the field that turns a dispatchable location from an inference into a fact. Without
+	 * it a consumer has to walk `callerNumber → extension → device_line → device`, which is right
+	 * for one desk on one extension and a coin flip for two — the case Ray Baum's Act exists for.
+	 *
+	 * Absent means the consumer falls back to that inference: an API-originated leg has no
+	 * registration, a trunk INVITE has no device, and a SIP edge that predates the field sends
+	 * none. Absence is therefore never an error, and a consumer must not treat it as one.
+	 */
+	deviceId: z.uuid().optional(),
 	callerName: z.string().max(128).optional(),
 	/** The ELIN actually presented. Absent means the call went out with no caller id at all. */
 	elin: dialStringSchema.optional(),
@@ -256,6 +408,99 @@ export const callEmergencyDialedDataSchema = z.object({
 	emergencyAddressId: z.uuid().optional(),
 	/** The trunk the first attempt was placed over, for the "did it get out?" question. */
 	trunkName: z.string().max(128).optional(),
+});
+
+/**
+ * `call.tap.started` — a supervisor is now listening to a call that is not theirs.
+ *
+ * ## Why the subject is the TARGET call, not the supervisor's
+ *
+ * Both are real calls with real ids, and the supervisor's leg has its own `channel.created`. The
+ * subject is the monitored one because that is the call anybody ever asks about: a compliance
+ * review starts from "this customer conversation" and needs to discover who was on it. Keyed the
+ * other way, finding the taps on a call would mean scanning every call in the org.
+ *
+ * `legId` is therefore the SUPERVISOR's leg — the one this event is news about — matching the
+ * convention `call.picked-up` uses, where `legId` is the party that acted.
+ *
+ * ## Published again on escalation
+ *
+ * `*0` starts in `eavesdrop` and DTMF moves it to `whisper` (5) or `barge` (6). Each transition
+ * publishes a fresh `started` carrying the new `mode`, with `previousMode` set. A single event
+ * with the final mode would mean a supervisor who listened silently for ten minutes and then
+ * barged is indistinguishable from one who barged immediately.
+ */
+export const callTapStartedDataSchema = z.object({
+	/** The supervisor's own leg — the party doing the listening. */
+	legId: z.uuid(),
+	mode: tapModeSchema,
+	/** The supervising extension, as the engine authenticated it. */
+	supervisorExtension: dialStringSchema,
+	/** The extension whose call is being monitored — what `*0` was dialled with. */
+	targetExtension: dialStringSchema,
+	/** The monitored party's leg inside the target call, when it is known. */
+	targetLegId: z.uuid().optional(),
+	/**
+	 * The mode this replaced, on an escalation. Absent on the first `started` of a tap, which is
+	 * what distinguishes "began monitoring" from "changed how they were monitoring".
+	 */
+	previousMode: tapModeSchema.optional(),
+	/** The supervisor's own call id, so the two calls can be joined without a scan. */
+	supervisorCallId: z.uuid().optional(),
+});
+
+/** `call.tap.ended` — the supervisor stopped listening. Bounds the monitored interval. */
+export const callTapEndedDataSchema = z.object({
+	legId: z.uuid(),
+	mode: tapModeSchema,
+	supervisorExtension: dialStringSchema,
+	targetExtension: dialStringSchema,
+	reason: tapEndReasonSchema,
+	/** How long the tap was open. Absent when the engine lost the start (a restart mid-tap). */
+	durationMs: z.int().min(0).optional(),
+});
+
+/**
+ * `call.paging.started` — a one-way announcement was opened to a group of handsets.
+ *
+ * `answeredCount` is the number of members whose phone actually auto-answered, and it is the
+ * point of the event: a page to a group of twelve where two phones were unregistered is a page
+ * the person making it believes reached everybody. `memberCount` is what was attempted, so the
+ * pair is a delivery report rather than an intention.
+ */
+export const callPagingStartedDataSchema = z.object({
+	/** The pager's own leg — the party talking. */
+	legId: z.uuid(),
+	/** `paging_group.id`. */
+	pagingGroupId: z.uuid(),
+	pagingGroupName: z.string().max(128),
+	/** The dial code that opened it, e.g. `*81` plus the group's number. */
+	dialed: dialStringSchema.optional(),
+	pagerExtension: dialStringSchema.optional(),
+	/** Members the page was offered to. */
+	memberCount: z.int().min(0),
+	/** Members whose handset came up. */
+	answeredCount: z.int().min(0),
+	/**
+	 * False for a talkback page, where members can answer back.
+	 *
+	 * Required rather than defaulted, because the publisher always knows: it is compiled onto the
+	 * paging node and the engine read it in order to decide which way to point the audio. A default
+	 * here would let a producer that forgot the field report a one-way announcement for a page the
+	 * whole warehouse could talk over.
+	 */
+	oneWay: z.boolean(),
+});
+
+/** `call.paging.ended` — the announcement finished and its bridge went away. */
+export const callPagingEndedDataSchema = z.object({
+	legId: z.uuid(),
+	pagingGroupId: z.uuid(),
+	pagingGroupName: z.string().max(128),
+	/** How long the page was open. */
+	durationMs: z.int().min(0).optional(),
+	/** Members still connected when it ended, for the "did anybody hang up early?" question. */
+	answeredCount: z.int().min(0).optional(),
 });
 
 /** Every call event contract, keyed by its `type` (which is also its subject event token). */
@@ -283,6 +528,17 @@ export const CALL_EVENT_DEFINITIONS = {
 	"channel.destroyed": defineEvent("call", "channel.destroyed", channelDestroyedDataSchema),
 	"conference.joined": defineEvent("call", "conference.joined", conferenceJoinedDataSchema),
 	"conference.left": defineEvent("call", "conference.left", conferenceLeftDataSchema),
+	"conference.participant.updated": defineEvent(
+		"call",
+		"conference.participant.updated",
+		conferenceParticipantUpdatedDataSchema,
+	),
+	"conference.locked": defineEvent("call", "conference.locked", conferenceLockChangedDataSchema),
+	"conference.unlocked": defineEvent(
+		"call",
+		"conference.unlocked",
+		conferenceLockChangedDataSchema,
+	),
 	"call.parked": defineEvent("call", "call.parked", callParkedDataSchema),
 	"call.unparked": defineEvent("call", "call.unparked", callUnparkedDataSchema),
 	"call.transferred": defineEvent("call", "call.transferred", callTransferredDataSchema),
@@ -292,6 +548,10 @@ export const CALL_EVENT_DEFINITIONS = {
 		"call.emergency.dialed",
 		callEmergencyDialedDataSchema,
 	),
+	"call.tap.started": defineEvent("call", "call.tap.started", callTapStartedDataSchema),
+	"call.tap.ended": defineEvent("call", "call.tap.ended", callTapEndedDataSchema),
+	"call.paging.started": defineEvent("call", "call.paging.started", callPagingStartedDataSchema),
+	"call.paging.ended": defineEvent("call", "call.paging.ended", callPagingEndedDataSchema),
 } as const;
 
 export type CallEventDefinitions = typeof CALL_EVENT_DEFINITIONS;
@@ -322,11 +582,18 @@ export const callEventSchema = z.discriminatedUnion("type", [
 	CALL_EVENT_DEFINITIONS["channel.destroyed"].envelope,
 	CALL_EVENT_DEFINITIONS["conference.joined"].envelope,
 	CALL_EVENT_DEFINITIONS["conference.left"].envelope,
+	CALL_EVENT_DEFINITIONS["conference.participant.updated"].envelope,
+	CALL_EVENT_DEFINITIONS["conference.locked"].envelope,
+	CALL_EVENT_DEFINITIONS["conference.unlocked"].envelope,
 	CALL_EVENT_DEFINITIONS["call.parked"].envelope,
 	CALL_EVENT_DEFINITIONS["call.unparked"].envelope,
 	CALL_EVENT_DEFINITIONS["call.transferred"].envelope,
 	CALL_EVENT_DEFINITIONS["call.picked-up"].envelope,
 	CALL_EVENT_DEFINITIONS["call.emergency.dialed"].envelope,
+	CALL_EVENT_DEFINITIONS["call.tap.started"].envelope,
+	CALL_EVENT_DEFINITIONS["call.tap.ended"].envelope,
+	CALL_EVENT_DEFINITIONS["call.paging.started"].envelope,
+	CALL_EVENT_DEFINITIONS["call.paging.ended"].envelope,
 ]);
 
 export type CallEventEnvelope = z.infer<typeof callEventSchema>;

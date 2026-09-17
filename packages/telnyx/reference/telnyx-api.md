@@ -29,21 +29,21 @@ places noted below):**
 
 Filters are one `filter` parameter serialized `deepObject`/`explode`, i.e. `filter[key]=value`.
 
-| Parameter                            | Values                                                                                   |
-| ------------------------------------ | ---------------------------------------------------------------------------------------- |
-| `filter[country_code]`               | ISO-3166 alpha-2                                                                          |
-| `filter[national_destination_code]`  | area code                                                                                 |
-| `filter[phone_number][contains]`     | also `[starts_with]`, `[ends_with]`                                                        |
-| `filter[locality]`                   | city                                                                                      |
-| `filter[administrative_area]`        | state/province                                                                            |
-| `filter[rate_center]`                | US/CA only                                                                                |
-| **`filter[phone_number_type]`**      | `local` · `toll_free` · `mobile` · `national` · `shared_cost`                              |
-| `filter[features]`                   | `sms` `mms` `voice` `fax` `emergency` `hd_voice` `international_sms` `local_calling`        |
-| `filter[limit]`                      | integer                                                                                    |
-| `filter[best_effort]`                | boolean, US/CA only                                                                        |
-| `filter[quickship]`                  | boolean, +1 toll-free only                                                                 |
-| `filter[reservable]`                 | boolean                                                                                    |
-| `filter[exclude_held_numbers]`       | boolean                                                                                    |
+| Parameter                           | Values                                                                               |
+| ----------------------------------- | ------------------------------------------------------------------------------------ |
+| `filter[country_code]`              | ISO-3166 alpha-2                                                                     |
+| `filter[national_destination_code]` | area code                                                                            |
+| `filter[phone_number][contains]`    | also `[starts_with]`, `[ends_with]`                                                  |
+| `filter[locality]`                  | city                                                                                 |
+| `filter[administrative_area]`       | state/province                                                                       |
+| `filter[rate_center]`               | US/CA only                                                                           |
+| **`filter[phone_number_type]`**     | `local` · `toll_free` · `mobile` · `national` · `shared_cost`                        |
+| `filter[features]`                  | `sms` `mms` `voice` `fax` `emergency` `hd_voice` `international_sms` `local_calling` |
+| `filter[limit]`                     | integer                                                                              |
+| `filter[best_effort]`               | boolean, US/CA only                                                                  |
+| `filter[quickship]`                 | boolean, +1 toll-free only                                                           |
+| `filter[reservable]`                | boolean                                                                              |
+| `filter[exclude_held_numbers]`      | boolean                                                                              |
 
 > **Trap.** It is `filter[phone_number_type]` here but `filter[number_type][eq]` on
 > `GET /v2/phone_numbers`. The two endpoints genuinely differ.
@@ -96,8 +96,8 @@ phone_number_type, regulatory_requirements[], requirements_met, requirements_sta
   `deleted` · `requirement-info-exception` · `requirement-info-pending` ·
   `requirement-info-under-review`.
 
-**Ordering constraint.** Error `85000` — *"You must search for the number through our API before
-attempting to purchase."* An arbitrary E.164 cannot be ordered; a search must precede the order.
+**Ordering constraint.** Error `85000` — _"You must search for the number through our API before
+attempting to purchase."_ An arbitrary E.164 cannot be ordered; a search must precede the order.
 
 List filters include `filter[customer_reference]`, which is the reconciliation path this package
 relies on in the absence of idempotency (below).
@@ -195,14 +195,14 @@ INVITE with a SIP `407` and the same digest credential answers it
 
 Regional signalling FQDNs (DNS-verified 2026-08-06):
 
-| Region      | FQDN                | Addresses                     |
-| ----------- | ------------------- | ----------------------------- |
-| US          | `sip.telnyx.com`    | 192.76.120.10, 64.16.250.10   |
-| Europe      | `sip.telnyx.eu`     | 185.246.41.140, .141          |
-| Australia   | `sip.telnyx.com.au` | 103.115.244.145, .146         |
-| Canada      | `sip.telnyx.ca`     | 192.76.120.31, 64.16.250.13   |
-| Middle East | `sip.telnyx.me`     | 185.246.42.128, .129          |
-| Asia (beta) | `sip.telnyx.asia`   | 103.115.244.158, .159         |
+| Region      | FQDN                | Addresses                   |
+| ----------- | ------------------- | --------------------------- |
+| US          | `sip.telnyx.com`    | 192.76.120.10, 64.16.250.10 |
+| Europe      | `sip.telnyx.eu`     | 185.246.41.140, .141        |
+| Australia   | `sip.telnyx.com.au` | 103.115.244.145, .146       |
+| Canada      | `sip.telnyx.ca`     | 192.76.120.31, 64.16.250.13 |
+| Middle East | `sip.telnyx.me`     | 185.246.42.128, .129        |
+| Asia (beta) | `sip.telnyx.asia`   | 103.115.244.158, .159       |
 
 > Two Telnyx doc pages publish `sip-eu.telnyx.com` / `sip-ca.telnyx.com` / `sip-au.telnyx.com`.
 > Those names do not resolve. There are no city-level signalling hostnames; city names appear only
@@ -233,17 +233,90 @@ addition fails loudly here rather than silently downstream.
 
 ---
 
+## Programmable Fax — `POST /v2/faxes`, `GET /v2/faxes/{id}`
+
+<https://developers.telnyx.com/api-reference/programmable-fax/send-fax>
+
+Fax is routed at the **carrier edge**, not in the media plane: mediad has no T.38 gateway and no
+CNG/CED tone detector (rung 8, absent — see `plans/parity-audit-2026-08-11.md` rows 2.27, 4.20), so
+Telnyx receives the inbound fax and renders it to a document, and we hand Telnyx a document to send.
+
+`POST /v2/faxes` — send. Body:
+
+| Field               | Notes                                                                          |
+| ------------------- | ------------------------------------------------------------------------------ |
+| `connection_id`     | **required** — a fax-enabled connection / Fax Application id                   |
+| `to`, `from`        | **required** — E.164                                                           |
+| `media_url`         | a URL to the source PDF or TIFF. **Exactly one** of `media_url` / `media_name` |
+| `media_name`        | a name from the Media Storage API. Exactly one of the two                      |
+| `from_display_name` | optional header text                                                           |
+| `quality`           | `normal` (default) · `high` · `ultra`                                          |
+| `monochrome`        | boolean, default false                                                         |
+| `store_media`       | boolean, default false — keep the sent document for later retrieval            |
+| `t38_enabled`       | boolean, default true                                                          |
+| `webhook_url`       | per-fax override of the connection webhook                                     |
+| `client_state`      | echoed verbatim on every `fax.*` webhook — our correlation token               |
+
+> **Trap.** `POST /v2/faxes` returns **202 Accepted**, not 200/201 — the fax is _queued_, and the
+> outcome arrives asynchronously over webhooks. `GET /v2/faxes/{id}` returns the identical `fax`
+> object, so one schema serves both.
+
+> **Trap.** There is **no `Idempotency-Key`** on this endpoint (§Idempotency), and no
+> `customer_reference`/filter to reconcile by. So a send must be `retryable: false` — a retried send
+> is a second fax — and reconciliation is by webhook keyed on `client_state`, or a `GET` on the id
+> the 202 returned.
+
+The `fax` object (send response and read):
+
+```jsonc
+{
+	"data": {
+		"record_type": "fax",
+		"id": "<uuid>",
+		"direction": "outbound", // or "inbound"
+		"status": "queued", // queued → media.processed → originated → sending → delivered|failed
+		"connection_id": "<uuid>",
+		"from": "+13125550000",
+		"to": "+13125551111",
+		"quality": "normal",
+		"media_url": "https://…/doc.pdf",
+		"media_name": null,
+		"original_media_url": "https://…/doc.pdf",
+		"stored_media_url": null,
+		"page_count": null,
+		"store_media": false,
+		"t38_enabled": true,
+		"client_state": "<our fax_message row id>",
+		"created_at": "…",
+		"updated_at": "…",
+	},
+}
+```
+
+Statuses (object level): `queued` · `media.processed` · `originated` · `sending` · `delivered` ·
+`failed` · `initiated` · `receiving` · `received`. Unknown members must not break a read.
+
+Fax lifecycle is reported over webhooks (§Webhooks), not polled.
+
+---
+
 ## Errors
 
 <https://developers.telnyx.com/development/api-fundamentals/api-errors> ·
 catalog: <https://developers.telnyx.com/data/api-errors.json>
 
 ```jsonc
-{ "errors": [ { "code": "10009",
-                "title": "Authentication failed",
-                "detail": "Could not find any usable credentials in the request.",
-                "source": { "pointer": "/" },
-                "meta": { "url": "…" } } ] }
+{
+	"errors": [
+		{
+			"code": "10009",
+			"title": "Authentication failed",
+			"detail": "Could not find any usable credentials in the request.",
+			"source": { "pointer": "/" },
+			"meta": { "url": "…" },
+		},
+	],
+}
 ```
 
 > **Trap.** `code` is a **string** on the wire (verified live) even though one of the spec's two
@@ -251,21 +324,21 @@ catalog: <https://developers.telnyx.com/data/api-errors.json>
 
 Codes this integration branches on or logs by name:
 
-| Code    | Meaning                                                    |
-| ------- | ---------------------------------------------------------- |
-| `10009` | Authentication failed — our platform key is wrong           |
-| `10010` | Authorization failed                                       |
-| `10011` | Too many requests (the 429 body code)                      |
-| `10015` | Bad request / invalid `Idempotency-Key`                    |
-| `10027` | Unprocessable entity                                       |
-| `20012` | Account inactive                                           |
-| `20100` | Insufficient funds                                         |
-| `85000` | Must search the number through the API before ordering     |
-| `85001` | Phone numbers not available                                |
-| `85004` | Invalid connection id provided                             |
-| `85006` | The phone number is already reserved                       |
-| `90042` | Outbound voice profile channel limit exceeded              |
-| `90043` | Connection outbound channel limit exceeded                 |
+| Code    | Meaning                                                |
+| ------- | ------------------------------------------------------ |
+| `10009` | Authentication failed — our platform key is wrong      |
+| `10010` | Authorization failed                                   |
+| `10011` | Too many requests (the 429 body code)                  |
+| `10015` | Bad request / invalid `Idempotency-Key`                |
+| `10027` | Unprocessable entity                                   |
+| `20012` | Account inactive                                       |
+| `20100` | Insufficient funds                                     |
+| `85000` | Must search the number through the API before ordering |
+| `85001` | Phone numbers not available                            |
+| `85004` | Invalid connection id provided                         |
+| `85006` | The phone number is already reserved                   |
+| `90042` | Outbound voice profile channel limit exceeded          |
+| `90043` | Connection outbound channel limit exceeded             |
 
 HTTP statuses in use: 200, 201, 202, 204, 400, 401, 403, 404, 409, 422, 429, 500, 502, 503, 504.
 
@@ -307,7 +380,7 @@ retryable**. This package therefore
 1. sets `retryable: false` on order creation, so a timeout never silently becomes a second order;
 2. stamps a caller-supplied `customer_reference` on every order, which is our own idempotency
    token; and
-3. exposes `numberOrders.findByCustomerReference` so an ambiguous failure is *reconciled* rather
+3. exposes `numberOrders.findByCustomerReference` so an ambiguous failure is _reconciled_ rather
    than retried.
 
 Where Telnyx does honour the header, the contract is: `^[A-Za-z0-9_-]{1,255}$`, 409 while a request
@@ -348,12 +421,16 @@ verify(base64decode(signature), utf8(`${timestamp}|${rawBody}`), base64decode(pu
 Body, for `webhook_api_version: "2"`:
 
 ```jsonc
-{ "data": { "record_type": "event",
-            "event_type": "number_order.complete",
-            "id": "<uuid>",
-            "occurred_at": "2026-08-06T16:23:54.496464Z",
-            "payload": { /* the number order, as in §Number orders */ } },
-  "meta": { "attempt": 1, "delivered_to": "https://…/webhooks/telnyx" } }
+{
+	"data": {
+		"record_type": "event",
+		"event_type": "number_order.complete",
+		"id": "<uuid>",
+		"occurred_at": "2026-08-06T16:23:54.496464Z",
+		"payload": {/* the number order, as in §Number orders */},
+	},
+	"meta": { "attempt": 1, "delivered_to": "https://…/webhooks/telnyx" },
+}
 ```
 
 > **Traps.** This envelope holds **only** for `webhook_api_version: "2"`; version `"1"` — the
@@ -361,7 +438,7 @@ Body, for `webhook_api_version: "2"`:
 > sets `"2"` explicitly on every connection it creates.
 >
 > The only number-order event type is **`number_order.complete`**; there is no
-> `number_order.status_update` (that is the OpenAPI *webhook key*, not the emitted string). It
+> `number_order.status_update` (that is the OpenAPI _webhook key_, not the emitted string). It
 > fires for both outcomes, so branch on `data.payload.status`.
 >
 > **There are no `phone_number.*` webhook events at all.** Number state changes are polled.

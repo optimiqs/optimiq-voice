@@ -90,6 +90,7 @@ function harness(options: HarnessOptions = {}): Harness {
 		isAnswered: options.answered !== false,
 		bridgeId: options.bridged === false ? undefined : "bridge-1",
 		peerMediaChannelId: "b",
+		side: "a",
 		moveTo: () => true,
 		moveCallStateTo: () => true,
 		setBridge: () => undefined,
@@ -113,8 +114,8 @@ function harness(options: HarnessOptions = {}): Harness {
 			return { ok: true };
 		},
 		hasPendingTransfer: () => options.pendingTransfer === true,
-		park: async (_leg, request) => {
-			calls.push({ method: "park", args: request });
+		parkPeer: async (_leg, request) => {
+			calls.push({ method: "parkPeer", args: request });
 			return options.parkResult ?? { result: { ok: true }, slot: 401 };
 		},
 		startRecording: async (): Promise<RecordingOutcome> => {
@@ -344,14 +345,14 @@ describe("*5 — park", () => {
 		await press(h, "*5");
 		h.advanceTo(DEFAULT_MID_CALL_FEATURE_SETTINGS.interDigitTimeoutMs + 1);
 		await flush();
-		expect(h.calls).toEqual([{ method: "park", args: {} }]);
+		expect(h.calls).toEqual([{ method: "parkPeer", args: {} }]);
 	});
 
 	it("takes the orbit the parker asked for", async () => {
 		const h = harness();
 		await press(h, "*5401#");
 		await flush();
-		expect(h.calls).toEqual([{ method: "park", args: { orbit: "401" } }]);
+		expect(h.calls).toEqual([{ method: "parkPeer", args: { orbit: "401" } }]);
 	});
 
 	it("settles the machine when the park is refused, rather than swallowing forever", async () => {
@@ -521,5 +522,91 @@ describe("lifecycle", () => {
 		h.runtime.clear();
 		expect(h.runtime.activeCaptureCount).toBe(0);
 		expect(await press(h, "#")).toEqual(["pass-through"]);
+	});
+});
+
+// =================================================================================================
+// The supervisor's mode keys
+// =================================================================================================
+
+/**
+ * `4`/`5`/`6` while a tap is open.
+ *
+ * These digits deliberately never enter the machine's table — see `armSupervisionKeys` — so the
+ * assertions are about the boundary rather than about the state machine: armed only where a runtime
+ * armed them, gone the moment it disarms, and never able to reach the far end of a conversation the
+ * supervisor is not part of.
+ */
+describe("supervision mode keys", () => {
+	it("consumes an armed mode key and reports the mode it means", async () => {
+		const h = harness();
+		const pressed: string[] = [];
+		h.runtime.armSupervisionKeys("a", async (mode) => {
+			pressed.push(mode);
+		});
+
+		expect(await h.runtime.offer(h.leg, "4")).toBe("consumed");
+		expect(await h.runtime.offer(h.leg, "5")).toBe("consumed");
+		expect(await h.runtime.offer(h.leg, "6")).toBe("consumed");
+		await Promise.resolve();
+		// The FreeSWITCH `eavesdrop` convention, digit for digit, so a supervisor moving from another
+		// PBX finds the keys where they expect them.
+		expect(pressed).toEqual(["eavesdrop", "whisper", "barge"]);
+	});
+
+	it("swallows EVERY digit while a tap is open, not just the three that mean something", async () => {
+		// A stray key forwarded into the tap bridge would be injected into somebody else's call on any
+		// mode that speaks to it, with a payment IVR possibly on the other end.
+		const h = harness();
+		h.runtime.armSupervisionKeys("a", async () => undefined);
+
+		expect(await h.runtime.offer(h.leg, "7")).toBe("consumed");
+		expect(await h.runtime.offer(h.leg, "*")).toBe("consumed");
+	});
+
+	it("does not touch a leg that is not monitoring", async () => {
+		const h = harness();
+		h.runtime.armSupervisionKeys("some-other-leg", async () => undefined);
+
+		// `4` on an ordinary bridged leg goes where it always did: to the far end.
+		expect(await h.runtime.offer(h.leg, "4")).toBe("pass-through");
+	});
+
+	it("stops consuming once the keys are disarmed", async () => {
+		const h = harness();
+		h.runtime.armSupervisionKeys("a", async () => undefined);
+		h.runtime.disarmSupervisionKeys("a");
+
+		expect(await h.runtime.offer(h.leg, "4")).toBe("pass-through");
+	});
+
+	it("drops the arming when the leg goes away, and when the runtime is drained", async () => {
+		const released = harness();
+		released.runtime.armSupervisionKeys("a", async () => undefined);
+		released.runtime.release("a");
+		expect(await released.runtime.offer(released.leg, "4")).toBe("pass-through");
+
+		const drained = harness();
+		drained.runtime.armSupervisionKeys("a", async () => undefined);
+		drained.runtime.clear();
+		expect(await drained.runtime.offer(drained.leg, "4")).toBe("pass-through");
+	});
+
+	it("does not arm anything after the drain has started", async () => {
+		const h = harness();
+		h.runtime.clear();
+		h.runtime.armSupervisionKeys("a", async () => undefined);
+		expect(await h.runtime.offer(h.leg, "4")).toBe("pass-through");
+	});
+
+	it("consumes the digit even when the escalation itself fails", async () => {
+		// The digit was the supervisor's and must not reach anybody else, whatever came of it.
+		const h = harness();
+		h.runtime.armSupervisionKeys("a", async () => {
+			throw new Error("the media plane refused the re-tap");
+		});
+
+		expect(await h.runtime.offer(h.leg, "5")).toBe("consumed");
+		await Promise.resolve();
 	});
 });

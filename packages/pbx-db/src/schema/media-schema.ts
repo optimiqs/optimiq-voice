@@ -1,4 +1,5 @@
-import { boolean, index, integer, pgTable, text, uniqueIndex } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { boolean, check, index, integer, pgTable, text, uniqueIndex } from "drizzle-orm/pg-core";
 import {
 	auditTimestampColumns,
 	tenantOrganizationIdColumn,
@@ -17,8 +18,27 @@ import { tenantIsolationPolicy } from "../tenant";
 export const MOH_SOURCES = ["library", "stream"] as const;
 export type MohSource = (typeof MOH_SOURCES)[number];
 
-/** What a media object is used for. Drives retention policy and where the UI offers it. */
-export const PROMPT_KINDS = ["prompt", "moh", "greeting"] as const;
+/**
+ * What a media object is used for. Drives retention policy and where the UI offers it.
+ *
+ * # `phrase` is the odd member, and it is here rather than in a table of its own
+ *
+ * A phrase is an ordered sequence of other prompts played as one — "your call is number", "seven",
+ * "in the queue" — which is upstream's Phrases feature and the only way to say a number aloud on a
+ * platform with no text-to-speech. The question was where the row lives, and the answer is decided
+ * entirely by the foreign keys that already exist: `ivr_menu.greeting_prompt_id`,
+ * `queue.announce_prompt_id`, `ring_group.ringback_prompt_id` and five more all carry
+ * `references(() => prompt.id)`. A phrase in a separate table could never be stored in any of them,
+ * so "playable anywhere a prompt is accepted" would have meant a second nullable column beside every
+ * one of those eight — eight columns, eight DTO fields, eight compiler branches, and a permanent
+ * question at every site about which of the pair wins.
+ *
+ * A phrase IS a prompt instead, and every existing pointer accepts one for free. The price is one
+ * loosened column: `prompt.object_key` becomes nullable, because a phrase has no audio of its own,
+ * guarded by `prompt_object_key_kind_check` so a non-phrase still cannot exist without a file. The
+ * steps live in `phrase_step`, which references `prompt.id` on both sides.
+ */
+export const PROMPT_KINDS = ["prompt", "moh", "greeting", "phrase"] as const;
 export type PromptKind = (typeof PROMPT_KINDS)[number];
 
 export const mohClass = pgTable.withRLS(
@@ -55,8 +75,14 @@ export const prompt = pgTable.withRLS(
 		mohClassId: uuidEntityId("moh_class_id").references(() => mohClass.id, {
 			onDelete: "cascade",
 		}),
-		/** S3-style storage key. The API signs it; the engine fetches or caches it. */
-		objectKey: text("object_key").notNull(),
+		/**
+		 * S3-style storage key. The API signs it; the engine fetches or caches it.
+		 *
+		 * Nullable ONLY for `kind = "phrase"`, which has no audio of its own — it names other rows'.
+		 * `prompt_object_key_kind_check` is what keeps that from widening into "a prompt with no
+		 * file", which would be a row every player has to guard against. See {@link PROMPT_KINDS}.
+		 */
+		objectKey: text("object_key"),
 		contentType: text("content_type").notNull().default("audio/wav"),
 		durationMs: integer("duration_ms"),
 		sizeBytes: integer("size_bytes"),
@@ -69,6 +95,13 @@ export const prompt = pgTable.withRLS(
 		uniqueIndex("prompt_organization_name_key").on(table.organizationId, table.name),
 		index("prompt_organization_kind_idx").on(table.organizationId, table.kind),
 		index("prompt_organization_moh_class_idx").on(table.organizationId, table.mohClassId),
+		// A phrase is the only kind with no file of its own; everything else must have one. Written
+		// as one constraint over both directions so neither half can be relaxed without the other
+		// being read.
+		check(
+			"prompt_object_key_kind_check",
+			sql`(kind = 'phrase' and object_key is null) or (kind <> 'phrase' and object_key is not null)`,
+		),
 		tenantIsolationPolicy("prompt"),
 	],
 );

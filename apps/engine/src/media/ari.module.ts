@@ -1,9 +1,15 @@
 import { Module } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logging";
+import { JetStreamService } from "../nats/jetstream.service";
 import { ENGINE_ENV, MEDIA_PORT } from "../nats/nats.tokens";
+import { SipdCommandClient } from "../nats/sipd-command.client";
 import { AriConnectionService } from "./ari-connection.service";
 import { AriMediaAdapter } from "./ari-media.adapter";
 import { MediadService } from "./mediad.service";
+import { SipRenegotiateService } from "./sip-renegotiate.service";
+import { SipdLivenessService } from "./sipd-liveness.service";
+import { SipdService } from "./sipd.service";
+import { SplitPlaneMediaPort } from "./split-plane.port";
 import type { EngineEnv } from "../config/engine-env";
 import type { MediaPort } from "./media-port";
 
@@ -31,24 +37,55 @@ import type { MediaPort } from "./media-port";
 	providers: [
 		AriConnectionService,
 		MediadService,
+		// The signalling plane's EVENT half. Not a `MEDIA_PORT` candidate and never will be: it serves
+		// no command, it only turns `sip.evt.v1` into the same union the two drivers above produce. It
+		// is constructed unconditionally for the reason the other two are — the factory below stays a
+		// one-line choice — and starts only on a deployment that signals on `apps/sipd`.
+		SipdService,
+		// The signalling plane's LIVENESS half. It commands nothing either; it watches the
+		// `sip-instances` bucket so a `sipd` that died without saying so stops being a call the engine
+		// holds forever. Constructed unconditionally like the rest, started from `main.ts`.
+		SipdLivenessService,
+		SipRenegotiateService,
 		{
 			provide: MEDIA_PORT,
-			useFactory: (env: EngineEnv, ari: AriConnectionService, mediad: MediadService): MediaPort => {
+			useFactory: (
+				env: EngineEnv,
+				ari: AriConnectionService,
+				mediad: MediadService,
+				jetstream: JetStreamService,
+			): MediaPort => {
 				if (env.ENGINE_MEDIA_DRIVER === "mediad") {
+					// The COMPOSITE (split-plane) port of `plans/sipd-invite-design.md` §3.2: signalling on
+					// `apps/sipd`, media on `apps/mediad`. This is the first `MediaPort` for which `answer`,
+					// `ring` and `originate` are servable — they become compositions of a `mediad` session
+					// and a `sipd` dialog command rather than the refusals `MediadMediaPort` returns on its
+					// own. The one illegal pairing (signalling on `sipd`, media on Asterisk) is refused per
+					// call in `placeInvitedCall` until `ENGINE_SIGNALLING_DRIVER` refuses it at boot (§3.5).
+					//
+					// `SipdCommandClient` reads the live NATS connection each call rather than capturing it,
+					// because Nest builds providers before it opens the connection in
+					// `JetStreamService.onModuleInit` — the same accessor `NatsMediadTransport` uses.
 					getLogger("engine.media").warn(
-						{ driver: "mediad" },
-						"ENGINE_MEDIA_DRIVER=mediad: media is served by apps/mediad at rung 2 (bridged " +
-							"G.711 calls). Every operation above that rung — playback, recording, hold, " +
-							"music on hold, DTMF generation, conferencing — will FAIL LOUDLY rather than " +
-							"silently do nothing. See MediadMediaPort for the coverage map.",
+						{ driver: "mediad", signalling: "sipd" },
+						"ENGINE_MEDIA_DRIVER=mediad: media is served by apps/mediad and signalling by " +
+							"apps/sipd via the composite split-plane MediaPort. answer/ring/originate/hangup " +
+							"are compositions across both planes; operations above the built rungs (early " +
+							"media, re-INVITE hold, conferencing) still FAIL LOUDLY rather than silently do " +
+							"nothing. See SplitPlaneMediaPort and MediadMediaPort for the coverage map.",
 					);
-					return mediad.port;
+					return new SplitPlaneMediaPort(
+						mediad.port,
+						new SipdCommandClient(() => jetstream.rawConnection),
+						undefined,
+						env.ENGINE_INSTANCE_ID,
+					);
 				}
 				return new AriMediaAdapter(ari.client, ari.applicationName);
 			},
-			inject: [ENGINE_ENV, AriConnectionService, MediadService],
+			inject: [ENGINE_ENV, AriConnectionService, MediadService, JetStreamService],
 		},
 	],
-	exports: [AriConnectionService, MediadService, MEDIA_PORT],
+	exports: [AriConnectionService, MediadService, SipdService, SipdLivenessService, MEDIA_PORT],
 })
 export class AriModule {}

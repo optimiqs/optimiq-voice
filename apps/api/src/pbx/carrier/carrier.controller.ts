@@ -6,13 +6,21 @@ import {
 	Inject,
 	Param,
 	ParseUUIDPipe,
+	Patch,
 	Post,
 	Query,
 } from "@nestjs/common";
 import { RequirePermissions } from "../../auth/require-permissions.decorator";
 import { Session } from "../../auth/session.decorator";
 import { parseDto } from "../shared/dto";
-import { createNumberOrderDto, provisionTrunkDto, searchAvailableNumbersDto } from "./carrier.dto";
+import {
+	createNumberOrderDto,
+	createPortingOrderDto,
+	listPortingOrdersDto,
+	provisionTrunkDto,
+	searchAvailableNumbersDto,
+	updateCnamListingDto,
+} from "./carrier.dto";
 import { CarrierService } from "./carrier.service";
 import type { AppSession } from "@optimiq-voice/auth";
 
@@ -32,6 +40,19 @@ import type { AppSession } from "@optimiq-voice/auth";
  * `numbers.delete`, because a role that could delete the row but not release the number upstream
  * would leave DIDs orphaned at the carrier, billed forever, invisible to the tenant who caused it.
  * Splitting them would create that state; keeping them together makes it unreachable.
+ *
+ * ## Porting and CNAM land on the same three grants, and no fourth one
+ *
+ * **Filing a port is `numbers.order`.** It is not a write to a number the organization has — it is
+ * a commitment to take one over and pay for it every month afterwards, which is the exact thing
+ * `numbers.order` was separated out to gate. Reading ports is `numbers.read` for the same reason
+ * the carrier status probe is: it is inventory, not capability.
+ *
+ * **Changing a CNAM listing is `numbers.write`**, because it changes how a DID the organization
+ * already owns behaves and adds nothing to the bill — the same class of change as re-pointing the
+ * number at a different IVR. Giving it its own grant would mean every role that manages numbers
+ * needs a permission whose only distinct meaning is "and also the caller-ID name", which is how a
+ * permission registry stops being readable.
  */
 @Controller("api/v1/carrier")
 export class CarrierController {
@@ -64,6 +85,65 @@ export class CarrierController {
 	@RequirePermissions("numbers.order")
 	async order(@Session() session: AppSession, @Body() body: unknown) {
 		return await this.carrier.orderNumber(session, parseDto(createNumberOrderDto, body));
+	}
+
+	/**
+	 * `POST /api/v1/carrier/porting-orders` — file a port-in.
+	 *
+	 * Answers with an ARRAY of orders, because the carrier splits a request across losing carriers
+	 * and this endpoint refuses to pretend otherwise. See `CarrierService.createPortingOrder` for
+	 * why it writes no `phone_number` row.
+	 */
+	@Post("porting-orders")
+	@RequirePermissions("numbers.order")
+	async createPortingOrder(@Session() session: AppSession, @Body() body: unknown) {
+		return await this.carrier.createPortingOrder(session, parseDto(createPortingOrderDto, body));
+	}
+
+	@Get("porting-orders")
+	@RequirePermissions("numbers.read")
+	async listPortingOrders(@Session() session: AppSession, @Query() query: unknown) {
+		return await this.carrier.listPortingOrders(
+			session,
+			parseDto(listPortingOrdersDto, query ?? {}),
+		);
+	}
+
+	/**
+	 * One port's status.
+	 *
+	 * `ParseUUIDPipe` even though the id is the carrier's rather than ours: Telnyx porting-order ids
+	 * are UUIDs, and validating that here is what keeps an arbitrary string out of a path this
+	 * service interpolates into a carrier URL.
+	 */
+	@Get("porting-orders/:id")
+	@RequirePermissions("numbers.read")
+	async getPortingOrder(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
+		return await this.carrier.getPortingOrder(session, id);
+	}
+
+	/**
+	 * `GET|PATCH /api/v1/carrier/numbers/:id/cnam` — the caller-ID name a called party sees.
+	 *
+	 * `:id` is the LOCAL `phone_number` id, never the carrier's. That is what makes the pair
+	 * tenant-safe: the lookup that resolves it is organization-scoped, so another tenant's number
+	 * is a 404 before a carrier request exists. Accepting a Telnyx id would have made this a
+	 * read-anyone's-CNAM oracle over a namespace shared with every other Telnyx customer.
+	 */
+	@Get("numbers/:id/cnam")
+	@RequirePermissions("numbers.read")
+	async getCnam(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
+		return await this.carrier.getCnamListing(session, id);
+	}
+
+	@Patch("numbers/:id/cnam")
+	@RequirePermissions("numbers.write")
+	async updateCnam(
+		@Session() session: AppSession,
+		@Param("id", ParseUUIDPipe) id: string,
+		@Body() body: unknown,
+	) {
+		return await this.carrier.updateCnamListing(session, id, parseDto(updateCnamListingDto, body));
 	}
 
 	/**

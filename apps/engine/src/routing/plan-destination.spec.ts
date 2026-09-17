@@ -96,11 +96,38 @@ describe("planDestinationOf", () => {
 			planDestinationOf({
 				id: "f",
 				kind: "feature-code",
-				featureCodeId: "fc-1",
+				featureCodeId: "01a087c7-3aba-7000-8000-0000000000fc",
 				code: "*97",
 				action: "voicemail-check",
 			} as PlanNode),
-		).toEqual({ destinationType: "feature-code", destinationRef: "fc-1" });
+		).toEqual({
+			destinationType: "feature-code",
+			destinationRef: "01a087c7-3aba-7000-8000-0000000000fc",
+		});
+	});
+
+	/**
+	 * The compiler mints `feature-code:<kind>:<uuid>` for the `*65`/`*64` toggles, which have no
+	 * `feature_code` row. `cdrLegWriteDataSchema.destinationRef` is a `z.uuid()`, so a leg that
+	 * visited one produced a CDR that could never validate — the engine retried the publish forever
+	 * and never released the leg. The TYPE still travels, exactly as it does for `external`.
+	 */
+	it("drops a synthetic feature-code id that could never be a CDR ref", () => {
+		for (const featureCodeId of [
+			"feature-code:call-flow:01a087c7-3aba-7000-8000-0000000000fc",
+			"feature-code:time-condition:01a087c7-3a5d-7000-8000-0000000000fd",
+			"fc-1",
+		]) {
+			expect(
+				planDestinationOf({
+					id: "f",
+					kind: "feature-code",
+					featureCodeId,
+					code: "*65",
+					action: "call-flow-toggle",
+				} as PlanNode),
+			).toEqual({ destinationType: "feature-code" });
+		}
 	});
 
 	it("maps a queue, a conference and a park lot to their rows", () => {
@@ -126,8 +153,11 @@ describe("planDestinationOf", () => {
 				mapped.add(kind);
 			}
 		}
-		// The only two kinds that intentionally have no destination.
+		// The only three kinds that intentionally have no destination: one terminal and two GATES. A
+		// call that crossed a day/night switch and then rang an extension was destined for the
+		// extension, exactly as one that crossed a time condition was.
 		expect([...PLAN_NODE_KINDS].filter((kind) => !mapped.has(kind)).sort()).toEqual([
+			"call-flow",
 			"hangup",
 			"time-condition",
 		]);

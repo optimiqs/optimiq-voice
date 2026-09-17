@@ -105,12 +105,19 @@ export interface NumberOrdersResource {
 	readonly create: (input: CreateNumberOrderInput) => Promise<TelnyxNumberOrder>;
 	readonly get: (orderId: string) => Promise<TelnyxNumberOrder>;
 	/**
-	 * The reconciliation read. Returns every order stamped with the token, newest first as Telnyx
-	 * returns them; the caller decides whether one of them is the order it thought it lost.
+	 * The reconciliation read. Returns every order stamped with the token, newest first — sorted
+	 * here rather than trusted from the API, whose default ordering for this endpoint is not
+	 * documented and therefore not something a caller picking `[0]` may rely on.
 	 */
 	readonly findByCustomerReference: (
 		customerReference: string,
 	) => Promise<readonly TelnyxNumberOrder[]>;
+}
+
+/** `created_at` as a sortable number. An order without one sorts oldest, never first. */
+function orderedAt(order: TelnyxNumberOrder): number {
+	const parsed = order.created_at === undefined ? Number.NaN : Date.parse(order.created_at);
+	return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
 }
 
 export function makeNumberOrders(transport: TelnyxTransport): NumberOrdersResource {
@@ -153,7 +160,7 @@ export function makeNumberOrders(transport: TelnyxTransport): NumberOrdersResour
 				query: { "filter[customer_reference]": customerReference, "page[size]": 20 },
 				schema: orderListResponse,
 			});
-			return response.data;
+			return [...response.data].sort((left, right) => orderedAt(right) - orderedAt(left));
 		},
 	};
 }

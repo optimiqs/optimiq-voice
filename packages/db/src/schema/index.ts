@@ -15,8 +15,15 @@ export {
 	jwks,
 	member,
 	organization,
+	rateLimit,
 	session,
 	twoFactor,
 	user,
 	verification,
 } from "./auth/index";
+export {
+	organizationBranding,
+	organizationHierarchy,
+	organizationMailTemplate,
+	organizationSsoProvider,
+} from "./platform/organization-platform-schema";

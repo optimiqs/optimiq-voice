@@ -24,13 +24,15 @@ import type { AppSession } from "@optimiq-voice/auth";
  *
  * ## The permissions
  *
- * | Route                              | Permission       |
- * | ---------------------------------- | ---------------- |
- * | `GET …/catalog`                    | `settings.read`  |
- * | `GET …/categories/:category`       | `settings.read`  |
- * | `PATCH …/categories/:category`     | `settings.write` |
- * | `GET …` / `GET …/:id`              | `settings.read`  |
- * | `POST …` / `PATCH …/:id` / `DELETE`| `settings.write` |
+ * | Route                              | Permission (floor)    |
+ * | ---------------------------------- | --------------------- |
+ * | `GET …/catalog`                    | `settings.read`       |
+ * | `GET …/me`                         | `settings.read.own`   |
+ * | `PATCH …/me/categories/:category`  | `settings.write.own`  |
+ * | `GET …/categories/:category`       | `settings.read`       |
+ * | `PATCH …/categories/:category`     | `settings.write`      |
+ * | `GET …` / `GET …/:id`              | `settings.read`       |
+ * | `POST …` / `PATCH …/:id` / `DELETE`| `settings.write`      |
  *
  * `settings.write` and not a new `org-settings.*` pair: the registry already declares
  * `settings.read` / `settings.write` / `settings.write.all` for exactly "the organization settings
@@ -38,17 +40,28 @@ import type { AppSession } from "@optimiq-voice/auth";
  * used here — it means platform-operator defaults that apply to every organization, and nothing in
  * this controller can write outside one tenant.
  *
+ * "Floor" is now the accurate word rather than a hedge, twice over. The category routes consult
+ * `CATEGORY_PERMISSIONS` in the service — `recordings` demands `recordings.configure` on write —
+ * because a decorator is static metadata and the category is a path parameter; see the map's own
+ * header. And the `…/me` routes hold the `.own` pair as their floor while own-ness itself is
+ * structural: the service writes `userId: session.user.id` and takes no user id from anywhere, so
+ * there is no row check to pass or fail. `settings.read.own` rather than `settings.read` on
+ * `GET …/me` because reading YOUR overrides is exactly what the narrower grant means, and a role
+ * built for machine callers could legitimately hold the org read without the personal one.
+ *
  * There is no `settings.delete` in the registry, so removing a row takes `settings.write`. That is
  * the right shape rather than an omission: deleting an `org_setting` row does not destroy data, it
  * reverts the setting to the platform default, which is the same class of act as changing it.
  *
  * ## Route order
  *
- * `catalog` and `categories` are declared before `:id`, which is a `ParseUUIDPipe`. Fastify's
- * radix router prefers a static segment over a parametric one regardless of declaration order (the
- * property `VoicemailMessagesController` relies on for its media route), so the order here is for
- * the reader rather than the router — but it is the order that would also be correct under a
- * router that resolved by declaration.
+ * `catalog`, `me` and `categories` are declared before `:id`, which is a `ParseUUIDPipe`.
+ * Fastify's radix router prefers a static segment over a parametric one regardless of declaration
+ * order (the property `VoicemailMessagesController` relies on for its media route), so the order
+ * here is for the reader rather than the router — but it is the order that would also be correct
+ * under a router that resolved by declaration. `me/categories/:category` additionally has two
+ * literal leading segments, the shape `queue-agent-session.controller.ts` chose for `session/me`
+ * so that no ordering of controllers could ever let a parametric route capture it.
  */
 @Controller("api/v1/org-settings")
 export class OrgSettingsController {
@@ -65,6 +78,38 @@ export class OrgSettingsController {
 	@RequirePermissions("settings.read")
 	catalog() {
 		return { data: toWireCatalog() };
+	}
+
+	/**
+	 * The caller's own preferences — every user-scoped setting, resolved through all three levels.
+	 *
+	 * The fourth prerequisite `settings-schema.ts` named for `user_setting`'s return: the surface.
+	 */
+	@Get("me")
+	@RequirePermissions("settings.read.own")
+	async readOwn(@Session() session: AppSession) {
+		return await this.settings.readOwnSettings(session);
+	}
+
+	/**
+	 * Saves part of one category of the caller's own preferences.
+	 *
+	 * A setting the catalogue does not mark user-scoped is a 400 naming the setting; whose row is
+	 * written is not negotiable — see the service, and the class header for why `.own` is a floor
+	 * rather than the whole rule.
+	 */
+	@Patch("me/categories/:category")
+	@RequirePermissions("settings.write.own")
+	async patchOwnCategory(
+		@Session() session: AppSession,
+		@Param("category") category: string,
+		@Body() body: unknown,
+	) {
+		return await this.settings.patchOwnCategory(
+			session,
+			category,
+			parseDto(categoryPatchDto, body ?? {}),
+		);
 	}
 
 	@Get("categories/:category")

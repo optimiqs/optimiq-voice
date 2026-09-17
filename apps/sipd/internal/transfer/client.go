@@ -11,40 +11,24 @@ import (
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 )
 
-// ErrRequestFailed wraps every transport-level failure, so a caller can tell "the engine said no"
-// (a well-formed response with `ok: false` and a reason) from "there was no answer".
-//
-// The distinction matters to the phone, but only just: both end as `503` in the sipfrag, because a
-// handset has one behaviour for a failed transfer. It matters a great deal to the log, where a
-// timeout is an engine that is down and a refusal is a transfer that was considered and declined.
+// ErrRequestFailed wraps every transport-level failure, so a caller can tell "there was no answer"
+// from "the engine said no" (a well-formed response with `ok: false`). Both become 503 in the
+// sipfrag; the distinction is for the log.
 var ErrRequestFailed = errors.New("transfer: the transfer request failed")
 
-// Requester issues `rpc.sip.v1.transfer`. An interface so the handler is testable without a broker,
-// and so the fake in the tests is forced to speak the same contract types as the real one.
+// Requester issues `rpc.sip.v1.transfer`. An interface so the handler is testable without a broker.
 type Requester interface {
 	Transfer(ctx context.Context, request contract.SipTransferRequest) (contract.SipTransferResponse, error)
 }
 
 // NATSRequester is the production Requester: raw NATS core request-reply against apps/engine.
 //
-// # Raw, and never a Nest client
+// The payload is the bare contract type, NOT Nest framing: the responder
+// (`apps/engine/src/nats/sip-transfer.service.ts`) subscribes raw, and a `{"pattern":…,"data":…}`
+// wrapper is rejected as `bad_request`.
 //
-// The responder is a NestJS service, which is exactly the case where reaching for Nest's own framing
-// is tempting and wrong in the other direction: `apps/engine/src/nats/sip-transfer.service.ts`
-// subscribes RAW and unmarshals the bare contract, precisely because this caller is Go. A payload
-// wrapped as `{"pattern":…,"data":…}` would be rejected as `bad_request`.
-//
-// # Core NATS, never JetStream
-//
-// A transfer is a synchronous question whose answer is worthless a second later: the phone is
-// holding the line and the edge has a two-second deadline before it must tell the handset something.
-// Persisting it would be storage for a message nobody will ever replay, and a stream's redelivery
-// would move a call minutes after the person who asked gave up and hung up.
-//
-// # No caching, positive or negative
-//
-// Unlike the credential store next door, every request here is unique and every answer is about one
-// moment in one call's life. There is nothing to reuse.
+// Core NATS rather than JetStream, and uncached: the answer is about one moment in one call's life,
+// and a stream's redelivery would move a call minutes after the caller hung up.
 type NATSRequester struct {
 	conn    *nats.Conn
 	subject string
@@ -77,7 +61,7 @@ func NewNATSRequester(conn *nats.Conn, opts NATSOptions) (*NATSRequester, error)
 	return requester, nil
 }
 
-// Subject reports the subject this requester publishes on. Diagnostics and the boot log.
+// Subject reports the subject this requester publishes on.
 func (r *NATSRequester) Subject() string { return r.subject }
 
 // Transfer implements Requester.
@@ -106,8 +90,8 @@ func (r *NATSRequester) Transfer(
 			ErrRequestFailed, r.subject, err)
 	}
 
-	// A reply for a different call is a responder bug, and acting on it would tell one phone about
-	// another phone's transfer. Cheap to check, and it makes the bug loud instead of confusing.
+	// A reply for a different call is a responder bug; acting on it would tell one phone about
+	// another phone's transfer.
 	if reply.SIPCallID != "" && reply.SIPCallID != request.SIPCallID {
 		return contract.SipTransferResponse{}, fmt.Errorf("%w: asked about call %q, answered about %q",
 			ErrRequestFailed, request.SIPCallID, reply.SIPCallID)

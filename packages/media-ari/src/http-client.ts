@@ -91,6 +91,7 @@ export class AriHttpClient {
 		}, this.timeoutMs);
 
 		let response: Response;
+		let text: string;
 		try {
 			response = await this.fetchImpl(url, {
 				method: input.method,
@@ -102,17 +103,22 @@ export class AriHttpClient {
 				body: input.body === undefined ? undefined : JSON.stringify(input.body),
 				signal: controller.signal,
 			});
+			if (response.status === 204) {
+				return undefined;
+			}
+			// Inside the same try, and before the timer is cleared: `fetch` resolves on HEADERS, so
+			// clearing the timer here left the body read with no timeout and no signal. A stalled
+			// body on a loaded box then wedged a call leg forever inside `channels.answer`, which is
+			// precisely what the timeout budget exists to prevent.
+			text = await response.text();
 		} catch (cause) {
-			throw new AriTransportError(input.method, input.path, { cause });
+			throw new AriTransportError(input.method, input.path, {
+				cause,
+				timedOut: controller.signal.aborted,
+			});
 		} finally {
 			clearTimeout(timer);
 		}
-
-		if (response.status === 204) {
-			return undefined;
-		}
-
-		const text = await response.text();
 
 		if (!response.ok) {
 			if (response.status === 404 && input.tolerateNotFound === true) {

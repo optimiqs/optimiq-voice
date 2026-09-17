@@ -1,7 +1,10 @@
 package presence
 
 import (
+	"context"
 	"encoding/json"
+	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,10 +32,7 @@ func (e fakeEntry) Operation() jetstream.KeyValueOp { return e.operation }
 
 const jetstreamDelete = jetstream.KeyValueDelete
 
-// The key parser is the whole surface of this package that is not a NATS call, and it is the one
-// place where a mistake would be invisible: a key that split wrongly would attribute one tenant's
-// presence to another's extension, and the symptom is a lamp that lights for a call that is not
-// there.
+// A key that split wrongly would attribute one tenant's presence to another's extension.
 func TestSplitKeyIsExactAndRejectsAnythingElse(t *testing.T) {
 	const org = "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
 
@@ -54,8 +54,8 @@ func TestSplitKeyIsExactAndRejectsAnythingElse(t *testing.T) {
 	}
 }
 
-// A value that will not decode is DROPPED, not reported as `down`: the alternative is one malformed
-// write from a future engine release clearing every lamp in a tenant.
+// A value that will not decode is DROPPED, not reported as `down`: one malformed write must not
+// clear every lamp in a tenant.
 func TestChangeForDropsAnUndecodableValue(t *testing.T) {
 	entry := fakeEntry{key: "org.1001", value: []byte("{not json")}
 	if _, ok := changeFor(entry); ok {
@@ -116,5 +116,78 @@ func TestMemoryStoreRoundTrips(t *testing.T) {
 	}
 	if _, found, _ := store.Get(t.Context(), org, "1001"); found {
 		t.Error("the state survived a delete")
+	}
+}
+
+// stubWatcher is one update stream that the test closes to simulate a broker restart ending the
+// ordered consumer.
+type stubWatcher struct {
+	updates chan jetstream.KeyValueEntry
+	stopped atomic.Bool
+}
+
+func (s *stubWatcher) Updates() <-chan jetstream.KeyValueEntry { return s.updates }
+func (s *stubWatcher) Stop() error                             { s.stopped.Store(true); return nil }
+
+// stubBucket hands out one stubWatcher per WatchAll. Only WatchAll is implemented; the embedded
+// interface is nil, so any other call would panic — which is the assertion that Watch uses nothing
+// else.
+type stubBucket struct {
+	jetstream.KeyValue
+	watchers chan *stubWatcher
+}
+
+func (b *stubBucket) WatchAll(context.Context, ...jetstream.WatchOpt) (jetstream.KeyWatcher, error) {
+	watcher := &stubWatcher{updates: make(chan jetstream.KeyValueEntry, 8)}
+	b.watchers <- watcher
+	return watcher, nil
+}
+
+// TestTheWatchSurvivesTheStreamEnding is the broker-restart case: nats.go ends the ordered consumer,
+// and a watch that did not re-establish itself — or that closed its Change channel doing so — would
+// freeze every busy lamp for the life of the process, silently.
+func TestTheWatchSurvivesTheStreamEnding(t *testing.T) {
+	bucket := &stubBucket{watchers: make(chan *stubWatcher, 4)}
+	store := &NATSStore{bucket: bucket, log: slog.New(slog.DiscardHandler)}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	changes, err := store.Watch(ctx)
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+
+	first := <-bucket.watchers
+	close(first.updates)
+
+	var second *stubWatcher
+	select {
+	case second = <-bucket.watchers:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the watch was never re-established after the update stream ended")
+	}
+
+	const org = "018f4f5e-1c2a-7a3b-9c4d-5e6f70819293"
+	state := State{OrgID: org, ExtensionNumber: "1001", State: contract.PresenceDeviceStateActive}
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("marshalling the state: %v", err)
+	}
+	second.updates <- fakeEntry{
+		key:       org + ".1001",
+		value:     encoded,
+		operation: jetstream.KeyValuePut,
+	}
+
+	select {
+	case change, ok := <-changes:
+		if !ok {
+			t.Fatal("the change channel was closed by the re-establish; the handler would go deaf")
+		}
+		if change.ExtensionNumber != "1001" {
+			t.Fatalf("change after the restart is for %q", change.ExtensionNumber)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a change written after the stream restarted never arrived")
 	}
 }

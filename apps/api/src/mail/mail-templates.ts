@@ -310,6 +310,85 @@ export function voicemailMail(input: VoicemailMailInput): RenderedMail {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Fax-to-email
+
+export interface FaxReceivedMailInput {
+	readonly appName: string;
+	readonly fromName?: string | undefined;
+	/** The DID the fax arrived on. */
+	readonly toNumber: string;
+	/** The sending fax number. */
+	readonly fromNumber: string;
+	readonly pages?: number | undefined;
+	readonly receivedAt: Date;
+	/**
+	 * A signed, expiring link to the document, when one could be minted. Absent when
+	 * `FAX_MEDIA_URL_SECRET` is not configured — the notification still goes out with the metadata
+	 * and the inbox link, because "a fax arrived from +1…" is the time-critical part.
+	 */
+	readonly documentUrl?: string | undefined;
+	/** The fax inbox in the web UI. Absent when no app URL is configured. */
+	readonly inboxUrl?: string | undefined;
+}
+
+/**
+ * The fax-to-email notification.
+ *
+ * A signed, expiring LINK rather than an attachment, deliberately — the same choice
+ * `voicemail-email.service.ts` defends for voicemail audio: an attachment is a copy of a customer's
+ * document sitting in an arbitrary mail store forever with no revocation, and rotating the URL secret
+ * kills every outstanding link while nothing kills an attachment. The document is the fax; the mail
+ * is how you learn it arrived and where to open it.
+ */
+export function faxReceivedMail(input: FaxReceivedMailInput): RenderedMail {
+	const received = input.receivedAt.toISOString().replace("T", " ").slice(0, 19) + " UTC";
+	const pages =
+		input.pages === undefined ? undefined : `${input.pages} page${input.pages === 1 ? "" : "s"}`;
+
+	const textLines = [
+		`New fax received on ${input.toNumber}.`,
+		"",
+		`From:     ${input.fromNumber}`,
+		`Received: ${received}`,
+	];
+	if (pages !== undefined) {
+		textLines.push(`Pages:    ${pages}`);
+	}
+	if (input.documentUrl !== undefined) {
+		textLines.push("", "Open the fax (this link expires shortly):", input.documentUrl);
+	}
+	if (input.inboxUrl !== undefined) {
+		textLines.push("", "Open the fax inbox:", input.inboxUrl);
+	}
+
+	const htmlParts: string[] = [
+		escapeHtml(`New fax received on ${input.toNumber}.`),
+		[
+			`<span style="color:#666">From</span> ${escapeHtml(input.fromNumber)}<br/>`,
+			`<span style="color:#666">Received</span> ${escapeHtml(received)}`,
+			pages === undefined ? "" : `<br/><span style="color:#666">Pages</span> ${escapeHtml(pages)}`,
+		].join("\n"),
+	];
+	if (input.documentUrl !== undefined) {
+		htmlParts.push(
+			actionLink("Open the fax", input.documentUrl),
+			`<span style="color:#666;font-size:13px">This link expires shortly.</span>`,
+		);
+	}
+	if (input.inboxUrl !== undefined) {
+		htmlParts.push(
+			`<a href="${escapeHtml(input.inboxUrl)}" style="color:#111">Open the fax inbox</a>`,
+		);
+	}
+
+	return {
+		subject: `New fax from ${input.fromNumber}${pages === undefined ? "" : ` (${pages})`}`,
+		text: textLines.join("\n"),
+		html: shell(input.fromName ?? input.appName, htmlParts),
+	};
+}
+
+// ---------------------------------------------------------------------------------------------
 // Kari's Law
 // ---------------------------------------------------------------------------------------------
 
@@ -331,27 +410,57 @@ export interface EmergencyDialedMailInput {
 	readonly location?: string | undefined;
 	/** Set when the event named an address the control plane could not find or read. */
 	readonly locationUnknown?: boolean | undefined;
+	/**
+	 * The handset the location came from, when it came from one rather than from the number.
+	 *
+	 * This is the RAY BAUM'S half a number-level address cannot answer: two desks sharing an
+	 * extension share a DID and therefore shared an address, and the responder was sent to the
+	 * building. Naming the device — its label, or its MAC when it has none — is what lets somebody
+	 * at the front desk walk to the right one.
+	 */
+	readonly locationDevice?: string | undefined;
+	/**
+	 * Whether the address behind the location is provider-validated.
+	 *
+	 * Stated only when it is FALSE, and stated rather than suppressed: an unvalidated address is
+	 * still the best information anybody has at the moment somebody dials 911, and withholding it
+	 * would leave the recipient with nothing. Saying it is unvalidated is what turns it into
+	 * something they check on the way.
+	 */
+	readonly locationValidated?: boolean | undefined;
 	readonly trunkName?: string | undefined;
 	/** When the call was placed — the event's `at`, never when this message was rendered. */
 	readonly dialedAt: Date;
 }
 
-/** The address a responder is given, on one line. Empty parts are dropped, never rendered blank. */
-export function formatDispatchableLocation(address: {
-	readonly label?: string | null;
-	readonly streetLine1?: string | null;
-	readonly streetLine2?: string | null;
-	readonly locationDetail?: string | null;
-	readonly locality?: string | null;
-	readonly administrativeArea?: string | null;
-	readonly postalCode?: string | null;
-	readonly country?: string | null;
-}): string {
+/**
+ * The address a responder is given, on one line. Empty parts are dropped, never rendered blank.
+ *
+ * `deviceDetail` is the per-handset refinement (`device.emergency_location_detail`) and it is
+ * placed immediately AFTER the address's own `locationDetail` rather than replacing it, because the
+ * two are different scopes and a dispatcher needs both: the address says "Floor 3", the device says
+ * "desk by the window". Replacing would throw away the half somebody validated; putting it last
+ * would separate it from the detail it refines by three lines of postal address.
+ */
+export function formatDispatchableLocation(
+	address: {
+		readonly label?: string | null;
+		readonly streetLine1?: string | null;
+		readonly streetLine2?: string | null;
+		readonly locationDetail?: string | null;
+		readonly locality?: string | null;
+		readonly administrativeArea?: string | null;
+		readonly postalCode?: string | null;
+		readonly country?: string | null;
+	},
+	deviceDetail?: string | null,
+): string {
 	const parts = [
 		address.label,
 		address.streetLine1,
 		address.streetLine2,
 		address.locationDetail,
+		deviceDetail,
 		address.locality,
 		address.administrativeArea,
 		address.postalCode,
@@ -389,12 +498,18 @@ export function emergencyDialedMail(input: EmergencyDialedMailInput): RenderedMa
 		input.callerExtension === undefined || input.callerExtension.trim().length === 0
 			? "unknown"
 			: input.callerExtension.trim();
-	const location =
-		input.location !== undefined && input.location.length > 0
-			? input.location
-			: input.locationUnknown === true
-				? "on record but could not be read — check the emergency address for this number"
-				: "not registered for this call";
+	const located = input.location !== undefined && input.location.length > 0;
+	const location = located
+		? `${input.location}${input.locationValidated === false ? " (address not validated)" : ""}`
+		: input.locationUnknown === true
+			? "on record but could not be read — check the emergency address for this number"
+			: "not registered for this call";
+	// Only when the location actually came from a handset. A device row beside a number-level
+	// address would read as "the phone is here" about an address the phone had no part in.
+	const device =
+		located && input.locationDevice !== undefined && input.locationDevice.trim().length > 0
+			? input.locationDevice.trim()
+			: undefined;
 	const elin = input.elin === undefined || input.elin.trim().length === 0 ? "none" : input.elin;
 
 	const textLines = [
@@ -405,6 +520,7 @@ export function emergencyDialedMail(input: EmergencyDialedMailInput): RenderedMa
 		`Callback:  ${callback}`,
 		`Extension: ${extension}`,
 		`Location:  ${location}`,
+		...(device === undefined ? [] : [`Device:    ${device}`]),
 		`ELIN:      ${elin}`,
 		`Placed:    ${placed}`,
 	];
@@ -426,6 +542,7 @@ export function emergencyDialedMail(input: EmergencyDialedMailInput): RenderedMa
 		["Callback", callback],
 		["Extension", extension],
 		["Location", location],
+		...(device === undefined ? [] : [["Device", device]]),
 		["ELIN", elin],
 		["Placed", placed],
 		...(input.trunkName !== undefined && input.trunkName.trim().length > 0

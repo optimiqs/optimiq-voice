@@ -1,6 +1,9 @@
-import { Inject, Injectable } from "@nestjs/common";
+import { ForbiddenException, Inject, Injectable } from "@nestjs/common";
+import { requireActiveOrganizationId } from "@optimiq-voice/auth";
+import { EmergencyAddressesService } from "../../pbx/emergency-addresses/emergency-addresses.service";
 import { PbxChildResourceService, PbxResourceService } from "../../pbx/shared/pbx-resource.service";
-import { PBX_EFFECT_RUNTIME } from "../../pbx/shared/pbx.tokens";
+import { PBX_DATABASE, PBX_EFFECT_RUNTIME } from "../../pbx/shared/pbx.tokens";
+import { assertOwnsRow, holdsUnscoped, ownedDeviceIds } from "../../pbx/shared/self-ownership";
 import { PROVISIONING_ENV } from "../provisioning.tokens";
 import { mintProvisioningToken, provisioningConfigUrl } from "../render/provision-token";
 import { ProvisioningNotConfiguredException } from "../render/provision.errors";
@@ -11,10 +14,59 @@ import {
 	DEVICE_PROFILE_RESOURCE,
 	DEVICE_RESOURCE,
 } from "./devices.resource";
-import type { MutationEnvelope } from "../../pbx/shared/pbx-resource.service";
+import type { ListQuery, PagedResult } from "../../pbx/shared/pagination";
+import type { ItemEnvelope, MutationEnvelope } from "../../pbx/shared/pbx-resource.service";
 import type { PbxRepositoryRuntime } from "../../pbx/shared/pbx-runtime";
 import type { ProvisioningEnv } from "../provisioning-env";
 import type { AppSession } from "@optimiq-voice/auth";
+import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
+
+/**
+ * A device is owned when it carries a line bound to one of the caller's extensions.
+ *
+ * The `user` role holds `devices.read.own` and no unscoped device grant, so the read endpoints name
+ * the scoped floor and the services narrow the rows here — the same `.own` seam extensions and
+ * voicemail take. A device with no owned line is not the caller's, and the child line/key lists are
+ * gated on the same fact so a `.own` holder cannot read another device's lines by id.
+ */
+const NOT_YOURS =
+	"You hold access to your own devices only, and this device is not linked to any of your extensions.";
+
+/** The two columns that say where a 911 call from this handset comes from. */
+const DISPATCHABLE_LOCATION_FIELDS = ["emergencyAddressId", "emergencyLocationDetail"] as const;
+
+/**
+ * A dispatchable location is a `numbers.emergency` write, even though a device is a `devices.write`.
+ *
+ * The two grants answer different questions and the registry already separates them:
+ * `devices.write` is "who may configure a phone" — a deskside technician swapping a handset holds
+ * it — while `numbers.emergency`'s catalogue entry is the E911 address surface, held by whoever is
+ * accountable for what a dispatcher is told. Letting the wider grant move a phone's address would
+ * make the narrower one decorative: an operator refused at `PATCH /emergency-addresses/:id` could
+ * simply point every device at a different address instead.
+ *
+ * Checked here rather than in the decorator because it is CONDITIONAL: the whole point is that a
+ * `devices.write`-only holder can still rename a phone, change its profile and rotate its keys.
+ * `@RequirePermissions` declares an unconditional floor and cannot express "only when this key is
+ * present". Presence is what is tested, not a change of value — an unchanged field still asserts an
+ * address, and comparing against the stored row would need a read the caller may not be entitled to.
+ */
+export function assertMayWriteDispatchableLocation(
+	session: AppSession,
+	values: Record<string, unknown>,
+): void {
+	const touched = DISPATCHABLE_LOCATION_FIELDS.filter((field) => field in values);
+	if (touched.length === 0 || holdsUnscoped(session, "numbers.emergency")) {
+		return;
+	}
+	throw new ForbiddenException({
+		code: "EMERGENCY_LOCATION_FORBIDDEN",
+		message:
+			"Setting a device's dispatchable location needs the emergency address permission " +
+			"(numbers.emergency), not device configuration alone.",
+		fields: touched,
+	});
+}
 
 @Injectable()
 export class DeviceProfilesService extends PbxResourceService {
@@ -32,16 +84,59 @@ export class DeviceProfileKeysService extends PbxChildResourceService {
 
 @Injectable()
 export class DeviceLinesService extends PbxChildResourceService {
-	constructor(@Inject(PBX_EFFECT_RUNTIME) runtime: PbxRepositoryRuntime) {
+	constructor(
+		@Inject(PBX_EFFECT_RUNTIME) runtime: PbxRepositoryRuntime,
+		@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient,
+	) {
 		super(runtime, DEVICE_LINE_RESOURCE);
+	}
+
+	override async list(
+		session: AppSession,
+		parentId: string,
+	): Promise<{ readonly data: readonly Record<string, unknown>[] }> {
+		await assertOwnsDevice(this.database, session, parentId);
+		return await super.list(session, parentId);
 	}
 }
 
 @Injectable()
 export class DeviceKeysService extends PbxChildResourceService {
-	constructor(@Inject(PBX_EFFECT_RUNTIME) runtime: PbxRepositoryRuntime) {
+	constructor(
+		@Inject(PBX_EFFECT_RUNTIME) runtime: PbxRepositoryRuntime,
+		@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient,
+	) {
 		super(runtime, DEVICE_KEY_RESOURCE);
 	}
+
+	override async list(
+		session: AppSession,
+		parentId: string,
+	): Promise<{ readonly data: readonly Record<string, unknown>[] }> {
+		await assertOwnsDevice(this.database, session, parentId);
+		return await super.list(session, parentId);
+	}
+}
+
+/**
+ * The device-ownership assert the read endpoints share.
+ *
+ * A no-op for an unscoped `devices.read` holder (the manager/admin path); for a `.own`-only holder
+ * it refuses unless the device carries a line bound to one of their extensions. `requireActiveOrgan…`
+ * is reached through the base service's `organizationId`, so this free function takes the resolved
+ * id from the caller instead.
+ */
+async function assertOwnsDevice(
+	database: PbxDatabaseClient,
+	session: AppSession,
+	deviceId: string,
+): Promise<void> {
+	if (holdsUnscoped(session, "devices.read")) {
+		return;
+	}
+	const organizationId = requireActiveOrganizationId(session);
+	const owned = await ownedDeviceIds(database, organizationId, session.user.id);
+	assertOwnsRow(owned, deviceId, NOT_YOURS);
 }
 
 /** A device row plus the token that was just minted for it. The token appears here and nowhere else. */
@@ -63,8 +158,82 @@ export class DevicesService extends PbxResourceService {
 	constructor(
 		@Inject(PBX_EFFECT_RUNTIME) runtime: PbxRepositoryRuntime,
 		@Inject(PROVISIONING_ENV) private readonly env: ProvisioningEnv,
+		@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient,
+		@Inject(EmergencyAddressesService)
+		private readonly emergencyAddresses: EmergencyAddressesService,
 	) {
 		super(runtime, DEVICE_RESOURCE);
+	}
+
+	override async create(
+		session: AppSession,
+		values: Record<string, unknown>,
+	): ReturnType<PbxResourceService["create"]> {
+		await this.assertEmergencyAddressAssignable(session, values);
+		return await super.create(session, values);
+	}
+
+	override async update(
+		session: AppSession,
+		id: string,
+		values: Record<string, unknown>,
+	): ReturnType<PbxResourceService["update"]> {
+		await this.assertEmergencyAddressAssignable(session, values);
+		return await super.update(session, id, values);
+	}
+
+	/**
+	 * A handset gets the same E911 gate a DID gets: an address a carrier has not confirmed is a
+	 * dispatchable location may not be attached to it.
+	 *
+	 * `PhoneNumbersService` refuses `EMERGENCY_ADDRESS_NOT_VALIDATED` on the DID path for the reason
+	 * RAY BAUM's Act cares about — an unvalidated address reads as compliant on the screen and sends
+	 * an ambulance to a door that does not exist. A device carries its own dispatchable location, so
+	 * the gate has to be here too or the DID gate is trivially bypassed by pointing a phone at the
+	 * address instead.
+	 *
+	 * Only when the write NAMES the column, and never for a cleared one — same rule and same reason
+	 * as the DID path: an unrelated rename must not fail because of a grandfathered address, and
+	 * detaching one must stay possible whatever its state.
+	 */
+	private async assertEmergencyAddressAssignable(
+		session: AppSession,
+		values: Record<string, unknown>,
+	): Promise<void> {
+		if (!Object.hasOwn(values, "emergencyAddressId")) {
+			return;
+		}
+		const addressId = values.emergencyAddressId;
+		await this.emergencyAddresses.assertAssignable(
+			session,
+			typeof addressId === "string" ? addressId : null,
+			typeof values.macAddress === "string" ? `device ${values.macAddress}` : "this device",
+		);
+	}
+
+	override async list(
+		session: AppSession,
+		query: ListQuery,
+	): Promise<PagedResult<Record<string, unknown>>> {
+		if (holdsUnscoped(session, "devices.read")) {
+			return await super.list(session, query);
+		}
+		return await this.listRestricted(session, query, await this.ownedIds(session));
+	}
+
+	override async get(
+		session: AppSession,
+		id: string,
+	): Promise<ItemEnvelope<Record<string, unknown>>> {
+		const result = await super.get(session, id);
+		if (!holdsUnscoped(session, "devices.read")) {
+			assertOwnsRow(await this.ownedIds(session), id, NOT_YOURS);
+		}
+		return result;
+	}
+
+	private async ownedIds(session: AppSession): Promise<readonly string[]> {
+		return await ownedDeviceIds(this.database, this.organizationId(session), session.user.id);
 	}
 
 	/**

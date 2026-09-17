@@ -1,9 +1,10 @@
 import { getLogger } from "@optimiq-voice/logging";
+import { attachUpgradeHandler } from "../core/http/upgrade-router";
+import { registerGauge } from "../core/metrics/metrics";
 import { LiveGateway } from "./live-gateway";
 import { LIVE_PATH } from "./live-protocol";
 import type { INestApplication } from "@nestjs/common";
-import type { IncomingMessage, Server } from "node:http";
-import type { Duplex } from "node:stream";
+import type { Server } from "node:http";
 
 const logger = getLogger("api.live");
 
@@ -18,11 +19,11 @@ const logger = getLogger("api.live");
  * `registerAuthTransport`: raw transport wiring, done after `NestFactory.create` (so the container
  * can build the gateway) and before `listen` (so the listener exists when the first client arrives).
  *
- * ## The listener does not consume upgrades it does not own
+ * ## The gateway does not consume upgrades it does not own
  *
- * `handleUpgrade` returns without touching the socket when the path is not {@link LIVE_PATH}. Node
- * destroys an upgrade nothing answered, which is the correct default; a gateway that destroyed
- * every upgrade it saw would break any future feature that wants one.
+ * `handleUpgrade` returns `false` without touching the socket when the path is not
+ * {@link LIVE_PATH}, so a future feature that wants that path can claim it. Destroying an upgrade
+ * NOBODY claims is `attachUpgradeHandler`'s job — Node will not do it once a listener exists.
  */
 export async function registerLiveTransport(app: INestApplication): Promise<boolean> {
 	const gateway = app.get(LiveGateway);
@@ -34,17 +35,33 @@ export async function registerLiveTransport(app: INestApplication): Promise<bool
 		return false;
 	}
 
-	server.on("upgrade", (request: IncomingMessage, socket: Duplex, head: Buffer) => {
-		// The handler is async because session resolution is; the event is not. A rejection here
-		// would be unhandled and would take the process down, so it is caught and the socket is
-		// closed — an upgrade that failed for an unexpected reason must not be left half-open.
-		void gateway.handleUpgrade(request, socket, head).catch((error) => {
-			logger.error({ err: error }, "a live upgrade failed");
-			socket.destroy();
-		});
-	});
+	attachUpgradeHandler(server, (request, socket, head) =>
+		gateway.handleUpgrade(request, socket, head),
+	);
 
 	gateway.start();
+	// Read at scrape time off the gateway's own counters rather than mirrored into metrics of our
+	// own, so there is exactly one place a connection is counted.
+	registerGauge(
+		"api_live_ws_clients",
+		"Live-channel WebSocket clients currently connected.",
+		() => gateway.stats.connections,
+	);
+	registerGauge(
+		"api_live_ws_accepted_total",
+		"Live-channel upgrades accepted since boot.",
+		() => gateway.stats.accepted,
+	);
+	registerGauge(
+		"api_live_ws_refused_total",
+		"Live-channel upgrades refused since boot.",
+		() => gateway.stats.refused,
+	);
+	registerGauge(
+		"api_live_ws_messages_delivered_total",
+		"Live-channel messages fanned out to clients since boot.",
+		() => gateway.stats.delivered,
+	);
 	logger.info(`live WebSocket channel serving ${LIVE_PATH}`);
 	await Promise.resolve();
 	return true;

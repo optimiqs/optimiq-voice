@@ -272,6 +272,7 @@ export function IvrMenuDialog({
 							field={field}
 							label="Wait between digits (ms)"
 							placeholder="2000"
+							description="How long a caller may pause mid-entry. It is also what separates pressing an option from dialling an extension: press 1 and stop and the option is taken after this long."
 							disabled={mutation.isPending}
 							submitError={errors.interDigitTimeoutMs}
 						/>
@@ -283,6 +284,7 @@ export function IvrMenuDialog({
 							field={field}
 							label="Max digits"
 							placeholder="1"
+							description="How many digits an option may need. Dialling an extension is not capped by this — the menu always collects enough for your longest extension number."
 							disabled={mutation.isPending}
 							submitError={errors.maxDigits}
 						/>
@@ -344,7 +346,7 @@ export function IvrMenuDialog({
 						<SwitchField
 							field={field}
 							label="Allow dialling an extension"
-							description="A caller may enter any extension number, not only the options you listed."
+							description="A caller may enter any extension number, not only the options you listed. Options are matched first, so an option whose digit starts an extension number makes that caller wait for the between-digits timeout."
 							disabled={mutation.isPending}
 						/>
 					)}

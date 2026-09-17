@@ -1,0 +1,22 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"legId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"sdpOffer": {
+			"type": "string",
+			"maxLength": 16384
+		},
+		"intent": {
+			"default": "move",
+			"type": "string",
+			"enum": ["hold", "resume", "move", "refresh"]
+		}
+	},
+	"required": ["legId", "sdpOffer", "intent"],
+	"additionalProperties": false
+}

@@ -14,6 +14,7 @@ import { HttpException, HttpStatus } from "@nestjs/common";
  * { "statusCode": 400, "code": "CDR_RANGE_TOO_WIDE",  "message": "…", "maxDays": 92 }
  * { "statusCode": 404, "code": "CDR_NOT_FOUND",       "message": "…", "kind": "call-leg", "id": "…" }
  * { "statusCode": 403, "code": "CDR_LINK_INVALID",    "message": "…" }
+ * { "statusCode": 403, "code": "CDR_SELF_SCOPE_UNAVAILABLE", "message": "…" }
  * { "statusCode": 410, "code": "CDR_LINK_EXPIRED",    "message": "…" }
  * { "statusCode": 501, "code": "CDR_SIGNING_UNAVAILABLE", "message": "…" }
  * ```
@@ -67,6 +68,30 @@ export class CdrInvalidCursorException extends HttpException {
 				message: `The pagination cursor could not be read (${detail}). Start the listing again.`,
 			},
 			HttpStatus.BAD_REQUEST,
+		);
+	}
+}
+
+/**
+ * A caller holds `cdr.read.own` on a deployment where "own" cannot be resolved.
+ *
+ * The link from a person to their calls is their extensions, which the PBX area owns; with that
+ * area absent this API has no way to work out which rows are theirs. 403 and by name, because both
+ * alternatives are worse: returning every row is a silent privilege escalation, and returning none
+ * is a screen that looks broken with nothing to explain it. Mirrors the PBX area's
+ * `SELF_SERVICE_SCOPE_FORBIDDEN` without importing it — the two areas are siblings and neither may
+ * depend on the other.
+ */
+export class CdrSelfScopeUnavailableException extends HttpException {
+	constructor() {
+		super(
+			{
+				statusCode: HttpStatus.FORBIDDEN,
+				code: "CDR_SELF_SCOPE_UNAVAILABLE",
+				message:
+					"Your access to call history is limited to your own calls, and this deployment cannot resolve which extensions you hold.",
+			},
+			HttpStatus.FORBIDDEN,
 		);
 	}
 }
@@ -137,6 +162,33 @@ export class CdrMediaGoneException extends HttpException {
 				message: "The recording metadata exists but its media has been deleted.",
 			},
 			HttpStatus.GONE,
+		);
+	}
+}
+
+/**
+ * Too many of this organization's exports are already owed work.
+ *
+ * A 429 rather than a 409, and the distinction is the one a client acts on: a conflict says "this
+ * request contradicts the current state", which invites a re-read and a different request. This
+ * says "the same request will work shortly", which is what it means — the worker takes one job at
+ * a time and the queue drains on its own.
+ *
+ * `retryAfterSeconds` is a hint rather than a header, because there is no honest number: how long
+ * a queue of five exports takes depends entirely on their windows. It is set to a minute, which is
+ * a polling interval and not a promise.
+ */
+export class CdrExportPendingLimitException extends HttpException {
+	constructor(maxPending: number) {
+		super(
+			{
+				statusCode: HttpStatus.TOO_MANY_REQUESTS,
+				code: "CDR_EXPORT_PENDING_LIMIT",
+				message: `This organization already has ${maxPending} exports queued or running. Wait for one to finish, or delete one you no longer need.`,
+				maxPending,
+				retryAfterSeconds: 60,
+			},
+			HttpStatus.TOO_MANY_REQUESTS,
 		);
 	}
 }

@@ -115,3 +115,23 @@ describe("parseRateLimitResetMs", () => {
 		expect(parseRateLimitResetMs("2000, 2000;w=1")).toBeUndefined();
 	});
 });
+
+/**
+ * A carrier hint is a hint, not a licence to sleep.
+ *
+ * `parseRateLimitResetMs` refuses an implausible reset, but `Retry-After` had no equivalent bound —
+ * and it is read FIRST, so it won over the guarded header. A proxy in front of Telnyx answering
+ * `503 Retry-After: 86400` would have pinned the calling handler, and its database transaction,
+ * for a day per attempt: `timeoutMs` covers the request, never the sleep.
+ */
+describe("backoffDelayMs — the carrier floor is bounded", () => {
+	it("clamps an absurd Retry-After to maxRetryAfterMs", () => {
+		expect(backoffDelayMs(DEFAULT_RETRY_POLICY, 0, 86_400_000, () => 0)).toBe(
+			DEFAULT_RETRY_POLICY.maxRetryAfterMs,
+		);
+	});
+
+	it("leaves a plausible floor alone", () => {
+		expect(backoffDelayMs(DEFAULT_RETRY_POLICY, 0, 2_000, () => 0)).toBe(2_000);
+	});
+});

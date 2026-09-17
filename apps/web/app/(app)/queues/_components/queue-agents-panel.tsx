@@ -15,8 +15,9 @@ import { Button } from "~/components/ui/button";
 import { MenuItem } from "~/components/ui/menu";
 import { DEFAULT_PAGE_LIMIT, PBX_RESOURCES } from "~/lib/pbx/client";
 import { usePermission } from "../../_context/session-context";
-import { usePbxDelete, usePbxList } from "../../_hooks/use-pbx-queries";
+import { usePbxDelete, usePbxList, usePbxRoster } from "../../_hooks/use-pbx-queries";
 import { QueueAgentDialog } from "./queue-agent-dialog";
+import { QueueAgentSkillsDialog } from "./queue-agent-skills-dialog";
 import { AgentStatusBadge } from "./queue-shared";
 import { QueueTierDialog } from "./queue-tier-dialog";
 import type { ExtensionRow, QueueAgentRow } from "~/lib/pbx/contracts";
@@ -41,7 +42,7 @@ export function QueueAgentsPanel() {
 	const canManage = usePermission(resource.permissions.write);
 
 	/** Only to name the extension an agent answers on; the row stores an id. */
-	const extensions = usePbxList(PBX_RESOURCES.extensions, { page: 1, limit: 100 });
+	const extensions = usePbxRoster(PBX_RESOURCES.extensions);
 	const extensionNames = new Map(
 		extensions.rows.map((row: ExtensionRow) => [row.id, PBX_RESOURCES.extensions.displayName(row)]),
 	);
@@ -49,6 +50,7 @@ export function QueueAgentsPanel() {
 	const [editing, setEditing] = useState<QueueAgentRow | null>(null);
 	const [dialogOpen, setDialogOpen] = useState(false);
 	const [assigning, setAssigning] = useState<QueueAgentRow | null>(null);
+	const [editingSkills, setEditingSkills] = useState<QueueAgentRow | null>(null);
 	const [pendingDelete, setPendingDelete] = useState<QueueAgentRow | null>(null);
 
 	const createButton = canManage ? (
@@ -135,7 +137,15 @@ export function QueueAgentsPanel() {
 						}
 						extra={
 							canManage ? (
-								<MenuItem onClick={() => setAssigning(row)}>Add to a queue…</MenuItem>
+								<>
+									<MenuItem onClick={() => setAssigning(row)}>Add to a queue…</MenuItem>
+									{/*
+									 * Skills are the person's, not the membership's, so they are edited from
+									 * the roster rather than from a queue's page — the same reason this
+									 * table is top-level at all.
+									 */}
+									<MenuItem onClick={() => setEditingSkills(row)}>Skills…</MenuItem>
+								</>
 							) : null
 						}
 						onDelete={
@@ -164,6 +174,20 @@ export function QueueAgentsPanel() {
 				onOpenChange={setDialogOpen}
 				agent={editing}
 			/>
+
+			{editingSkills ? (
+				<QueueAgentSkillsDialog
+					key={`skills-${editingSkills.id}`}
+					open
+					onOpenChange={(open) => {
+						if (!open) {
+							setEditingSkills(null);
+						}
+					}}
+					agent={editingSkills}
+					canManage={canManage}
+				/>
+			) : null}
 
 			{assigning ? (
 				<QueueTierDialog

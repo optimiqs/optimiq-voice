@@ -8,6 +8,7 @@ import { extension } from "./schema/extensions-schema";
 import { ivrMenu } from "./schema/ivr-schema";
 import { phoneNumber } from "./schema/numbers-schema";
 import { auditLog } from "./schema/security-schema";
+import { orgSetting } from "./schema/settings-schema";
 
 /**
  * Proves tenant isolation against a live PostgreSQL, which is the only place it can be proven:
@@ -92,10 +93,74 @@ describe.skipIf(!enabled)("pbx tenant row-level security", () => {
 		if (!client) {
 			return;
 		}
-		for (const table of [extension, ivrMenu, phoneNumber, auditLog]) {
+		for (const table of [extension, ivrMenu, phoneNumber, auditLog, orgSetting]) {
 			await client.adminDb.delete(table).where(inArray(table.organizationId, ORGANIZATIONS));
 		}
 		await client.close();
+	});
+
+	it("allows exactly one tenant to claim a SIP domain, including concurrent normalized writes", async () => {
+		const realm = `tenant-${ORGANIZATION_A}.voice.example`;
+		const claims = await Promise.allSettled(
+			ORGANIZATIONS.map((organizationId, index) =>
+				client.withTenantScope(
+					organizationId,
+					async (transaction) =>
+						await transaction
+							.insert(orgSetting)
+							.values({
+								organizationId,
+								category: "sip",
+								name: "realm",
+								value: index === 0 ? realm : ` ${realm.toUpperCase()} `,
+							})
+							.returning(),
+				),
+			),
+		);
+		expect(claims.filter((claim) => claim.status === "fulfilled")).toHaveLength(1);
+		const rejected = claims.find((claim) => claim.status === "rejected");
+		expect(rejected?.status).toBe("rejected");
+		if (rejected?.status === "rejected") {
+			const cause = rejected.reason.cause ?? rejected.reason;
+			expect(cause.code).toBe("23505");
+			expect(cause.constraint_name).toBe("org_setting_sip_realm_global_key");
+		}
+		const winningIndex = claims.findIndex((claim) => claim.status === "fulfilled");
+		const owner = ORGANIZATIONS[winningIndex]!;
+		const other = ORGANIZATIONS[1 - winningIndex]!;
+		const visible = await client.withTenantScope(
+			other,
+			async (transaction) =>
+				await transaction.select().from(orgSetting).where(eq(orgSetting.category, "sip")),
+		);
+		expect(visible).toHaveLength(0);
+		await client.withTenantScope(
+			owner,
+			async (transaction) =>
+				await transaction
+					.update(orgSetting)
+					.set({ value: null })
+					.where(eq(orgSetting.category, "sip")),
+		);
+		await client.withTenantScope(
+			other,
+			async (transaction) =>
+				await transaction
+					.insert(orgSetting)
+					.values({ organizationId: other, category: "sip", name: "realm", value: realm }),
+		);
+		const invalid = await capturePostgresFailure(
+			client.withTenantScope(
+				other,
+				async (transaction) =>
+					await transaction
+						.update(orgSetting)
+						.set({ value: {} })
+						.where(eq(orgSetting.category, "sip")),
+			),
+		);
+		expect(invalid.code).toBe(CHECK_VIOLATION);
 	});
 
 	it("passes the boot-time preflight against the live database", async () => {

@@ -32,9 +32,45 @@ export interface MediaReply {
 	status(code: number): unknown;
 }
 
-/** The one property of the Fastify request a media route reads. */
+/** The properties of the Fastify request a media route reads. */
 export interface MediaRequest {
 	readonly headers?: Readonly<Record<string, string | string[] | undefined>>;
+	/**
+	 * Fastify's resolved client address.
+	 *
+	 * Declared optional because the interface above is structural by design (see the header) and
+	 * every existing caller — the specs included — constructs a bare `{ headers }`. It is read only
+	 * to attribute an ANONYMOUS media fetch in the audit ledger, where an absent address is a
+	 * NULL rather than a failure.
+	 */
+	readonly ip?: string | undefined;
+}
+
+/** What an audit row can honestly say about the party behind an anonymous media fetch. */
+export interface MediaClient {
+	readonly ipAddress: string | undefined;
+	readonly userAgent: string | undefined;
+}
+
+/**
+ * The two identifying facts a signed-token media request actually carries.
+ *
+ * A signed link is followed without a session — that is the whole point of the scheme — so the
+ * address and the user-agent are the ONLY things that distinguish one fetch of a leaked URL from
+ * another. `request.ip` is preferred over the header because Fastify has already applied the
+ * deployment's `trustProxy` configuration to it, and a raw `x-forwarded-for` is attacker-controlled
+ * in a deployment that has not; the header is read only as the fallback for a request object that
+ * did not resolve one, and only its FIRST entry, which is the closest thing to a client address the
+ * chain contains.
+ */
+export function readMediaClient(request: MediaRequest): MediaClient {
+	const forwarded = request.headers?.["x-forwarded-for"];
+	const header = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+	const agent = request.headers?.["user-agent"];
+	return {
+		ipAddress: request.ip ?? header?.split(",")[0]?.trim(),
+		userAgent: Array.isArray(agent) ? agent[0] : agent,
+	};
 }
 
 /**

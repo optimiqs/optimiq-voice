@@ -31,6 +31,8 @@
 		"src/mail/**/*",
 		"src/media/**/*",
 		"src/pbx/**/*",
+		"src/provisioning/**/*",
+		"src/session/**/*",
 		"src/storage/**/*",
 		"src/transcription/**/*",
 		"scripts/**/*",
@@ -39,6 +41,8 @@
 		"test/live/**/*",
 		"test/mail/**/*",
 		"test/pbx/**/*",
+		"test/provisioning/**/*",
+		"test/session/**/*",
 		"test/storage/**/*",
 		"test/transcription/**/*"
 	],

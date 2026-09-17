@@ -26,10 +26,11 @@ import { utcTimestamp, uuidEntityId, uuidV7PrimaryKey } from "@optimiq-voice/db"
  * for. The column is nullable and carries the org when the envelope had a credible one, purely so
  * an operator can group a spike by tenant.
  *
- * It is therefore deliberately absent from `cdrTenantRlsPreflightPlan`: the tenant role has no
- * grants on it, no policies apply, and only the schema owner (which is who the writer runs as)
- * can read or write it. The preflight introspects the plan's tables by name, so an unlisted table
- * is not a preflight failure — see `packages/db/src/rls-preflight.ts`.
+ * It is therefore deliberately absent from `cdrTenantRlsPreflightPlan`'s expectations: the tenant
+ * role has no grants on it, no policies apply, and only the schema owner (which is who the writer
+ * runs as) can read or write it. The preflight introspects every org-scoped table in the schema,
+ * not just the planned ones, so the exemption has to be DECLARED — it is named in the plan's
+ * `unscopedTables`. Removing it from there fails the boot preflight, which is the point.
  */
 
 /**

@@ -645,6 +645,10 @@ function session(): AppSession {
 	return {
 		session: { activeOrganizationId: ORGANIZATION_ID },
 		user: { id: "user-1" },
+		// The unscoped read grant: these read-model specs are the manager/admin path, so the message
+		// list's `.own` narrowing passes straight through. The row-ownership narrowing itself is
+		// covered by `selfServiceScope.test.ts`.
+		permissions: ["voicemail.read"],
 	} as unknown as AppSession;
 }
 
@@ -705,6 +709,7 @@ function messagesHarness(message: {
 		{} as never,
 		database,
 		{ publish: async () => {} } as never,
+		{} as never,
 		{} as never,
 	);
 	return { service };

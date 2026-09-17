@@ -28,6 +28,14 @@ export const DESTINATION_SITE_KINDS: readonly string[] = [
 	"feature-code",
 	"conference",
 	/**
+	 * A phrase holds a scalar reference to the PROMPT each of its steps plays, so deleting a prompt a
+	 * sequence still plays is refused and names the phrases. It is the only `on delete restrict`
+	 * column in the schema — cascading would silently shorten the sentence — and the site is declared
+	 * with `idColumn: "phrase_id"`, so the kind that appears in the 409 is `phrase` and never
+	 * `phrase-step`. Adding `phrase-step` here would be a listing for a kind the server cannot emit.
+	 */
+	"phrase",
+	/**
 	 * A device holds a scalar reference to a device PROFILE, so deleting a profile a fleet still
 	 * uses is refused and names the devices. That delete is the one place a `device` appears in a
 	 * `PBX_REFERENCED` body — a device is never a destination, because a call is routed to an

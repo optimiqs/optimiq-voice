@@ -5,25 +5,33 @@ import { snapshotHash } from "./cache";
 import { canonicalJson } from "./canonical-json";
 import { callBlockHangupCause, compileRoutingArtifact, tryCompileRoutingArtifact } from "./compile";
 import { RoutingCompileError, RoutingSnapshotError } from "./errors";
+import { matchFeatureCode } from "./feature-codes";
 import {
 	aCallBlockRule,
+	aCallFlow,
 	aConference,
+	aDirectory,
 	aFeatureCode,
 	anExtension,
 	anInboundRoute,
 	anIvrMenu,
 	anIvrOption,
 	anOutboundRoute,
+	aPagingGroup,
 	aParkLot,
 	aPhoneNumber,
+	aPrompt,
 	aQueue,
 	aRingGroup,
 	aRingGroupMember,
+	aSharedLine,
 	aSnapshot,
+	aStream,
 	aTimeCondition,
 	aTimeRule,
 	aTrunk,
 	aVoicemailBox,
+	aVoicemailGreeting,
 	codesOf,
 	compileAttempt,
 	compiled,
@@ -31,11 +39,17 @@ import {
 	ORG_ID,
 } from "./fixtures";
 import { planNodeReferences } from "./plan";
+import { DEFAULT_ALL_PARTY_REGIONS } from "./recording-consent";
 import { emptySnapshot } from "./snapshot";
+import type { RoutingArtifact } from "./artifact";
 import type {
+	ConferencePlanNode,
 	ExtensionPlanNode,
 	IvrMenuPlanNode,
+	PagingPlanNode,
+	QueuePlanNode,
 	RingGroupPlanNode,
+	SharedLinePlanNode,
 	TrunkDialPlanNode,
 } from "./plan";
 
@@ -165,6 +179,93 @@ describe("compile — the node graph is closed", () => {
 
 	it("resolves every reference in every node", () => {
 		const artifact = compiled(snapshot);
+		for (const node of Object.values(artifact.nodes)) {
+			for (const reference of planNodeReferences(node)) {
+				expect(artifact.nodes[reference]).toBeDefined();
+			}
+		}
+	});
+
+	// Every branch field the compiler can emit, in one snapshot: the property below walks the node
+	// objects rather than a hand-written list of kinds, so a branch field that `planNodeReferences`
+	// forgets fails here whether or not anybody remembered to name it.
+	const branchy = aSnapshot({
+		extensions: [
+			anExtension({ label: "Ada Lovelace", voicemailEnabled: true }),
+			anExtension({ id: "ext-2", number: "1002", label: "Grace Hopper" }),
+			anExtension({ id: "ext-3", number: "1003", label: "Alan Turing" }),
+		],
+		voicemailBoxes: [aVoicemailBox()],
+		voicemailGreetings: [
+			aVoicemailGreeting({ kind: "name", objectKey: "org-0001/voicemail/vm-1/name.wav" }),
+		],
+		queues: [
+			aQueue({
+				timeoutDestinationType: "extension",
+				timeoutDestinationRef: "ext-1",
+				exitKey: "9",
+				exitDestinationType: "extension",
+				exitDestinationRef: "ext-2",
+			}),
+		],
+		callFlows: [
+			aCallFlow({
+				destinationType: "extension",
+				destinationRef: "ext-1",
+				nightDestinationType: "extension",
+				nightDestinationRef: "ext-2",
+			}),
+		],
+		audioStreams: [
+			aStream({ fallbackDestinationType: "extension", fallbackDestinationRef: "ext-1" }),
+		],
+		directories: [
+			aDirectory({ timeoutDestinationType: "extension", timeoutDestinationRef: "ext-3" }),
+		],
+	});
+
+	/** Every `*NodeId` a node carries, at any depth, found by shape rather than by kind. */
+	function branchFieldsOf(value: unknown): string[] {
+		if (Array.isArray(value)) {
+			return value.flatMap((item) => branchFieldsOf(item));
+		}
+		if (typeof value !== "object" || value === null) {
+			return [];
+		}
+		const found: string[] = [];
+		for (const [key, field] of Object.entries(value)) {
+			if (key.endsWith("NodeId") && typeof field === "string") {
+				found.push(field);
+			} else {
+				found.push(...branchFieldsOf(field));
+			}
+		}
+		return found;
+	}
+
+	it("reports every branch field every node carries", () => {
+		const artifact = compiled(branchy);
+		const kinds = new Set<string>();
+		for (const node of Object.values(artifact.nodes)) {
+			kinds.add(node.kind);
+			const reported = new Set(planNodeReferences(node));
+			for (const reference of branchFieldsOf(node)) {
+				expect([node.kind, reference, reported.has(reference)]).toEqual([
+					node.kind,
+					reference,
+					true,
+				]);
+			}
+		}
+		// The snapshot has to actually produce the kinds whose branches were being missed, or the
+		// property above passes vacuously.
+		for (const kind of ["queue", "call-flow", "stream", "dial-by-name"]) {
+			expect(kinds.has(kind)).toBe(true);
+		}
+	});
+
+	it("closes and reaches every branch of the branchy snapshot", () => {
+		const artifact = compiled(branchy);
 		for (const node of Object.values(artifact.nodes)) {
 			for (const reference of planNodeReferences(node)) {
 				expect(artifact.nodes[reference]).toBeDefined();
@@ -325,6 +426,21 @@ describe("compile — extensions", () => {
 			extensionId: "ext-1",
 			tollClass: "national",
 		});
+	});
+
+	it("carries a withheld caller id, and writes nothing when it is presented", () => {
+		const withheld = compiled(
+			aSnapshot({ extensions: [anExtension({ outboundCallerIdPresentation: "restricted" })] }),
+		);
+		expect(withheld.extensionsByNumber["1001"]?.outboundCallerIdPresentation).toBe("restricted");
+		for (const value of ["allowed", null, undefined] as const) {
+			const artifact = compiled(
+				aSnapshot({ extensions: [anExtension({ outboundCallerIdPresentation: value })] }),
+			);
+			expect(artifact.extensionsByNumber["1001"]).not.toHaveProperty(
+				"outboundCallerIdPresentation",
+			);
+		}
 	});
 });
 
@@ -510,6 +626,38 @@ describe("compile — feature codes", () => {
 		expect(result.ok).toBe(false);
 	});
 
+	it("warns when a hot-desk login has no logout beside it", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				featureCodes: [aFeatureCode({ id: "fc-hd", code: "*31", action: "hotdesk-login" })],
+			}),
+		);
+		expect(codesOf(result)).toContain("hotdesk-logout-missing");
+	});
+
+	it("does not warn when the hot-desk pair is complete", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				featureCodes: [
+					aFeatureCode({ id: "fc-hd", code: "*31", action: "hotdesk-login" }),
+					aFeatureCode({ id: "fc-hd2", code: "*32", action: "hotdesk-logout" }),
+				],
+			}),
+		);
+		expect(codesOf(result)).not.toContain("hotdesk-logout-missing");
+	});
+
+	it("keeps a hot-desk login argument-taking, so *311104 carries the extension", () => {
+		const artifact = compiled(
+			aSnapshot({
+				featureCodes: [aFeatureCode({ id: "fc-hd", code: "*31", action: "hotdesk-login" })],
+			}),
+		);
+		const match = matchFeatureCode(artifact.internal.featureCodes, "*311104");
+		expect(match?.featureCode.action).toBe("hotdesk-login");
+		expect(match?.argument).toBe("1104");
+	});
+
 	it("skips a disabled code", () => {
 		const artifact = compiled(aSnapshot({ featureCodes: [aFeatureCode({ enabled: false })] }));
 		expect(artifact.internal.featureCodes).toEqual([]);
@@ -559,6 +707,20 @@ describe("compile — feature codes", () => {
 			}),
 		);
 		expect(codesOf(result)).toContain("conflicting-feature-code");
+	});
+
+	/**
+	 * `*9` takes no argument, so `matchFeatureCode` only ever matches it whole — `*99200` reaches
+	 * voicemail. A warning about a collision that cannot happen teaches tenants to ignore warnings.
+	 */
+	it("does not warn when the feature code takes no argument and cannot consume the prefix", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				settings: { voicemailPrefix: "*99" },
+				featureCodes: [aFeatureCode({ code: "*9", action: "voicemail-check" })],
+			}),
+		);
+		expect(codesOf(result)).not.toContain("conflicting-feature-code");
 	});
 });
 
@@ -981,6 +1143,579 @@ describe("compile — ring groups", () => {
 	});
 });
 
+describe("compile — shared lines", () => {
+	it("resolves appearances to extension nodes in appearance-index order", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension(), anExtension({ id: "ext-2", number: "1002" })],
+				sharedLines: [
+					aSharedLine({
+						appearances: [
+							{ extensionId: "ext-2", ordinal: 2, enabled: true },
+							{ extensionId: "ext-1", ordinal: 1, enabled: true },
+						],
+					}),
+				],
+			}),
+		);
+		const node = artifact.nodes["shared-line:sl-1"] as SharedLinePlanNode;
+		expect(node.appearances.map((appearance) => appearance.appearanceIndex)).toEqual([1, 2]);
+		expect(node.appearances.map((appearance) => appearance.targetNodeId)).toEqual([
+			"extension:ext-1",
+			"extension:ext-2",
+		]);
+		expect(node.holdRecallTimeoutSeconds).toBe(60);
+		expect(node.bargeInEnabled).toBe(false);
+	});
+
+	it("claims the line's number so dialling it reaches the node", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				sharedLines: [aSharedLine({ extensionNumber: "700" })],
+			}),
+		);
+		expect(artifact.internal.numbers["700"]).toEqual({
+			number: "700",
+			kind: "shared-line",
+			entityId: "sl-1",
+			nodeId: "shared-line:sl-1",
+		});
+	});
+
+	it("projects a member's appearance index into the extension index for the credential path", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				sharedLines: [aSharedLine({ extensionNumber: "700" })],
+			}),
+		);
+		expect(artifact.extensionsByNumber["1001"]?.sharedLineAppearances).toEqual([
+			{ sharedLineId: "sl-1", number: "700", appearanceIndex: 1 },
+		]);
+	});
+
+	it("warns about a shared line with no reachable appearance but still compiles it", () => {
+		const result = compileAttempt(aSnapshot({ sharedLines: [aSharedLine({ appearances: [] })] }));
+		expect(result.ok).toBe(true);
+		expect(codesOf(result)).toContain("empty-shared-line");
+	});
+
+	it("drops a disabled appearance", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				sharedLines: [
+					aSharedLine({ appearances: [{ extensionId: "ext-1", ordinal: 1, enabled: false }] }),
+				],
+			}),
+		);
+		expect((artifact.nodes["shared-line:sl-1"] as SharedLinePlanNode).appearances).toEqual([]);
+	});
+});
+
+describe("compile — paging groups", () => {
+	it("compiles member NUMBERS in ordinal order", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [
+					anExtension(),
+					anExtension({ id: "ext-2", number: "1002" }),
+					anExtension({ id: "ext-3", number: "1003" }),
+				],
+				pagingGroups: [
+					aPagingGroup({
+						members: [
+							{ extensionId: "ext-3", ordinal: 3, enabled: true },
+							{ extensionId: "ext-1", ordinal: 1, enabled: true },
+							{ extensionId: "ext-2", ordinal: 2, enabled: true },
+						],
+					}),
+				],
+			}),
+		);
+		const node = artifact.nodes["paging:pg-1"] as PagingPlanNode;
+		// Numbers, not endpoints and not ids: the engine owns the dial template.
+		expect(node.members).toEqual(["1001", "1002", "1003"]);
+		expect(node.duplex).toBe(false);
+		expect(node.timeoutSeconds).toBe(30);
+	});
+
+	it("carries the talkback flag when the group is duplex", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				pagingGroups: [aPagingGroup({ duplex: true, timeoutSeconds: 15 })],
+			}),
+		);
+		const node = artifact.nodes["paging:pg-1"] as PagingPlanNode;
+		expect(node.duplex).toBe(true);
+		expect(node.timeoutSeconds).toBe(15);
+	});
+
+	it("drops a disabled member silently", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension(), anExtension({ id: "ext-2", number: "1002" })],
+				pagingGroups: [
+					aPagingGroup({
+						members: [
+							{ extensionId: "ext-1", ordinal: 1, enabled: false },
+							{ extensionId: "ext-2", ordinal: 2, enabled: true },
+						],
+					}),
+				],
+			}),
+		);
+		expect(result.ok).toBe(true);
+		const node = (result.ok ? result.artifact.nodes["paging:pg-1"] : undefined) as PagingPlanNode;
+		expect(node.members).toEqual(["1002"]);
+		expect(codesOf(result)).not.toContain("dangling-destination");
+	});
+
+	it("drops a member whose extension is gone, and says so", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension()],
+				pagingGroups: [
+					aPagingGroup({
+						members: [
+							{ extensionId: "ext-1", ordinal: 1, enabled: true },
+							{ extensionId: "ext-missing", ordinal: 2, enabled: true },
+						],
+					}),
+				],
+			}),
+		);
+		// A warning, not an error: the artifact is sound, the page is just smaller than intended.
+		expect(result.ok).toBe(true);
+		const node = (result.ok ? result.artifact.nodes["paging:pg-1"] : undefined) as PagingPlanNode;
+		expect(node.members).toEqual(["1001"]);
+		const diagnostic = result.diagnostics.find((entry) => entry.code === "dangling-destination");
+		expect(diagnostic?.severity).toBe("warning");
+		expect(diagnostic?.message).toContain("All handsets");
+		expect(diagnostic?.message).toContain("ext-missing");
+	});
+
+	it("drops a member whose extension is disabled, and says which it was", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension({ enabled: false })],
+				pagingGroups: [aPagingGroup()],
+			}),
+		);
+		expect(result.ok).toBe(true);
+		const node = (result.ok ? result.artifact.nodes["paging:pg-1"] : undefined) as PagingPlanNode;
+		expect(node.members).toEqual([]);
+		// `disabled-entity`, not `dangling-destination`: the desk exists, somebody switched it off.
+		const diagnostic = result.diagnostics.find(
+			(entry) => entry.code === "disabled-entity" && entry.subject?.kind === "paging-group",
+		);
+		expect(diagnostic?.severity).toBe("warning");
+		expect(diagnostic?.message).toContain("1001");
+	});
+
+	it("warns about a group with no reachable members but still compiles it", () => {
+		const result = compileAttempt(aSnapshot({ pagingGroups: [aPagingGroup({ members: [] })] }));
+		expect(result.ok).toBe(true);
+		expect(codesOf(result)).toContain("empty-paging-group");
+	});
+
+	it("does not materialise a disabled group", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				pagingGroups: [aPagingGroup({ enabled: false })],
+			}),
+		);
+		expect(artifact.nodes["paging:pg-1"]).toBeUndefined();
+	});
+
+	it("claims a dialable internal number when the group has one", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				pagingGroups: [aPagingGroup({ extensionNumber: "8000" })],
+			}),
+		);
+		expect(artifact.internal.numbers["8000"]).toEqual({
+			number: "8000",
+			kind: "paging-group",
+			entityId: "pg-1",
+			nodeId: "paging:pg-1",
+		});
+	});
+
+	it("errors when a group's number collides with an extension", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension()],
+				pagingGroups: [aPagingGroup({ extensionNumber: "1001" })],
+			}),
+		);
+		expect(result.ok).toBe(false);
+		expect(codesOf(result)).toContain("duplicate-internal-number");
+	});
+
+	it("resolves a paging group named in a `*81` code's params", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				pagingGroups: [aPagingGroup()],
+				featureCodes: [
+					aFeatureCode({ code: "*81", action: "paging", params: { groupId: "pg-1" } }),
+				],
+			}),
+		);
+		expect(artifact.nodes["feature-code:fc-1"]).toMatchObject({ targetNodeId: "paging:pg-1" });
+	});
+
+	it("errors when a code names a paging group that does not exist", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				featureCodes: [
+					aFeatureCode({ code: "*81", action: "paging", params: { groupId: "nope" } }),
+				],
+			}),
+		);
+		expect(result.ok).toBe(false);
+		expect(codesOf(result)).toContain("dangling-destination");
+	});
+
+	/** `intercom` takes a live keypress, not a stored id — there is nothing to resolve. */
+	it("leaves an intercom code without a compile-time target", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				featureCodes: [aFeatureCode({ code: "*80", action: "intercom" })],
+			}),
+		);
+		expect(artifact.nodes["feature-code:fc-1"]).not.toHaveProperty("targetNodeId");
+	});
+
+	it("is reachable as a destination from an IVR option", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				pagingGroups: [aPagingGroup()],
+				ivrMenus: [anIvrMenu()],
+				ivrMenuOptions: [anIvrOption({ destinationType: "paging-group", destinationRef: "pg-1" })],
+			}),
+		);
+		const menu = artifact.nodes["ivr-menu:ivr-1"] as IvrMenuPlanNode;
+		expect(menu.options[0]?.targetNodeId).toBe("paging:pg-1");
+		// And it ends there: a page has no continuation to walk to.
+		expect(planNodeReferences(artifact.nodes["paging:pg-1"] as PagingPlanNode)).toEqual([]);
+	});
+});
+
+describe("compile — screening and whisper", () => {
+	it("carries call screening onto the extension node when it is on", () => {
+		const artifact = compiled(aSnapshot({ extensions: [anExtension({ callScreening: true })] }));
+		expect((artifact.nodes["extension:ext-1"] as ExtensionPlanNode).callScreening).toBe(true);
+	});
+
+	it("omits the flag entirely when it is unset, so absent and false are one artifact", () => {
+		const artifact = compiled(aSnapshot({ extensions: [anExtension()] }));
+		expect(artifact.nodes["extension:ext-1"]).not.toHaveProperty("callScreening");
+	});
+
+	it("carries the agent whisper prompt onto the queue node", () => {
+		const artifact = compiled(
+			aSnapshot({ queues: [aQueue({ agentWhisperPromptId: "prompt-9" })] }),
+		);
+		expect((artifact.nodes["queue:q-1"] as QueuePlanNode).agentWhisperPromptId).toBe("prompt-9");
+	});
+
+	it("omits the whisper when a queue has none", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue()] }));
+		expect(artifact.nodes["queue:q-1"]).not.toHaveProperty("agentWhisperPromptId");
+	});
+});
+
+describe("compile — queue callback (virtual hold)", () => {
+	it("compiles the block only for a queue that offers one", () => {
+		const artifact = compiled(aSnapshot({ extensions: [anExtension()], queues: [aQueue()] }));
+		expect((artifact.nodes["queue:q-1"] as QueuePlanNode).callback).toBeUndefined();
+	});
+
+	it("carries the offer, the key and the bounded retry policy", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				queues: [
+					aQueue({
+						callbackEnabled: true,
+						callbackKey: "2",
+						callbackOfferAfterSeconds: 90,
+						callbackMaxAttempts: 4,
+						callbackRetryDelaySeconds: 600,
+						callbackExpiresAfterSeconds: 7200,
+					}),
+				],
+			}),
+		);
+		expect((artifact.nodes["queue:q-1"] as QueuePlanNode).callback).toEqual({
+			key: "2",
+			offerAfterSeconds: 90,
+			maxAttempts: 4,
+			retryDelaySeconds: 600,
+			expiresAfterSeconds: 7200,
+		});
+	});
+
+	it("clamps a value that reached the row from somewhere other than the form", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				queues: [
+					aQueue({
+						callbackEnabled: true,
+						callbackKey: "2",
+						callbackMaxAttempts: 0,
+						callbackRetryDelaySeconds: 1,
+						callbackExpiresAfterSeconds: 1,
+					}),
+				],
+			}),
+		);
+		const callback = (artifact.nodes["queue:q-1"] as QueuePlanNode).callback;
+		expect(callback).toMatchObject({
+			maxAttempts: 1,
+			retryDelaySeconds: 30,
+			expiresAfterSeconds: 60,
+		});
+	});
+
+	/** One digit cannot mean two things, and the exit key keeps it. */
+	it("refuses to give the callback a digit the exit key already claims", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension()],
+				queues: [
+					aQueue({
+						exitKey: "2",
+						exitDestinationType: "hangup",
+						callbackEnabled: true,
+						callbackKey: "2",
+						callbackOfferAfterSeconds: 60,
+					}),
+				],
+			}),
+		);
+		expect(codesOf(result)).toContain("queue-callback-unusable");
+		const node = result.ok ? (result.artifact.nodes["queue:q-1"] as QueuePlanNode) : undefined;
+		expect(node?.exitKey).toBe("2");
+		expect(node?.callback?.key).toBeUndefined();
+	});
+
+	it("drops an accept key a phone cannot send, and says so", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension()],
+				queues: [
+					aQueue({ callbackEnabled: true, callbackKey: "22", callbackOfferAfterSeconds: 60 }),
+				],
+			}),
+		);
+		expect(codesOf(result)).toContain("queue-callback-unusable");
+		const node = result.ok ? (result.artifact.nodes["queue:q-1"] as QueuePlanNode) : undefined;
+		expect(node?.callback?.key).toBeUndefined();
+		expect(node?.callback?.offerAfterSeconds).toBe(60);
+	});
+
+	it("compiles no callback at all when no caller could ever be offered one", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension()],
+				queues: [aQueue({ callbackEnabled: true })],
+			}),
+		);
+		expect(codesOf(result)).toContain("queue-callback-unusable");
+		const node = result.ok ? (result.artifact.nodes["queue:q-1"] as QueuePlanNode) : undefined;
+		expect(node?.callback).toBeUndefined();
+	});
+
+	it("allows an announcement-only offer, which is a real configuration", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension()],
+				queues: [aQueue({ callbackEnabled: true, callbackOfferAfterSeconds: 60 })],
+			}),
+		);
+		expect(codesOf(result)).not.toContain("queue-callback-unusable");
+	});
+});
+
+describe("compile — the entity toggle codes", () => {
+	/**
+	 * `*65` on a call flow and `*64` on a time condition. Both were validated on write and offered in
+	 * the admin UI while reaching neither `internal.featureCodes` nor `internal.numbers` — a code
+	 * answered by "no outbound route matched" (`E2E-routing2.md`).
+	 */
+	it("puts a call flow's toggle code in the catalogue, pinned to that flow", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				callFlows: [aCallFlow({ featureCode: "*65" })],
+			}),
+		);
+		const entry = artifact.internal.featureCodes.find((code) => code.code === "*65");
+		expect(entry).toMatchObject({
+			action: "call-flow-toggle",
+			argumentMode: "none",
+			params: { callFlowId: "cf-1" },
+		});
+		expect(artifact.nodes[entry?.nodeId ?? ""]).toMatchObject({
+			kind: "feature-code",
+			action: "call-flow-toggle",
+		});
+	});
+
+	it("puts a time condition's override code in the catalogue, pinned to that condition", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				timeConditions: [aTimeCondition({ overrideFeatureCode: "*64" })],
+				timeConditionRules: [aTimeRule()],
+			}),
+		);
+		const entry = artifact.internal.featureCodes.find((code) => code.code === "*64");
+		expect(entry).toMatchObject({
+			action: "time-condition-override",
+			argumentMode: "none",
+			params: { timeConditionId: "tc-1" },
+		});
+	});
+
+	it("matches the toggle code the way the engine will, longest code first", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				callFlows: [aCallFlow({ featureCode: "*65" })],
+				featureCodes: [aFeatureCode({ code: "*6", action: "redial" })],
+			}),
+		);
+		expect(matchFeatureCode(artifact.internal.featureCodes, "*65")?.featureCode.code).toBe("*65");
+	});
+
+	it("leaves a disabled flow's code out of the catalogue", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				callFlows: [aCallFlow({ featureCode: "*65", enabled: false })],
+			}),
+		);
+		expect(artifact.internal.featureCodes.map((code) => code.code)).not.toContain("*65");
+	});
+
+	it("still reports a real feature code that would swallow the toggle code", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension()],
+				callFlows: [aCallFlow({ featureCode: "*65" })],
+				featureCodes: [aFeatureCode({ code: "*65", action: "redial" })],
+			}),
+		);
+		expect(result.ok).toBe(false);
+		expect(codesOf(result)).toContain("conflicting-feature-code");
+	});
+
+	it("does not report a toggle code as colliding with the entry compiled from it", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension()],
+				callFlows: [aCallFlow({ featureCode: "*65" })],
+			}),
+		);
+		expect(codesOf(result)).not.toContain("conflicting-feature-code");
+	});
+});
+
+describe("compile — IVR direct dial", () => {
+	it("puts the directory's width on the node so the walker can collect a whole number", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [
+					anExtension({ number: "1001" }),
+					anExtension({ id: "ext-2", number: "20001" }),
+				],
+				ivrMenus: [anIvrMenu({ directDialEnabled: true })],
+			}),
+		);
+		const node = artifact.nodes["ivr-menu:ivr-1"] as IvrMenuPlanNode;
+		expect(node.maxDigits).toBe(1);
+		expect(node.directDialMaxDigits).toBe(5);
+	});
+
+	it("carries no width at all when the menu does not allow direct dial", () => {
+		const artifact = compiled(aSnapshot({ extensions: [anExtension()], ivrMenus: [anIvrMenu()] }));
+		const node = artifact.nodes["ivr-menu:ivr-1"] as IvrMenuPlanNode;
+		expect(node.directDialMaxDigits).toBeUndefined();
+	});
+
+	it("warns that an option is a prefix of an extension number, and names the cost", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension({ number: "1001" })],
+				ivrMenus: [anIvrMenu({ directDialEnabled: true, interDigitTimeoutMs: 2500 })],
+				ivrMenuOptions: [anIvrOption({ matchValue: "1" })],
+			}),
+		);
+		expect(result.ok).toBe(true);
+		const warning = result.diagnostics.find((entry) => entry.code === "ivr-direct-dial-ambiguous");
+		expect(warning?.message).toContain("extension 1001 starts with");
+		expect(warning?.message).toContain("2500ms");
+	});
+
+	it("warns that an option IS an extension number, which direct dial can never reach", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension({ number: "1001" })],
+				ivrMenus: [anIvrMenu({ directDialEnabled: true, maxDigits: 4 })],
+				ivrMenuOptions: [anIvrOption({ matchValue: "1001" })],
+			}),
+		);
+		const warning = result.diagnostics.find((entry) => entry.code === "ivr-direct-dial-ambiguous");
+		expect(warning?.message).toContain("cannot be reached by direct dial");
+	});
+
+	it("says nothing about an option no extension number starts with", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension({ number: "1001" })],
+				ivrMenus: [anIvrMenu({ directDialEnabled: true })],
+				ivrMenuOptions: [anIvrOption({ matchValue: "9" })],
+			}),
+		);
+		expect(codesOf(result)).not.toContain("ivr-direct-dial-ambiguous");
+	});
+
+	it("does not judge a regex option, whose shadow is not decidable from the pattern", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				extensions: [anExtension({ number: "1001" })],
+				ivrMenus: [anIvrMenu({ directDialEnabled: true })],
+				ivrMenuOptions: [anIvrOption({ matchKind: "regex", matchValue: "^1$" })],
+			}),
+		);
+		expect(codesOf(result)).not.toContain("ivr-direct-dial-ambiguous");
+	});
+
+	it("warns when direct dial is on for an organization with no extension to dial", () => {
+		const result = compileAttempt(
+			aSnapshot({
+				ivrMenus: [anIvrMenu({ directDialEnabled: true })],
+			}),
+		);
+		expect(codesOf(result)).toContain("ivr-direct-dial-empty");
+		const node = result.ok
+			? (result.artifact.nodes["ivr-menu:ivr-1"] as IvrMenuPlanNode)
+			: undefined;
+		expect(node?.directDialMaxDigits).toBeUndefined();
+	});
+});
+
 describe("compile — IVR menus", () => {
 	it("compiles digit options into exact patterns", () => {
 		const artifact = compiled(
@@ -1311,5 +2046,567 @@ describe("compile — failure surface", () => {
 	it("never puts an error diagnostic on an artifact", () => {
 		const artifact = compiled(aSnapshot({ ringGroups: [aRingGroup()] }));
 		expect(artifact.diagnostics.every((entry) => entry.severity !== "error")).toBe(true);
+	});
+});
+
+/**
+ * The contact-centre block on the queue node.
+ *
+ * Two of these are about node IDENTITY rather than about a field, and those are the ones worth
+ * having: the compiler now mints more than one node per queue row, and the properties that must
+ * survive that are (a) the same override deduplicates to one node, so an artifact cannot grow a node
+ * per reference, and (b) every node minted from one row keeps one `queueId`, because everything
+ * downstream — the roster, the waiting line, the events — keys on it. A change that broke the second
+ * would split one queue into several silently: two lines, two position counters, and a wallboard
+ * showing a queue nobody configured.
+ */
+describe("compile — queue contact-centre settings", () => {
+	function queueOf(artifact: RoutingArtifact, id = "queue:q-1"): QueuePlanNode {
+		return artifact.nodes[id] as QueuePlanNode;
+	}
+
+	it("carries the record policy, replacing the boolean nothing honoured", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue({ recordPolicy: "all" })] }));
+		expect(queueOf(artifact).recordPolicy).toBe("all");
+		expect(artifact.nodes["queue:q-1"]).not.toHaveProperty("recordEnabled");
+	});
+
+	it("defaults a queue whose loader has not been taught the column to recording nothing", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue({ recordPolicy: undefined })] }));
+		expect(queueOf(artifact).recordPolicy).toBe("none");
+	});
+
+	it("compiles the exit key and its destination", () => {
+		const artifact = compiled(
+			aSnapshot({
+				voicemailBoxes: [aVoicemailBox()],
+				queues: [
+					aQueue({ exitKey: "9", exitDestinationType: "voicemail", exitDestinationRef: "vm-1" }),
+				],
+			}),
+		);
+		expect(queueOf(artifact).exitKey).toBe("9");
+		expect(queueOf(artifact).exitNodeId).toBe("voicemail:vm-1:leave");
+	});
+
+	it("upper-cases a letter key rather than silently disabling it", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue({ exitKey: "d" })] }));
+		expect(queueOf(artifact).exitKey).toBe("D");
+	});
+
+	it("drops a key no phone could send, so the engine never compares against it", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue({ exitKey: "99" })] }));
+		expect(artifact.nodes["queue:q-1"]).not.toHaveProperty("exitKey");
+	});
+
+	it("says so when it drops one, rather than dropping it silently", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue({ exitKey: "Z" })] }));
+		const warning = artifact.diagnostics.find(
+			(entry) => entry.code === "queue-exit-key-without-destination",
+		);
+		expect(warning?.message).toContain('"Z"');
+	});
+
+	it("warns when a key has nowhere to send the caller", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue({ exitKey: "9" })] }));
+		expect(artifact.diagnostics.map((entry) => entry.code)).toContain(
+			"queue-exit-key-without-destination",
+		);
+	});
+
+	it("takes the queue's default priority when nothing overrides it", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue({ defaultPriority: 300 })] }));
+		expect(queueOf(artifact).priority).toBe(300);
+	});
+
+	it("mints a distinct node for a reference that overrides the priority", () => {
+		const artifact = compiled(
+			aSnapshot({
+				queues: [aQueue({ defaultPriority: 0 })],
+				inboundRoutes: [
+					anInboundRoute({
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { priority: 800 } },
+					}),
+				],
+			}),
+		);
+		const node = queueOf(artifact, "queue:q-1:p800");
+		expect(node.priority).toBe(800);
+		// The identity that keeps two doors one queue.
+		expect(node.queueId).toBe("q-1");
+	});
+
+	/**
+	 * Two doors at one priority are one door. The base `queue:q-1` is always minted — it is the
+	 * queue's own entrance, at its default priority — so what this asserts is that the OVERRIDE adds
+	 * exactly one node however many references carry it, which is the property that stops an
+	 * artifact growing a node per reference.
+	 */
+	it("gives two references at the same priority one node", () => {
+		const artifact = compiled(
+			aSnapshot({
+				queues: [aQueue()],
+				inboundRoutes: [
+					anInboundRoute({
+						id: "in-1",
+						matchPattern: "+15551230001",
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { priority: 800 } },
+					}),
+					anInboundRoute({
+						id: "in-2",
+						matchPattern: "+15551230002",
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { priority: 800 } },
+					}),
+				],
+			}),
+		);
+		const queueNodes = Object.keys(artifact.nodes)
+			.filter((id) => id.startsWith("queue:q-1"))
+			.sort();
+		expect(queueNodes).toEqual(["queue:q-1", "queue:q-1:p800"]);
+	});
+
+	/**
+	 * A caller who waits their turn, and a warning — not a refusal that would take every unrelated
+	 * route in the tenant down with it over one mistyped form field.
+	 */
+	it("warns and falls back to the default when the override is out of range", () => {
+		const artifact = compiled(
+			aSnapshot({
+				queues: [aQueue({ defaultPriority: 10 })],
+				inboundRoutes: [
+					anInboundRoute({
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { priority: 5000 } },
+					}),
+				],
+			}),
+		);
+		expect(artifact.diagnostics.map((entry) => entry.code)).toContain("invalid-queue-priority");
+		expect(queueOf(artifact).priority).toBe(10);
+	});
+
+	/**
+	 * Skills reach the artifact the same way a priority does — on the EDGE — because "press 2 for
+	 * Spanish" is a property of the IVR option and not of the queue. The queue's own requirements
+	 * travel on the roster, so nothing here should appear on a queue nobody pointed at with any.
+	 */
+	it("leaves a queue nobody asked a skill of with no requirements at all", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue()] }));
+		expect(queueOf(artifact)).not.toHaveProperty("requiredSkills");
+	});
+
+	it("compiles an entrance's skill requirements onto its own node", () => {
+		const artifact = compiled(
+			aSnapshot({
+				queues: [aQueue()],
+				inboundRoutes: [
+					anInboundRoute({
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { skills: "spanish:3:60" } },
+					}),
+				],
+			}),
+		);
+		const node = queueOf(artifact, "queue:q-1:sspanish-3-60");
+		expect(node.requiredSkills).toEqual([{ skill: "spanish", minLevel: 3, relaxAfterSeconds: 60 }]);
+		// Same identity rule the priority override has: a second door, one queue.
+		expect(node.queueId).toBe("q-1");
+	});
+
+	/** A tag typed into a spreadsheet is the common producer, and it means level 1, never relaxed. */
+	it("reads a bare tag as level 1 with no relaxation", () => {
+		const artifact = compiled(
+			aSnapshot({
+				queues: [aQueue()],
+				inboundRoutes: [
+					anInboundRoute({
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { skills: "Spanish " } },
+					}),
+				],
+			}),
+		);
+		expect(queueOf(artifact, "queue:q-1:sspanish-1-0").requiredSkills).toEqual([
+			{ skill: "spanish", minLevel: 1, relaxAfterSeconds: 0 },
+		]);
+	});
+
+	/**
+	 * One bad entry costs the caller that one requirement. Refusing the compile would cost the
+	 * tenant every route in the artifact, which is the trade `invalid-queue-priority` already makes.
+	 */
+	it("drops a malformed entry with a warning and keeps the rest of the list", () => {
+		const artifact = compiled(
+			aSnapshot({
+				queues: [aQueue()],
+				inboundRoutes: [
+					anInboundRoute({
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { skills: "billing,spanish:99" } },
+					}),
+				],
+			}),
+		);
+		expect(artifact.diagnostics.map((entry) => entry.code)).toContain("invalid-queue-skills");
+		expect(queueOf(artifact, "queue:q-1:sbilling-1-0").requiredSkills).toEqual([
+			{ skill: "billing", minLevel: 1, relaxAfterSeconds: 0 },
+		]);
+	});
+
+	/**
+	 * A list that is entirely unusable must be indistinguishable from no list at all, or the node
+	 * would carry an empty requirement set that reads as "this entrance asks for nothing" when what
+	 * happened is that nobody could tell what it asked for.
+	 */
+	it("falls back to the queue's own requirements when every entry is malformed", () => {
+		const artifact = compiled(
+			aSnapshot({
+				queues: [aQueue()],
+				inboundRoutes: [
+					anInboundRoute({
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { skills: "not a tag" } },
+					}),
+				],
+			}),
+		);
+		expect(artifact.diagnostics.map((entry) => entry.code)).toContain("invalid-queue-skills");
+		expect(Object.keys(artifact.nodes).filter((id) => id.startsWith("queue:q-1"))).toEqual([
+			"queue:q-1",
+		]);
+	});
+
+	it("gives two entrances asking for the same skills one node", () => {
+		const artifact = compiled(
+			aSnapshot({
+				queues: [aQueue()],
+				inboundRoutes: [
+					anInboundRoute({
+						id: "in-1",
+						matchPattern: "+15551230001",
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { skills: "spanish" } },
+					}),
+					anInboundRoute({
+						id: "in-2",
+						matchPattern: "+15551230002",
+						destinationType: "queue",
+						destinationRef: "q-1",
+						destinationData: { args: { skills: "spanish" } },
+					}),
+				],
+			}),
+		);
+		expect(
+			Object.keys(artifact.nodes)
+				.filter((id) => id.startsWith("queue:q-1"))
+				.sort(),
+		).toEqual(["queue:q-1", "queue:q-1:sspanish-1-0"]);
+	});
+
+	it("carries the abandoned-resume window onto the node", () => {
+		const artifact = compiled(
+			aSnapshot({
+				queues: [aQueue({ abandonedResumeAllowed: true, discardAbandonedAfterSeconds: 120 })],
+			}),
+		);
+		expect(queueOf(artifact).abandonedResumeAllowed).toBe(true);
+		expect(queueOf(artifact).discardAbandonedAfterSeconds).toBe(120);
+	});
+});
+
+/**
+ * The conference-depth block.
+ *
+ * Every assertion here is about a field REACHING the node, because the failure this whole layer has
+ * is silent: a column the loader does not map produces an identical `snapshotHash`, so the artifact
+ * never changes and the engine never learns the tenant configured anything.
+ */
+describe("compile — conference depth", () => {
+	function conferenceOf(artifact: RoutingArtifact, id = "conference:conf-1"): ConferencePlanNode {
+		return artifact.nodes[id] as ConferencePlanNode;
+	}
+
+	it("carries the record policy, replacing the boolean the walker read by nothing", () => {
+		const artifact = compiled(aSnapshot({ conferences: [aConference({ recordPolicy: "all" })] }));
+		expect(conferenceOf(artifact).recordPolicy).toBe("all");
+		expect(artifact.nodes["conference:conf-1"]).not.toHaveProperty("recordEnabled");
+	});
+
+	it("defaults a room whose loader has not been taught the column to recording nothing", () => {
+		const artifact = compiled(
+			aSnapshot({ conferences: [aConference({ recordPolicy: undefined })] }),
+		);
+		// `none` and not absent: the walker branches on this, and "the tenant asked for no recording"
+		// must not be the same value as "this artifact predates the column".
+		expect(conferenceOf(artifact).recordPolicy).toBe("none");
+	});
+
+	/**
+	 * The tones default ON at every layer, so the artifact carries them only when they are OFF. That
+	 * is `compact()` dropping a `true` and the reader defaulting an absent field to `true` — the same
+	 * statement made twice, which is what makes an old artifact safe.
+	 */
+	it("emits the tone flags only when a tenant switched them off", () => {
+		const on = compiled(aSnapshot({ conferences: [aConference()] }));
+		expect(on.nodes["conference:conf-1"]).not.toHaveProperty("entryToneEnabled");
+		expect(on.nodes["conference:conf-1"]).not.toHaveProperty("exitToneEnabled");
+
+		const off = compiled(
+			aSnapshot({
+				conferences: [aConference({ entryToneEnabled: false, exitToneEnabled: false })],
+			}),
+		);
+		expect(conferenceOf(off).entryToneEnabled).toBe(false);
+		expect(conferenceOf(off).exitToneEnabled).toBe(false);
+	});
+
+	it("compiles the name announcement, which until now was written by an API and read by nothing", () => {
+		const artifact = compiled(
+			aSnapshot({ conferences: [aConference({ announceJoinLeave: false })] }),
+		);
+		expect(conferenceOf(artifact).announceJoinLeave).toBe(false);
+	});
+
+	/**
+	 * The point of the whole layer, stated as a test: two rooms that differ only in a field the
+	 * loader carries must compile to different artifacts. Before these columns were mapped, toggling
+	 * `announce_join_leave` produced a byte-identical artifact and the engine was never told.
+	 */
+	it("changes the artifact when a depth flag changes", () => {
+		const on = canonicalJson(compiled(aSnapshot({ conferences: [aConference()] })));
+		const off = canonicalJson(
+			compiled(aSnapshot({ conferences: [aConference({ entryToneEnabled: false })] })),
+		);
+		expect(on).not.toBe(off);
+	});
+});
+
+/**
+ * Recording consent is the one settings block a fresh compile always writes, and every field in it
+ * defaults — so the interesting assertions are about what the compiler does with a tenant who has
+ * configured NOTHING, and about the two places an override may beat the org.
+ */
+describe("compile — recording consent", () => {
+	it("defaults the whole block for a tenant that has set nothing", () => {
+		const artifact = compiled(emptySnapshot(ORG_ID));
+		expect(artifact.settings.recording).toEqual({
+			consentPolicy: "none",
+			acceptDigit: "1",
+			declineDigit: "2",
+			allPartyRegions: [...DEFAULT_ALL_PARTY_REGIONS],
+			autoPauseOnDtmf: false,
+		});
+		// Absent rather than a fabricated row id: the engine reads its own seeded stem, and an id
+		// invented here would be a dangling reference the media plane fails on.
+		expect(artifact.settings.recording).not.toHaveProperty("consentPromptId");
+	});
+
+	it("keeps an explicitly empty region list, which is a tenant switching the safety net off", () => {
+		const artifact = compiled(aSnapshot({ settings: { recordingAllPartyRegions: [] } }));
+		expect(artifact.settings.recording?.allPartyRegions).toEqual([]);
+	});
+
+	it("carries the org policy, the digits and the pause default", () => {
+		const artifact = compiled(
+			aSnapshot({
+				settings: {
+					recordingConsentPolicy: "announce-and-require-keypress",
+					recordingConsentAcceptDigit: "5",
+					recordingConsentDeclineDigit: "#",
+					recordingAutoPauseOnDtmf: true,
+				},
+			}),
+		);
+		expect(artifact.settings.recording).toMatchObject({
+			consentPolicy: "announce-and-require-keypress",
+			acceptDigit: "5",
+			declineDigit: "#",
+			autoPauseOnDtmf: true,
+		});
+	});
+
+	it("falls back to the documented digits when the row holds something no keypad produces", () => {
+		const artifact = compiled(
+			aSnapshot({
+				settings: { recordingConsentAcceptDigit: "yes", recordingConsentDeclineDigit: "  " },
+			}),
+		);
+		expect(artifact.settings.recording?.acceptDigit).toBe("1");
+		expect(artifact.settings.recording?.declineDigit).toBe("2");
+	});
+
+	it("lets a DID raise the organization's policy, and leaves every other DID inheriting", () => {
+		const artifact = compiled(
+			aSnapshot({
+				settings: { recordingConsentPolicy: "announce" },
+				extensions: [anExtension()],
+				phoneNumbers: [
+					aPhoneNumber({
+						recordingConsentPolicy: "announce-and-require-keypress",
+						recordingConsentPromptId: "prompt-1",
+					}),
+					aPhoneNumber({ id: "did-2", e164: "+15551230002" }),
+				],
+				prompts: [aPrompt()],
+			}),
+		);
+		expect(artifact.inbound.didDefaults["+15551230001"]).toMatchObject({
+			recordingConsentPolicy: "announce-and-require-keypress",
+			recordingConsentPromptId: "prompt-1",
+		});
+		// Inherit is expressed by ABSENCE, so the org policy is the only thing left to read.
+		expect(artifact.inbound.didDefaults["+15551230002"]).not.toHaveProperty(
+			"recordingConsentPolicy",
+		);
+	});
+
+	it("drops a DID override that is null, which is the column saying 'inherit'", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				phoneNumbers: [
+					aPhoneNumber({ recordingConsentPolicy: null, recordingConsentPromptId: null }),
+				],
+			}),
+		);
+		expect(artifact.inbound.didDefaults["+15551230001"]).not.toHaveProperty(
+			"recordingConsentPolicy",
+		);
+		expect(artifact.inbound.didDefaults["+15551230001"]).not.toHaveProperty(
+			"recordingConsentPromptId",
+		);
+	});
+
+	it("carries an inbound route's override onto its rule", () => {
+		const artifact = compiled(
+			aSnapshot({
+				extensions: [anExtension()],
+				phoneNumbers: [aPhoneNumber()],
+				inboundRoutes: [anInboundRoute({ recordingConsentPolicy: "announce" })],
+			}),
+		);
+		expect(artifact.inbound.rules[0]).toMatchObject({ recordingConsentPolicy: "announce" });
+	});
+
+	/**
+	 * The prompt rule this field breaks with, and the only one in the compiler that does: a dangling
+	 * consent prompt is dropped as well as reported, because the engine's seeded announcement is a
+	 * working substitute and a dead id would replace it with silence.
+	 */
+	it("warns about a consent prompt that is not in the snapshot, and drops it", () => {
+		const snapshot = aSnapshot({
+			settings: { recordingConsentPromptId: "gone" },
+			prompts: [aPrompt()],
+		});
+		expect(codesOf(compileAttempt(snapshot))).toContain("dangling-prompt");
+		expect(compiled(snapshot).settings.recording).not.toHaveProperty("consentPromptId");
+	});
+
+	it("keeps a consent prompt the library actually has", () => {
+		const artifact = compiled(
+			aSnapshot({ settings: { recordingConsentPromptId: "prompt-1" }, prompts: [aPrompt()] }),
+		);
+		expect(artifact.settings.recording?.consentPromptId).toBe("prompt-1");
+	});
+
+	it("drops a dangling override prompt on a DID too", () => {
+		const snapshot = aSnapshot({
+			extensions: [anExtension()],
+			phoneNumbers: [aPhoneNumber({ recordingConsentPromptId: "gone" })],
+			prompts: [aPrompt()],
+		});
+		expect(codesOf(compileAttempt(snapshot))).toContain("dangling-prompt");
+		expect(compiled(snapshot).inbound.didDefaults["+15551230001"]).not.toHaveProperty(
+			"recordingConsentPromptId",
+		);
+	});
+});
+
+/**
+ * The PCI pause is written only when it is ON, at all three places that carry it. Absent already
+ * means "do not pause", so a `false` in the artifact would be a republished artifact and an
+ * invalidated cache for a behaviour that did not change — which is what the last test here asserts.
+ */
+describe("compile — auto-pause on DTMF", () => {
+	function withoutHash(artifact: RoutingArtifact): Omit<RoutingArtifact, "snapshotHash"> {
+		const { snapshotHash, ...rest } = artifact;
+		void snapshotHash;
+		return rest;
+	}
+
+	it("writes the extension flag on both the node and the index when it is on", () => {
+		const artifact = compiled(
+			aSnapshot({ extensions: [anExtension({ recordAutoPauseOnDtmf: true })] }),
+		);
+		expect((artifact.nodes["extension:ext-1"] as ExtensionPlanNode).recordAutoPauseOnDtmf).toBe(
+			true,
+		);
+		expect(artifact.extensionsByNumber["1001"]?.recordAutoPauseOnDtmf).toBe(true);
+	});
+
+	it("writes the queue flag when it is on", () => {
+		const artifact = compiled(aSnapshot({ queues: [aQueue({ recordAutoPauseOnDtmf: true })] }));
+		expect((artifact.nodes["queue:q-1"] as QueuePlanNode).recordAutoPauseOnDtmf).toBe(true);
+	});
+
+	it("omits the key entirely for false, null and a loader that does not select the column", () => {
+		for (const value of [false, null, undefined] as const) {
+			const artifact = compiled(
+				aSnapshot({
+					extensions: [anExtension({ recordAutoPauseOnDtmf: value })],
+					queues: [aQueue({ recordAutoPauseOnDtmf: value })],
+				}),
+			);
+			expect(artifact.nodes["extension:ext-1"]).not.toHaveProperty("recordAutoPauseOnDtmf");
+			expect(artifact.nodes["queue:q-1"]).not.toHaveProperty("recordAutoPauseOnDtmf");
+			expect(artifact.extensionsByNumber["1001"]).not.toHaveProperty("recordAutoPauseOnDtmf");
+		}
+	});
+
+	/**
+	 * The rollout claim, stated as a test: a tenant whose loader learns to select the four new
+	 * columns and finds them unset compiles to the SAME artifact they had. Only `snapshotHash`
+	 * moves, and it moves because the INPUT literally gained keys — that is a recompile the cache
+	 * contract already handles, and it publishes an artifact the engine cannot tell from the last
+	 * one, which is the whole point of writing nothing for a `false`.
+	 */
+	it("leaves the artifact of a tenant that set none of the new fields byte-identical", () => {
+		const before = aSnapshot({
+			extensions: [anExtension()],
+			phoneNumbers: [aPhoneNumber()],
+			queues: [aQueue()],
+		});
+		const after = aSnapshot({
+			extensions: [anExtension({ recordAutoPauseOnDtmf: false })],
+			phoneNumbers: [
+				aPhoneNumber({ recordingConsentPolicy: null, recordingConsentPromptId: null }),
+			],
+			queues: [aQueue({ recordAutoPauseOnDtmf: null })],
+		});
+		expect(canonicalJson(withoutHash(compiled(after)))).toBe(
+			canonicalJson(withoutHash(compiled(before))),
+		);
+	});
+
+	it("changes the artifact the moment a tenant switches the pause on", () => {
+		const off = canonicalJson(compiled(aSnapshot({ extensions: [anExtension()] })));
+		const on = canonicalJson(
+			compiled(aSnapshot({ extensions: [anExtension({ recordAutoPauseOnDtmf: true })] })),
+		);
+		expect(on).not.toBe(off);
 	});
 });

@@ -12,18 +12,36 @@ import { createHash } from "node:crypto";
  * ```text
  * calls.evt.v1.<orgId>.<callId>.<event>      event = channel.created … channel.destroyed
  * sip.reg.v1.<orgId>.<aorHash>.<event>       event = registered | unregistered | expired
+ * sip.evt.v1.<orgId>.<legId>.<event>         event = dialog.progressed | dialog.answered |
+ *                                                    dialog.held | dialog.resumed |
+ *                                                    dialog.terminated | dialog.dtmf
  * queue.evt.v1.<orgId>.<queueId>.<event>     event = caller.joined | … | agent.state
  * voicemail.evt.v1.<orgId>.<mailboxId>.<event>  event = message.left | mwi.updated
  * media.evt.v1.<orgId>.<sessionId>.<event>   event = session.ended | session.rtp-timeout |
  *                                                    playback.finished | recording.finished |
  *                                                    dtmf.received
+ * messaging.evt.v1.<orgId>.<conversationId>.<event>  event = message.received | message.delivered
+ * trunk.evt.v1.<orgId>.<trunkId>.<event>     event = status.changed
  * cdr.leg.v1.<orgId>                         one subject per org; event type is in the envelope
  * audit.evt.v1.<orgId>
  * provision.evt.v1.<orgId>
  * rpc.routing.v1.resolve                     request-reply, not JetStream
  * rpc.authz.v1.check
+ * rpc.pbx.v1.extension-feature               engine -> api; a handset writing its own state
+ * rpc.pbx.v1.last-caller                     engine -> api; `*69`, answered from cdr-db
+ * rpc.pbx.v1.file-greeting                   engine -> api; `*99`, a recorded greeting filed
+ * rpc.pbx.v1.queue-disposition               engine -> api; the wrap-up nobody chose a code for
+ * rpc.pbx.v1.queue-survey                    engine -> api; what a caller pressed after the call
  * rpc.sip.v1.credential
+ * rpc.sip.v1.invite                          sipd -> engine; ADMISSION only (queue group)
+ * rpc.sip.v1.ring.<sipdInstanceTok>          engine -> sipd; the instance HOLDING the dialog
+ * rpc.sip.v1.answer.<sipdInstanceTok>
+ * rpc.sip.v1.hangup.<sipdInstanceTok>
+ * rpc.sip.v1.reinvite.<sipdInstanceTok>
+ * rpc.sip.v1.originate                       engine -> sipd; ANY instance answers (queue group)
  * rpc.media.v1.allocate-session              engine -> mediad; RAW NATS both ends (see rpc.ts)
+ * rpc.media.v1.create-offer                  engine -> mediad; a B-leg offer mediad writes
+ * rpc.media.v1.accept-answer                 engine -> mediad; settle the B-leg codec
  * rpc.media.v1.bridge-sessions
  * rpc.media.v1.unbridge-sessions
  * rpc.media.v1.release-session
@@ -32,8 +50,15 @@ import { createHash } from "node:crypto";
  * rpc.media.v1.send-dtmf
  * rpc.media.v1.start-recording
  * rpc.media.v1.stop-recording
+ * rpc.media.v1.tap-session               engine -> mediad; supervision, as an asymmetric member
+ * rpc.media.v1.untap-session
+ * rpc.media.v1.mute-session              engine -> mediad; one direction of one leg, gated
+ * rpc.media.v1.hold-session              engine -> mediad; out of the conversation, with music
  * rpc.engine.v1.originate                   api -> engine; ANY instance answers (queue group)
  * rpc.engine.v1.park-handoff.<instanceTok>   engine -> engine; the OWNING instance answers
+ * rpc.engine.v1.session-verb.<instanceTok>   api -> engine; the instance that OWNS the leg answers
+ * rpc.engine.v1.conference-control.<instTok> api -> engine; the instance holding the MEMBER answers
+ * rpc.session.v1.announce.<org>.<appTok>     engine -> api; the replica holding the app's socket
  * ```
  *
  * The version token (`v1`) is a MAJOR version and is part of the subject, not the payload: a
@@ -54,10 +79,50 @@ export const SUBJECT_VERSION = "v1";
 export const SUBJECT_ROOTS = {
 	call: `calls.evt.${SUBJECT_VERSION}`,
 	registration: `sip.reg.${SUBJECT_VERSION}`,
+	/**
+	 * SIP DIALOG lifecycle from `apps/sipd` — a second root under `sip.`, alongside `sip.reg`.
+	 *
+	 * A second root rather than a second event family under `sip.reg` because the two differ by two
+	 * orders of magnitude in volume and by their whole purpose: a registration transition is presence,
+	 * and a `dialog.terminated` is CDR evidence carrying a real Q.850 cause. They are carried by
+	 * different streams with different retention for exactly that reason (`SIP_STREAM` versus
+	 * `REGISTRATIONS_STREAM`), and one root per stream is how every other family here is shaped.
+	 */
+	sipDialog: `sip.evt.${SUBJECT_VERSION}`,
 	queue: `queue.evt.${SUBJECT_VERSION}`,
 	voicemail: `voicemail.evt.${SUBJECT_VERSION}`,
 	media: `media.evt.${SUBJECT_VERSION}`,
+	/**
+	 * SMS/MMS on a messaging number — `messaging.evt.v1.<orgId>.<conversationId>.<event>`.
+	 *
+	 * The middle token is the CONVERSATION and not the message, which is the one decision this root
+	 * makes. A conversation is what a consumer subscribes to (an open thread in an agent's client,
+	 * a CRM screen-pop watching one customer) and what JetStream orders for you: per-subject
+	 * ordering means an inbound and its delivery receipt cannot be seen out of order by anybody
+	 * watching one thread. Keying by message id would give every message its own subject, one
+	 * message long, and make "follow this conversation" a filter nobody can express.
+	 *
+	 * `conversationId` is therefore subject-carried and does NOT appear in the payloads, on this
+	 * package's standing rule — the same one `mailboxId`, `queueId` and `callId` follow: one copy,
+	 * in the address. A consumer that wants it reads it back with {@link parseSubject}.
+	 */
+	messaging: `messaging.evt.${SUBJECT_VERSION}`,
+	trunk: `trunk.evt.${SUBJECT_VERSION}`,
 	cdrLeg: `cdr.leg.${SUBJECT_VERSION}`,
+	/**
+	 * Security SIGNALS from the control plane — today `fraud-signal`, the toll-fraud detector's
+	 * output.
+	 *
+	 * A root of its own rather than a member of `audit.evt`, and the difference is the one that
+	 * matters for anything downstream: an audit row says a PERSON changed something and is written
+	 * inside that change's transaction, while this says the PLATFORM noticed something and is
+	 * written by a process nobody asked. They have different retention (a signal is worth thirty
+	 * days; a change ledger is worth four hundred), different volume, and — decisively — different
+	 * audiences: `subjects.ts`'s webhook note explains at length why `audit` is deliberately not
+	 * deliverable to a tenant endpoint, and a fraud alert is exactly the thing a tenant DOES want
+	 * a callback for. One root per stream, which is how every other family here is shaped.
+	 */
+	security: `security.evt.${SUBJECT_VERSION}`,
 	audit: `audit.evt.${SUBJECT_VERSION}`,
 	provision: `provision.evt.${SUBJECT_VERSION}`,
 } as const;
@@ -67,7 +132,103 @@ export const RPC_SUBJECTS = {
 	routingResolve: `rpc.routing.${SUBJECT_VERSION}.resolve`,
 	authzCheck: `rpc.authz.${SUBJECT_VERSION}.check`,
 	voicemailList: `rpc.voicemail.${SUBJECT_VERSION}.list`,
+	/**
+	 * A user changing their OWN forwarding, do-not-disturb or follow-me from a handset:
+	 * `apps/engine` → `apps/api`.
+	 *
+	 * The engine holds no database handle, and `extension` is `pbx-db` — so `*72`, `*74`, `*76`,
+	 * `*78` and `*21` cannot be anything but a request-reply to the process that owns the row. It
+	 * is a write, unlike every other subject the engine calls, which is why the responder treats
+	 * `extensionNumber` as a CLAIM to be resolved rather than as an identity to be trusted.
+	 */
+	/**
+	 * "May this extension dial this number right now?" — `apps/engine` → `apps/api`, on the outbound
+	 * call-setup path, before the first INVITE.
+	 *
+	 * A request-reply rather than a fact on the artifact, and both exist for different halves of the
+	 * same control. The CEILINGS are compiled into `CompiledRoutingSettings.tollFraud` because they
+	 * are configuration and the engine holds no database handle. The COUNTERS are not: rolling
+	 * international minutes and simultaneous international legs change between compiles by
+	 * definition, and an artifact that carried them would be stale the moment it was published.
+	 *
+	 * So the engine asks. The responder is the only process with both the counter store and the
+	 * per-extension override, and it FAILS OPEN on its own errors — an unreachable counter must not
+	 * bar every international call on the platform, which is a strictly worse outage than the fraud
+	 * it would be preventing.
+	 */
+	pbxAuthorizeOutbound: `rpc.pbx.${SUBJECT_VERSION}.authorize-outbound`,
+	pbxExtensionFeature: `rpc.pbx.${SUBJECT_VERSION}.extension-feature`,
+	/**
+	 * An ORGANIZATION-wide toggle dialled from a handset — a call flow's day/night switch and a time
+	 * condition's override: `apps/engine` → `apps/api`.
+	 *
+	 * Its own subject rather than a member of `extension-feature`, and the difference is not
+	 * cosmetic. That one changes a column on the CALLER's own extension, which is why its responder
+	 * treats `extensionNumber` as a claim to resolve and needs no authorisation beyond owning the
+	 * line. This one changes what every caller to the tenant hears, so the thing it must be granted
+	 * on at the broker is different, and folding them together would make "may divert my own calls"
+	 * and "may put the whole company into night mode" one permission.
+	 */
+	pbxToggleFeature: `rpc.pbx.${SUBJECT_VERSION}.toggle-feature`,
+	/**
+	 * Hot desking — an agent claiming a shared handset, and giving it back:
+	 * `apps/engine` → `apps/api`.
+	 *
+	 * Its own subject for the reason the two above have theirs, and one more. It carries a PIN, in
+	 * the clear, inside the request: the digits are collected by the engine and verified against
+	 * `pin_set_entry.pin_hash` by the process that owns the row, because putting a hot-desk gate in
+	 * the compiled artifact would broadcast every agent's digest to every engine on a KV bucket.
+	 * A subject carrying a credential is one that has to be grantable — and refusable — on its own.
+	 */
+	pbxHotDesk: `rpc.pbx.${SUBJECT_VERSION}.hot-desk`,
+	/**
+	 * `*69` — who rang this extension last: `apps/engine` → `apps/api`.
+	 *
+	 * Separate from the subject above because it is a READ, and a read of a different database:
+	 * the answer lives in `cdr-db`'s `call_legs`, not in `pbx-db`. Folding a query into a
+	 * mutation's subject would have put a partitioned time-series scan behind a name that says
+	 * "feature", and would have made the two impossible to grant separately at the broker.
+	 */
+	pbxLastCaller: `rpc.pbx.${SUBJECT_VERSION}.last-caller`,
+	/**
+	 * `*99` — the greeting a user has just recorded from their handset, filed into their mailbox:
+	 * `apps/engine` → `apps/api`.
+	 *
+	 * The second WRITE the engine makes, and a different one from `extension-feature` above: that
+	 * one changes a column, this one files a row and moves audio into the media library. It is its
+	 * own subject rather than a member of the feature family because it carries an OBJECT KEY and
+	 * because the two are worth granting separately at the broker — a process that may toggle
+	 * forwarding is not thereby a process that may replace what a mailbox says.
+	 */
+	pbxFileGreeting: `rpc.pbx.${SUBJECT_VERSION}.file-greeting`,
+	/**
+	 * The wrap-up window that closed with nobody choosing a code: `apps/engine` → `apps/api`.
+	 *
+	 * The engine is the only process that knows a wrap-up deadline expired — it owns the timer that
+	 * ends it — and the control plane is the only one that can file the row. A request-reply rather
+	 * than a `queue.evt.v1` event because the whole content of the message is "nobody chose": an
+	 * event would have needed a durable consumer and an at-least-once story for a fact whose retry
+	 * the engine can simply own, and the reply is something it can log and drop.
+	 *
+	 * Its own subject rather than a member of the feature family for the reason each of those has
+	 * one: the ability to file an agent's after-call work is not the ability to change a mailbox's
+	 * greeting, and the two must be withdrawable one at a time.
+	 */
+	pbxQueueDisposition: `rpc.pbx.${SUBJECT_VERSION}.queue-disposition`,
+	/**
+	 * What a caller pressed in the post-call survey: `apps/engine` → `apps/api`.
+	 *
+	 * Separate from the subject above even though both are filed as one call ends, because they are
+	 * facts about opposite ends of it — one is the AGENT's wrap-up code, one is the CALLER's rating
+	 * of them — and they are collected minutes apart by two independent detached tasks. Folding them
+	 * into one subject would mean a report that could carry either, so the responder would have to
+	 * decide which halves of its payload it believed, and a tenant who wanted surveys without
+	 * dispositions could not be granted one without the other.
+	 */
+	pbxQueueSurvey: `rpc.pbx.${SUBJECT_VERSION}.queue-survey`,
 	sipCredential: `rpc.sip.${SUBJECT_VERSION}.credential`,
+	/** Carrier digest derivation. Only sipd may request it; the API retains the carrier password. */
+	sipTrunkCredential: `rpc.sip.${SUBJECT_VERSION}.trunk-credential`,
 	/**
 	 * The SIP edge asking the call engine to execute a phone's REFER: `apps/sipd` (Go) → the
 	 * NestJS engine.
@@ -79,6 +240,57 @@ export const RPC_SUBJECTS = {
 	 */
 	sipTransfer: `rpc.sip.${SUBJECT_VERSION}.transfer`,
 	/**
+	 * ADMISSION: the SIP edge asking the call engine whether it will take an arriving INVITE at all.
+	 *
+	 * FLAT and queue-grouped, like `rpc.sip.v1.transfer` and unlike the five command subjects below
+	 * it. The asymmetry is the whole shape of the INVITE path (`plans/sipd-invite-design.md` §4.2):
+	 * an arriving call has no owner yet, so whichever engine answers becomes the owner — which is
+	 * precisely what a queue group picks for you — while every command AFTER admission is addressed
+	 * at the one `sipd` process that holds the dialog.
+	 *
+	 * It decides ADMISSION ONLY, never the outcome. A routing walk rings for thirty seconds and a
+	 * request-reply with a sixty-second deadline is a subscription wearing one's clothes; so the
+	 * reply says "yes, and this is the tenant and call id I filed it under", and the ringing, the
+	 * answer and the teardown all arrive later as commands and events.
+	 */
+	sipInvite: `rpc.sip.${SUBJECT_VERSION}.invite`,
+	/**
+	 * The dialog command surface: `apps/engine` (TypeScript) → `apps/sipd` (Go). A PREFIX, not a
+	 * complete subject — see {@link subjectFor.sipRingRpc} and its three siblings.
+	 *
+	 * Instance-addressed for the reason `park-handoff` is, in its strongest form: a SIP dialog's
+	 * transaction state, its retransmission timers and its socket are all LOCAL to one process, and
+	 * its `Contact` header tells the far end which host to send mid-dialog requests to (RFC 3261
+	 * §12.1.1). A second `sipd` cannot answer this call, cannot retransmit its 2xx and cannot BYE it.
+	 * A queue group would deliver each command to a member chosen by the server, and seven times out
+	 * of eight that member is not the one holding the dialog.
+	 *
+	 * The engine learns which instance from the admission reply's own `sipdInstanceId` (for an
+	 * inbound leg) or from the `originate` reply (for an outbound one) — never from a directory
+	 * lookup, because the fact travelled with the leg that created it.
+	 */
+	sipRing: `rpc.sip.${SUBJECT_VERSION}.ring`,
+	/** @see {@link RPC_SUBJECTS.sipRing} — instance-addressed, {@link subjectFor.sipAnswerRpc}. */
+	sipAnswer: `rpc.sip.${SUBJECT_VERSION}.answer`,
+	/** @see {@link RPC_SUBJECTS.sipRing} — instance-addressed, {@link subjectFor.sipHangupRpc}. */
+	sipHangup: `rpc.sip.${SUBJECT_VERSION}.hangup`,
+	/** @see {@link RPC_SUBJECTS.sipRing} — instance-addressed, {@link subjectFor.sipReinviteRpc}. */
+	sipReinvite: `rpc.sip.${SUBJECT_VERSION}.reinvite`,
+	/**
+	 * OUTBOUND: the engine asking the SIP edge to place a call. FLAT and queue-grouped, and the one
+	 * `sipd` command subject that is.
+	 *
+	 * The same distinction `engineOriginate` draws against `engineParkHandoff`: the four subjects
+	 * above act on a dialog that ALREADY exists on exactly one process, while this one CREATES the
+	 * dialog and therefore has no owner to find. **Any** `sipd` may place an outbound call, so the
+	 * reply carries the `instanceId` that took it — and the engine addresses every subsequent command
+	 * on that leg at exactly that instance, the same pattern `mediaAllocateSessionResponseSchema`
+	 * already uses for a media session.
+	 */
+	sipOriginate: `rpc.sip.${SUBJECT_VERSION}.originate`,
+	sipResolveTarget: `rpc.sip.${SUBJECT_VERSION}.resolve-target`,
+	engineRenegotiate: `rpc.engine.${SUBJECT_VERSION}.renegotiate`,
+	/**
 	 * The media-plane command surface: `apps/engine` (TypeScript) → `apps/mediad` (Go).
 	 *
 	 * These are the FIRST subjects on this backbone whose responder is Go and whose caller is
@@ -86,6 +298,18 @@ export const RPC_SUBJECTS = {
 	 * "raw NATS on both ends" note at the head of `schemas/rpc.ts`.
 	 */
 	mediaAllocateSession: `rpc.media.${SUBJECT_VERSION}.allocate-session`,
+	/**
+	 * The B-leg offer/answer pair, added when `mediad` learned to WRITE an offer.
+	 *
+	 * `allocate-session` ANSWERS an inbound offer — the A-leg path, where `apps/sipd` already holds
+	 * one. A leg the engine ORIGINATES has no offer yet, because we are the one calling, so `mediad`
+	 * generates one (`create-offer`) and later settles the codec from the callee's answer
+	 * (`accept-answer`). This keeps codec knowledge in `mediad` in BOTH directions — `apps/sipd`
+	 * forwards an offer it did not write exactly as it forwards one it did not parse. See
+	 * `plans/sipd-invite-design.md` §5.2 (decision A) and the raw-NATS note at the head of `rpc.ts`.
+	 */
+	mediaCreateOffer: `rpc.media.${SUBJECT_VERSION}.create-offer`,
+	mediaAcceptAnswer: `rpc.media.${SUBJECT_VERSION}.accept-answer`,
 	mediaBridgeSessions: `rpc.media.${SUBJECT_VERSION}.bridge-sessions`,
 	mediaUnbridgeSessions: `rpc.media.${SUBJECT_VERSION}.unbridge-sessions`,
 	mediaReleaseSession: `rpc.media.${SUBJECT_VERSION}.release-session`,
@@ -118,6 +342,45 @@ export const RPC_SUBJECTS = {
 	mediaStartRecording: `rpc.media.${SUBJECT_VERSION}.start-recording`,
 	mediaStopRecording: `rpc.media.${SUBJECT_VERSION}.stop-recording`,
 	/**
+	 * PCI: stop capturing while the caller reads a card number, WITHOUT ending the file.
+	 *
+	 * One subject with a `resume` bit rather than a pair, because both halves carry a reference and
+	 * nothing else — the same shape `mute-session` uses and for the same reason. A stop/start pair
+	 * would end the artifact at exactly the interesting moment and give the second half a different
+	 * object key; this keeps one file with a silence gap on the recorder's own clock, and the
+	 * intervals ride `recording.finished`.
+	 */
+	mediaPauseRecording: `rpc.media.${SUBJECT_VERSION}.pause-recording`,
+	/**
+	 * Supervision: a third party joining a live conversation on ASYMMETRIC terms.
+	 *
+	 * The pair behind `*0` — eavesdrop, whisper and barge — and the one media subject on this list
+	 * whose responder cannot serve it yet. It is declared now anyway, in its FULL shape, and that is
+	 * a deliberate decision rather than speculative generality: see `plans/mediad-design.md` §10
+	 * question 4. The short version is that a tap is not a snoop channel. A snoop is a listener glued
+	 * to one leg, which is the only thing ARI can address; a supervisor is a participant whose
+	 * `hear` and `speakTo` differ, which is a statement about a CALL. Rung 6's mixer serves that by
+	 * arriving — a tap is a mix-minus participant — so shipping `*0` against this contract today
+	 * costs the cutover nothing, while shipping it against `snoop` would have cost it the feature.
+	 */
+	mediaTapSession: `rpc.media.${SUBJECT_VERSION}.tap-session`,
+	mediaUntapSession: `rpc.media.${SUBJECT_VERSION}.untap-session`,
+	/**
+	 * Rung 5's two state commands, and they are two rather than one on purpose.
+	 *
+	 * MUTE is a statement about ONE DIRECTION of one leg and is invisible in signalling — a
+	 * conference attendee who pressed `*6`, a paging group's members. HOLD is a statement about the
+	 * CONVERSATION: the held party is out of it in both directions and usually hears music. A leg
+	 * that was muted before it was held must still be muted when it is unheld, which is only
+	 * expressible if the two are independent commands over independent state.
+	 *
+	 * Both are keyed by `sessionId` alone rather than by a reference, unlike the playback and
+	 * recording pairs: there is exactly one hold state and one mute state per leg, so there is
+	 * nothing to disambiguate and nothing for the caller to remember.
+	 */
+	mediaMuteSession: `rpc.media.${SUBJECT_VERSION}.mute-session`,
+	mediaHoldSession: `rpc.media.${SUBJECT_VERSION}.hold-session`,
+	/**
 	 * Click-to-call: the control plane asking the call engine to place a call.
 	 *
 	 * FLAT, and served on a queue group — the opposite of the entry below it, which is the only
@@ -128,6 +391,20 @@ export const RPC_SUBJECTS = {
 	 * picks for you.
 	 */
 	engineOriginate: `rpc.engine.${SUBJECT_VERSION}.originate`,
+	/**
+	 * Virtual hold: a queue asking the call engine to ring a caller back.
+	 *
+	 * A SIBLING of the originate above rather than a variant of it, because the two requests have
+	 * different subjects in the grammatical sense. An originate is an EXTENSION placing a call and
+	 * every refusal it can produce is about that extension; a callback is the QUEUE placing one, has
+	 * no extension at all, presents the queue's identity, and is authorised by the queue's own
+	 * outbound routing. Folding them into one schema would make `fromExtension` optional, which is
+	 * how a required field stops being checked.
+	 *
+	 * FLAT and queue-grouped, for the originate's reason exactly: a callback CREATES a call, so
+	 * there is no owner to address and whichever instance answers becomes it.
+	 */
+	engineQueueCallback: `rpc.engine.${SUBJECT_VERSION}.queue-callback`,
 	/**
 	 * The engine-to-engine command surface. A PREFIX, not a complete subject.
 	 *
@@ -142,6 +419,79 @@ export const RPC_SUBJECTS = {
 	 * that member is not the one holding the call.
 	 */
 	engineParkHandoff: `rpc.engine.${SUBJECT_VERSION}.park-handoff`,
+	/**
+	 * The session protocol's verb surface: an external application, through the control plane,
+	 * commanding one leg of a live call. A PREFIX, like `park-handoff` above and for the same
+	 * reason — a leg lives on ONE engine instance's media channel, and only that instance can act
+	 * on it.
+	 *
+	 * The address is not read out of a KV bucket, though, which is the one way it differs from the
+	 * park handoff: the announcement that started the session carried the owning `instanceId`, and
+	 * the control plane has held it for the life of the socket. A lookup would be a second source
+	 * of truth for a fact the session was opened with.
+	 */
+	engineSessionVerb: `rpc.engine.${SUBJECT_VERSION}.session-verb`,
+	/**
+	 * In-conference moderation: the control plane muting, deafening, kicking or re-levelling ONE
+	 * member of a live room, or locking the room itself. A PREFIX, like the two above it.
+	 *
+	 * The reason it is instance-addressed is the same one the park handoff gives and is worth
+	 * restating in the conference's own terms: a room is JOINTLY held — `conference-claims` records
+	 * one contribution per engine instance with members in it — so "the conference" is not on any
+	 * one instance, but every MEMBER is, and only the instance holding a member's media channel can
+	 * mute it. There is no instance that could serve a command about somebody else's member.
+	 *
+	 * Where the address comes from is the one thing that differs from `session-verb`, which was told
+	 * the owning instance by the announcement that opened the session. Nothing announces a
+	 * conference to the control plane, so the api reads the room's `conference-claims` value and
+	 * addresses each unexpired CONTRIBUTOR in turn until one answers something other than
+	 * `unknown-member`. That is a fan-out bounded by the number of engine instances with members in
+	 * ONE room — one, in every deployment that is not mid-scale-out — on a path driven by an
+	 * operator clicking a button. Cheaper than the alternative, which is a second directory of
+	 * per-member ownership that would have to be written on every join and reaped on every crash.
+	 */
+	engineConferenceControl: `rpc.engine.${SUBJECT_VERSION}.conference-control`,
+	/**
+	 * A leg-scoped control command on a call NOBODY handed out: the control plane pausing or
+	 * stopping the recording on a call an agent placed from a desk phone or the softphone. A PREFIX,
+	 * like the three above it, and for the same reason — the leg lives on ONE instance's media
+	 * channel.
+	 *
+	 * The one thing that distinguishes it from {@link RPC_SUBJECTS.engineSessionVerb} is WHO may be
+	 * addressed. A session verb commands a leg an application was handed and is authorised against
+	 * the session id the engine minted; there is no such handle for a PBX call, and inventing one
+	 * would mean minting a session for every call in the platform so that a pause button could
+	 * exist. This subject authorises on the two things a control plane genuinely has: the call's
+	 * organization, which it takes from the operator's own session and never from a payload, and
+	 * ownership of the leg, which the engine re-checks against its own registry.
+	 *
+	 * The address comes from the `channels` bucket, whose every value carries
+	 * `variables.OPTIMIQ_ENGINE_INSTANCE_ID` — the same lookup `park-handoff` makes against
+	 * `park-claims`, against a bucket the api already reads for the live-calls topic. An engine that
+	 * is addressed for a call it no longer holds answers `wrong_instance`, exactly as `apps/mediad`
+	 * does, so a stale entry is a retry rather than a lie.
+	 */
+	engineCallControl: `rpc.engine.${SUBJECT_VERSION}.call-control`,
+	/**
+	 * The session protocol's other half: a call has reached an `application` destination, and the
+	 * engine is asking whoever holds that application's socket to take it.
+	 *
+	 * A PREFIX, and the only subject on this list whose variable tail is not an instance token —
+	 * it is `<orgId>.<applicationToken>` (see {@link subjectFor.sessionAnnounceRpc}). **The subject
+	 * IS the registration.** A control-plane replica subscribes to exactly the applications whose
+	 * sockets it is holding and unsubscribes when the last one goes, so:
+	 *
+	 * - no directory has to be kept anywhere, and none can go stale;
+	 * - an application nobody has claimed produces `no responders available` IMMEDIATELY, which is
+	 *   what lets the walker take its failure path — an announcement — instead of leaving a caller
+	 *   listening to silence for the length of a request timeout;
+	 * - two replicas holding the same application share the arrivals, because the responders join a
+	 *   queue group named after it.
+	 *
+	 * `rpc.session.` and not `rpc.api.`: every other family here is named for the DOMAIN, and this
+	 * one's domain is the session protocol rather than the process that happens to terminate it.
+	 */
+	sessionAnnounce: `rpc.session.${SUBJECT_VERSION}.announce`,
 } as const;
 
 /**
@@ -170,6 +520,33 @@ export const CALL_EVENTS = [
 	"conference.joined",
 	/** A conference participant left. The pair bounds a participant's time in the room. */
 	"conference.left",
+	/**
+	 * A member's state inside the room changed — muted, deafened, re-levelled, or promoted.
+	 *
+	 * One event for four facts rather than four events, because they are all the same sentence with
+	 * a different field in it ("this member is now X") and a consumer renders them into one row.
+	 * The alternative — `conference.member.muted` and three siblings — would put four subjects on
+	 * the wire whose only consumer is a participant list that has to merge them back together.
+	 *
+	 * It carries the WHOLE state after the change, not the delta, for the reason every live
+	 * projection on this backbone carries whole values: a browser that missed one frame must not
+	 * end up with a row that says muted and a mixer that says otherwise.
+	 *
+	 * Not published for a member LEAVING, even though leaving changes their state: that is
+	 * `conference.left`, and publishing both would double-count a departure in every report.
+	 */
+	"conference.participant.updated",
+	/**
+	 * The room stopped admitting new participants. A moderator's decision, not a capacity limit.
+	 *
+	 * Distinct from a room at `maxMembers`, which is the same user-visible outcome for a completely
+	 * different reason: a full room admits the next caller the moment somebody leaves, and a locked
+	 * one does not admit anybody until it is unlocked. A consumer that could not tell them apart
+	 * would tell a caller to try again in a minute when the answer is "the meeting has started".
+	 */
+	"conference.locked",
+	/** The room is admitting participants again. Pairs with `conference.locked`. */
+	"conference.unlocked",
 	/**
 	 * A call was placed in a park lot's orbit slot.
 	 *
@@ -218,12 +595,89 @@ export const CALL_EVENTS = [
 	 * message needs.
 	 */
 	"call.emergency.dialed",
+	/**
+	 * A supervisor started listening to somebody else's live call. **This is a compliance seam.**
+	 *
+	 * Silent monitoring is the one telephony feature whose entire value depends on the monitored
+	 * parties not noticing, which is exactly why it must leave a trail that does not depend on them
+	 * noticing either. Two-party-consent jurisdictions, PCI-DSS and every call-centre policy
+	 * document ask the same question after the fact — who listened to which call, when, and could
+	 * they be heard? — and the only process that knows is the one that opened the tap.
+	 *
+	 * So it is an event and not a log line: a log line lives on one engine and is rotated away,
+	 * while this rides the `CALLS` stream the audit writer and the webhook dispatcher already
+	 * consume. `mode` is on it because eavesdrop and barge are legally different acts, and it is
+	 * published again on ESCALATION — pressing `5` mid-tap is a new fact, not a continuation.
+	 */
+	"call.tap.started",
+	/** The tap ended. Pairs with `call.tap.started` to bound how long somebody listened. */
+	"call.tap.ended",
+	/**
+	 * A page was opened to a group: every member's handset auto-answered into a one-way bridge.
+	 *
+	 * Distinct from a `conference.joined` per member, which is what a page technically is
+	 * underneath: the fact anybody wants is "the warehouse was paged at 14:02 by extension 1001",
+	 * and rebuilding that from N join events means already knowing which bridge was a page.
+	 * `answeredCount` is how many handsets actually came up, which is the number that matters when
+	 * somebody asks whether the announcement was heard.
+	 */
+	"call.paging.started",
+	/** The page ended and its bridge was torn down. Pairs with `call.paging.started`. */
+	"call.paging.ended",
 ] as const;
 export type CallEvent = (typeof CALL_EVENTS)[number];
 
-/** SIP registrar vocabulary. `expired` is the registrar's TTL sweep, not a client REGISTER. */
-export const REGISTRATION_EVENTS = ["registered", "unregistered", "expired"] as const;
+/**
+ * SIP registrar vocabulary. `expired` is the registrar's TTL sweep, not a client REGISTER.
+ *
+ * `auth-failed` is the only member that is not a binding transition: it is the edge reporting a
+ * REGISTER it refused, so that `sip_auth_event` has a `bad-credentials` writer at all. It rides
+ * this family because only the registrar can raise it and it is keyed by the same AOR.
+ */
+export const REGISTRATION_EVENTS = [
+	"registered",
+	"unregistered",
+	"expired",
+	"auth-failed",
+] as const;
 export type RegistrationEvent = (typeof REGISTRATION_EVENTS)[number];
+
+/**
+ * SIP dialog lifecycle — what `apps/sipd` TELLS, as opposed to what it is ASKED (`rpc.sip.v1.*`).
+ *
+ * The same ask-over-core / tell-over-JetStream split as `MEDIA_SESSION_EVENTS`, and the same
+ * discipline about which facts earn a member. Each of these six maps onto a member of the engine's
+ * existing `MediaEvent` union (`apps/engine/src/media/media-event.ts`) — the union is NOT extended,
+ * because a member nobody branches on is a shape three services would have to agree on for no
+ * reason. `plans/sipd-invite-design.md` §3.3 is the mapping table.
+ *
+ * - `dialog.progressed` is a `18x`: `ringing`, or `early` when the response carried SDP.
+ * - `dialog.answered` is the ACK for a UAS leg and the `2xx` for a UAC leg. The asymmetry is not
+ *   sloppiness — it is the moment the call is genuinely up in each direction, and `billsec` counts
+ *   from it.
+ * - `dialog.held` / `dialog.resumed` are a re-INVITE or UPDATE moving the far end to `sendonly` /
+ *   `inactive` and back.
+ * - `dialog.terminated` carries a REAL Q.850 cause, which is the one thing this plane knows and a
+ *   media plane cannot: `mediad` never saw a SIP response and picks the closest cause it can defend,
+ *   while `sipd` maps the status through RFC 3398 and lets an RFC 3326 `Reason` header win verbatim.
+ * - `dialog.dtmf` is SIP INFO digits ONLY. RFC 4733 is `mediad`'s, and a consumer handed both would
+ *   have to decide which one a `gather` counts.
+ *
+ * Three members of the engine's union are deliberately never produced here, and each absence is a
+ * decision argued in §3.3: `leg-arrived` (it is the admission RPC's caller-side, not an event),
+ * `leg-left` (a SIP dialog either exists or it does not — there is no dialplan to leave) and
+ * `hangup-requested` (under `sipd` there is no "afterwards": a BYE IS the termination, and emitting
+ * both from one wire event would tear the leg down twice).
+ */
+export const SIP_DIALOG_EVENTS = [
+	"dialog.progressed",
+	"dialog.answered",
+	"dialog.held",
+	"dialog.resumed",
+	"dialog.terminated",
+	"dialog.dtmf",
+] as const;
+export type SipDialogEvent = (typeof SIP_DIALOG_EVENTS)[number];
 
 /** Queue/ACD vocabulary. */
 export const QUEUE_EVENTS = [
@@ -231,6 +685,8 @@ export const QUEUE_EVENTS = [
 	"caller.answered",
 	"caller.abandoned",
 	"agent.state",
+	"callback.placed",
+	"callback.failed",
 ] as const;
 export type QueueEvent = (typeof QUEUE_EVENTS)[number];
 
@@ -307,6 +763,55 @@ export const MEDIA_SESSION_EVENTS = [
 export type MediaSessionEvent = (typeof MEDIA_SESSION_EVENTS)[number];
 
 /**
+ * Messaging vocabulary — SMS and MMS on a tenant's messaging numbers.
+ *
+ * Two members, one per DIRECTION of interest, and the asymmetry in their names is deliberate.
+ * `message.received` is an inbound arriving from the carrier. `message.delivered` is the DELIVERY
+ * RECEIPT for something the tenant sent — one fact with an outcome on it, which is why there is no
+ * `message.failed` beside it; see {@link messagingMessageDeliveredDataSchema} for the argument.
+ *
+ * There is deliberately no `message.sent`: the accepted-by-us moment is the API call's own
+ * response, and publishing it would be telling the caller something it is still holding.
+ */
+export const MESSAGING_EVENTS = ["message.received", "message.delivered"] as const;
+export type MessagingEvent = (typeof MESSAGING_EVENTS)[number];
+
+/**
+ * Trunk vocabulary — the SIP edge's verdict on a carrier, written back to the control plane.
+ *
+ * One member, and the name is doing deliberate work: `status.changed` is a TRANSITION, not a
+ * heartbeat. The media server qualifies every trunk on a timer (`qualify_frequency`), but a
+ * qualify that confirms what everybody already believed is not an event — publishing every tick
+ * would put a per-trunk metronome on the stream and a `trunk` row UPDATE behind each beat. The
+ * producer therefore publishes only when the answer CHANGES, and the payload's `status` vocabulary
+ * is pinned to `TRUNK_STATUSES` in `packages/pbx-db` (`trunks-schema.ts`) because the whole point
+ * of the event is to land in that column: a value the column cannot hold is an event the consumer
+ * can only drop.
+ */
+export const TRUNK_EVENTS = ["status.changed"] as const;
+export type TrunkEvent = (typeof TRUNK_EVENTS)[number];
+
+/**
+ * Security signals — `security.evt.v1.<orgId>.<subjectRef>.<event>`.
+ *
+ * One member today. It is a LIST rather than a literal for the reason every other family here is
+ * one: a second signal (a registration flood, a credential-stuffing burst) joins by appending, and
+ * consumers that parse against the family schema need no release.
+ */
+export const SECURITY_EVENTS = ["fraud-signal"] as const;
+export type SecurityEvent = (typeof SECURITY_EVENTS)[number];
+
+/**
+ * Reserved security-scope token for a signal that belongs to the ORGANIZATION rather than to one
+ * extension — a tenant-wide minutes spike with no single account behind it.
+ *
+ * The same idiom, and the same reason, as {@link QUEUE_SCOPE_ALL}: the subject's middle token is
+ * the thing the signal is ABOUT, a consumer subscribed to `security.evt.v1.<org>.>` sees both
+ * scopes, and inventing an extension id for a finding that has none would make the subject lie.
+ */
+export const SECURITY_SCOPE_ORG = "_org";
+
+/**
  * Reserved queue-scope token for events that belong to the org rather than to one queue —
  * in practice `agent.state`, since an agent has one status across every tier they sit in.
  * Wallboards subscribe to `queue.evt.v1.<org>.>` and therefore see both scopes.
@@ -320,10 +825,14 @@ export const QUEUE_SCOPE_ALL = "_all";
 export const EVENT_FAMILIES = [
 	"call",
 	"registration",
+	"sipDialog",
 	"queue",
 	"voicemail",
 	"media",
+	"messaging",
+	"trunk",
 	"cdr",
+	"security",
 	"audit",
 	"provision",
 ] as const;
@@ -420,6 +929,34 @@ export function instanceSubjectToken(instanceId: string): string {
 }
 
 /**
+ * Stable subject token for a session-protocol application name.
+ *
+ * An application name is whatever a tenant typed into the `application` destination — `autopilot`,
+ * `crm-screenpop`, `Sales IVR (new)`. Most are already one subject token and are returned VERBATIM,
+ * for the same reason {@link instanceSubjectToken} returns an instance id verbatim: a subject an
+ * operator can read is a subject an operator can `nats sub` while an integration is not being
+ * announced calls. The rest — anything with a space, a dot or punctuation — would silently become
+ * several tokens, or a subject nobody can subscribe to, so they hash.
+ *
+ * Case is NOT normalised, and that is deliberate rather than an oversight. The engine builds this
+ * token from the compiled plan node and the control plane builds it from what the socket claimed;
+ * if the two were folded to lower case, `Support` and `support` would become one registration and a
+ * tenant with both would have their calls delivered to whichever socket connected first. Two names
+ * that differ in case are two applications, and each gets its own subject.
+ *
+ * @throws {SubjectTokenError} when the name is empty.
+ */
+export function applicationSubjectToken(application: string): string {
+	const normalized = application.trim();
+	if (normalized.length === 0) {
+		throw new SubjectTokenError("application", application);
+	}
+	return TOKEN_PATTERN.test(normalized)
+		? normalized
+		: createHash("sha256").update(normalized).digest("hex").slice(0, 32);
+}
+
+/**
  * Stable key token for a DID, for the `did-index` KV bucket.
  *
  * An E.164 number is stored as `+441632960111` and dialled as `441632960111`, `+441632960111` or
@@ -454,6 +991,23 @@ export const subjectFor = {
 	registration(orgId: string, aorHash: string, event: RegistrationEvent | (string & {})): string {
 		return `${SUBJECT_ROOTS.registration}.${assertToken("orgId", orgId)}.${assertToken("aorHash", aorHash)}.${assertEvent(event)}`;
 	},
+	/**
+	 * `sip.evt.v1.<orgId>.<legId>.<event>` — one SIP dialog's lifecycle.
+	 *
+	 * The middle token is the LEG id, and that is the whole of `plans/sipd-invite-design.md` §3.1 in
+	 * one line: one string names the leg, the `mediad` session and the `sipd` dialog. The SIP dialog
+	 * identifier — `Call-ID` plus tags — is data on the payload and never the key, because a
+	 * `Call-ID` is phone-chosen, arbitrary-length and full of characters {@link isSubjectToken}
+	 * rejects.
+	 *
+	 * Every subject in this family carries a REAL tenant. That is why admission is an RPC rather than
+	 * an event: for a trunk INVITE the edge does not know the org until the engine answers, and a
+	 * family that started before admission would need an `_unknown` token and a re-publish once the
+	 * tenant was learned.
+	 */
+	sipDialog(orgId: string, legId: string, event: string): string {
+		return `${SUBJECT_ROOTS.sipDialog}.${assertToken("orgId", orgId)}.${assertToken("legId", legId)}.${assertEvent(event)}`;
+	},
 	/** `queue.evt.v1.<orgId>.<queueId>.<event>` */
 	queue(orgId: string, queueId: string, event: QueueEvent | (string & {})): string {
 		return `${SUBJECT_ROOTS.queue}.${assertToken("orgId", orgId)}.${assertToken("queueId", queueId)}.${assertEvent(event)}`;
@@ -472,9 +1026,33 @@ export const subjectFor = {
 	media(orgId: string, sessionId: string, event: MediaSessionEvent | (string & {})): string {
 		return `${SUBJECT_ROOTS.media}.${assertToken("orgId", orgId)}.${assertToken("sessionId", sessionId)}.${assertEvent(event)}`;
 	},
+	/**
+	 * `messaging.evt.v1.<orgId>.<conversationId>.<event>` — one SMS/MMS thread's traffic.
+	 *
+	 * `conversationId` and not `messageId`: see {@link SUBJECT_ROOTS.messaging}. It is the address,
+	 * so it is absent from every payload in the family.
+	 */
+	messaging(orgId: string, conversationId: string, event: MessagingEvent | (string & {})): string {
+		return `${SUBJECT_ROOTS.messaging}.${assertToken("orgId", orgId)}.${assertToken("conversationId", conversationId)}.${assertEvent(event)}`;
+	},
+	/**
+	 * `trunk.evt.v1.<orgId>.<trunkId>.<event>` — a carrier trunk's reachability transitions.
+	 *
+	 * `trunkId` is the `trunk` row id, not the trunk's name: the name is what the media server
+	 * knows (it IS the PJSIP endpoint), but a tenant may rename a trunk while it is down, and a
+	 * subject that moved under a rename would strand a durable consumer's ordering mid-outage.
+	 * The producer resolves name → id before publishing; the name travels in the payload.
+	 */
+	trunk(orgId: string, trunkId: string, event: TrunkEvent | (string & {})): string {
+		return `${SUBJECT_ROOTS.trunk}.${assertToken("orgId", orgId)}.${assertToken("trunkId", trunkId)}.${assertEvent(event)}`;
+	},
 	/** `cdr.leg.v1.<orgId>` — a single ordered subject per org; the CDR writer consumes it. */
 	cdrLeg(orgId: string): string {
 		return `${SUBJECT_ROOTS.cdrLeg}.${assertToken("orgId", orgId)}`;
+	},
+	/** `security.evt.v1.<orgId>.<subjectRef>.<event>` — `subjectRef` is {@link SECURITY_SCOPE_ORG} or an extension id. */
+	security(orgId: string, subjectRef: string, event: string): string {
+		return `${SUBJECT_ROOTS.security}.${assertToken("orgId", orgId)}.${assertToken("subjectRef", subjectRef)}.${assertEvent(event)}`;
 	},
 	/** `audit.evt.v1.<orgId>` */
 	audit(orgId: string): string {
@@ -492,6 +1070,26 @@ export const subjectFor = {
 	authzCheckRpc(): string {
 		return RPC_SUBJECTS.authzCheck;
 	},
+	/** `rpc.pbx.v1.extension-feature` */
+	pbxExtensionFeatureRpc(): string {
+		return RPC_SUBJECTS.pbxExtensionFeature;
+	},
+	/** `rpc.pbx.v1.toggle-feature` */
+	pbxToggleFeatureRpc(): string {
+		return RPC_SUBJECTS.pbxToggleFeature;
+	},
+	/** `rpc.pbx.v1.hot-desk` */
+	pbxHotDeskRpc(): string {
+		return RPC_SUBJECTS.pbxHotDesk;
+	},
+	/** `rpc.pbx.v1.last-caller` */
+	pbxLastCallerRpc(): string {
+		return RPC_SUBJECTS.pbxLastCaller;
+	},
+	/** `rpc.pbx.v1.file-greeting` */
+	pbxFileGreetingRpc(): string {
+		return RPC_SUBJECTS.pbxFileGreeting;
+	},
 	/** `rpc.sip.v1.credential` */
 	sipCredentialRpc(): string {
 		return RPC_SUBJECTS.sipCredential;
@@ -500,9 +1098,57 @@ export const subjectFor = {
 	sipTransferRpc(): string {
 		return RPC_SUBJECTS.sipTransfer;
 	},
+	/**
+	 * `rpc.engine.v1.renegotiate.<instanceToken>` — addressed at the ONE engine instance holding
+	 * the session, never queue-grouped.
+	 */
+	engineRenegotiateRpc(instanceId: string): string {
+		return `${RPC_SUBJECTS.engineRenegotiate}.${instanceSubjectToken(instanceId)}`;
+	},
+
+	/** `rpc.sip.v1.invite` — flat, queue-grouped. See {@link RPC_SUBJECTS.sipInvite}. */
+	sipInviteRpc(): string {
+		return RPC_SUBJECTS.sipInvite;
+	},
+	/**
+	 * `rpc.sip.v1.ring.<instanceToken>` — addressed at the ONE `sipd` holding the dialog.
+	 *
+	 * The token comes from {@link instanceSubjectToken}, so the `sipd` subscribing with its own
+	 * configured id and the engine building the subject from the `sipdInstanceId` it was told on
+	 * admission land on the same string. See {@link RPC_SUBJECTS.sipRing} for why a queue group
+	 * cannot serve this.
+	 */
+	sipRingRpc(instanceId: string): string {
+		return `${RPC_SUBJECTS.sipRing}.${instanceSubjectToken(instanceId)}`;
+	},
+	/** `rpc.sip.v1.answer.<instanceToken>`. @see {@link subjectFor.sipRingRpc} */
+	sipAnswerRpc(instanceId: string): string {
+		return `${RPC_SUBJECTS.sipAnswer}.${instanceSubjectToken(instanceId)}`;
+	},
+	/** `rpc.sip.v1.hangup.<instanceToken>`. @see {@link subjectFor.sipRingRpc} */
+	sipHangupRpc(instanceId: string): string {
+		return `${RPC_SUBJECTS.sipHangup}.${instanceSubjectToken(instanceId)}`;
+	},
+	/** `rpc.sip.v1.reinvite.<instanceToken>`. @see {@link subjectFor.sipRingRpc} */
+	sipReinviteRpc(instanceId: string): string {
+		return `${RPC_SUBJECTS.sipReinvite}.${instanceSubjectToken(instanceId)}`;
+	},
+	/** `rpc.sip.v1.originate` — flat, queue-grouped. See {@link RPC_SUBJECTS.sipOriginate}. */
+	sipOriginateRpc(instanceId?: string): string {
+		return instanceId === undefined
+			? RPC_SUBJECTS.sipOriginate
+			: `${RPC_SUBJECTS.sipOriginate}.${instanceSubjectToken(instanceId)}`;
+	},
 	/** `rpc.engine.v1.originate` — flat, queue-grouped. See {@link RPC_SUBJECTS.engineOriginate}. */
 	engineOriginateRpc(): string {
 		return RPC_SUBJECTS.engineOriginate;
+	},
+	/**
+	 * `rpc.engine.v1.queue-callback` — flat, queue-grouped. See
+	 * {@link RPC_SUBJECTS.engineQueueCallback}.
+	 */
+	engineQueueCallbackRpc(): string {
+		return RPC_SUBJECTS.engineQueueCallback;
 	},
 	/**
 	 * `rpc.engine.v1.park-handoff.<instanceToken>` — addressed at ONE engine instance.
@@ -513,6 +1159,41 @@ export const subjectFor = {
 	 */
 	engineParkHandoffRpc(instanceId: string): string {
 		return `${RPC_SUBJECTS.engineParkHandoff}.${instanceSubjectToken(instanceId)}`;
+	},
+	/**
+	 * `rpc.engine.v1.session-verb.<instanceToken>` — addressed at the engine instance that owns the
+	 * leg the verb acts on. See {@link RPC_SUBJECTS.engineSessionVerb}.
+	 */
+	engineSessionVerbRpc(instanceId: string): string {
+		return `${RPC_SUBJECTS.engineSessionVerb}.${instanceSubjectToken(instanceId)}`;
+	},
+	/**
+	 * `rpc.engine.v1.conference-control.<instanceToken>` — addressed at an engine instance that has
+	 * members in the room. See {@link RPC_SUBJECTS.engineConferenceControl} for where the caller
+	 * learns which instances those are.
+	 */
+	engineConferenceControlRpc(instanceId: string): string {
+		return `${RPC_SUBJECTS.engineConferenceControl}.${instanceSubjectToken(instanceId)}`;
+	},
+	/**
+	 * `rpc.engine.v1.call-control.<instanceToken>` — addressed at the engine instance that owns the
+	 * leg, as the `channels` bucket names it. See {@link RPC_SUBJECTS.engineCallControl}.
+	 */
+	engineCallControlRpc(instanceId: string): string {
+		return `${RPC_SUBJECTS.engineCallControl}.${instanceSubjectToken(instanceId)}`;
+	},
+	/**
+	 * `rpc.session.v1.announce.<orgId>.<applicationToken>` — the subject that IS the registration.
+	 *
+	 * Two variable tokens rather than one, and the ORGANIZATION comes first: an application name is
+	 * a tenant's own string, so `crm` in one organization and `crm` in another are different
+	 * applications and must be different subjects. Putting the org first also means an operator can
+	 * watch one tenant's whole integration surface with `rpc.session.v1.announce.<org>.*`, and — the
+	 * reason that matters — it is the shape a per-tenant broker permission would take if one is ever
+	 * needed.
+	 */
+	sessionAnnounceRpc(orgId: string, application: string): string {
+		return `${RPC_SUBJECTS.sessionAnnounce}.${assertToken("orgId", orgId)}.${applicationSubjectToken(application)}`;
 	},
 } as const;
 
@@ -541,6 +1222,20 @@ export const subjectFilterFor = {
 	callEvent(event: CallEvent | (string & {})): string {
 		return `${SUBJECT_ROOTS.call}.*.*.${assertEvent(event)}`;
 	},
+	/**
+	 * Every `conference.*` event of one org — the conference live topic's upstream.
+	 *
+	 * A PREFIX filter rather than one subject per event name, because the family is open at the
+	 * tail: `conference.participant.updated` is three tokens where `conference.joined` is two, and
+	 * `>` matches one or more. It is deliberately NOT `callsInOrg`, even though these are call
+	 * events and that filter would deliver them: a subscriber holding `conferences.read` and not
+	 * `cdr.read` must not be handed every channel transition in the tenant because the two families
+	 * share a root. Filtering at the SUBJECT means those bytes never leave the broker — the same
+	 * argument `voicemailEventInOrg` makes for keeping `message.left` off the MWI topic.
+	 */
+	conferenceEventsInOrg(orgId: string): string {
+		return `${SUBJECT_ROOTS.call}.${assertToken("orgId", orgId)}.*.conference.>`;
+	},
 
 	allRegistrations(): string {
 		return `${SUBJECT_ROOTS.registration}.>`;
@@ -553,6 +1248,28 @@ export const subjectFilterFor = {
 	},
 	registrationEventInOrg(orgId: string, event: RegistrationEvent | (string & {})): string {
 		return `${SUBJECT_ROOTS.registration}.${assertToken("orgId", orgId)}.*.${assertEvent(event)}`;
+	},
+
+	/**
+	 * Every SIP dialog event, every org — the `SIP` stream's own subject list, and the filter the
+	 * engine subscribes with.
+	 *
+	 * The engine reads this family on a CORE subscription, not a durable consumer, for the identical
+	 * reason it reads `media.evt.v1.>` that way: it wants a leg torn down NOW and must not pay for an
+	 * ack round trip on the call path. The stream exists behind it so a `dialog.terminated` that the
+	 * engine missed is still CDR evidence somebody can replay.
+	 */
+	allSipDialogs(): string {
+		return `${SUBJECT_ROOTS.sipDialog}.>`;
+	},
+	sipDialogsInOrg(orgId: string): string {
+		return `${SUBJECT_ROOTS.sipDialog}.${assertToken("orgId", orgId)}.>`;
+	},
+	sipDialog(orgId: string, legId: string): string {
+		return `${SUBJECT_ROOTS.sipDialog}.${assertToken("orgId", orgId)}.${assertToken("legId", legId)}.>`;
+	},
+	sipDialogEventInOrg(orgId: string, event: SipDialogEvent | (string & {})): string {
+		return `${SUBJECT_ROOTS.sipDialog}.${assertToken("orgId", orgId)}.*.${assertEvent(event)}`;
 	},
 
 	allQueues(): string {
@@ -598,6 +1315,48 @@ export const subjectFilterFor = {
 		return `${SUBJECT_ROOTS.media}.${assertToken("orgId", orgId)}.*.${assertEvent(event)}`;
 	},
 
+	/** Every messaging event, every org — the MESSAGING stream's own subject list. */
+	allMessaging(): string {
+		return `${SUBJECT_ROOTS.messaging}.>`;
+	},
+	messagingInOrg(orgId: string): string {
+		return `${SUBJECT_ROOTS.messaging}.${assertToken("orgId", orgId)}.>`;
+	},
+	/** Every event of one thread — what an open conversation in an agent's client watches. */
+	messagingConversation(orgId: string, conversationId: string): string {
+		return `${SUBJECT_ROOTS.messaging}.${assertToken("orgId", orgId)}.${assertToken("conversationId", conversationId)}.>`;
+	},
+	/**
+	 * One event name across every conversation of one org.
+	 *
+	 * The event names are DOTTED, so the tail is two tokens and the conversation wildcard is a
+	 * single `*` — the same seven-token arithmetic {@link subjectFilterFor.trunkStatusInOrg}
+	 * spells out, and the same one that governs the broker grants in `config/nats.conf`.
+	 */
+	messagingEventInOrg(orgId: string, event: MessagingEvent | (string & {})): string {
+		return `${SUBJECT_ROOTS.messaging}.${assertToken("orgId", orgId)}.*.${assertEvent(event)}`;
+	},
+
+	/** Every trunk event, every org — the TRUNKS stream's own subject list. */
+	allTrunks(): string {
+		return `${SUBJECT_ROOTS.trunk}.>`;
+	},
+	/** Every trunk event of one org — what the live fan-out subscribes for a wallboard. */
+	trunksInOrg(orgId: string): string {
+		return `${SUBJECT_ROOTS.trunk}.${assertToken("orgId", orgId)}.>`;
+	},
+	/**
+	 * `status.changed` across every trunk of one org.
+	 *
+	 * The event name is DOTTED, so the tail is two tokens and the trunk wildcard cannot be a `>`:
+	 * `trunk.evt.v1.<org>.>` would be the whole family, and `trunk.evt.v1.<org>.*.*` would match
+	 * nothing at all. The same seven-token arithmetic governs the broker grants in
+	 * `config/nats.conf`.
+	 */
+	trunkStatusInOrg(orgId: string): string {
+		return `${SUBJECT_ROOTS.trunk}.${assertToken("orgId", orgId)}.*.status.changed`;
+	},
+
 	/** `cdr.leg.v1.*` — the CDR writer's filter; one token, so `*` not `>`. */
 	allCdrLegs(): string {
 		return `${SUBJECT_ROOTS.cdrLeg}.*`;
@@ -606,6 +1365,15 @@ export const subjectFilterFor = {
 		return subjectFor.cdrLeg(orgId);
 	},
 
+	allSecurity(): string {
+		return `${SUBJECT_ROOTS.security}.>`;
+	},
+	securityInOrg(orgId: string): string {
+		return `${SUBJECT_ROOTS.security}.${assertToken("orgId", orgId)}.>`;
+	},
+	securityEvent(orgId: string, event: string): string {
+		return `${SUBJECT_ROOTS.security}.${assertToken("orgId", orgId)}.*.${assertEvent(event)}`;
+	},
 	allAudit(): string {
 		return `${SUBJECT_ROOTS.audit}.*`;
 	},
@@ -640,6 +1408,14 @@ export type ParsedSubject =
 			readonly event: string;
 	  }
 	| {
+			readonly kind: "sip-dialog";
+			readonly family: "sipDialog";
+			readonly version: string;
+			readonly orgId: string;
+			readonly legId: string;
+			readonly event: string;
+	  }
+	| {
 			readonly kind: "queue";
 			readonly family: "queue";
 			readonly version: string;
@@ -664,10 +1440,35 @@ export type ParsedSubject =
 			readonly event: string;
 	  }
 	| {
+			readonly kind: "messaging";
+			readonly family: "messaging";
+			readonly version: string;
+			readonly orgId: string;
+			readonly conversationId: string;
+			readonly event: string;
+	  }
+	| {
+			readonly kind: "trunk";
+			readonly family: "trunk";
+			readonly version: string;
+			readonly orgId: string;
+			readonly trunkId: string;
+			readonly event: string;
+	  }
+	| {
 			readonly kind: "cdr-leg";
 			readonly family: "cdr";
 			readonly version: string;
 			readonly orgId: string;
+	  }
+	| {
+			readonly kind: "security";
+			readonly family: "security";
+			readonly version: string;
+			readonly orgId: string;
+			/** {@link SECURITY_SCOPE_ORG}, or the extension id the signal is about. */
+			readonly subjectRef: string;
+			readonly event: string;
 	  }
 	| {
 			readonly kind: "audit";
@@ -687,6 +1488,12 @@ export type ParsedSubject =
 			readonly version: string;
 			readonly service: string;
 			readonly method: string;
+			/**
+			 * The tail an instance-addressed subject carries — the `<instanceToken>` of
+			 * `rpc.sip.v1.ring.<tok>`, or the `<orgId>.<appToken>` of `rpc.session.v1.announce`.
+			 * Absent on the flat, queue-grouped subjects.
+			 */
+			readonly target?: string;
 	  };
 
 /** Raised by {@link parseSubjectOrThrow} when a subject is outside the taxonomy. */
@@ -738,6 +1545,17 @@ export function parseSubject(subject: string): ParsedSubject | undefined {
 			event: event.join("."),
 		};
 	}
+	if (prefix === "sip.evt" && rest.length >= 3) {
+		const [orgId, legId, ...event] = rest as [string, string, ...string[]];
+		return {
+			kind: "sip-dialog",
+			family: "sipDialog",
+			version,
+			orgId,
+			legId,
+			event: event.join("."),
+		};
+	}
 	if (prefix === "queue.evt" && rest.length >= 3) {
 		const [orgId, queueId, ...event] = rest as [string, string, ...string[]];
 		return { kind: "queue", family: "queue", version, orgId, queueId, event: event.join(".") };
@@ -757,8 +1575,34 @@ export function parseSubject(subject: string): ParsedSubject | undefined {
 		const [orgId, sessionId, ...event] = rest as [string, string, ...string[]];
 		return { kind: "media", family: "media", version, orgId, sessionId, event: event.join(".") };
 	}
+	if (prefix === "messaging.evt" && rest.length >= 3) {
+		const [orgId, conversationId, ...event] = rest as [string, string, ...string[]];
+		return {
+			kind: "messaging",
+			family: "messaging",
+			version,
+			orgId,
+			conversationId,
+			event: event.join("."),
+		};
+	}
+	if (prefix === "trunk.evt" && rest.length >= 3) {
+		const [orgId, trunkId, ...event] = rest as [string, string, ...string[]];
+		return { kind: "trunk", family: "trunk", version, orgId, trunkId, event: event.join(".") };
+	}
 	if (prefix === "cdr.leg" && rest.length === 1) {
 		return { kind: "cdr-leg", family: "cdr", version, orgId: rest[0] as string };
+	}
+	if (prefix === "security.evt" && rest.length >= 3) {
+		const [orgId, subjectRef, ...event] = rest as [string, string, ...string[]];
+		return {
+			kind: "security",
+			family: "security",
+			version,
+			orgId,
+			subjectRef,
+			event: event.join("."),
+		};
 	}
 	if (prefix === "audit.evt" && rest.length === 1) {
 		return { kind: "audit", family: "audit", version, orgId: rest[0] as string };
@@ -766,8 +1610,18 @@ export function parseSubject(subject: string): ParsedSubject | undefined {
 	if (prefix === "provision.evt" && rest.length === 1) {
 		return { kind: "provision", family: "provision", version, orgId: rest[0] as string };
 	}
-	if (first === "rpc" && rest.length === 1) {
-		return { kind: "rpc", family: "rpc", version, service: second, method: rest[0] as string };
+	if (first === "rpc" && rest.length >= 1) {
+		// Eight subjects carry a variable tail (`subjectFor.sipRingRpc` and friends). Parsing only
+		// the flat ones would make this function refuse subjects the same file builds.
+		const target = rest.slice(1).join(".");
+		return {
+			kind: "rpc",
+			family: "rpc",
+			version,
+			service: second,
+			method: rest[0] as string,
+			...(target === "" ? {} : { target }),
+		};
 	}
 	return undefined;
 }
@@ -798,6 +1652,10 @@ export function isRegistrationEvent(value: string): value is RegistrationEvent {
 	return (REGISTRATION_EVENTS as readonly string[]).includes(value);
 }
 
+export function isSipDialogEvent(value: string): value is SipDialogEvent {
+	return (SIP_DIALOG_EVENTS as readonly string[]).includes(value);
+}
+
 export function isQueueEvent(value: string): value is QueueEvent {
 	return (QUEUE_EVENTS as readonly string[]).includes(value);
 }
@@ -808,6 +1666,18 @@ export function isVoicemailEvent(value: string): value is VoicemailEvent {
 
 export function isMediaSessionEvent(value: string): value is MediaSessionEvent {
 	return (MEDIA_SESSION_EVENTS as readonly string[]).includes(value);
+}
+
+export function isMessagingEvent(value: string): value is MessagingEvent {
+	return (MESSAGING_EVENTS as readonly string[]).includes(value);
+}
+
+export function isSecurityEvent(value: string): value is SecurityEvent {
+	return (SECURITY_EVENTS as readonly string[]).includes(value);
+}
+
+export function isTrunkEvent(value: string): value is TrunkEvent {
+	return (TRUNK_EVENTS as readonly string[]).includes(value);
 }
 
 /**

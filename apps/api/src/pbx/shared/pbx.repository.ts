@@ -7,6 +7,7 @@ import {
 	asc,
 	eq,
 	ilike,
+	inArray,
 	or,
 	type PbxDatabaseClient,
 	type PbxDatabaseTransaction,
@@ -16,6 +17,7 @@ import { compileOnWrite, requiresRecompile } from "../routing/compile-on-write";
 import {
 	assertDestinations,
 	findDestinationReferences,
+	findPagingGroupFeatureCodeReferences,
 	findParkLotFeatureCodeReferences,
 	findScalarReferences,
 	findTrunkReferences,
@@ -96,6 +98,13 @@ export interface PbxRepositoryInterface {
 		organizationId: string,
 		resource: PbxResource,
 		query: ListQuery,
+		/**
+		 * Restricts the page to these row ids — the `.own` scope's narrowing, resolved by the service
+		 * from the row-ownership link. `undefined` is the ordinary org-wide list; a non-empty set adds
+		 * an `id IN (…)` to the same scan (the service never passes an empty set — it answers that with
+		 * an empty page and no query).
+		 */
+		restrictToIds?: readonly string[],
 	) => Effect.Effect<PagedResult<Record<string, unknown>>, PbxFailure>;
 
 	readonly get: (
@@ -194,6 +203,15 @@ function searchPredicate(resource: PbxResource, search: string | undefined): SQL
 	const escaped = term.replace(/[\\%_]/gu, (match) => `\\${match}`);
 	const clauses = resource.searchColumns.map((column) => ilike(column, `%${escaped}%`));
 	return clauses.length === 1 ? clauses[0] : or(...clauses);
+}
+
+/** `and` over the clauses that are actually present, collapsing 0 → undefined and 1 → itself. */
+function combinePredicates(...clauses: (SQL | undefined)[]): SQL | undefined {
+	const present = clauses.filter((clause): clause is SQL => clause !== undefined);
+	if (present.length === 0) {
+		return undefined;
+	}
+	return present.length === 1 ? present[0] : and(...present);
 }
 
 function listPredicate(resource: PbxResource, query: ListQuery): SQL | undefined {
@@ -307,6 +325,17 @@ async function selectById(
 }
 
 /**
+ * The ceiling on a child collection read.
+ *
+ * Children are not paginated — an IVR menu with more than a screenful of options is a design
+ * problem, not a paging problem — but "not paginated" is not "unbounded" (oikos §4). Collections
+ * whose size is genuinely tenant-controlled (`pin_set_entry`, `paging_group_member`,
+ * `shared_line_appearance`) would otherwise serialise an arbitrarily large table into one body.
+ * The value is well above any collection a UI can drive and above `reorderDto`'s own 500.
+ */
+const MAX_CHILDREN = 1000;
+
+/**
  * The `id` column object.
  *
  * Reached through the table's column map rather than declared on every descriptor: `id` is
@@ -357,11 +386,15 @@ async function assertNotReferenced(
 		...(resource.scalarReferences === undefined
 			? []
 			: await findScalarReferences(transaction, resource.scalarReferences, id)),
-		// Two references live inside `jsonb` where no column — and therefore no generic scan — can
-		// reach them: an outbound route's trunk list, and a `call-park` code's pinned lot.
+		// Three references live inside `jsonb` where no column — and therefore no generic scan — can
+		// reach them: an outbound route's trunk list, a `call-park` code's pinned lot, and a `paging`
+		// code's pinned group.
 		...(resource.tableName === "trunk" ? await findTrunkReferences(transaction, id) : []),
 		...(resource.tableName === "park_lot"
 			? await findParkLotFeatureCodeReferences(transaction, id)
+			: []),
+		...(resource.tableName === "paging_group"
+			? await findPagingGroupFeatureCodeReferences(transaction, id)
 			: []),
 	];
 
@@ -589,6 +622,7 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 		organizationId: string,
 		resource: PbxResource,
 		query: ListQuery,
+		restrictToIds?: readonly string[],
 	) {
 		const pagination: Pagination = normalizePagination(query);
 		const rows = yield* scoped(
@@ -597,7 +631,13 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 			organizationId,
 			resource.table,
 			async (transaction) => {
-				const predicate = listPredicate(resource, query);
+				// The `.own` narrowing rides the same predicate as search/enabled, so the `count(*)
+				// over ()` total counts the owned rows and pagination stays honest.
+				const ownership =
+					restrictToIds === undefined || restrictToIds.length === 0
+						? undefined
+						: inArray(rowId(resource), [...restrictToIds]);
+				const predicate = combinePredicates(listPredicate(resource, query), ownership);
 				const base = transaction
 					.select({ row: resource.table, total: windowTotal })
 					.from(resource.table);
@@ -776,7 +816,8 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 					.select()
 					.from(resource.table)
 					.where(eq(resource.parentColumn, parentId))
-					.orderBy(...resource.orderBy.map((column) => asc(column)))) as Record<string, unknown>[];
+					.orderBy(...resource.orderBy.map((column) => asc(column)))
+					.limit(MAX_CHILDREN)) as Record<string, unknown>[];
 			},
 		);
 	});
@@ -953,7 +994,8 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 				const existing = (await transaction
 					.select()
 					.from(resource.table)
-					.where(eq(resource.parentColumn, parentId))) as Record<string, unknown>[];
+					.where(eq(resource.parentColumn, parentId))
+					.limit(MAX_CHILDREN)) as Record<string, unknown>[];
 
 				assertPermutation(
 					resource.kind,
@@ -964,6 +1006,19 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 				// Ordinals are rewritten to 0…n-1 rather than preserving whatever the rows happened to
 				// hold: the point of the endpoint is that the stored order is exactly the sent order,
 				// and reusing the old values would leave gaps that the next insert has to guess around.
+				//
+				// In two passes, because every reorderable collection but IVR options carries a
+				// non-deferrable UNIQUE (parent, ordinal) index: writing the final ordinals directly
+				// would collide with a row that still holds the value (swapping the first two rows
+				// raises 23505 on the first statement). The parking pass moves every row to a negative
+				// ordinal — no collection constrains the column to be non-negative — so the second pass
+				// lands in a range nothing occupies.
+				for (const [index, id] of ids.entries()) {
+					await transaction
+						.update(resource.table)
+						.set({ [columnKey(ordinalColumn)]: -(index + 1) } as never)
+						.where(and(eq(rowId(resource), id), eq(resource.parentColumn, parentId)));
+				}
 				for (const [index, id] of ids.entries()) {
 					await transaction
 						.update(resource.table)
@@ -975,7 +1030,8 @@ export function makePbxRepository(deps: PbxRepositoryDependencies): PbxRepositor
 					.select()
 					.from(resource.table)
 					.where(eq(resource.parentColumn, parentId))
-					.orderBy(...resource.orderBy.map((column) => asc(column)))) as Record<string, unknown>[];
+					.orderBy(...resource.orderBy.map((column) => asc(column)))
+					.limit(MAX_CHILDREN)) as Record<string, unknown>[];
 				// The collection, not a row: a reorder's `resource_ref` is the PARENT, and the change is
 				// the ordering itself — recording N per-row ordinal diffs would say the same thing N
 				// times and still not say what the new order is. Only `after` is stored, because the

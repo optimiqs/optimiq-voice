@@ -1,10 +1,20 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logging";
-import { and, eq, isNull, voicemailBox, voicemailMessage } from "@optimiq-voice/pbx-db";
+import {
+	and,
+	eq,
+	extensionUser,
+	isNull,
+	voicemailBox,
+	voicemailMessage,
+} from "@optimiq-voice/pbx-db";
+import { MailTemplateService } from "../../auth/mail-templates/mail-template.service";
 import { DEFAULT_MAIL_APP_NAME, Mailer, voicemailMail } from "../../mail";
+import { applyMailOverride } from "../../mail/mail-template-resolution";
 import { OrgSettingsService } from "../org-settings/org-settings.service";
 import { PBX_DATABASE, PBX_ENV } from "../shared/pbx.tokens";
 import { mintVoicemailMediaToken, voicemailMediaPath } from "./voicemail-media-token";
+import type { MailComposition } from "../../auth/mail-templates/mail-template.service";
 import type { PbxEnv } from "../shared/pbx-env";
 import type {
 	PbxDatabaseClient,
@@ -56,13 +66,21 @@ export type VoicemailEmailOutcome =
  * control-plane facts, which is why `VoicemailConsumer` already exists here to file the row, and
  * why this hangs off that consumer rather than off the publisher.
  *
- * ## Two switches, both of which must be on
+ * ## Two switches, both of which must be on — and one person's presentation on top
  *
  * `voicemail_box.email_mode` is the mailbox's own preference (`none` / `notify` / `attach`) and
  * `notifications.voicemailToEmailEnabled` is the organization's policy. The org switch can only
  * narrow: a tenant that turns voicemail-to-email off stops every mailbox, and a mailbox set to
  * `none` is never emailed even when the tenant allows it. See `org-settings.catalog.ts` for why
  * both exist.
+ *
+ * The two `include*` settings are now resolved through the USER level as well — this is the
+ * consumer that makes `user_setting`'s return more than a table. The user behind a mailbox is
+ * found through the only join that exists: `voicemail_box.extension_id → extension_user`, taking
+ * the `primary` link and nobody else's. A `shared` or `delegate` link is somebody ELSE's access
+ * to the line, and rendering the box's mail to a delegate's taste would apply one colleague's
+ * preference to another colleague's inbox. A box with no extension, or an extension with no
+ * primary user, resolves org-only — exactly what every box did before the level existed.
  *
  * ## `attach` is honoured as `notify`, deliberately, and it is recorded rather than hidden
  *
@@ -97,6 +115,7 @@ export class VoicemailEmailService {
 		@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient,
 		@Inject(Mailer) private readonly mailer: Mailer,
 		@Inject(OrgSettingsService) private readonly settings: OrgSettingsService,
+		@Inject(MailTemplateService) private readonly templates: MailTemplateService,
 	) {}
 
 	get stats(): { readonly sent: number; readonly skipped: number; readonly failed: number } {
@@ -165,13 +184,25 @@ export class VoicemailEmailService {
 			);
 		}
 
-		const playUrl = policy.voicemailToEmailIncludeLink
+		/**
+		 * The user level, applied only once a user is known. The org read above stays first and
+		 * stays the kill switch — it is one query that short-circuits a whole disabled tenant
+		 * before the box is even fetched, and `voicemailToEmailEnabled` is not user-scoped so no
+		 * override could revive it. Only the two presentation settings can differ here, which
+		 * `resolveForUser` guarantees by construction.
+		 */
+		const effective =
+			context.userId === undefined
+				? policy
+				: await this.settings.readNotificationSettingsForUser(organizationId, context.userId);
+
+		const playUrl = effective.voicemailToEmailIncludeLink
 			? this.mintPlaybackUrl(organizationId, messageId)
 			: undefined;
 		const inboxUrl =
 			this.mailer.appUrl === undefined ? undefined : `${this.mailer.appUrl}/voicemail`;
 		const transcription = transcriptionFor(
-			policy.voicemailToEmailIncludeTranscription,
+			effective.voicemailToEmailIncludeTranscription,
 			context.transcription,
 			context.transcriptionStatus,
 		);
@@ -185,19 +216,28 @@ export class VoicemailEmailService {
 			return { outcome: "skipped", reason: "already-sent" };
 		}
 
-		const rendered = voicemailMail({
-			appName: DEFAULT_MAIL_APP_NAME,
-			fromName: policy.fromName,
-			mailboxNumber: context.mailboxNumber,
-			mailboxLabel: context.label ?? undefined,
-			callerIdName: context.callerIdName ?? undefined,
-			callerIdNumber: context.callerIdNumber ?? undefined,
-			receivedAt: context.receivedAt,
-			durationMs: context.durationMs,
-			playUrl,
-			inboxUrl,
-			transcription,
-		});
+		// The mail-template cascade: the org's (or its reseller's) branding product name feeds the code
+		// template as its `appName`, and the resolved subject/intro override is applied to the result.
+		// This is the wire the mail-template feature was built for — `resolveComposition` +
+		// `applyMailOverride`, the two halves `MailTemplateService`'s header names — reached from the
+		// consumer that has an organization id and a template key in hand.
+		const composition = await this.compose(organizationId);
+		const rendered = applyMailOverride(
+			voicemailMail({
+				appName: composition.productName,
+				fromName: policy.fromName,
+				mailboxNumber: context.mailboxNumber,
+				mailboxLabel: context.label ?? undefined,
+				callerIdName: context.callerIdName ?? undefined,
+				callerIdNumber: context.callerIdNumber ?? undefined,
+				receivedAt: context.receivedAt,
+				durationMs: context.durationMs,
+				playUrl,
+				inboxUrl,
+				transcription,
+			}),
+			composition.override,
+		);
 
 		const result = await this.mailer.sendRendered(to, rendered, {
 			...(policy.replyTo === undefined ? {} : { replyTo: policy.replyTo }),
@@ -222,6 +262,28 @@ export class VoicemailEmailService {
 	}
 
 	/**
+	 * The branding product name and the resolved template override for this organization's voicemail
+	 * mail.
+	 *
+	 * Best-effort, like everything else past the ack: a template-cascade read that fails must not
+	 * suppress a notification whose audio is already durable, so a failure falls back to the code
+	 * default (`DEFAULT_MAIL_APP_NAME`, no override) — the exact message this consumer sent before the
+	 * cascade was wired. Language is `en`: voicemail mail carries no per-recipient locale yet, and the
+	 * override table keys on `(org, template, language)` with `en` as its own default.
+	 */
+	private async compose(organizationId: string): Promise<MailComposition> {
+		try {
+			return await this.templates.resolveComposition(organizationId, "voicemail", "en");
+		} catch (error) {
+			logger.warn(
+				{ organizationId, err: error },
+				"could not resolve the voicemail mail template; sending with the default branding",
+			);
+			return { productName: DEFAULT_MAIL_APP_NAME, override: null };
+		}
+	}
+
+	/**
 	 * Whether this organization wants its voicemail notifications to WAIT for a transcript.
 	 *
 	 * The consumer's question at filing time, answered from the same policy read the send itself
@@ -230,6 +292,12 @@ export class VoicemailEmailService {
 	 *
 	 * The mailbox's half of the decision — whether this message is being transcribed at all — is the
 	 * consumer's to add, and it has it already: `file()` returns it as `transcribe`.
+	 *
+	 * The USER level is deliberately not consulted here, though `voicemailToEmailIncludeTranscription`
+	 * is user-scoped: resolving the mailbox's user at this seam would put the extension-user join on
+	 * every filing to refine a scheduling hint, and being wrong costs only comfort — a deferral that
+	 * was not needed, or a send whose transcript section says unavailable. The SEND honours the
+	 * override; this only decides how long to wait for it.
 	 */
 	async deferForTranscription(organizationId: string): Promise<boolean> {
 		try {
@@ -313,6 +381,7 @@ export class VoicemailEmailService {
 					label: voicemailBox.label,
 					emailAddress: voicemailBox.emailAddress,
 					emailMode: voicemailBox.emailMode,
+					extensionId: voicemailBox.extensionId,
 				})
 				.from(voicemailBox)
 				.where(eq(voicemailBox.id, mailboxId))
@@ -320,6 +389,27 @@ export class VoicemailEmailService {
 			const box = boxes[0];
 			if (box === undefined) {
 				return undefined;
+			}
+
+			/**
+			 * The user behind the mailbox: `voicemail_box.extension_id → extension_user`, primary
+			 * link only — see the class header for why a delegate's preferences must not style this
+			 * mail. Ordered by creation then id so two primary links (the unique index permits them)
+			 * resolve the same way on every delivery rather than flapping with the planner. The
+			 * guard is a string check rather than `!== null` so an absent column (however a driver
+			 * or a fake spells absence) reads as "no extension" and never as a joinable id.
+			 */
+			let boundUserId: string | undefined;
+			if (typeof box.extensionId === "string") {
+				const links = await transaction
+					.select({ userId: extensionUser.userId })
+					.from(extensionUser)
+					.where(
+						and(eq(extensionUser.extensionId, box.extensionId), eq(extensionUser.role, "primary")),
+					)
+					.orderBy(extensionUser.createdAt, extensionUser.id)
+					.limit(1);
+				boundUserId = links[0]?.userId;
 			}
 
 			const messages = await transaction
@@ -339,7 +429,11 @@ export class VoicemailEmailService {
 				return undefined;
 			}
 
-			return { ...box, ...message };
+			// `extensionId` was read only to find the user behind the mailbox; it is not part of the
+			// context the notification is rendered from, and dropping it here keeps that seam narrow.
+			// Spelled with a helper rather than a destructure with a discarded binding, which the lint
+			// rule against unused variables is right to call a declaration nobody reads.
+			return { ...withoutExtensionId(box), ...message, userId: boundUserId };
 		});
 	}
 }
@@ -349,6 +443,8 @@ interface VoicemailEmailContext {
 	readonly label: string | null;
 	readonly emailAddress: string | null;
 	readonly emailMode: VoicemailEmailMode;
+	/** The primary user behind the mailbox's extension, when the chain exists. */
+	readonly userId: string | undefined;
 	readonly callerIdName: string | null;
 	readonly callerIdNumber: string | null;
 	readonly receivedAt: Date;
@@ -393,4 +489,13 @@ function transcriptionFor(
 	return status === "pending" || status === "failed" || status === "done"
 		? TRANSCRIPTION_UNAVAILABLE
 		: undefined;
+}
+
+/** The mailbox row minus the join key. See its one call site for why the key is dropped. */
+function withoutExtensionId<T extends { readonly extensionId?: unknown }>(
+	box: T,
+): Omit<T, "extensionId"> {
+	const rest: Record<string, unknown> = { ...box };
+	delete rest.extensionId;
+	return rest as Omit<T, "extensionId">;
 }

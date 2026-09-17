@@ -87,10 +87,80 @@ export const registrationBindingSchema = z
 		expiresAt: eventInstantSchema,
 		/** The interval GRANTED, which is not always the one requested. */
 		expiresInSeconds: z.int().min(0).max(86_400),
+		/**
+		 * EVERY live contact for this AOR, when the registrar tracks more than one.
+		 *
+		 * ## Why this is additive and why the flat fields above stay
+		 *
+		 * One AOR routinely has several devices: a desk phone and a softphone registered as the same
+		 * extension is the normal case, not an edge one, and until this field existed the second
+		 * REGISTER simply overwrote the first — so a call rang whichever handset had refreshed most
+		 * recently, and the other was invisible.
+		 *
+		 * Adding contacts could have been done by REPLACING `contact` / `transport` / `sourceAddress`
+		 * with this array, and that would have been the tidier shape and the wrong change. Three
+		 * readers across two languages already consume the flat fields, and a value shape that
+		 * arrives before every reader has been taught about it is a registration that reads as
+		 * unregistered — a phone that cannot be called, produced by a deploy ordering detail. So the
+		 * flat fields REMAIN and describe the PRIMARY contact, this array is optional, and a reader
+		 * that has never heard of it behaves exactly as it did before.
+		 *
+		 * The registrar keeps the two in step by construction: the primary is `contacts[0]` and its
+		 * fields are copied outward on every write. A value where they disagree is a bug in the
+		 * writer, and a reader should trust the flat fields, because they are the ones every reader
+		 * has always used.
+		 *
+		 * ## What the engine does with it
+		 *
+		 * Forks. One `originate` per contact, raced by `dialSimultaneous` exactly as a ring group is
+		 * raced — one channel id, one `ChannelAggregate` and therefore one CDR row per attempt, with
+		 * the losers getting `LOSE_RACE`. The SIP edge deliberately does NOT fork: it reports the
+		 * contacts and the engine, which has the accounting and the confirmation flow, does the rest.
+		 */
+		contacts: z
+			.array(
+				z
+					.object({
+						/** The contact URI as the device offered it. Same caveats as the flat `contact`. */
+						contact: z.string().min(1).max(1024),
+						transport: sipTransportSchema,
+						userAgent: z.string().max(256).optional(),
+						sourceAddress: z.string().max(128).optional(),
+						deviceId: z.string().max(64).optional(),
+						/**
+						 * The device's `+sip.instance` (RFC 5626), which is what makes a contact STABLE
+						 * across re-registrations from a changing port. Where a device supplies one it is
+						 * the identity a `{kind:"aor"}` originate should name; where it does not, the URI is.
+						 */
+						instance: z.string().max(256).optional(),
+						registeredAt: eventInstantSchema,
+						expiresAt: eventInstantSchema,
+					})
+					.loose(),
+			)
+			// Same ceiling as extension.maxRegistrations and the SIP registrar.
+			.max(20)
+			.optional(),
 	})
 	.loose();
 
 export type RegistrationBinding = z.infer<typeof registrationBindingSchema>;
+
+/**
+ * Every live contact for a binding, oldest shape included.
+ *
+ * The one function a caller should use, so "does this binding have a contacts array" is asked once
+ * rather than at every call site: a binding written before the array existed yields its single flat
+ * contact, and one written after yields the whole list.
+ */
+export function contactsOf(
+	binding: RegistrationBinding,
+): readonly { contact: string; transport: RegistrationBinding["transport"] }[] {
+	if (binding.contacts !== undefined && binding.contacts.length > 0) {
+		return binding.contacts;
+	}
+	return [{ contact: binding.contact, transport: binding.transport }];
+}
 
 /** Whether a binding's granted interval has lapsed at `now` (epoch millis). */
 export function isRegistrationLapsed(binding: RegistrationBinding, now: number): boolean {
@@ -185,6 +255,42 @@ export function isLiveChannel(channel: LiveChannel): boolean {
 	return !TEARDOWN_SET.has(channel.state) && channel.hangupAt === undefined;
 }
 
+/**
+ * The flags that carry a leg's recording state. `packages/telephony`'s `CHANNEL_FLAGS` owns them.
+ *
+ * Copied here rather than imported for the reason {@link LIVE_CHANNEL_TEARDOWN_STATES} states:
+ * `packages/events` is the bottom of the dependency graph and must not depend on
+ * `packages/telephony`. Two strings, pinned by a spec on the telephony side.
+ */
+export const LIVE_CHANNEL_RECORDING_FLAGS = {
+	active: "recording",
+	paused: "recording-paused",
+} as const;
+
+/** Whether a leg is being recorded, and whether that recording is silenced. */
+export interface LiveChannelRecording {
+	readonly active: boolean;
+	/** The PCI pause. Always `false` when {@link active} is — a paused nothing is not a state. */
+	readonly paused: boolean;
+}
+
+/**
+ * What the recorder is doing on this leg, as the snapshot's flags report it.
+ *
+ * The reader's half of the rule the engine writes under: `recording-paused` is meaningless without
+ * `recording`, so it is IGNORED rather than trusted when the active flag is absent. A surface that
+ * read the two independently could render "Recording paused" for a call nothing is recording,
+ * which on a PCI control is the one wrong answer that matters — it tells an agent a card number is
+ * safe from a recorder that is not running and is therefore not the thing to check.
+ */
+export function recordingStateOf(channel: LiveChannel): LiveChannelRecording {
+	const active = channel.flags.includes(LIVE_CHANNEL_RECORDING_FLAGS.active);
+	return {
+		active,
+		paused: active && channel.flags.includes(LIVE_CHANNEL_RECORDING_FLAGS.paused),
+	};
+}
+
 // ---------------------------------------------------------------------------------------------
 // media-sessions — which mediad instance holds which RTP session
 // ---------------------------------------------------------------------------------------------
@@ -255,6 +361,341 @@ export const mediaSessionDirectoryEntrySchema = z
 	.loose();
 
 export type MediaSessionDirectoryEntry = z.infer<typeof mediaSessionDirectoryEntrySchema>;
+
+// ---------------------------------------------------------------------------------------------
+// sip-dialogs — which sipd instance holds which dialog, and until when
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One entry in the `sip-dialogs` KV bucket.
+ *
+ * ## A claim, not a directory — and the difference is the lease
+ *
+ * `mediaSessionDirectoryEntrySchema` above carries no expiry, and its note says why: "nothing races
+ * for a media session". Something races here, and it is not two writers — it is a REAPER against a
+ * corpse. A dialog's sockets, timers and CSeq are local to one process (`plans/sipd-invite-design.md`
+ * §6.1), so when a `sipd` dies its calls die with it and nothing can fail them over. What must not
+ * also die is the ENGINE's knowledge that they ended: without it the engine holds channels for calls
+ * that ended when a pod was rescheduled, and no CDR is ever written for any of them.
+ *
+ * So the record carries a lease its owner heartbeats, exactly as a park claim does, and a surviving
+ * instance that finds an expired claim publishes `dialog.terminated{reason: "instance-lost"}` on the
+ * dead owner's behalf. **The engine writes a CDR from a `leg-ended` it would otherwise never have
+ * received.** That is the entire job. It is not failover and must not be mistaken for it.
+ *
+ * ## Why {@link expiresAt} rather than the bucket's TTL
+ *
+ * The same argument `PARK_CLAIMS_KV` makes: server-side expiry cannot tell "the owner stopped
+ * heartbeating" from "this was written a long time ago and is still correct". A six-hour call would
+ * be reaped by a TTL and must not be; a thirty-second-dead instance must be reaped and a TTL would
+ * not notice for hours. The lease is what a reaper reads; the bucket TTL is a backstop for keys
+ * nobody ever cleaned up at all.
+ *
+ * ## Its own expired claim is NOT reapable by its owner
+ *
+ * Worth stating on the contract because it is the one rule a reaper gets wrong. A `sipd` that finds
+ * its OWN claim expired has a late heartbeat, not a dead call — the process is plainly alive, it is
+ * running the sweep — and terminating its own live calls because the broker was slow would turn a
+ * network blip into dropped calls. Only another instance's expired claim is an orphan.
+ *
+ * `.loose()`, like every other KV contract here.
+ */
+export const sipDialogClaimSchema = z
+	.object({
+		/** The key, repeated in the value. One string names the leg, the dialog and the RTP session. */
+		legId: z.string().min(1).max(128),
+		/** The `sipd` process that holds it. THE field this bucket exists for. */
+		instanceId: z.string().min(1).max(128),
+		/** Present once admission resolved it. Absent for the window before the engine answered. */
+		orgId: z.string().max(128).optional(),
+		callId: z.string().max(128).optional(),
+		/** `uas` when we answered the INVITE, `uac` when we placed it. */
+		role: z.enum(["uas", "uac"]),
+		/** The dialog triple. A LOOKUP KEY and never an authorisation. */
+		sipCallId: z.string().min(1).max(256),
+		localTag: z.string().max(128).optional(),
+		remoteTag: z.string().max(128).optional(),
+		/** `early` before a 2xx, `confirmed` after the ACK, `terminating` on the way out. */
+		state: z.string().min(1).max(32),
+		/** The observed peer, `host:port` — the address that actually works. */
+		remoteAddress: z.string().max(128).optional(),
+		transport: sipTransportSchema.optional(),
+		/** Set when the dialog is a carrier's. Absent for a registered endpoint. */
+		trunkId: z.string().max(128).optional(),
+		/** The trust boundary the dialog arrived on, so a reaped call's record says which. */
+		profile: z.string().max(64).optional(),
+		/** Epoch millis, as `channels` and `media-sessions` do it. */
+		createdAt: z.number(),
+		/** The lease. See the note above on why this is not the bucket's TTL. */
+		expiresAt: z.number(),
+	})
+	.loose();
+
+export type SipDialogClaim = z.infer<typeof sipDialogClaimSchema>;
+
+/** Whether a claim's lease has lapsed at `now` (epoch millis). */
+export function isSipDialogClaimExpired(claim: SipDialogClaim, now: number): boolean {
+	return now >= claim.expiresAt;
+}
+
+/**
+ * The claims that belong to some OTHER instance and whose lease has lapsed.
+ *
+ * Deliberately not "every expired claim" — see the rule on {@link sipDialogClaimSchema} about an
+ * instance's own late heartbeat. Exported from the contract package rather than reimplemented in Go
+ * and TypeScript because a reaper that got this predicate wrong would drop live calls, and one
+ * definition cannot disagree with itself.
+ */
+export function orphanedSipDialogClaims(
+	claims: readonly SipDialogClaim[],
+	instanceId: string,
+	now: number,
+): readonly SipDialogClaim[] {
+	return claims.filter(
+		(claim) => claim.instanceId !== instanceId && isSipDialogClaimExpired(claim, now),
+	);
+}
+
+// ---------------------------------------------------------------------------------------------
+// sip-instances — which sipd processes are alive, right now
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One entry in the `sip-instances` KV bucket: a `sipd` process saying "I am still here".
+ *
+ * ## Why the dialog claims are not enough
+ *
+ * {@link sipDialogClaimSchema} already carries a lease, and a SURVIVING `sipd` reaps a dead peer's
+ * claims off it. That leaves the case a single-instance edge — which is every small deployment and
+ * every developer stack — cannot cover: when the only `sipd` dies there is no survivor to sweep, so
+ * the engine holds live channels for calls whose signalling plane no longer exists, and a BYE from
+ * the phone is answered `481` by the process that replaced it. The engine has to be able to notice
+ * on its own.
+ *
+ * One key per PROCESS rather than per dialog is what makes that cheap: the engine watches a handful
+ * of keys instead of every dialog on the fleet, and a lease measured in seconds is affordable on a
+ * key each instance rewrites anyway.
+ *
+ * ## Why this lease is short where the dialog lease is long
+ *
+ * The dialog claim's ninety seconds is sized against a heartbeat that walks every live dialog. This
+ * record is one write, so it can be renewed every few seconds, and its expiry is the time a stranded
+ * call spends live and unbillable after its edge dies. Short is the whole point.
+ *
+ * Unlike the dialog claim, this bucket's TTL and the record's {@link expiresAt} are deliberately
+ * the SAME horizon: there is no long-lived correct value here, so server-side expiry is not a
+ * backstop that could reap something live — it is a second reader of the same fact, and it is what
+ * lets a watcher learn of a death from a delete rather than by polling.
+ */
+export const sipInstanceLeaseSchema = z
+	.object({
+		/** The key, repeated in the value: the `sipd` process's own instance id. */
+		instanceId: z.string().min(1).max(128),
+		/** When this process booted. Distinguishes a restart from a renewal at a glance. */
+		startedAt: z.number(),
+		/** Epoch millis of the most recent renewal. */
+		renewedAt: z.number(),
+		/** Epoch millis after which a reader must treat the instance as gone. */
+		expiresAt: z.number(),
+		/** Live dialogs the instance held at the last renewal. Operator-facing; never authorising. */
+		dialogs: z.int().min(0).optional(),
+	})
+	.loose();
+
+export type SipInstanceLease = z.infer<typeof sipInstanceLeaseSchema>;
+
+/** Whether an instance lease has lapsed at `now` (epoch millis). */
+export function isSipInstanceLeaseExpired(lease: SipInstanceLease, now: number): boolean {
+	return now >= lease.expiresAt;
+}
+
+// ---------------------------------------------------------------------------------------------
+// engine-instances — which engine processes are alive, right now
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One entry in the `engine-instances` KV bucket: an engine process saying "I am still here".
+ *
+ * ## Why the channel ownership leases are not enough
+ *
+ * Every `channels` snapshot already carries `OPTIMIQ_ENGINE_INSTANCE_ID` and an expiry, and a
+ * surviving replica's ownership-maintenance pass already adopts a snapshot whose lease has lapsed.
+ * That lease is ninety seconds wide, because it is sized against a heartbeat that rewrites EVERY
+ * live channel — so between an engine being SIGKILLed and its calls being adopted there is up to a
+ * minute and a half in which the audio still flows through `mediad`, the dialog still stands in
+ * `sipd`, and no process in the fleet holds an aggregate for the call. A BYE arriving in that window
+ * reaches a replica with no aggregate and returns early: the call is never ended and never billed.
+ *
+ * One key per PROCESS collapses that window to the lease below, for the same reason
+ * {@link sipInstanceLeaseSchema} does it for the edge, and at the same cost: a handful of keys to
+ * watch instead of every channel on the fleet. The channel lease stays exactly as it is — it is the
+ * FENCE that makes an adoption safe, and a survivor that has proved the owner dead can contest an
+ * unexpired one, whereas a survivor with no such proof must not.
+ *
+ * ## Why this is symmetric with `sip-instances` and not merged with it
+ *
+ * The two record the same fact about two different planes, and the verdicts they drive are
+ * opposites: a dead `sipd` means its legs must be ENDED, because a dialog cannot be re-homed; a dead
+ * engine means its channels must be ADOPTED, because nothing about a channel is bound to the process
+ * that held it. Sharing a bucket would put those two verdicts one malformed value apart, and would
+ * let an engine's write reach a reader that ends calls.
+ */
+export const engineInstanceLeaseSchema = z
+	.object({
+		/** The key, repeated in the value: the engine process's own instance id. */
+		instanceId: z.string().min(1).max(128),
+		/** When this process booted. Distinguishes a restart from a renewal at a glance. */
+		startedAt: z.number(),
+		/** Epoch millis of the most recent renewal. */
+		renewedAt: z.number(),
+		/** Epoch millis after which a reader must treat the instance as gone. */
+		expiresAt: z.number(),
+		/** Live channels the instance held at the last renewal. Operator-facing; never authorising. */
+		channels: z.int().min(0).optional(),
+	})
+	.loose();
+
+export type EngineInstanceLease = z.infer<typeof engineInstanceLeaseSchema>;
+
+/** Whether an engine instance lease has lapsed at `now` (epoch millis). */
+export function isEngineInstanceLeaseExpired(lease: EngineInstanceLease, now: number): boolean {
+	return now >= lease.expiresAt;
+}
+
+// ---------------------------------------------------------------------------------------------
+// trunks — the carrier directory the SIP edge dials
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One entry in the `trunks` KV bucket: a `trunk` row, reduced to what it takes to place a call.
+ *
+ * A DERIVED read model. `pbx-db`'s `trunk` table is the authority and this is rebuildable from it at
+ * any time, exactly as `did-index` is — the same shape, the same writer (`apps/api`, inside the unit
+ * of work that changed the row) and the same repair path.
+ *
+ * ## What is deliberately not here
+ *
+ * **The secret.** {@link secretRef} is a handle into the secret manager, precisely as `sipSecretRef`
+ * is in the column, and the password it names never lands on the broker. A read model that carried
+ * credentials would put every tenant's carrier password in a bucket four services can open.
+ *
+ * **`codecPrefs`.** It is on the row and it is ADVISORY until the media plane can serve more than
+ * G.711 (`plans/sipd-invite-design.md` §5.2): `mediad` writes every offer, and the SIP edge holds no
+ * codec knowledge in either direction. Carrying a preference the edge cannot act on would invite the
+ * edge to act on it.
+ *
+ * **Status.** Reachability changes on a timer and configuration does not. It travels as
+ * `trunk.evt.v1.…status.changed`, which is an event precisely because it is a transition, and the
+ * persisted view is the `trunk.status*` columns.
+ */
+export const trunkDirectoryEntrySchema = z
+	.object({
+		trunkId: z.string().min(1).max(128),
+		orgId: z.string().min(1).max(128),
+		/** The `trunk.name` column — what a dial template used to substitute, kept for the log. */
+		name: z.string().min(1).max(128),
+		/** `register` means we REGISTER to the carrier; `ip-auth` means it authenticates our source IP. */
+		kind: z.enum(["register", "ip-auth"]),
+		/** SIP domain for `From`/`To`; usually the carrier's realm. */
+		sipDomain: z.string().min(1).max(255),
+		/** Where INVITEs go. */
+		sipProxy: z.string().min(1).max(255),
+		/** A pre-loaded route, when the carrier fronts its proxy with an SBC. */
+		outboundProxy: z.string().max(255).optional(),
+		authUser: z.string().max(128).optional(),
+		/** A HANDLE, never a password. See the note above. */
+		secretRef: z.string().max(256).optional(),
+		transport: sipTransportSchema,
+		registerExpiresSeconds: z.int().min(30).max(86_400).default(300),
+		/**
+		 * The concurrency cap. Enforced at the EDGE as well as in the engine, and the duplication is
+		 * deliberate: the engine's check happens before it offers a call to this trunk, and the edge's
+		 * is what stands between a carrier and a runaway loop that never consulted the engine at all.
+		 */
+		maxChannels: z.int().min(1).max(10_000).optional(),
+		callerIdNumberOverride: z.string().max(64).optional(),
+		/**
+		 * SDES-SRTP (RFC 4568) on this trunk's legs, overriding the media plane's process-wide
+		 * default. ABSENT means "let the media plane decide", which is what every entry written
+		 * before this field existed means — that is what keeps the field additive.
+		 */
+		srtpPolicy: z.enum(["none", "prefer", "require"]).optional(),
+		/** A disabled trunk stays in the bucket and is not dialled. Removal is a DELETE. */
+		enabled: z.boolean().default(true),
+		updatedAt: z.number(),
+	})
+	.loose();
+
+export type TrunkDirectoryEntry = z.infer<typeof trunkDirectoryEntrySchema>;
+
+// ---------------------------------------------------------------------------------------------
+// sip-acl — the networks the edge accepts unauthenticated traffic from
+// ---------------------------------------------------------------------------------------------
+
+/** What an ACL entry governs. Mirrors `pbx-db`'s `sip_acl_entry.scope`. */
+export const SIP_ACL_SCOPES = ["registration", "trunk", "provisioning", "api"] as const;
+export type SipAclScope = (typeof SIP_ACL_SCOPES)[number];
+
+/**
+ * One entry in the `sip-acl` KV bucket.
+ *
+ * ## Why a read model rather than a query
+ *
+ * `sip_acl_entry` is organization-scoped and the reader is not: an INVITE from a carrier arrives
+ * carrying a source address and nothing else. Same problem as `did-index`, same answer — a derived,
+ * non-org-scoped bucket written by `apps/api` from the table.
+ *
+ * And the edge WATCHES it, compiling the entries into an in-process longest-prefix match, rather
+ * than doing a get per INVITE. A get per INVITE is a broker round trip inside a SIP transaction on
+ * the one code path an attacker controls the rate of.
+ *
+ * ## Evaluation order is part of the contract
+ *
+ * Lowest {@link priority} first; ties broken by the most specific prefix; `deny` and `allow` are
+ * both real verdicts and the first match wins. **An address matching nothing is REFUSED** — the
+ * allow-list rule the broker's own permissions follow, and the only default that is safe on a
+ * boundary whose whole job is that unauthenticated traffic never resolves in a trunk-capable
+ * context.
+ *
+ * ## Why {@link trunkId} is here
+ *
+ * `pbx-db`'s `trunk` table has `kind: "ip-auth"` — "the carrier authenticates our source IP" — and
+ * NO field for which source addresses we accept, while `sip_acl_entry` has the networks and no idea
+ * which trunk they belong to. Carrying the association here is what lets a matched packet be
+ * attributed to a carrier, which is what puts a `trunkId` on the admission request and ultimately a
+ * trunk on the CDR. Absent means the entry admits without attributing.
+ */
+export const sipAclEntrySchema = z
+	.object({
+		/** The network in CIDR form, e.g. `203.0.113.0/24`. The key is this, dots and slash folded. */
+		network: z.string().min(1).max(64),
+		orgId: z.string().min(1).max(128),
+		action: z.enum(["allow", "deny"]),
+		scope: z.enum(SIP_ACL_SCOPES),
+		/**
+		 * Lowest first. See the evaluation-order note above.
+		 *
+		 * Required rather than defaulted: this value crosses to Go, whose decoder has no notion of a
+		 * Zod default and would read an absent field as `0` — the HIGHEST precedence. Every writer
+		 * emits it explicitly, so an entry without it is corrupt and is rewritten, not guessed at.
+		 */
+		priority: z.int().min(0).max(65_535),
+		/** The carrier this network belongs to, when the entry attributes one. */
+		trunkId: z.string().max(128).optional(),
+		/** The admin's own label, so a refusal log names the rule a human wrote. */
+		name: z.string().max(128).optional(),
+		/**
+		 * A disabled entry stays in the bucket and does not match. Removal is a DELETE.
+		 *
+		 * Required for the same reason as {@link priority}: absent decodes to `false` in Go, which
+		 * would silently disable a rule TypeScript believes is active.
+		 */
+		enabled: z.boolean(),
+		updatedAt: z.number(),
+	})
+	.loose();
+
+export type SipAclEntry = z.infer<typeof sipAclEntrySchema>;
 
 // ---------------------------------------------------------------------------------------------
 // presence — the value a busy-lamp key renders

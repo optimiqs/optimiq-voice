@@ -6,6 +6,14 @@ import {
 	HANGUP_CAUSES,
 	RECORDING_KINDS,
 } from "@optimiq-voice/cdr-db";
+import {
+	DEFAULT_AGENT_STATS_GROUPS,
+	DEFAULT_WRAP_UP_SECONDS,
+	MAX_AGENT_STATS_GROUPS,
+	MAX_WRAP_UP_SECONDS,
+} from "./agent-stats";
+import { DEFAULT_VOLUME_BUCKET, MAX_VOLUME_BUCKETS, VOLUME_BUCKETS } from "./call-volume";
+import { DEFAULT_SLA_SECONDS, MAX_SLA_SECONDS } from "./queue-stats";
 
 /**
  * The query contract for the reporting surface.
@@ -61,12 +69,84 @@ const dialFilter = z
 	.regex(/^[+*#0-9A-Za-z._-]+$/u, "must be a dialable string")
 	.optional();
 
+/**
+ * `GET /cdr/queue-stats` — service level over a window.
+ *
+ * The window shape is shared with every other reporting query here, so `MAX_RANGE_DAYS` applies
+ * unchanged: this is a live aggregate, not a rollup, and a year of a large tenant belongs on the
+ * export path. `slaSeconds` is a query parameter rather than a stored setting because it is a
+ * QUESTION, not a configuration — a supervisor comparing "how are we at 20 seconds" against "how
+ * are we at 60" is doing the normal thing with this endpoint, and a column would make that two
+ * writes and a race.
+ */
+export const queueStatsQuerySchema = z.strictObject({
+	from: z.iso.datetime({ offset: true }).or(z.iso.datetime()).optional(),
+	to: z.iso.datetime({ offset: true }).or(z.iso.datetime()).optional(),
+	/** One queue, or every queue with traffic in the window. */
+	queueId: z.uuid().optional(),
+	slaSeconds: z.coerce.number().int().min(1).max(MAX_SLA_SECONDS).default(DEFAULT_SLA_SECONDS),
+});
+
+export type QueueStatsQueryDto = z.infer<typeof queueStatsQuerySchema>;
+
 const timeRangeShape = {
 	/** Inclusive lower bound on `started_at`. Defaults to 24 hours before `to`. */
 	from: isoDateTime.optional(),
 	/** Exclusive upper bound on `started_at`. Defaults to now. */
 	to: isoDateTime.optional(),
 } as const;
+
+/**
+ * `GET /cdr/agent-stats` — per-agent handling over a window.
+ *
+ * Same window contract as every other reporting query here, and the same argument for it. The two
+ * parameters that are NOT the window are both questions rather than settings, which is why neither
+ * is a stored column: `wrapUpSeconds` is where a supervisor decides how long a gap still counts as
+ * after-call work (see `agent-stats.ts` for why that is a proxy at all), and `limit` is the group
+ * ceiling rather than a page size — there is no cursor here, deliberately, and the module header
+ * argues why.
+ */
+export const agentStatsQuerySchema = z.strictObject({
+	...timeRangeShape,
+	/** One agent, or every agent who took a call in the window. A `queue_agent` row id. */
+	agentId: z.uuid().optional(),
+	/** One queue, or every queue. */
+	queueId: z.uuid().optional(),
+	wrapUpSeconds: z.coerce
+		.number()
+		.int()
+		.min(1)
+		.max(MAX_WRAP_UP_SECONDS)
+		.default(DEFAULT_WRAP_UP_SECONDS),
+	limit: z.coerce
+		.number()
+		.int()
+		.min(1)
+		.max(MAX_AGENT_STATS_GROUPS)
+		.default(DEFAULT_AGENT_STATS_GROUPS),
+});
+
+export type AgentStatsQueryDto = z.infer<typeof agentStatsQuerySchema>;
+
+/**
+ * `GET /cdr/call-volume` — bucketed counts over a window.
+ *
+ * `bucket` is an enum and not a free-text `date_trunc` grain, which is the difference between a
+ * validated parameter and an injection site — `call-volume.ts` binds it rather than interpolating
+ * it as well, so both halves have to fail before it matters.
+ *
+ * `limit` caps the number of BUCKETS. It cannot bite on a window this DTO accepts
+ * ({@link MAX_RANGE_DAYS} days of hours is exactly {@link MAX_VOLUME_BUCKETS}); it is here so that
+ * the two constants drifting apart shows up as a `truncated` flag rather than as a chart that
+ * silently stops.
+ */
+export const callVolumeQuerySchema = z.strictObject({
+	...timeRangeShape,
+	bucket: z.enum(VOLUME_BUCKETS).default(DEFAULT_VOLUME_BUCKET),
+	limit: z.coerce.number().int().min(1).max(MAX_VOLUME_BUCKETS).default(MAX_VOLUME_BUCKETS),
+});
+
+export type CallVolumeQueryDto = z.infer<typeof callVolumeQuerySchema>;
 
 export const cdrListQuerySchema = z.object({
 	...timeRangeShape,

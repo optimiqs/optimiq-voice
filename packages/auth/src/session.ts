@@ -66,7 +66,7 @@ export class UnauthenticatedSessionError extends Error {
 	}
 }
 
-function normalizeOrganizationId(value: string | null | undefined): string | undefined {
+function normalizeNonEmpty(value: string | null | undefined): string | undefined {
 	const trimmed = value?.trim();
 	return trimmed && trimmed.length > 0 ? trimmed : undefined;
 }
@@ -74,7 +74,7 @@ function normalizeOrganizationId(value: string | null | undefined): string | und
 export function getActiveOrganizationId(
 	session: Pick<AppSession, "session"> | null | undefined,
 ): string | undefined {
-	return normalizeOrganizationId(session?.session.activeOrganizationId);
+	return normalizeNonEmpty(session?.session.activeOrganizationId);
 }
 
 /** The single supported way to obtain the tenant id for row-level-security scoping. */
@@ -98,7 +98,7 @@ export function requireSession(session: AppSession | null | undefined): AppSessi
 
 /** True while a platform operator is acting as another user; audit records must say so. */
 export function isImpersonatedSession(session: AppSession | null | undefined): boolean {
-	return Boolean(normalizeOrganizationId(session?.session.impersonatedBy));
+	return Boolean(normalizeNonEmpty(session?.session.impersonatedBy));
 }
 
 export interface OrganizationMembership {
@@ -134,7 +134,7 @@ export async function resolveSessionOrganizationContext(input: {
 	readonly activeOrganizationId?: string | null;
 	readonly repository: SessionOrganizationRepository;
 }): Promise<SessionOrganizationContext> {
-	const requested = normalizeOrganizationId(input.activeOrganizationId);
+	const requested = normalizeNonEmpty(input.activeOrganizationId);
 	const membership = await input.repository.findMembership(input.userId, requested);
 	if (!membership) {
 		return {};

@@ -51,6 +51,10 @@ export interface PbxErrorBody {
 	readonly issues?: readonly (ValidationIssue | DestinationIssue)[];
 	readonly references?: readonly EntityReference[];
 	readonly diagnostics?: readonly WireDiagnostic[];
+	/** `CONFERENCE_ACTION_NOT_SERVABLE` names the verb no media plane can serve. */
+	readonly action?: string;
+	readonly conferenceId?: string;
+	readonly memberRef?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -165,6 +169,90 @@ export function pbxDiagnostics(error: unknown): readonly WireDiagnostic[] {
 /** True when the write was refused AND rolled back by the routing compiler. */
 export function isCompileRollback(error: unknown): boolean {
 	return pbxErrorCode(error) === "ROUTING_COMPILE_FAILED";
+}
+
+// ---------------------------------------------------------------------------------------------
+// Conference moderation — a taxonomy of its own
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The live-conference surface's failures, restated from
+ * `apps/api/src/pbx/conferences/conference-moderation.errors.ts`.
+ *
+ * ```jsonc
+ * { "statusCode": 403, "code": "CONFERENCE_MODERATE_FORBIDDEN" }
+ * { "statusCode": 404, "code": "CONFERENCE_NOT_RUNNING",           "conferenceId": "…" }
+ * { "statusCode": 404, "code": "CONFERENCE_MEMBER_NOT_FOUND",      "memberRef": "…" }
+ * { "statusCode": 501, "code": "CONFERENCE_ACTION_NOT_SERVABLE",   "action": "volume" }
+ * { "statusCode": 503, "code": "CONFERENCE_CONTROL_UNAVAILABLE" }
+ * ```
+ *
+ * They are Nest exceptions server-side rather than the PBX area's tagged failures, because the
+ * moderation service's store is a KV read and a request-reply and not a repository. The body
+ * contract is identical on purpose — this module switches on `code` and must not care which layer
+ * produced it — which is exactly why these readers live here beside the CRUD taxonomy rather than in
+ * the panel that renders them.
+ *
+ * They deliberately do NOT go through {@link pbxFieldErrors}: not one of the five addresses a form
+ * control, because this surface has no form. Every one of them is an outcome, and an outcome is a
+ * toast.
+ */
+export const CONFERENCE_MODERATION_ERROR_CODES = [
+	"CONFERENCE_MODERATE_FORBIDDEN",
+	"CONFERENCE_NOT_RUNNING",
+	"CONFERENCE_MEMBER_NOT_FOUND",
+	"CONFERENCE_ACTION_NOT_SERVABLE",
+	"CONFERENCE_CONTROL_UNAVAILABLE",
+] as const;
+export type ConferenceModerationErrorCode = (typeof CONFERENCE_MODERATION_ERROR_CODES)[number];
+
+/**
+ * Whether the platform refused the ACTION rather than the request.
+ *
+ * The one status a client may use to disable a control instead of retrying it — 501 means the
+ * request was well formed and no media plane can serve it, which no amount of trying again will
+ * change. `volume` is the only action that produces it today.
+ */
+export function isConferenceActionNotServable(error: unknown): boolean {
+	return pbxErrorCode(error) === "CONFERENCE_ACTION_NOT_SERVABLE";
+}
+
+/**
+ * A moderation failure, in words whose next step differs.
+ *
+ * That is the whole reason this is not one sentence: each of the five sends the operator somewhere
+ * else — ask an administrator, re-read the room, re-read the member, stop pressing this control, or
+ * wait — and a shared "Something went wrong" would send all five to the same place.
+ *
+ * The 503 line is the one to keep exact. `CONFERENCE_CONTROL_UNAVAILABLE` promises that NOTHING was
+ * applied, and saying so is what stops a moderator from muting somebody twice and unmuting them by
+ * accident.
+ */
+export function conferenceModerationMessage(error: unknown): string {
+	const body = pbxErrorBody(error);
+	switch (body?.code) {
+		case "CONFERENCE_MODERATE_FORBIDDEN": {
+			return (
+				body.message ??
+				"Moderating a live conference needs the conferences.moderate permission, which your role does not include."
+			);
+		}
+		case "CONFERENCE_NOT_RUNNING": {
+			return "Nobody is in this room any more, so there was nothing to change.";
+		}
+		case "CONFERENCE_MEMBER_NOT_FOUND": {
+			return "That participant has already left the meeting.";
+		}
+		case "CONFERENCE_ACTION_NOT_SERVABLE": {
+			return body.message ?? `No media plane on this platform can ${body.action ?? "do that"}.`;
+		}
+		case "CONFERENCE_CONTROL_UNAVAILABLE": {
+			return "The call engine could not be reached, so nothing was changed. The meeting is unaffected.";
+		}
+		default: {
+			return body?.message ?? "That could not be applied to the meeting. Try again in a moment.";
+		}
+	}
 }
 
 /**

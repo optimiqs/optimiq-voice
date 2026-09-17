@@ -197,11 +197,15 @@ export function createTelnyxTransport(options: TelnyxClientOptions): TelnyxTrans
 		}
 
 		const maxAttempts = input.retryable === false ? 1 : policy.maxAttempts;
+		const deadline = Date.now() + policy.maxTotalMs;
 		let lastTransportCause: unknown;
+		let attemptsMade = 0;
 
 		for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
 			const startedAt = Date.now();
+			attemptsMade += 1;
 			let response: Response;
+			let text: string;
 			try {
 				response = await doFetch(url, {
 					method: input.method,
@@ -209,6 +213,11 @@ export function createTelnyxTransport(options: TelnyxClientOptions): TelnyxTrans
 					...(input.body === undefined ? {} : { body: JSON.stringify(input.body) }),
 					signal: AbortSignal.timeout(timeoutMs),
 				});
+				// Inside the same `try`, because `fetch` resolves on HEADERS and the body streams
+				// afterwards under the same signal: a per-attempt timeout firing mid-body, or a
+				// socket reset, rejects HERE. Outside, that escaped as a raw `AbortError` past every
+				// typed error this package promises, unretried and unreported.
+				text = await response.text();
 			} catch (cause) {
 				lastTransportCause = cause;
 				const isLast = attempt === maxAttempts - 1;
@@ -221,14 +230,13 @@ export function createTelnyxTransport(options: TelnyxClientOptions): TelnyxTrans
 					error: cause,
 					...(retryInMs === undefined ? {} : { retryInMs }),
 				});
-				if (isLast) {
+				if (isLast || wouldPassDeadline(deadline, retryInMs)) {
 					break;
 				}
 				await wait(retryInMs ?? 0);
 				continue;
 			}
 
-			const text = await response.text();
 			let payload: unknown = null;
 			if (text.length > 0) {
 				try {
@@ -282,7 +290,7 @@ export function createTelnyxTransport(options: TelnyxClientOptions): TelnyxTrans
 				...(retryInMs === undefined ? {} : { retryInMs }),
 			});
 
-			if (!retryable || isLast) {
+			if (!retryable || isLast || wouldPassDeadline(deadline, retryInMs)) {
 				const requestId = response.headers.get("x-request-id") ?? undefined;
 				throw new TelnyxApiError({
 					status: response.status,
@@ -298,10 +306,20 @@ export function createTelnyxTransport(options: TelnyxClientOptions): TelnyxTrans
 		throw new TelnyxTransportError({
 			method: input.method,
 			path: input.path,
-			attempts: maxAttempts,
+			attempts: attemptsMade,
 			cause: lastTransportCause,
 		});
 	}
 
 	return { request, baseUrl };
+}
+
+/**
+ * Whether taking `delayMs` would spend more of the budget than is left.
+ *
+ * The check is before the sleep rather than after it, so the deadline bounds what the caller waits
+ * for rather than merely recording that the budget was blown.
+ */
+function wouldPassDeadline(deadline: number, delayMs: number | undefined): boolean {
+	return Date.now() + (delayMs ?? 0) >= deadline;
 }

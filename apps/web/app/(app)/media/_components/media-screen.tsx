@@ -5,12 +5,13 @@ import { PageHeader } from "~/components/ui/page-header";
 import { Tabs, TabsIndicator, TabsList, TabsPanel, TabsTrigger } from "~/components/ui/tabs";
 import { MEDIA_TABS, type MediaTab } from "~/lib/routes";
 import { MohClassesPanel } from "./moh-classes-panel";
+import { PhrasesPanel } from "./phrases-panel";
 import { PromptsPanel } from "./prompts-panel";
 
 /**
- * Everything the phone system can play, on one page with two tabs.
+ * Everything the phone system can play, on one page with three tabs.
  *
- * ## Why one page rather than two sidebar entries
+ * ## Why one page rather than three sidebar entries
  *
  * Hold music and prompts are the SAME subject to the person managing them — audio somebody uploads
  * so a caller can hear it — and they are managed by the same people under the same grant
@@ -22,7 +23,18 @@ import { PromptsPanel } from "./prompts-panel";
  *
  * They are nonetheless not one LIST, and that is not a contradiction: a hold-music class is a
  * playlist with a sample rate and a stream option, a prompt is a single object with a language tag,
- * and a table that tried to show both would have a column that is empty for half its rows.
+ * a phrase is an ordered sequence of those objects with no audio of its own, and a table that tried
+ * to show all three would have columns that are empty for two thirds of its rows.
+ *
+ * ## The third tab does not share the first two's permission
+ *
+ * Hold music and prompts are `settings.*`, which is what `PAGE_PERMISSIONS` names for this route.
+ * Phrases are `recordings.*` — the API's split, argued in `phrases.controller.ts`. Everywhere else
+ * in this app that difference has forced a route of its own, and here it does not, because the two
+ * grants come apart in the harmless direction: `settings.read` is the wider of the two, so nobody
+ * holding `recordings.read` is shut out, and the phrases panel explains itself to the people the API
+ * refuses rather than showing them an empty table. A phrase's own PAGE is a different matter and is
+ * declared explicitly — see `app/(app)/media/phrases/[id]/page.tsx`.
  *
  * ## Why the tab is in the query string
  *
@@ -35,6 +47,7 @@ import { PromptsPanel } from "./prompts-panel";
 const TAB_LABELS: Readonly<Record<MediaTab, string>> = {
 	"hold-music": "Hold music",
 	prompts: "Prompts",
+	phrases: "Phrases",
 };
 
 export function MediaScreen() {
@@ -67,6 +80,9 @@ export function MediaScreen() {
 				</TabsPanel>
 				<TabsPanel value="prompts">
 					<PromptsPanel />
+				</TabsPanel>
+				<TabsPanel value="phrases">
+					<PhrasesPanel />
 				</TabsPanel>
 			</Tabs>
 		</>

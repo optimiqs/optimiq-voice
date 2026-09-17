@@ -143,6 +143,21 @@ const sipAclEntryShape = {
 	scope: z.enum(SIP_ACL_SCOPES),
 	/** Lower wins. Ties are broken by the longer prefix. */
 	priority: z.int().min(0).max(10_000).optional(),
+	/**
+	 * The carrier this network belongs to, or absent for a rule about the tenant at large.
+	 *
+	 * `nullish` rather than `optional`, and the difference is the one thing a form needs: `undefined`
+	 * on a PATCH leaves the binding alone, `null` CLEARS it. Without the second, an entry bound to the
+	 * wrong trunk could only be un-bound by deleting the row and typing the network again — and
+	 * retyping a CIDR to fix a dropdown is how the wrong network gets allowed.
+	 *
+	 * A bare `z.uuid()` here, because a DTO has no tenant: the column's foreign key makes the id
+	 * real and RLS keeps the ROW this tenant's, but neither stops a body naming ANOTHER tenant's
+	 * trunk — an FK check runs as the system. `SipAclEntriesService` proves the trunk inside the
+	 * writer's own scope and answers 404 when it is not there. See the schema comment for what the
+	 * binding is for and why deleting the trunk takes the entry with it.
+	 */
+	trunkId: z.uuid().nullish(),
 	description: z.string().trim().max(512).nullish(),
 	enabled: z.boolean().optional(),
 };

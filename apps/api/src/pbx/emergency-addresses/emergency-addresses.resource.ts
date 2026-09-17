@@ -22,13 +22,19 @@ import type { PbxResource } from "../shared/pbx-resource";
  * once its address has been validated by the upstream provider, so `validated` is a hard gate the
  * CRUD layer must check before allowing an emergency caller id."*
  *
- * That gate is deliberately NOT implemented as a refusal on this resource, and the reason is that
- * there is nothing to validate against. Address validation is a call to a carrier's E911
- * provisioning API (Telnyx, Bandwidth, Intrado); `apps/api/src/pbx/carrier` exists but has no such
- * call, and a `validated` flag this API set for itself would be a lie with a compliance label on
- * it. So the column is writable only by a future provisioning path, defaults to `false`, and the
- * gate is enforced where it can be enforced honestly: `phone-numbers.dto.ts` accepts an
- * `emergencyAddressId` and the admin UI shows an unvalidated address as unvalidated.
+ * The gate is real now, and it is enforced in one place rather than on this descriptor. Address
+ * validation is a call to a carrier's E911 provisioning API — `packages/telnyx`'s `e911Addresses`
+ * resource wraps Telnyx's, and `emergency-addresses.service.ts` is the only code allowed to write
+ * `validated` and its three companions, from the carrier's answer and nothing else. A `validated`
+ * flag this API set for itself would still be a lie with a compliance label on it, so the DTOs keep
+ * refusing to accept one from a request body.
+ *
+ * The refusal itself is `EmergencyAddressNotValidatedException`, raised by
+ * `EmergencyAddressesService.assertAssignable` — which every write that attaches an address to
+ * something that can originate 911 calls first (`phone_number.emergency_address_id`,
+ * `device.emergency_address_id`). It is a method on the service rather than a rule on this
+ * descriptor because the seams that need it are in other slices, and a second copy of "what
+ * validated means" is how the two drift apart.
  *
  * ## No destination trio, and one scalar reference
  *

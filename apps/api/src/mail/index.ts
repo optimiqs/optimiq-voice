@@ -19,6 +19,8 @@ export {
 	type EmergencyDialedMailInput,
 	emergencyDialedMail,
 	escapeHtml,
+	type FaxReceivedMailInput,
+	faxReceivedMail,
 	formatCaller,
 	formatDispatchableLocation,
 	formatDuration,

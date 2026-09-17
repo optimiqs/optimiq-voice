@@ -181,9 +181,7 @@ export function MohClassDialog({
 							<Select
 								id={field.name}
 								value={String(field.state.value)}
-								onChange={(event) =>
-									field.handleChange(Number(event.target.value) as SampleRate)
-								}
+								onChange={(event) => field.handleChange(Number(event.target.value) as SampleRate)}
 								onBlur={field.handleBlur}
 								disabled={mutation.isPending}
 								aria-invalid={server.errors.sampleRateHz ? true : undefined}

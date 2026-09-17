@@ -54,7 +54,11 @@ export function VoicemailScreen() {
 	const canWrite = usePermission(resource.permissions.write);
 	const canDelete = usePermission(resource.permissions.delete);
 
-	const canListen = usePermission("voicemail.listen");
+	// The action opens the message LIST, so it asks for the read grant; playing and changing a
+	// message are gated inside the dialog on the control that performs them. `.own` because every
+	// route the dialog calls accepts it — an agent reaches their own mailbox without the tenant-wide
+	// grant, which still covers this by implication.
+	const canReadMessages = usePermission("voicemail.read.own");
 
 	const [editing, setEditing] = useState<VoicemailBoxRow | null>(null);
 	const [dialogOpen, setDialogOpen] = useState(false);
@@ -142,9 +146,7 @@ export function VoicemailScreen() {
 							return counts === undefined ? (
 								<span className="text-muted-foreground">—</span>
 							) : (
-								<Badge tone={counts.newCount > 0 ? "accent" : "neutral"}>
-									{counts.newCount}
-								</Badge>
+								<Badge tone={counts.newCount > 0 ? "accent" : "neutral"}>{counts.newCount}</Badge>
 							);
 						},
 					},
@@ -169,7 +171,7 @@ export function VoicemailScreen() {
 						label={`mailbox ${row.mailboxNumber}`}
 						extra={
 							<>
-								{canListen ? (
+								{canReadMessages ? (
 									<MenuItem onClick={() => setMessagesFor(row)}>Messages</MenuItem>
 								) : null}
 								<MenuItem onClick={() => setGreetingsFor(row)}>Greetings…</MenuItem>

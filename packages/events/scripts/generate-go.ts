@@ -4,13 +4,21 @@ import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import {
+	EXTENDED_HANGUP_CAUSES,
+	HANGUP_CAUSE_CODES,
+	type HangupCause,
+	Q850_HANGUP_CAUSES,
+} from "@optimiq-voice/telephony";
 import { makeAuditEvent } from "../src/schemas/audit-events";
 import { makeCallEvent } from "../src/schemas/call-events";
 import { makeCdrLegWriteEvent } from "../src/schemas/cdr-events";
+import { defineEvent, makeEvent } from "../src/schemas/envelope";
 import { makeMediaEvent } from "../src/schemas/media-events";
 import { makeProvisionEvent } from "../src/schemas/provision-events";
 import { makeQueueEvent } from "../src/schemas/queue-events";
 import { makeRegistrationEvent } from "../src/schemas/registration-events";
+import { makeTrunkEvent } from "../src/schemas/trunk-events";
 import { makeVoicemailEvent } from "../src/schemas/voicemail-events";
 import {
 	EVENT_STREAMS,
@@ -23,17 +31,20 @@ import {
 	aorSubjectToken,
 	CALL_EVENTS,
 	didIndexToken,
+	instanceSubjectToken,
 	matchesSubject,
 	MEDIA_SESSION_EVENTS,
 	parseSubject,
 	QUEUE_EVENTS,
 	QUEUE_SCOPE_ALL,
+	SECURITY_SCOPE_ORG,
 	REGISTRATION_EVENTS,
 	RPC_SUBJECTS,
 	SUBJECT_ROOTS,
 	SUBJECT_VERSION,
 	subjectFilterFor,
 	subjectFor,
+	TRUNK_EVENTS,
 	VOICEMAIL_EVENTS,
 } from "../src/subjects";
 import { GoFileEmitter, pascal, type JsonSchema } from "./go-emitter";
@@ -42,6 +53,7 @@ import {
 	EVENT_ENTRIES,
 	FAMILY_FILE,
 	FAMILY_ORDER,
+	LIVE_STATE_ENTRIES,
 	NAMED_ENUMS,
 	RPC_ENTRIES,
 	type EventEntry,
@@ -213,6 +225,11 @@ function emitJsonSchemas(): {
 		subjectRoots: SUBJECT_ROOTS,
 		events,
 		rpc,
+		liveState: LIVE_STATE_ENTRIES.map((entry) => ({
+			bucket: entry.bucket,
+			schema: `live-state/${entry.bucket}.schema.json`,
+			goType: entry.goName,
+		})),
 	});
 
 	return { eventSchemas, rpcSchemas };
@@ -221,6 +238,173 @@ function emitJsonSchemas(): {
 // ------------------------------------------------------------------------------------------------
 // 2 — Go structs
 // ------------------------------------------------------------------------------------------------
+
+/**
+ * `SCREAMING_SNAKE` → `PascalCase`, for a Go identifier built from a cause name.
+ *
+ * Deliberately naive: it upper-cases the first rune of each underscore-separated run and lower-cases
+ * the rest, so `BEARERCAPABILITY_NOTAUTH` becomes `BearercapabilityNotauth` rather than anything
+ * cleverer. A table of special cases here would be a second opinion about a name whose authority is
+ * `packages/telephony`, and the generated identifier only has to be stable and unambiguous — it is
+ * never the value on the wire, which stays the SCREAMING_SNAKE string.
+ */
+function goCauseIdentifier(cause: string): string {
+	return cause
+		.split("_")
+		.map((part) => part.charAt(0) + part.slice(1).toLowerCase())
+		.join("");
+}
+
+/**
+ * The Q.850 table, in Go — generated from `@optimiq-voice/telephony`, which is the authority.
+ *
+ * ## The direction, stated once, because it was the open question
+ *
+ * TypeScript already HAD the canonical table (`packages/telephony/src/hangup-causes.ts`, pinned by
+ * its own spec against the frozen reference §6), and `apps/sipd/internal/dialog/cause.go` had grown
+ * a hand-written subset of the same numbers. Two hand-written copies of a table whose values end up
+ * on billed CDR rows is the drift this repository already spends a codegen step avoiding everywhere
+ * else, so the Go side becomes a GENERATED COPY and the TypeScript side stays the source. The
+ * alternative — moving the table into Go and generating TypeScript — would put a domain vocabulary
+ * that the routing executor, the session protocol and the CDR writer all key off behind a Go build.
+ *
+ * `sipd` keeps its `Cause*` constants (they read well at a SIP call site and the SIP→Q.850 mapping
+ * is genuinely the edge's own knowledge); their VALUES now come from here, so a re-coded cause is a
+ * one-line change in one file rather than a silent disagreement between two.
+ *
+ * ## Why this is in `events-go` rather than a `telephony-go` module
+ *
+ * `apps/sipd` and `apps/mediad` already depend on `packages/events-go` and on nothing else shared.
+ * A second Go module for one table would be a `go.work` entry, a `replace` directive in two `go.mod`
+ * files and a release step, bought for tidiness alone.
+ *
+ * ## Not the schema's business
+ *
+ * `hangupCauseSchema` still validates the SHAPE and not the membership, for the reason its own
+ * JSDoc gives: carriers keep inventing causes, and an unrecognised one must reach the CDR writer
+ * rather than being terminated at the broker edge. Generating this table does not close that door —
+ * nothing here is used to reject a payload.
+ */
+function emitHangupCauses(): void {
+	const emitter = new GoFileEmitter({ namedEnums: [] });
+	const all = [...Q850_HANGUP_CAUSES, ...EXTENDED_HANGUP_CAUSES] as readonly HangupCause[];
+
+	emitter.declareRaw(
+		"type:HangupCause",
+		[
+			"// HangupCause is a hangup-cause NAME, as stored on `call_legs.hangup_cause`. Open rather than",
+			"// a closed enum: a cause this build does not know must still reach the CDR writer.",
+			"type HangupCause string",
+		].join("\n"),
+	);
+
+	emitter.declareRaw(
+		"consts:HangupCause",
+		[
+			"// The named causes. Q.850 1-127 first, then the FreeSWITCH extensions.",
+			"const (",
+			...all.map(
+				(cause) =>
+					`\tHangupCause${goCauseIdentifier(cause)} HangupCause = ${JSON.stringify(cause)}`,
+			),
+			")",
+		].join("\n"),
+	);
+
+	emitter.declareRaw(
+		"consts:HangupCode",
+		[
+			"// The numeric code for each named cause, as untyped constants so callers can use them where",
+			"// a compile-time constant is required.",
+			"const (",
+			...all.map(
+				(cause) => `\tHangupCode${goCauseIdentifier(cause)} = ${HANGUP_CAUSE_CODES[cause]}`,
+			),
+			")",
+		].join("\n"),
+	);
+
+	emitter.declareRaw(
+		"var:Q850HangupCauses",
+		[
+			"// Q850HangupCauses lists the Q.850 members, in contract order.",
+			"var Q850HangupCauses = []HangupCause{",
+			...Q850_HANGUP_CAUSES.map((cause) => `\tHangupCause${goCauseIdentifier(cause)},`),
+			"}",
+			"",
+			"// ExtendedHangupCauses lists the FreeSWITCH extensions, in contract order.",
+			"var ExtendedHangupCauses = []HangupCause{",
+			...EXTENDED_HANGUP_CAUSES.map((cause) => `\tHangupCause${goCauseIdentifier(cause)},`),
+			"}",
+			"",
+			"// HangupCauses lists every named cause, Q.850 first. Contract order, matching",
+			"// HANGUP_CAUSES in packages/telephony.",
+			"var HangupCauses = append(append([]HangupCause{}, Q850HangupCauses...), ExtendedHangupCauses...)",
+		].join("\n"),
+	);
+
+	emitter.declareRaw(
+		"var:HangupCauseCodes",
+		[
+			"// HangupCauseCodes maps a cause name onto its numeric code.",
+			"var HangupCauseCodes = map[HangupCause]int{",
+			...all.map(
+				(cause) =>
+					`\tHangupCause${goCauseIdentifier(cause)}: HangupCode${goCauseIdentifier(cause)},`,
+			),
+			"}",
+			"",
+			"// HangupCauseNames maps a numeric code back onto its name. Inverted from HangupCauseCodes, so",
+			"// the two cannot diverge.",
+			"var HangupCauseNames = func() map[int]HangupCause {",
+			"\tnames := make(map[int]HangupCause, len(HangupCauseCodes))",
+			"\tfor cause, code := range HangupCauseCodes {",
+			"\t\tnames[code] = cause",
+			"\t}",
+			"\treturn names",
+			"}()",
+		].join("\n"),
+	);
+
+	emitter.declareRaw(
+		"func:HangupCauseHelpers",
+		[
+			"// HangupCauseCodeOf returns the numeric code for a cause name, and whether the contract knows",
+			"// it. An unknown name yields 0 (NONE), never a real outcome, so ignoring the bool cannot bill.",
+			"func HangupCauseCodeOf(cause HangupCause) (int, bool) {",
+			"\tcode, found := HangupCauseCodes[cause]",
+			"\treturn code, found",
+			"}",
+			"",
+			"// HangupCauseFromCode returns the name for a numeric code. Only the codes a softswitch emits",
+			"// are named; anything else is reported absent rather than given an invented name.",
+			"func HangupCauseFromCode(code int) (HangupCause, bool) {",
+			"\tcause, found := HangupCauseNames[code]",
+			"\treturn cause, found",
+			"}",
+			"",
+			"// IsHangupCause reports whether a string arriving from the wire is a name this contract knows.",
+			"func IsHangupCause(value string) bool {",
+			"\t_, found := HangupCauseCodes[HangupCause(value)]",
+			"\treturn found",
+			"}",
+		].join("\n"),
+	);
+
+	writeText(
+		join(GO_DIR, "hangup_causes_gen.go"),
+		emitter.render(
+			[
+				"The Q.850 hangup-cause taxonomy, plus the FreeSWITCH extensions.",
+				"",
+				"Authority: packages/telephony/src/hangup-causes.ts. Generated so Go and TypeScript read one",
+				"table — renaming a member breaks stored CDR rows and re-coding one changes outbound failover.",
+				"The SIP status -> Q.850 mapping (RFC 3398) stays in apps/sipd.",
+			],
+			"events",
+		),
+	);
+}
 
 function emitGo(
 	eventSchemas: Map<string, JsonSchema>,
@@ -244,9 +428,30 @@ function emitGo(
 			[
 				"Closed telephony vocabularies shared by every event family.",
 				"",
-				"Authority: packages/events/src/schemas/telephony.ts. Large, still-growing domains",
-				"(hangup causes, destination types, dispositions) are deliberately plain strings there",
-				"and here — see that file's header for why.",
+				"Authority: packages/events/src/schemas/telephony.ts, where the still-growing domains",
+				"(hangup causes, destination types, dispositions) are plain strings rather than enums.",
+			],
+			"events",
+		),
+	);
+
+	emitHangupCauses();
+
+	// -- live-state KV values ---------------------------------------------------------------------
+	const liveStateEmitter = new GoFileEmitter({ namedEnums: NAMED_ENUMS });
+	for (const entry of LIVE_STATE_ENTRIES) {
+		const schema = toJsonSchema(entry.schema);
+		writeJson(join(SCHEMA_DIR, `live-state/${entry.bucket}.schema.json`), schema);
+		liveStateEmitter.declareStruct(entry.goName, [entry.doc], withoutDialect(schema));
+	}
+	writeText(
+		join(GO_DIR, "live_state_gen.go"),
+		liveStateEmitter.render(
+			[
+				"KV bucket VALUE contracts from schemas/live-state.ts.",
+				"",
+				"The keys are built by subjects.go; these are what the buckets hold. Hand-writing one of",
+				"these structs in Go is drift the parity golden cannot see — always use these.",
 			],
 			"events",
 		),
@@ -293,8 +498,8 @@ function emitGo(
 	// -- rpc --------------------------------------------------------------------------------------
 	const rpcEmitter = new GoFileEmitter({ namedEnums: NAMED_ENUMS });
 	const rpcConsts: string[] = [
-		"// Request-reply subjects and their suggested client deadlines. These are on the call path,",
-		"// so a slow reply is the same as a broken one.",
+		"// Request-reply subjects and their suggested client deadlines. On the call path: a slow reply",
+		"// is the same as a broken one.",
 		"const (",
 	];
 	for (const entry of RPC_ENTRIES) {
@@ -329,14 +534,11 @@ function emitGo(
 		join(GO_DIR, "rpc_gen.go"),
 		rpcEmitter.render(
 			[
-				"Request-reply contracts for the rpc.* subjects (plan §3.5).",
+				"Request-reply contracts for the rpc.* subjects. Contracts only: transport is the",
+				"application's business.",
 				"",
-				"Contracts only: transport is the application's business.",
-				"",
-				"rpc.media.v1.* is the exception that proves the rule: apps/mediad is the RESPONDER for",
-				"those four, so the request/response structs below are the wire, not documentation. Both",
-				"ends must be raw NATS — a NestJS ClientProxy would wrap the payload in its own framing",
-				"and mediad would reject it. See packages/events/src/schemas/rpc.ts.",
+				"For rpc.media.v1.* these structs ARE the wire — apps/mediad is the responder, so both ends",
+				"must speak raw NATS; a NestJS ClientProxy frame would be rejected.",
 			],
 			"events",
 		),
@@ -379,6 +581,34 @@ function emitGo(
 	registry.push("\t}");
 	registry.push("\treturn nil");
 	registry.push("}", "");
+	registry.push(
+		"// NewRPCRequestFor returns a pointer to a zero request struct for an rpc.* subject, or nil",
+	);
+	registry.push("// when the subject is not part of this contract version.");
+	registry.push("//");
+	registry.push(
+		"// Instance-addressed subjects carry a variable tail; pass the PREFIX (ParsedSubject.Method",
+	);
+	registry.push("// without Target), which is what RPC_SUBJECTS names.");
+	registry.push("func NewRPCRequestFor(subject string) any {");
+	registry.push("\tswitch subject {");
+	for (const entry of RPC_ENTRIES) {
+		registry.push(`\tcase Subject${entry.goName}RPC:`);
+		registry.push(`\t\treturn new(${entry.goName}Request)`);
+	}
+	registry.push("\t}");
+	registry.push("\treturn nil");
+	registry.push("}", "");
+	registry.push("// NewRPCResponseFor is NewRPCRequestFor for the reply body.");
+	registry.push("func NewRPCResponseFor(subject string) any {");
+	registry.push("\tswitch subject {");
+	for (const entry of RPC_ENTRIES) {
+		registry.push(`\tcase Subject${entry.goName}RPC:`);
+		registry.push(`\t\treturn new(${entry.goName}Response)`);
+	}
+	registry.push("\t}");
+	registry.push("\treturn nil");
+	registry.push("}", "");
 
 	const registryEmitter = new GoFileEmitter({ namedEnums: [] });
 	registryEmitter.declareRaw("registry", registry.join("\n"));
@@ -407,6 +637,11 @@ const DEVICE_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b50";
 const MAILBOX_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b51";
 const MESSAGE_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b52";
 const SESSION_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b53";
+/** The supervisor's own leg and call, for the tap samples: a tap names two calls, never one. */
+const SUPERVISOR_LEG_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b54";
+const SUPERVISOR_CALL_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b55";
+const PAGING_GROUP_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b56";
+const TRUNK_A = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b57";
 const MEDIAD_INSTANCE = "mediad-7c9f2a1b";
 /** DIDs in the two shapes the index has to reconcile: as stored, and as a carrier delivers it. */
 const DID_STORED = "+441632960111";
@@ -425,6 +660,19 @@ const DID_CASES = [
 	"+1 (212) 555-0100",
 	"+1-212-555-0100",
 	"0044 1632 960111",
+];
+
+// Instance ids that exercise both branches of instanceSubjectToken: verbatim when the id is already
+// one subject token, SHA-256/32-hex when it carries a dot or punctuation. The engine builds
+// rpc.sip.v1.<verb>.<tok> from these and apps/sipd subscribes with them, so a Go/TS disagreement is a
+// command addressed at a subject nobody is listening on.
+const INSTANCE_ID_CASES = [
+	"sipd",
+	"sipd-2",
+	"engine-7d9f4c-xk2lp",
+	"  sipd  ",
+	"sipd.eu-west.internal",
+	"host name with spaces",
 ];
 
 const AOR_CASES = [
@@ -509,6 +757,79 @@ function eventSamples(): readonly {
 	});
 
 	samples.push({
+		name: "call.tap.started",
+		goType: "CallTapStartedData",
+		envelope: makeCallEvent("call.tap.started", {
+			...next(),
+			orgId: ORG_A,
+			// The subject is the MONITORED call, not the supervisor's — see the schema's own note.
+			callId: CALL_A,
+			data: {
+				legId: SUPERVISOR_LEG_A,
+				mode: "whisper",
+				supervisorExtension: "1900",
+				targetExtension: "1001",
+				targetLegId: LEG_A,
+				previousMode: "eavesdrop",
+				supervisorCallId: SUPERVISOR_CALL_A,
+			},
+		}),
+	});
+	samples.push({
+		name: "call.tap.ended",
+		goType: "CallTapEndedData",
+		envelope: makeCallEvent("call.tap.ended", {
+			...next(),
+			orgId: ORG_A,
+			callId: CALL_A,
+			data: {
+				legId: SUPERVISOR_LEG_A,
+				mode: "whisper",
+				supervisorExtension: "1900",
+				targetExtension: "1001",
+				reason: "target-ended",
+				durationMs: 42_000,
+			},
+		}),
+	});
+	samples.push({
+		name: "call.paging.started",
+		goType: "CallPagingStartedData",
+		envelope: makeCallEvent("call.paging.started", {
+			...next(),
+			orgId: ORG_A,
+			callId: CALL_A,
+			data: {
+				legId: LEG_A,
+				pagingGroupId: PAGING_GROUP_A,
+				pagingGroupName: "Warehouse",
+				dialed: "*81300",
+				pagerExtension: "1001",
+				memberCount: 12,
+				// Two handsets were unregistered. The whole point of carrying both numbers.
+				answeredCount: 10,
+				oneWay: true,
+			},
+		}),
+	});
+	samples.push({
+		name: "call.paging.ended",
+		goType: "CallPagingEndedData",
+		envelope: makeCallEvent("call.paging.ended", {
+			...next(),
+			orgId: ORG_A,
+			callId: CALL_A,
+			data: {
+				legId: LEG_A,
+				pagingGroupId: PAGING_GROUP_A,
+				pagingGroupName: "Warehouse",
+				durationMs: 9_500,
+				answeredCount: 10,
+			},
+		}),
+	});
+
+	samples.push({
 		name: "registration.registered",
 		goType: "RegistrationRegisteredData",
 		envelope: makeRegistrationEvent("registered", {
@@ -554,6 +875,23 @@ function eventSamples(): readonly {
 				contact: "sip:2002@198.51.100.4:5060;transport=tcp",
 				transport: "tcp",
 				registeredForSeconds: 3_600,
+			},
+		}),
+	});
+	samples.push({
+		name: "registration.auth-failed",
+		goType: "RegistrationAuthFailedData",
+		envelope: makeRegistrationEvent("auth-failed", {
+			...next(),
+			orgId: ORG_A,
+			data: {
+				aor: "sip:1001@acme.example.com",
+				aorHash: "0".repeat(32),
+				transport: "udp",
+				sourceAddress: "203.0.113.9:5060",
+				userAgent: "friendly-scanner",
+				username: "1001",
+				reason: "bad-credentials",
 			},
 		}),
 	});
@@ -673,6 +1011,23 @@ function eventSamples(): readonly {
 	});
 
 	samples.push({
+		name: "trunk.status.changed",
+		goType: "TrunkStatusChangedData",
+		envelope: makeTrunkEvent("status.changed", {
+			...next(),
+			source: "engine",
+			orgId: ORG_A,
+			trunkId: TRUNK_A,
+			data: {
+				status: "down",
+				reason: "Unreachable",
+				latencyMs: 1_240,
+				endpoint: "carrier-a",
+			},
+		}),
+	});
+
+	samples.push({
 		name: "cdr.leg.write",
 		goType: "CDRLegWriteData",
 		envelope: makeCdrLegWriteEvent({
@@ -744,7 +1099,201 @@ function eventSamples(): readonly {
 	return samples;
 }
 
-function parityGolden(): unknown {
+/**
+ * Deterministic sample values, derived from the JSON Schema the emitter itself consumed.
+ *
+ * The hand-written samples above are realistic; these are EXHAUSTIVE, which is the property the
+ * parity proof needs. Every event type and every RPC request/response gets one, so an emitter
+ * mistake on a payload nobody thought to sample — a missing json tag, a value type where a pointer
+ * was needed, a dropped passthrough key — fails the Go round-trip instead of shipping.
+ *
+ * Values are chosen to SATISFY the schema, not to mean anything: the first enum member, the lower
+ * bound of a numeric range, the first candidate string matching the pattern. Optional fields are
+ * populated too — an absent field proves nothing about its Go type.
+ */
+const SAMPLE_UUID = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3c00";
+
+/** Strings tried in order against `pattern`/`minLength`/`maxLength`; the first fit wins. */
+const SAMPLE_STRINGS: readonly string[] = [
+	"1001",
+	"sipd",
+	SAMPLE_UUID,
+	AT,
+	"+441632960111",
+	"203.0.113.9",
+	"203.0.113.0/24",
+	"sip:1001@acme.example.com",
+	"3c26700c1adf6qgy0fkn7cvb",
+	"0192c7a14b8e7f218b3c9d0e1f2a3c00",
+	"a",
+	"NORMAL_CLEARING",
+	"acme.example.com",
+	"805ec0000044",
+	"1",
+	"0",
+	"#",
+	// An ISO-3166 alpha-2, for the two-character fields. Late in the list so it is only reached
+	// by a schema that pins the length to two — every earlier candidate is longer or shorter.
+	"GB",
+	"",
+];
+
+function sampleString(schema: JsonSchema): string {
+	if (schema.format === "uuid") {
+		return SAMPLE_UUID;
+	}
+	if (schema.format === "date-time") {
+		return AT;
+	}
+	if (schema.format === "email") {
+		return "agent@example.com";
+	}
+	const pattern = schema.pattern === undefined ? undefined : new RegExp(schema.pattern);
+	for (const candidate of SAMPLE_STRINGS) {
+		if (pattern !== undefined && !pattern.test(candidate)) {
+			continue;
+		}
+		if (schema.minLength !== undefined && candidate.length < schema.minLength) {
+			continue;
+		}
+		if (schema.maxLength !== undefined && candidate.length > schema.maxLength) {
+			continue;
+		}
+		return candidate;
+	}
+	throw new Error(`No sample string satisfies ${JSON.stringify(schema)}.`);
+}
+
+function sampleNumber(schema: JsonSchema): number {
+	const lower = schema.minimum ?? 1;
+	return schema.maximum !== undefined && lower > schema.maximum ? schema.maximum : lower;
+}
+
+function sampleFor(schema: JsonSchema): unknown {
+	if (schema.const !== undefined) {
+		return schema.const;
+	}
+	if (schema.enum !== undefined && schema.enum.length > 0) {
+		return schema.enum[0];
+	}
+	const branches = schema.anyOf ?? schema.oneOf;
+	if (branches !== undefined) {
+		const branch = branches.find((candidate) => candidate.type !== "null");
+		if (branch === undefined) {
+			throw new Error(`No non-null branch in ${JSON.stringify(schema)}.`);
+		}
+		return sampleFor(branch);
+	}
+	switch (schema.type) {
+		case "object": {
+			const value: Record<string, unknown> = {};
+			for (const [key, property] of Object.entries(schema.properties ?? {})) {
+				value[key] = sampleFor(property);
+			}
+			if (
+				schema.properties === undefined &&
+				typeof schema.additionalProperties === "object" &&
+				schema.additionalProperties !== null
+			) {
+				value.sample = sampleFor(schema.additionalProperties);
+			}
+			return value;
+		}
+		case "array": {
+			if (schema.maxItems === 0 || schema.items === undefined) {
+				return [];
+			}
+			const count = Math.max(schema.minItems ?? 1, 1);
+			const item = sampleFor(schema.items);
+			return Array.from({ length: count }, () => item);
+		}
+		case "boolean":
+			return true;
+		case "integer":
+		case "number":
+			return sampleNumber(schema);
+		case "string":
+			return sampleString(schema);
+		case "null":
+			return null;
+		default:
+			// `z.unknown()` and friends: any JSON value is in contract, so the simplest one is.
+			return {};
+	}
+}
+
+/** The concrete ids each `<…>` placeholder in a subject template stands for, in the golden. */
+const SUBJECT_TOKENS: Readonly<Record<string, string>> = {
+	orgId: ORG_A,
+	callId: CALL_A,
+	legId: LEG_A,
+	aorHash: aorSubjectToken(AOR_CASES[0] as string),
+	queueId: QUEUE_A,
+	mailboxId: MAILBOX_A,
+	sessionId: SESSION_A,
+	trunkId: TRUNK_A,
+	// The org-wide scope token rather than an extension id: it is the value the API publishes
+	// for a tenant-wide finding, and pinning the golden to it keeps the reserved token covered.
+	subjectRef: SECURITY_SCOPE_ORG,
+};
+
+function subjectFromTemplate(template: string): string {
+	return template.replace(/<([a-zA-Z]+)>/g, (_match, token: string) => {
+		const value = SUBJECT_TOKENS[token];
+		if (value === undefined) {
+			throw new Error(`No golden id for subject token <${token}> in ${template}.`);
+		}
+		return value;
+	});
+}
+
+/** One synthesized sample per event type, so every generated payload struct is round-tripped. */
+function synthesizedEventSamples(
+	eventSchemas: Map<string, JsonSchema>,
+): readonly { name: string; goType: string; envelope: unknown }[] {
+	return EVENT_ENTRIES.map((entry, index) => {
+		const schema = eventSchemas.get(`${entry.family}.${entry.type}`);
+		if (schema === undefined) {
+			throw new Error(`Missing schema for ${entry.family}.${entry.type}.`);
+		}
+		return {
+			name: `synthetic.${entry.family}.${entry.type}`,
+			goType: entry.goName,
+			envelope: makeEvent(defineEvent(entry.family, entry.type, entry.data), {
+				id: eventId(0x1000 + index),
+				at: AT,
+				orgId: ORG_A,
+				subject: subjectFromTemplate(entry.subjectTemplate),
+				source: "codegen",
+				data: sampleFor(withoutDialect(schema)),
+			}),
+		};
+	});
+}
+
+/** One synthesized request and response per RPC subject — the half the golden carried none of. */
+function rpcSamples(
+	rpcSchemas: Map<string, { request: JsonSchema; response: JsonSchema }>,
+): readonly { subject: string; goType: string; request: unknown; response: unknown }[] {
+	return RPC_ENTRIES.map((entry) => {
+		const pair = rpcSchemas.get(entry.subject);
+		if (pair === undefined) {
+			throw new Error(`Missing RPC schemas for ${entry.subject}.`);
+		}
+		const request = sampleFor(withoutDialect(pair.request));
+		const response = sampleFor(withoutDialect(pair.response));
+		// Parsed back through the contract itself, so a sample the emitter would round-trip but the
+		// schema would reject never reaches the golden.
+		entry.request.parse(request);
+		entry.response.parse(response);
+		return { subject: entry.subject, goType: entry.goName, request, response };
+	});
+}
+
+function parityGolden(
+	eventSchemas: Map<string, JsonSchema>,
+	rpcSchemas: Map<string, { request: JsonSchema; response: JsonSchema }>,
+): unknown {
 	const subjectBuilders = [
 		{
 			builder: "call",
@@ -769,6 +1318,18 @@ function parityGolden(): unknown {
 			builder: "registration",
 			args: [ORG_A, aorSubjectToken(AOR_CASES[4] as string), "expired"],
 			subject: subjectFor.registration(ORG_A, aorSubjectToken(AOR_CASES[4] as string), "expired"),
+		},
+		{
+			builder: "sipDialog",
+			args: [ORG_A, LEG_A, "dialog.answered"],
+			subject: subjectFor.sipDialog(ORG_A, LEG_A, "dialog.answered"),
+		},
+		{
+			// A dotted event on the second root that begins `sip.`, so a Go builder that confused
+			// `sip.evt` with `sip.reg` fails here rather than at three in the morning.
+			builder: "sipDialog",
+			args: [ORG_B, LEG_A, "dialog.terminated"],
+			subject: subjectFor.sipDialog(ORG_B, LEG_A, "dialog.terminated"),
 		},
 		{
 			builder: "queue",
@@ -799,6 +1360,11 @@ function parityGolden(): unknown {
 			builder: "media",
 			args: [ORG_A, SESSION_A, "session.rtp-timeout"],
 			subject: subjectFor.media(ORG_A, SESSION_A, "session.rtp-timeout"),
+		},
+		{
+			builder: "trunk",
+			args: [ORG_A, TRUNK_A, "status.changed"],
+			subject: subjectFor.trunk(ORG_A, TRUNK_A, "status.changed"),
 		},
 		{ builder: "cdrLeg", args: [ORG_A], subject: subjectFor.cdrLeg(ORG_A) },
 		{ builder: "audit", args: [ORG_A], subject: subjectFor.audit(ORG_A) },
@@ -835,6 +1401,17 @@ function parityGolden(): unknown {
 			args: [ORG_A, "expired"],
 			result: subjectFilterFor.registrationEventInOrg(ORG_A, "expired"),
 		},
+		{ filter: "allSipDialogs", args: [], result: subjectFilterFor.allSipDialogs() },
+		{
+			filter: "sipDialogsInOrg",
+			args: [ORG_A],
+			result: subjectFilterFor.sipDialogsInOrg(ORG_A),
+		},
+		{
+			filter: "sipDialog",
+			args: [ORG_A, LEG_A],
+			result: subjectFilterFor.sipDialog(ORG_A, LEG_A),
+		},
 		{ filter: "allQueues", args: [], result: subjectFilterFor.allQueues() },
 		{ filter: "queuesInOrg", args: [ORG_A], result: subjectFilterFor.queuesInOrg(ORG_A) },
 		{ filter: "queue", args: [ORG_A, QUEUE_A], result: subjectFilterFor.queue(ORG_A, QUEUE_A) },
@@ -867,6 +1444,13 @@ function parityGolden(): unknown {
 			args: [ORG_A, "session.ended"],
 			result: subjectFilterFor.mediaEventInOrg(ORG_A, "session.ended"),
 		},
+		{ filter: "allTrunks", args: [], result: subjectFilterFor.allTrunks() },
+		{ filter: "trunksInOrg", args: [ORG_A], result: subjectFilterFor.trunksInOrg(ORG_A) },
+		{
+			filter: "trunkStatusInOrg",
+			args: [ORG_A],
+			result: subjectFilterFor.trunkStatusInOrg(ORG_A),
+		},
 		{ filter: "allCdrLegs", args: [], result: subjectFilterFor.allCdrLegs() },
 		{ filter: "cdrLegsInOrg", args: [ORG_A], result: subjectFilterFor.cdrLegsInOrg(ORG_A) },
 		{ filter: "allAudit", args: [], result: subjectFilterFor.allAudit() },
@@ -881,11 +1465,16 @@ function parityGolden(): unknown {
 		subjectFor.queue(ORG_A, QUEUE_A, "caller.joined"),
 		subjectFor.voicemail(ORG_A, MAILBOX_A, "message.left"),
 		subjectFor.media(ORG_A, SESSION_A, "session.rtp-timeout"),
+		subjectFor.trunk(ORG_A, TRUNK_A, "status.changed"),
 		subjectFor.cdrLeg(ORG_A),
 		subjectFor.audit(ORG_A),
 		subjectFor.provision(ORG_A),
 		RPC_SUBJECTS.routingResolve,
 		RPC_SUBJECTS.authzCheck,
+		// Instance-addressed RPC: a subject this package builds and, until the `target` arm existed,
+		// refused to parse.
+		subjectFor.sipRingRpc(INSTANCE_ID_CASES[0] as string),
+		subjectFor.sessionAnnounceRpc(ORG_A, "app-1"),
 		"calls.evt.v2.org.call.channel.created",
 		"calls.evt.v1.org.call",
 		"nonsense",
@@ -927,6 +1516,10 @@ function parityGolden(): unknown {
 		rpcSubjects: RPC_SUBJECTS,
 		queueScopeAll: QUEUE_SCOPE_ALL,
 		aorSubjectTokens: AOR_CASES.map((aor) => ({ aor, token: aorSubjectToken(aor) })),
+		instanceSubjectTokens: INSTANCE_ID_CASES.map((instanceId) => ({
+			instanceId,
+			token: instanceSubjectToken(instanceId),
+		})),
 		didIndexTokens: DID_CASES.map((did) => ({ did, token: didIndexToken(did) })),
 		subjectBuilders,
 		subjectFilters,
@@ -971,7 +1564,27 @@ function parityGolden(): unknown {
 				args: [ORG_A, QUEUE_A],
 				key: kvKeyFor.queueMembership(ORG_A, QUEUE_A),
 			},
+			{
+				builder: "queueWaiting",
+				args: [ORG_A, QUEUE_A],
+				key: kvKeyFor.queueWaiting(ORG_A, QUEUE_A),
+			},
 			{ builder: "mediaSession", args: [SESSION_A], key: kvKeyFor.mediaSession(SESSION_A) },
+			{ builder: "sipDialog", args: [LEG_A], key: kvKeyFor.sipDialog(LEG_A) },
+			{ builder: "trunk", args: [ORG_A, TRUNK_A], key: kvKeyFor.trunk(ORG_A, TRUNK_A) },
+			// The one key in this file that TRANSFORMS its argument. Both writers and the reader go
+			// through one function; these vectors are what makes "both" true across the language
+			// border, and a Go folder that dropped the slash would produce a key nobody else writes.
+			{
+				builder: "sipAcl",
+				args: [ORG_A, "trunk", "203.0.113.0/24"],
+				key: kvKeyFor.sipAcl(ORG_A, "trunk", "203.0.113.0/24"),
+			},
+			{
+				builder: "sipAcl",
+				args: [ORG_A, "registration", "2001:db8::/32"],
+				key: kvKeyFor.sipAcl(ORG_A, "registration", "2001:db8::/32"),
+			},
 		],
 		streams: EVENT_STREAMS.map((definition: StreamDefinition) => ({ ...definition })),
 		kvBuckets: KV_BUCKETS.map((definition: KvBucketDefinition) => ({ ...definition })),
@@ -984,13 +1597,15 @@ function parityGolden(): unknown {
 			queue: [...QUEUE_EVENTS],
 			voicemail: [...VOICEMAIL_EVENTS],
 			media: [...MEDIA_SESSION_EVENTS],
+			trunk: [...TRUNK_EVENTS],
 		},
 		eventTypes: EVENT_ENTRIES.map((entry) => ({
 			family: entry.family,
 			type: entry.type,
 			goType: entry.goName,
 		})),
-		eventSamples: eventSamples(),
+		eventSamples: [...eventSamples(), ...synthesizedEventSamples(eventSchemas)],
+		rpcSamples: rpcSamples(rpcSchemas),
 	};
 }
 
@@ -1037,7 +1652,7 @@ function oxfmtJson(): void {
 function main(): void {
 	const { eventSchemas, rpcSchemas } = emitJsonSchemas();
 	emitGo(eventSchemas, rpcSchemas);
-	writeJson(join(GO_DIR, "testdata", "parity.json"), parityGolden());
+	writeJson(join(GO_DIR, "testdata", "parity.json"), parityGolden(eventSchemas, rpcSchemas));
 	gofmt();
 	oxfmtJson();
 

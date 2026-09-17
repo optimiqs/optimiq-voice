@@ -3,7 +3,7 @@
 import { useForm } from "@tanstack/react-form";
 import { useState } from "react";
 import { EntityFormDialog, FormSection } from "~/components/pbx/entity-form-dialog";
-import { ResourceSelect } from "~/components/pbx/resource-select";
+import { PromptSelect, ResourceSelect } from "~/components/pbx/resource-select";
 import { TextField } from "~/components/ui/form-fields";
 import { useServerFieldErrors } from "~/lib/forms/server-errors";
 import { PBX_CHILDREN, PBX_RESOURCES } from "~/lib/pbx/client";
@@ -40,6 +40,7 @@ function defaultsFor(
 			queueAgentId: tier.queueAgentId,
 			level: String(tier.level),
 			position: String(tier.position),
+			announcePromptId: tier.announcePromptId ?? "",
 		};
 	}
 	return {
@@ -47,6 +48,7 @@ function defaultsFor(
 		queueAgentId: fixed.agentId ?? "",
 		level: "",
 		position: fixed.position === undefined ? "" : String(fixed.position),
+		announcePromptId: "",
 	};
 }
 
@@ -99,6 +101,10 @@ export function QueueTierDialog({
 				queueAgentId: parsed.queueAgentId,
 				level: parsed.level,
 				position: parsed.position,
+				// `null` CLEARS it rather than restoring a default, unlike the two knobs above: the
+				// column is nullable, and a tier with no prompt of its own falls back to the queue's
+				// whisper — which is the cleared behaviour, not a stored default coming back.
+				announcePromptId: parsed.announcePromptId,
 			};
 
 			try {
@@ -186,6 +192,36 @@ export function QueueTierDialog({
 							description="The order top-down and round-robin walk in."
 							disabled={mutation.isPending}
 							submitError={server.errors.position}
+						/>
+					)}
+				</form.Field>
+			</FormSection>
+
+			{/*
+			 * The tier's own whisper.
+			 *
+			 * A section of its own for the reason the queue dialog files its whisper separately: this
+			 * plays to the ANSWERING AGENT alone and the caller hears none of it. What makes it belong
+			 * on the TIER rather than on the queue is that it is a fact about the membership — a level
+			 * that is only reached after the one below it could not take the call has something
+			 * different to say than the queue does, and "escalated from level 1" is the sentence.
+			 */}
+			<FormSection
+				title="What this agent hears on a call from this tier"
+				description="Replaces the queue's whisper for calls distributed by THIS membership, and only for them. Leave it empty and the queue's whisper plays as usual."
+				columns={1}
+			>
+				<form.Field name="announcePromptId">
+					{(field) => (
+						<PromptSelect
+							id="queueTierAnnouncePromptId"
+							label="Whisper on answer"
+							value={field.state.value}
+							onChange={(next) => field.handleChange(next)}
+							emptyLabel="Use the queue's whisper"
+							description="Played to the agent alone before the caller is connected — an escalation cue for a level that is reached only when the one below it could not answer."
+							disabled={mutation.isPending}
+							error={server.errors.announcePromptId}
 						/>
 					)}
 				</form.Field>

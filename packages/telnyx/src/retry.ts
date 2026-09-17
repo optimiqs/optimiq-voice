@@ -50,12 +50,31 @@ export interface RetryPolicy {
 	readonly baseDelayMs: number;
 	/** Ceiling for the doubling, before jitter and before any `Retry-After` floor. */
 	readonly maxDelayMs: number;
+	/**
+	 * Ceiling on a carrier-supplied floor (`Retry-After`, `x-ratelimit-reset`).
+	 *
+	 * `parseRateLimitResetMs` already refuses an implausible reset; this bounds the header we do
+	 * NOT control the encoding of. A proxy in front of Telnyx answering `503 Retry-After: 86400`
+	 * would otherwise pin the calling handler — and its database transaction — for a day per
+	 * attempt, because `timeoutMs` covers the request and not the sleep.
+	 */
+	readonly maxRetryAfterMs: number;
+	/**
+	 * Ceiling on the total time `request` may spend, sleeps included.
+	 *
+	 * The per-attempt timeout bounds one request; nothing bounded the sum, so a caller could not
+	 * state a worst case. Checked before each sleep: a delay that would cross the deadline ends the
+	 * retry loop instead of being taken.
+	 */
+	readonly maxTotalMs: number;
 }
 
 export const DEFAULT_RETRY_POLICY: RetryPolicy = {
 	maxAttempts: 4,
 	baseDelayMs: 250,
 	maxDelayMs: 8_000,
+	maxRetryAfterMs: 60_000,
+	maxTotalMs: 120_000,
 };
 
 /** Whether a completed response is worth another attempt. */
@@ -79,7 +98,10 @@ export function backoffDelayMs(
 	const exponential = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** attempt);
 	// Full jitter: uniform over [0, exponential]. See the header for why this and not equal jitter.
 	const jittered = Math.round(exponential * random());
-	return (retryAfterMs ?? 0) + jittered;
+	// The floor is the carrier's, the bound is ours: an unbounded header is somebody else's proxy
+	// deciding how long our process sleeps.
+	const floor = Math.min(retryAfterMs ?? 0, policy.maxRetryAfterMs);
+	return floor + jittered;
 }
 
 /**

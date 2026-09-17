@@ -45,6 +45,23 @@ export class FeatureCodesController {
 		return { data: FEATURE_CODE_PARAM_FIELDS };
 	}
 
+	/**
+	 * Give this organization the platform's default star codes, idempotently.
+	 *
+	 * A POST rather than something that happens on a read, and `feature-codes.write` rather than
+	 * `.read`, because it WRITES — twenty audited rows and a recompile. Declared before `@Get(":id")`
+	 * for the reason `param-fields` is: Nest matches in declaration order and `defaults` is a
+	 * literal, not a uuid.
+	 *
+	 * Safe to call more than once: a code the organization already holds is left exactly as it is.
+	 * See {@link FeatureCodesService.seedDefaults}.
+	 */
+	@Post("defaults")
+	@RequirePermissions("feature-codes.write")
+	async seedDefaults(@Session() session: AppSession) {
+		return { data: await this.codes.seedDefaults(session) };
+	}
+
 	@Get()
 	@RequirePermissions("feature-codes.read")
 	async list(@Session() session: AppSession, @Query() query: unknown) {

@@ -33,6 +33,14 @@ export const REFERENCE_KIND_LABELS: Readonly<Record<string, string>> = {
 	"voicemail-box": "Voicemail box",
 	"voicemail-option": "Voicemail option",
 	device: "Device",
+	/**
+	 * The kind a refused prompt delete names.
+	 *
+	 * `phrase_step.prompt_id` is the one `on delete restrict` column in the PBX schema, and
+	 * `PROMPT_RESOURCE` declares the site with `idColumn: "phrase_id"` — so the referrer is the
+	 * PHRASE, not the step, because a step has no screen and a phrase does.
+	 */
+	phrase: "Phrase",
 };
 
 export function referenceKindLabel(kind: string): string {
@@ -93,6 +101,18 @@ export function referenceHref(reference: EntityReference): string | undefined {
 		}
 		case "time-condition": {
 			return routes.timeCondition(reference.id);
+		}
+		/**
+		 * A phrase, and the one kind here that MUST be a direct link rather than a prefilled list.
+		 *
+		 * `PROMPT_RESOURCE` declares the site with `nameColumn: null`, so the reference arrives with
+		 * no name at all — there is nothing to put in a search box, and a bare list would land the
+		 * user on a page of phrases with no indication which of them is holding the delete. The id is
+		 * the only thing the 409 carries, and `idColumn: "phrase_id"` makes it the phrase's own, so
+		 * the step is editable one click from here.
+		 */
+		case "phrase": {
+			return routes.phrase(reference.id);
 		}
 		default: {
 			break;

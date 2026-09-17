@@ -6,9 +6,9 @@ import { Button } from "~/components/ui/button";
 import { Card, CardBody } from "~/components/ui/card";
 import { Input } from "~/components/ui/field";
 import { actionForStatus } from "~/lib/live/agent-session";
+import { useLiveStatus } from "../../_context/live-context";
 import { useAgentSessionAction, useMyAgentSession } from "../../_hooks/use-agent-session";
 import { useLiveAgentStates } from "../../_hooks/use-live-queries";
-import { useLiveStatus } from "../../_context/live-context";
 import { AGENT_STATUS_LABELS, AgentStatusBadge } from "./queue-shared";
 import type { QueueAgentStatus } from "~/lib/pbx/contracts";
 
@@ -208,10 +208,7 @@ export function LiveIndicator({ label = "Live" }: { label?: string }) {
 	if (status === "open") {
 		return (
 			<Badge tone="success">
-				<span
-					aria-hidden
-					className="size-1.5 rounded-full bg-current motion-safe:animate-pulse"
-				/>
+				<span aria-hidden className="size-1.5 rounded-full bg-current motion-safe:animate-pulse" />
 				{label}
 			</Badge>
 		);

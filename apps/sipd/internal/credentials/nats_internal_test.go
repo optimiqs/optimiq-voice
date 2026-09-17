@@ -1,19 +1,25 @@
 package credentials
 
 import (
+	"context"
 	"errors"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	contract "github.com/optimiqs/optimiq-voice/packages/events-go"
 )
 
-// In-package tests, because the two things worth pinning here — how a reply becomes a credential
-// or a refusal, and how the cache behaves — are deliberately not public API. The transport itself
-// is covered by the gated integration suite against a real NATS server; splitting the seam open
-// just to reach it from outside would be adding API surface for a test's convenience.
+// In-package: reply decoding and cache behaviour are deliberately not public API. The transport is
+// covered by the gated integration suite against a real NATS server.
 
 func ptr(s string) *string { return &s }
+
+func ptrInt(i int) *int { return &i }
 
 const testHA1 = "425d0b350d19aaf57ebe7faea9c87e27"
 
@@ -49,6 +55,27 @@ func TestCredentialFromReply(t *testing.T) {
 			},
 		},
 		{
+			// A shared line appearance: the reply names the shared line's number and this account's
+			// appearance index, and both must reach the Credential so the INVITE path can stamp them.
+			name: "a shared line appearance",
+			reply: contract.SipCredentialResponse{
+				Found: true, Enabled: true,
+				OrgID: ptr(org), Ha1: ptr(testHA1),
+				Username: ptr(user), Realm: ptr(realm),
+				SharedLineNumber: ptr("2000"),
+				AppearanceIndex:  ptrInt(2),
+			},
+			check: func(t *testing.T, c Credential) {
+				t.Helper()
+				if c.SharedLineNumber == nil || *c.SharedLineNumber != "2000" {
+					t.Errorf("sharedLineNumber = %v, want 2000", c.SharedLineNumber)
+				}
+				if c.AppearanceIndex == nil || *c.AppearanceIndex != 2 {
+					t.Errorf("appearanceIndex = %v, want 2", c.AppearanceIndex)
+				}
+			},
+		},
+		{
 			name:  "an unknown account",
 			reply: contract.SipCredentialResponse{Found: false},
 			want:  ErrNotFound,
@@ -59,8 +86,7 @@ func TestCredentialFromReply(t *testing.T) {
 			want:  ErrDisabled,
 		},
 		{
-			// Fail closed. "Found and enabled but here is no hash" is a responder bug, and the one
-			// thing it must not become is an authenticated registration.
+			// Fail closed: "found and enabled but no hash" is a responder bug, not an auth.
 			name:  "found and enabled with no ha1",
 			reply: contract.SipCredentialResponse{Found: true, Enabled: true, OrgID: ptr(org)},
 			want:  ErrLookupFailed,
@@ -174,8 +200,8 @@ func TestCacheHonoursItsTTLs(t *testing.T) {
 }
 
 func TestCacheStoresRefusalsButNeverFailures(t *testing.T) {
-	// The asymmetry is the point. A definite "no" is an answer and is cacheable; a transport
-	// failure is the absence of an answer, and caching it would extend an outage past its cause.
+	// A definite "no" is an answer and is cacheable; a transport failure is the absence of one,
+	// and caching it would extend an outage past its cause.
 	now := time.Unix(1_800_000_000, 0)
 	store := &NATSStore{
 		cache:       map[string]cacheEntry{},
@@ -200,8 +226,7 @@ func TestCacheStoresRefusalsButNeverFailures(t *testing.T) {
 }
 
 func TestCacheIsBounded(t *testing.T) {
-	// A username scanner against an open port produces one miss per guess. Without a ceiling the
-	// negative cache turns that into one map entry per guess, for free.
+	// A username scan produces one miss per guess; without a ceiling that is one map entry each.
 	now := time.Unix(1_800_000_000, 0)
 	store := &NATSStore{
 		cache:       map[string]cacheEntry{},
@@ -222,8 +247,8 @@ func TestCacheIsBounded(t *testing.T) {
 }
 
 func TestNewNATSStoreDefaultsToTheContract(t *testing.T) {
-	// The timeout and subject come from packages/events-go rather than from a literal here, so a
-	// contract change reaches the edge through codegen instead of through somebody remembering.
+	// Timeout and subject come from packages/events-go, so a contract change reaches the edge
+	// through codegen.
 	store := &NATSStore{}
 	store.subject, store.timeout = contract.SubjectSipCredentialRPC, contract.TimeoutSipCredentialRPC
 
@@ -232,5 +257,250 @@ func TestNewNATSStoreDefaultsToTheContract(t *testing.T) {
 	}
 	if store.timeout != 500*time.Millisecond {
 		t.Errorf("timeout = %s, want the contract's 500ms REGISTER-path deadline", store.timeout)
+	}
+}
+
+// A cold cache must not stampede the control plane: without single-flight a fleet restart or a TTL
+// boundary sends one RPC per concurrent REGISTER.
+func TestConcurrentLookupsForOneAccountIssueOneRequest(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	release := make(chan struct{})
+	var requests atomic.Int64
+	store := &NATSStore{
+		cache:       map[string]cacheEntry{},
+		maxEntries:  16,
+		positiveTTL: 30 * time.Second,
+		negativeTTL: 10 * time.Second,
+		now:         func() time.Time { return now },
+	}
+	store.rpc = func(context.Context, string, string) (Credential, error) {
+		requests.Add(1)
+		// Held open so every caller is genuinely concurrent, not serialised behind a filled cache.
+		<-release
+		return Credential{OrgID: "org", Username: "1001", Realm: "acme.example.com", HA1: strings.Repeat("a", 32)}, nil
+	}
+
+	const callers = 32
+	var group sync.WaitGroup
+	errs := make(chan error, callers)
+	for range callers {
+		group.Go(func() {
+			credential, err := store.Lookup(t.Context(), "acme.example.com", "1001")
+			if err != nil {
+				errs <- err
+				return
+			}
+			if credential.OrgID != "org" {
+				errs <- errors.New("a waiter got the wrong credential")
+			}
+		})
+	}
+	// Give the callers time to pile up behind the leader before it answers.
+	for requests.Load() == 0 {
+		runtime.Gosched()
+	}
+	close(release)
+	group.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("Lookup: %v", err)
+	}
+
+	if got := requests.Load(); got != 1 {
+		t.Errorf("%d concurrent lookups issued %d requests, want 1", callers, got)
+	}
+	if store.Len() != 1 {
+		t.Errorf("cache holds %d entries, want the one answer", store.Len())
+	}
+}
+
+// The eviction sweep is rate limited: a full cache is what a username scan produces, and sweeping
+// on every miss would make each guess a full map walk under the REGISTER mutex.
+func TestCacheEvictionSweepIsRateLimited(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	store := &NATSStore{
+		cache:       map[string]cacheEntry{},
+		maxEntries:  8,
+		positiveTTL: time.Minute,
+		negativeTTL: 10 * time.Second,
+		now:         func() time.Time { return now },
+	}
+	fill := func(count int, prefix string, expires time.Time) {
+		for i := range count {
+			store.store(lookupKey("acme.example.com", prefix+strconv.Itoa(i)), cacheEntry{err: ErrNotFound, expires: expires})
+		}
+	}
+
+	fill(8, "a", now.Add(5*time.Second))
+	if store.Len() != 8 {
+		t.Fatalf("cache holds %d entries, want 8", store.Len())
+	}
+
+	// Everything has lapsed and no sweep has ever run: this one sweeps.
+	now = now.Add(6 * time.Second)
+	fill(1, "b", now.Add(5*time.Second))
+	if store.Len() != 1 {
+		t.Fatalf("the first eviction holds %d entries, want the sweep to have cleared the lapsed 8", store.Len())
+	}
+
+	fill(7, "c", now.Add(5*time.Second))
+	now = now.Add(6 * time.Second)
+	// Last sweep was 6s ago and the negative TTL is 10s, so a single arbitrary entry goes instead
+	// of a full walk and the ceiling still holds.
+	fill(1, "d", now.Add(5*time.Second))
+	if store.Len() != 8 {
+		t.Errorf("cache holds %d entries, want the ceiling of 8 held by a single-entry eviction", store.Len())
+	}
+}
+
+// A rotated SIP secret leaves the cache holding the previous ha1 and there is no invalidation
+// channel to hear about it on, so a failed digest provokes the re-ask. It has to be bounded: a
+// failed digest is far more often a wrong password than a rotation.
+func TestRefreshReAsksOncePerAccountPerInterval(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	var asked atomic.Int64
+	store := &NATSStore{
+		cache:       map[string]cacheEntry{},
+		lastRefresh: map[string]time.Time{},
+		maxEntries:  16,
+		positiveTTL: 30 * time.Second,
+		negativeTTL: 10 * time.Second,
+		refreshTTL:  5 * time.Second,
+		now:         func() time.Time { return now },
+	}
+	store.rpc = func(_ context.Context, realm, username string) (Credential, error) {
+		asked.Add(1)
+		return Credential{OrgID: "org", Realm: realm, Username: username, HA1: testHA1}, nil
+	}
+
+	const realm, user = "acme.example.com", "1001"
+	key := lookupKey(realm, user)
+	store.store(key, cacheEntry{
+		credential: Credential{OrgID: "org", Realm: realm, Username: user, HA1: strings.Repeat("a", 32)},
+		expires:    now.Add(30 * time.Second),
+	})
+
+	// The first re-ask evicts and goes to the responder, so the rotated ha1 arrives immediately
+	// rather than on the positive TTL.
+	refreshed, err := store.Refresh(t.Context(), realm, user)
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if refreshed.HA1 != testHA1 {
+		t.Fatalf("ha1 = %q, want the re-fetched one", refreshed.HA1)
+	}
+	if asked.Load() != 1 {
+		t.Fatalf("asked the responder %d times, want 1", asked.Load())
+	}
+
+	// Everything inside the interval is answered from the cache the first re-ask installed: a spray
+	// against one account must not become one RPC per packet.
+	for range 20 {
+		if _, err := store.Refresh(t.Context(), realm, user); err != nil {
+			t.Fatalf("Refresh: %v", err)
+		}
+	}
+	if asked.Load() != 1 {
+		t.Fatalf("asked the responder %d times inside the interval, want 1", asked.Load())
+	}
+
+	now = now.Add(5 * time.Second)
+	if _, err := store.Refresh(t.Context(), realm, user); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if asked.Load() != 2 {
+		t.Fatalf("asked the responder %d times after the interval, want 2", asked.Load())
+	}
+}
+
+// The refresh table is keyed on an attacker-chosen username, so it is bounded like the cache.
+func TestTheRefreshTableIsBounded(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	store := &NATSStore{
+		cache:       map[string]cacheEntry{},
+		lastRefresh: map[string]time.Time{},
+		maxEntries:  8,
+		refreshTTL:  5 * time.Second,
+		now:         func() time.Time { return now },
+	}
+	for i := range 100 {
+		store.admitRefresh(lookupKey("acme.example.com", strconv.Itoa(i)))
+	}
+	store.mu.Lock()
+	held := len(store.lastRefresh)
+	store.mu.Unlock()
+	if held > store.maxEntries {
+		t.Fatalf("the refresh table holds %d entries, above the %d bound", held, store.maxEntries)
+	}
+}
+
+// A credential inside its rotation grace must not be cached: the window is minutes long and only
+// apps/api knows when it closes, so a cached answer would keep the retired secret working for a
+// whole positive TTL past the deadline the operator chose.
+func TestACredentialInItsRotationGraceIsNotCached(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	var requests atomic.Int64
+	store := &NATSStore{
+		cache:       map[string]cacheEntry{},
+		lastRefresh: map[string]time.Time{},
+		maxEntries:  16,
+		positiveTTL: 30 * time.Second,
+		negativeTTL: 10 * time.Second,
+		now:         func() time.Time { return now },
+	}
+	store.rpc = func(context.Context, string, string) (Credential, error) {
+		requests.Add(1)
+		return Credential{
+			OrgID: "org", Username: "1001", Realm: "acme.example.com",
+			HA1:         strings.Repeat("a", 32),
+			HA1Previous: strings.Repeat("b", 32),
+		}, nil
+	}
+
+	for range 3 {
+		credential, err := store.Lookup(t.Context(), "acme.example.com", "1001")
+		if err != nil {
+			t.Fatalf("Lookup: %v", err)
+		}
+		if credential.HA1Previous != strings.Repeat("b", 32) {
+			t.Fatalf("HA1Previous = %q, want the grace digest", credential.HA1Previous)
+		}
+	}
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("3 lookups issued %d requests, want 3: a credential in grace must not be cached", got)
+	}
+	if store.Len() != 0 {
+		t.Fatalf("cache holds %d entries, want none", store.Len())
+	}
+}
+
+// The grace digest travels off the wire like every other field, and is absent for the ordinary
+// account — which is what keeps `ha1Previous` additive.
+func TestCredentialFromReplyCarriesTheGraceDigest(t *testing.T) {
+	const realm, user, org = "acme.example.com", "1001", "018f4f5e-0000-7000-8000-0000000000a1"
+	previous := strings.Repeat("b", 32)
+
+	graced, err := credentialFromReply(realm, user, contract.SipCredentialResponse{
+		Found: true, Enabled: true,
+		OrgID: ptr(org), Ha1: ptr(testHA1), Ha1Previous: ptr(previous),
+		Username: ptr(user), Realm: ptr(realm),
+	})
+	if err != nil {
+		t.Fatalf("credentialFromReply: %v", err)
+	}
+	if graced.HA1Previous != previous {
+		t.Errorf("HA1Previous = %q, want %q", graced.HA1Previous, previous)
+	}
+
+	plain, err := credentialFromReply(realm, user, contract.SipCredentialResponse{
+		Found: true, Enabled: true,
+		OrgID: ptr(org), Ha1: ptr(testHA1),
+		Username: ptr(user), Realm: ptr(realm),
+	})
+	if err != nil {
+		t.Fatalf("credentialFromReply: %v", err)
+	}
+	if plain.HA1Previous != "" {
+		t.Errorf("HA1Previous = %q, want empty for an account with no grace", plain.HA1Previous)
 	}
 }

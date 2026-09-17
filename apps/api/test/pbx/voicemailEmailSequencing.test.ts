@@ -485,6 +485,13 @@ function emailHarness(options: {
 					};
 				},
 			} as never,
+			// The mail-template cascade, faked to the code default: `resolveComposition` returns the
+			// stock product name and no override, so the rendered message is byte-for-byte what this
+			// consumer sent before the cascade was wired — which is what these sequencing assertions
+			// are about. The override path itself is covered in `mailTemplate*` specs.
+			{
+				resolveComposition: async () => ({ productName: "Optimiq Voice", override: null }),
+			} as never,
 		),
 	};
 	return harness;

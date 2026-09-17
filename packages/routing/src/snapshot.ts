@@ -31,6 +31,7 @@
  * | `mohClasses`              | `moh_class`              | id → name, so a plan node can carry the name|
  * | `conferences`             | `conference`             | room number + PIN presence                 |
  * | `parkLots`                | `park_lot`               | slot range + timeout branch                |
+ * | `pagingGroups`            | `paging_group`           | members joined in, not a flat list          |
  * | `featureCodes`            | `feature_code`           | 1:1                                        |
  * | `callBlockRules`          | `call_block_rule`        | 1:1 minus the hit counters                 |
  * | `emergencyAddresses`      | `emergency_address`      | id, label and `validated` only             |
@@ -45,8 +46,8 @@
  *
  * # Optional collections
  *
- * Three collections — `mohClasses`, `voicemailGreetings` and `emergencyAddresses` — are declared
- * **optional** on
+ * Four collections — `mohClasses`, `voicemailGreetings`, `emergencyAddresses` and `pagingGroups` —
+ * are declared **optional** on
  * {@link OrgRoutingSnapshot} and listed in {@link OPTIONAL_SNAPSHOT_COLLECTIONS}. That is a
  * deliberate rollout affordance rather than a modelling accident: they were added after the API's
  * snapshot loader was written, and a required field would have made this package impossible to
@@ -56,7 +57,9 @@
  * them the optionality is free to go.
  */
 
+import type { UnverifiedCallerIdPolicy } from "./attestation";
 import type { DestinationInput } from "./destinations";
+import type { RecordingConsentPolicy } from "./recording-consent";
 
 /** Values mirrored from `pbx-db` `extensions-schema.ts`. */
 export const TOLL_CLASSES = ["internal", "local", "national", "international", "premium"] as const;
@@ -94,6 +97,49 @@ export type RouteMatchKind = (typeof ROUTE_MATCH_KINDS)[number];
 export const RING_GROUP_STRATEGIES = ["simultaneous", "sequential"] as const;
 
 export type RingGroupStrategy = (typeof RING_GROUP_STRATEGIES)[number];
+
+/** Mirrored from `pbx-db` `shared-lines-schema.ts`. */
+export const SHARED_LINE_STRATEGIES = ["simultaneous", "sequential"] as const;
+
+export type SharedLineStrategy = (typeof SHARED_LINE_STRATEGIES)[number];
+
+/**
+ * Mirrored from `pbx-db` `queues-schema.ts`.
+ *
+ * The caller-priority scale: higher dequeues first, and 0 means unprioritised. It is the same range
+ * `queue.caller.joined` has always published on, so nothing between the database, the compiler, the
+ * engine and a wallboard has to rescale.
+ */
+export const QUEUE_PRIORITY_MIN = 0;
+export const QUEUE_PRIORITY_MAX = 1000;
+
+/**
+ * The DTMF symbols a queue exit key may be.
+ *
+ * The sixteen a phone can actually send, and no others — the compiler normalises against this rather
+ * than trusting the column's check constraint, because an artifact compiled from a snapshot loader
+ * that did not select the column, or from a fixture, has never met that constraint.
+ */
+export const QUEUE_EXIT_KEYS = [
+	"0",
+	"1",
+	"2",
+	"3",
+	"4",
+	"5",
+	"6",
+	"7",
+	"8",
+	"9",
+	"*",
+	"#",
+	"A",
+	"B",
+	"C",
+	"D",
+] as const;
+
+export type QueueExitKey = (typeof QUEUE_EXIT_KEYS)[number];
 
 /** Mirrored from `pbx-db` `queues-schema.ts`. */
 export const QUEUE_STRATEGIES = [
@@ -134,6 +180,11 @@ export type VoicemailGreetingKind = (typeof VOICEMAIL_GREETING_KINDS)[number];
  */
 export const VOICEMAIL_LEAVE_GREETING_PRECEDENCE = ["temporary", "unavailable"] as const;
 
+/** Mirrored from `pbx-db` `extensions-schema.ts`. Absent on a row behaves as `allowed`. */
+export const CALLER_ID_PRESENTATIONS = ["allowed", "restricted"] as const;
+
+export type CallerIdPresentation = (typeof CALLER_ID_PRESENTATIONS)[number];
+
 /** Mirrored from `pbx-db` `features-schema.ts`. */
 export const FEATURE_CODE_ACTIONS = [
 	"voicemail-check",
@@ -156,6 +207,31 @@ export const FEATURE_CODE_ACTIONS = [
 	"agent-status",
 	"eavesdrop",
 	"transfer",
+	"hotdesk-login",
+	"hotdesk-logout",
+	/**
+	 * Per-call CLIR: `*67<destination>` withholds this call's caller id, `*82<destination>` presents
+	 * it. Both take the destination as their dialled argument — see `pbx-db` `features-schema.ts`.
+	 */
+	"caller-id-presentation-restrict",
+	"caller-id-presentation-allow",
+	/**
+	 * The two actions this package adds to `pbx-db`'s list, and the reason they are here and not
+	 * there.
+	 *
+	 * A `feature_code` ROW cannot carry either of them: the code that flips a call flow to night mode
+	 * lives on `call_flow.feature_code`, and the code that cycles a time-condition override lives on
+	 * `time_condition.override_feature_code` — because each belongs to one entity and a row in the
+	 * shared catalogue would need a `params` pointer back at it that nothing keeps honest. The DTO
+	 * enum therefore stays as it is, and a tenant cannot create a code with either action by hand.
+	 *
+	 * They exist HERE because the compiler synthesises a catalogue entry per flow and per condition,
+	 * which is what makes those codes dialable at all. Before this, both were validated on the form,
+	 * offered in the UI and reached neither `internal.featureCodes` nor `internal.numbers` — a `*65`
+	 * that fell through to "no outbound route matched", recorded in `E2E-routing2.md`.
+	 */
+	"call-flow-toggle",
+	"time-condition-override",
 ] as const;
 
 export type FeatureCodeAction = (typeof FEATURE_CODE_ACTIONS)[number];
@@ -247,6 +323,8 @@ export interface ExtensionInput extends RoutingEntityInput {
 	readonly callerIdNumber?: string | null;
 	readonly outboundCallerIdName?: string | null;
 	readonly outboundCallerIdNumber?: string | null;
+	/** `extension.outbound_caller_id_presentation`. Absent behaves as `allowed`. */
+	readonly outboundCallerIdPresentation?: CallerIdPresentation | null;
 	readonly emergencyCallerIdNumber?: string | null;
 	readonly voicemailEnabled: boolean;
 	readonly doNotDisturb: boolean;
@@ -294,7 +372,36 @@ export interface ExtensionInput extends RoutingEntityInput {
 	 * the documented fallback.
 	 */
 	readonly pickupGroup?: string | null;
+	/**
+	 * Whether an EXTERNAL caller is asked to record their name before this extension is rung, from
+	 * `extension.call_screening`.
+	 *
+	 * A compiled fact rather than a runtime lookup for the usual reason: the decision is taken at the
+	 * instant the leg is offered, by a process holding no database handle. Whose calls are screened —
+	 * external only, never a colleague — is the engine's rule and not a field, because it is not
+	 * something a tenant configures.
+	 *
+	 * Optional, like {@link ExtensionInput.followMe} and {@link ExtensionInput.pickupGroup}, so this
+	 * package stays compilable against a loader that does not yet select the column. Absent is read
+	 * as `false`, which is what every extension did before screening was compiled at all.
+	 */
+	readonly callScreening?: boolean | null;
 	readonly recordPolicy: RecordPolicy;
+	/**
+	 * Whether a recording of this extension's call is PAUSED while the caller is pressing digits,
+	 * from `extension.record_auto_pause_on_dtmf`.
+	 *
+	 * The PCI-DSS rule in one field: a card number read into a keypad must not land in an audio
+	 * file, and the only moment the platform can act on that is the instant a digit arrives. It is
+	 * per-extension rather than org-wide because the desk that takes payments is rarely the whole
+	 * tenant, and pausing every recording on every digit would silence the IVR selection at the front
+	 * of every recorded call.
+	 *
+	 * Optional for the rollout reason every other late field on this interface is optional: a loader
+	 * that does not select the column produces an extension that pauses nothing, which is what every
+	 * extension did before. `null` and absent both read as `false`.
+	 */
+	readonly recordAutoPauseOnDtmf?: boolean | null;
 	readonly mohClassId?: string | null;
 	readonly tollClass: TollClass;
 	readonly callTimeoutSeconds: number;
@@ -317,6 +424,30 @@ export interface PhoneNumberInput extends RoutingEntityInput, DestinationInput {
 	 * address would take their working calls down to fix a call they have not yet placed.
 	 */
 	readonly emergencyAddressId?: string | null;
+	/**
+	 * This DID's own recording-consent policy, overriding the organization's.
+	 *
+	 * A DID is the unit a tenant buys per market, so it is the unit that carries an obligation: the
+	 * London number a UK team answers and the California number a sales desk answers belong to one
+	 * organization and to two different sets of rules. An org-only setting would force the whole
+	 * tenant to the strictest of them, which is how a keypress gate ends up in front of calls that
+	 * never needed one.
+	 *
+	 * `null` and absent both mean INHERIT — they are not distinguishable here and do not need to be,
+	 * because there is no "record nothing, and ignore the org" state: a tenant that wants no
+	 * announcement on this DID sets `none` explicitly. Absent is also what a loader that does not yet
+	 * select the column produces, and it lands on the same behaviour every DID had before.
+	 */
+	readonly recordingConsentPolicy?: RecordingConsentPolicy | null;
+	/**
+	 * The prompt this DID announces with, overriding the organization's.
+	 *
+	 * Travels with the policy for the same reason it exists: a number bought for one market usually
+	 * needs the announcement in that market's language, and a policy override with the wrong
+	 * recording behind it is not an override. Absent means "use whatever the org named", and the org
+	 * naming nothing means the engine plays its seeded system prompt.
+	 */
+	readonly recordingConsentPromptId?: string | null;
 }
 
 export interface TrunkInput extends RoutingEntityInput {
@@ -329,6 +460,8 @@ export interface TrunkInput extends RoutingEntityInput {
 	readonly codecPrefs?: string | null;
 	readonly maxChannels?: number | null;
 	readonly callerIdNumberOverride?: string | null;
+	/** The shared ruleset applied to caller id ARRIVING on this trunk, before anything reads it. */
+	readonly inboundTranslationRulesetId?: string | null;
 }
 
 /** One trunk in an outbound route's ordered failover list. Mirrors `pbx-db` `TrunkPriorityEntry`. */
@@ -352,6 +485,20 @@ export interface InboundRouteInput extends RoutingEntityInput, DestinationInput 
 	readonly failoverDestinationData?: DestinationInput["destinationData"];
 	readonly timeConditionId?: string | null;
 	readonly recordEnabled: boolean;
+	/**
+	 * This route's own recording-consent policy, overriding the organization's.
+	 *
+	 * The same override {@link PhoneNumberInput.recordingConsentPolicy} carries, one level more
+	 * specific: a route is what narrows a DID by caller or by clock, so a tenant that announces only
+	 * to callers from a two-party state expresses it here and nowhere else. When both are set the
+	 * ROUTE wins, because it is the narrower statement — the compiler carries both through and the
+	 * engine resolves the precedence at call time, where it knows which one actually matched.
+	 *
+	 * `null` and absent both mean inherit, exactly as on the DID.
+	 */
+	readonly recordingConsentPolicy?: RecordingConsentPolicy | null;
+	/** The prompt this route announces with. Absent means "whatever the DID or the org named". */
+	readonly recordingConsentPromptId?: string | null;
 }
 
 export interface OutboundRouteInput extends RoutingEntityInput {
@@ -370,12 +517,31 @@ export interface OutboundRouteInput extends RoutingEntityInput {
 	readonly failoverDestinationData?: DestinationInput["destinationData"];
 	readonly callerIdNumberOverride?: string | null;
 	readonly recordEnabled: boolean;
+	/** The authorisation codes a caller must satisfy before any trunk on this route is dialled. */
+	readonly pinSetId?: string | null;
+	/** The shared rewrite applied AFTER this route's own strip/prepend. See `translations.ts`. */
+	readonly translationRulesetId?: string | null;
 }
+
+/** Mirrored from `pbx-db` `time-conditions-schema.ts`. */
+export const TIME_CONDITION_OVERRIDES = ["auto", "forced-match", "forced-no-match"] as const;
+
+export type TimeConditionOverride = (typeof TIME_CONDITION_OVERRIDES)[number];
 
 export interface TimeConditionInput extends RoutingEntityInput, DestinationInput {
 	readonly name: string;
 	/** IANA zone. Every rule is evaluated in this zone. */
 	readonly timezone: string;
+	/**
+	 * The manual override, which short-circuits rule evaluation entirely.
+	 *
+	 * Optional for the rollout reason every late field here carries: a loader that does not select
+	 * the column produces a condition that obeys its clock, which is what every condition did before
+	 * the column existed.
+	 */
+	readonly override?: TimeConditionOverride | null;
+	/** The star code that cycles the override, and the key a BLF lamp watches. */
+	readonly overrideFeatureCode?: string | null;
 	readonly nomatchDestinationType?: DestinationInput["destinationType"] | null;
 	readonly nomatchDestinationRef?: string | null;
 	readonly nomatchDestinationData?: DestinationInput["destinationData"];
@@ -450,11 +616,78 @@ export interface QueueInput extends RoutingEntityInput {
 	readonly mohClassId?: string | null;
 	readonly greetingPromptId?: string | null;
 	readonly announcePromptId?: string | null;
+	/**
+	 * Whisper-on-answer: played to the ANSWERING AGENT alone, before the caller is bridged in, from
+	 * `queue.agent_whisper_prompt_id`.
+	 *
+	 * A routing fact because it is a fact about the call: which prompt an agent hears depends on
+	 * which queue the call came from, and the queue is what this node is. Optional for the rollout
+	 * reason the other new fields here carry — a loader that does not select the column produces a
+	 * queue that bridges the agent straight through, which is what every queue did before.
+	 */
+	readonly agentWhisperPromptId?: string | null;
 	readonly maxWaitSeconds: number;
 	readonly maxWaitNoAgentSeconds: number;
 	readonly announcePositionEnabled: boolean;
 	readonly announceFrequencySeconds: number;
-	readonly recordEnabled: boolean;
+	/**
+	 * `queue.record_policy` — the same vocabulary `extension` and `trunk` carry, which replaced a
+	 * `recordEnabled` boolean no runtime honoured.
+	 *
+	 * Optional for the rollout reason every other new field on this interface is optional: a loader
+	 * that has not been taught the column yet produces a queue that records nothing, which is what
+	 * every queue did before, rather than one the compiler refuses.
+	 */
+	readonly recordPolicy?: RecordPolicy | null;
+	/**
+	 * Whether a recording of a call this queue distributed is PAUSED while digits are being pressed,
+	 * from `queue.record_auto_pause_on_dtmf`.
+	 *
+	 * The queue's copy of {@link ExtensionInput.recordAutoPauseOnDtmf}, and it is a separate field
+	 * rather than something derived from the answering agent's extension for one reason: the caller
+	 * types their card number to the QUEUE — into the payment IVR the queue fronts, or while on hold
+	 * — as readily as to the agent who eventually answers, and a rule that only existed on the
+	 * extension would leave that stretch of audio unprotected.
+	 *
+	 * Optional for the rollout reason every other late field here is optional; `null` and absent both
+	 * read as `false`, which is what every queue did before.
+	 */
+	readonly recordAutoPauseOnDtmf?: boolean | null;
+	/** The single DTMF digit a waiting caller may press to leave. Null/absent disables it. */
+	readonly exitKey?: string | null;
+	readonly exitDestinationType?: DestinationInput["destinationType"] | null;
+	readonly exitDestinationRef?: string | null;
+	readonly exitDestinationData?: DestinationInput["destinationData"];
+	/**
+	 * Virtual hold: whether a waiting caller may hang up and keep their place, to be called back
+	 * when an agent frees.
+	 *
+	 * Optional for the rollout reason every other late field here is optional: a loader that does
+	 * not select the column produces a queue with no callback, which is what every queue had.
+	 */
+	readonly callbackEnabled?: boolean | null;
+	/** The DTMF digit that accepts the offer. Null/absent means the offer is announcement-only. */
+	readonly callbackKey?: string | null;
+	/**
+	 * Wait after which the offer is announced unprompted. `0`/absent means it is never announced and
+	 * the caller reaches it only by pressing {@link callbackKey} — which is a real configuration and
+	 * not a mistake, so it earns no diagnostic on its own.
+	 */
+	readonly callbackOfferAfterSeconds?: number | null;
+	/** "Press 1 to keep your place and we will call you back." */
+	readonly callbackOfferPromptId?: string | null;
+	/** "Thank you — we will call you on this number." Played once the place is held. */
+	readonly callbackConfirmPromptId?: string | null;
+	/** How many times the callback is attempted before the place is given up. */
+	readonly callbackMaxAttempts?: number | null;
+	/** How long after a failed attempt the next one may be made. */
+	readonly callbackRetryDelaySeconds?: number | null;
+	/** How long the held place survives at all, across every attempt. */
+	readonly callbackExpiresAfterSeconds?: number | null;
+	/** `queue.default_priority`. A referring destination may override it per entry. */
+	readonly defaultPriority?: number | null;
+	readonly abandonedResumeAllowed?: boolean | null;
+	readonly discardAbandonedAfterSeconds?: number | null;
 	readonly timeoutDestinationType?: DestinationInput["destinationType"] | null;
 	readonly timeoutDestinationRef?: string | null;
 	readonly timeoutDestinationData?: DestinationInput["destinationData"];
@@ -536,7 +769,31 @@ export interface ConferenceInput extends RoutingEntityInput {
 	readonly maxMembers: number;
 	readonly mohClassId?: string | null;
 	readonly waitForModerator: boolean;
-	readonly recordEnabled: boolean;
+	/**
+	 * `conference.record_policy` — the same vocabulary `extension`, `trunk` and `queue` carry, which
+	 * replaced a `recordEnabled` boolean the walker read by nothing.
+	 *
+	 * Optional and null-tolerant for the reason every other converted column is: a loader that
+	 * predates the swap is a supported rollout state rather than a type error, and absent compiles
+	 * to `none` — which is what a room whose boolean was false always did.
+	 */
+	readonly recordPolicy?: RecordPolicy | null;
+	/**
+	 * Beep the room on a join and on a leave. Optional and absent is read as TRUE, which is the
+	 * column's own default and is a privacy position: a participant who cannot tell that a third
+	 * party has arrived is one who does not know the conversation stopped being private. An artifact
+	 * compiled before these existed must not silently turn the beeps off.
+	 */
+	readonly entryToneEnabled?: boolean | null;
+	readonly exitToneEnabled?: boolean | null;
+	/**
+	 * Play each arrival's and departure's recorded name to the room.
+	 *
+	 * Optional and absent is TRUE, matching the column's default and the two flags above. Distinct
+	 * from them: a name announcement costs everybody three seconds of somebody's voice and needs a
+	 * recording, where a tone costs a quarter of a second and needs nothing.
+	 */
+	readonly announceJoinLeave?: boolean | null;
 	/**
 	 * The participant PIN, as a digest in the format `voicemail-pin.ts` defines. Never a PIN.
 	 *
@@ -584,6 +841,84 @@ export interface ParkLotInput extends RoutingEntityInput {
 	readonly timeoutDestinationData?: DestinationInput["destinationData"];
 }
 
+/**
+ * One handset in a paging group, mirroring `paging_group_member`.
+ *
+ * `extensionId` rather than a number, because the row stores a foreign key and the loader must not
+ * start resolving things: turning the id into the number a page dials is the compiler's job, and it
+ * is the step that produces the diagnostic when the extension is gone. `ordinal` is the fan-out
+ * order the operator chose, and `enabled` is a member switched off without being removed — a
+ * distinction the artifact keeps by dropping the member from the compiled list, not from the row.
+ *
+ * Not a {@link RoutingEntityInput} despite having an `enabled` column: it has no `id` the compiler
+ * ever needs — a member is identified by the pair it names, and nothing points at one.
+ */
+export interface PagingGroupMemberInput {
+	readonly extensionId: string;
+	readonly ordinal: number;
+	readonly enabled: boolean;
+}
+
+/**
+ * A paging group, mirroring `paging_group`.
+ *
+ * # Why the members are nested here and ring-group destinations are not
+ *
+ * Every other parent/child pair in this snapshot is two flat collections joined by the compiler,
+ * because that is what `select … where organization_id = $1` returns and it keeps the loader a
+ * projection. Membership is the exception, and deliberately: a `paging_group_member` row carries no
+ * destination trio, no delay, no timeout and no id anything else can point at — it is a
+ * `(extension, position)` pair and nothing more. A second top-level collection for it would add a
+ * `SNAPSHOT_COLLECTIONS` entry, a cache-invalidation entry and an index pass to express a list, and
+ * the flat form's one real benefit — a child that several parents or several *kinds* of parent can
+ * reference — does not apply to something only its own group can name.
+ *
+ * `duplex` is carried because it changes what the engine does with the member legs (one-way
+ * announcement versus talkback), and `timeoutSeconds` because it bounds how long it waits for one
+ * to come up. There is no destination trio: a page ends when the pager hangs up.
+ */
+export interface PagingGroupInput extends RoutingEntityInput {
+	readonly name: string;
+	readonly extensionNumber?: string | null;
+	/** `false` is a one-way announcement: members hear the pager and cannot be heard. */
+	readonly duplex: boolean;
+	readonly timeoutSeconds: number;
+	/** In any order — the compiler sorts by `ordinal`, as it does everywhere else. */
+	readonly members: readonly PagingGroupMemberInput[];
+}
+
+/**
+ * A shared line and the appearances that ring on it.
+ *
+ * Membership is joined in rather than kept as a flat sibling collection, the same decision paging
+ * makes and for the same reason: an appearance is only ever named by its own line, so the flat
+ * form's one benefit — a child several kinds of parent can reference — does not apply, and it would
+ * cost a second collection, a hash-order entry and an index pass to express a list.
+ *
+ * `holdRecallTimeoutSeconds` and `bargeInEnabled` are carried because they are engine-runtime facts
+ * about the line the compiler has and the engine otherwise would not: a held call recalls on the
+ * line's own leash, and whether an idle appearance may join a call in progress is the line's policy,
+ * not a routing edge. `strategy` decides whether the appearances light and ring together or in
+ * ordinal order.
+ */
+export interface SharedLineInput extends RoutingEntityInput {
+	readonly name: string;
+	readonly extensionNumber?: string | null;
+	readonly strategy: SharedLineStrategy;
+	readonly ringTimeoutSeconds: number;
+	readonly holdRecallTimeoutSeconds: number;
+	readonly bargeInEnabled: boolean;
+	/** In any order — the compiler sorts by `ordinal`, as it does everywhere else. */
+	readonly appearances: readonly SharedLineAppearanceInput[];
+}
+
+export interface SharedLineAppearanceInput {
+	readonly extensionId: string;
+	/** The appearance index: the button position on the member's phone. */
+	readonly ordinal: number;
+	readonly enabled: boolean;
+}
+
 export interface FeatureCodeInput extends RoutingEntityInput {
 	/** Dialed string including the leading star, e.g. `*97`. */
 	readonly code: string;
@@ -600,13 +935,219 @@ export interface CallBlockRuleInput extends RoutingEntityInput {
 	readonly label?: string | null;
 }
 
+/** Mirrored from `pbx-db` `call-flows-schema.ts`. */
+export const CALL_FLOW_MODES = ["day", "night"] as const;
+
+export type CallFlowMode = (typeof CALL_FLOW_MODES)[number];
+
+/**
+ * A day/night switch, mirroring `call_flow`.
+ *
+ * # Why the mode is here and not read live
+ *
+ * It is compiled, so a flip costs a recompile and the artifact stays a complete answer to "where do
+ * this tenant's calls go right now". `call-flows-schema.ts` argues it against the park-slot
+ * precedent at length: a park LOT's slot range is configuration and is compiled; a park SLOT's
+ * occupancy is live state and is not. A mode is on the first side of that line — it changes a few
+ * times a day, it must survive the fleet restarting, and an administrator edits it in a form as
+ * readily as a receptionist toggles it from a handset.
+ *
+ * Both trios are REQUIRED. A flow with one destination is not a flow, and the database says so with
+ * a non-optional shape check on the night trio.
+ */
+export interface CallFlowInput extends RoutingEntityInput, DestinationInput {
+	readonly name: string;
+	readonly extensionNumber?: string | null;
+	/** The star code that toggles the mode, and the key a BLF lamp watches. */
+	readonly featureCode?: string | null;
+	readonly mode: CallFlowMode;
+	readonly nightDestinationType?: DestinationInput["destinationType"] | null;
+	readonly nightDestinationRef?: string | null;
+	readonly nightDestinationData?: DestinationInput["destinationData"];
+}
+
+/** Mirrored from `pbx-db` `pins-schema.ts`. */
+export interface PinSetEntryInput extends RoutingEntityInput {
+	readonly pinSetId: string;
+	readonly ordinal: number;
+	readonly label?: string | null;
+	/**
+	 * The PIN digest, in the format `voicemail-pin.ts` defines. Never a PIN.
+	 *
+	 * Here for exactly the reason `VoicemailBoxInput.pinHash` and `ConferenceInput.pinHash` are: the
+	 * engine challenges the caller on the call path, in a process holding no database handle. One
+	 * format, one parser, one verifier — a second PIN format would be a second thing to get wrong.
+	 */
+	readonly pinHash: string;
+}
+
+/** An outbound authorisation-code list, mirroring `pin_set`. */
+export interface PinSetInput extends RoutingEntityInput {
+	readonly name: string;
+	readonly promptId?: string | null;
+	readonly failurePromptId?: string | null;
+	readonly maxAttempts: number;
+	readonly digitTimeoutMs: number;
+}
+
+/** One rewrite in a ruleset, mirroring `translation_rule`. */
+export interface TranslationRuleInput extends RoutingEntityInput {
+	readonly translationRulesetId: string;
+	readonly ordinal: number;
+	readonly label?: string | null;
+	/** JavaScript regex source. Capture groups feed `replacement`. */
+	readonly matchPattern: string;
+	/** Dialable characters plus `$n` back-references. An empty string deletes the match. */
+	readonly replacement: string;
+}
+
+/** A reusable, named digit-manipulation pipeline, mirroring `translation_ruleset`. */
+export interface TranslationRulesetInput extends RoutingEntityInput {
+	readonly name: string;
+}
+
+/**
+ * A named destination, mirroring `destination_alias`.
+ *
+ * FusionPBX's "Bridge" with the raw dial string removed — see `aliases-schema.ts`. It compiles
+ * FLAT: the compiler resolves `alias:<id>` to whatever the alias's own trio resolved to, and no
+ * alias node ever appears in the artifact.
+ */
+export interface DestinationAliasInput extends RoutingEntityInput, DestinationInput {
+	readonly name: string;
+}
+
+/**
+ * A remote audio source usable as a destination, mirroring `audio_stream`.
+ *
+ * The fallback trio is required rather than optional because remote-URL playback is the one
+ * capability in this snapshot whose availability depends on the media driver: ARI's
+ * `POST /channels/{id}/play` takes `sound:`, `recording:`, `number:`, `digits:`, `characters:` and
+ * `tone:`, and an arbitrary `https://` is not one of them. A stream with nowhere to go is a call
+ * dropped in silence on any driver that cannot play it.
+ */
+export interface AudioStreamInput extends RoutingEntityInput {
+	readonly name: string;
+	readonly url: string;
+	readonly answerFirst: boolean;
+	/** Zero means "until the caller hangs up". */
+	readonly maxSeconds: number;
+	readonly fallbackDestinationType?: DestinationInput["destinationType"] | null;
+	readonly fallbackDestinationRef?: string | null;
+	readonly fallbackDestinationData?: DestinationInput["destinationData"];
+}
+
+/**
+ * One step of a phrase, mirroring `phrase_step`.
+ *
+ * `phraseId` is a `prompt` row of kind `phrase`, and `promptId` is a `prompt` row that is not — a
+ * phrase IS a prompt, which is what makes it storable in the eight `*_prompt_id` foreign keys that
+ * already exist. See `media-schema.ts`.
+ */
+export interface PhraseStepInput extends RoutingEntityInput {
+	readonly phraseId: string;
+	readonly promptId: string;
+	readonly ordinal: number;
+}
+
+/**
+ * A `prompt` row, as far as routing is concerned.
+ *
+ * Four fields. The first two are for phrases: the compiler has to know which prompt ids are
+ * PHRASES (so it can expand them) and which are audio (so it can refuse a nested phrase). The
+ * duration and the checksum belong to the media layer; nothing about them changes a routing
+ * decision.
+ *
+ * The object key does, though, and only because nothing else can supply it: a plan node names a
+ * prompt by ROW ID, the file lives under a different id inside the object store, and the engine
+ * holds no database handle. Without the key the reference is unresolvable at play time — the
+ * `object://` half of the same story `voicemail_greeting.object_key` already tells.
+ */
+export interface PromptInput extends RoutingEntityInput {
+	readonly name: string;
+	/** `"phrase"` marks a sequence; everything else is a single piece of audio. */
+	readonly kind: string;
+	/**
+	 * Key into the deployment's object store. Null for a phrase, which has audio of its own only
+	 * through its steps, and absent from a loader that does not project the column yet.
+	 */
+	readonly objectKey?: string | null;
+}
+
+/** Mirrored from `pbx-db` `directory-schema.ts`. */
+export const DIRECTORY_SEARCH_FIELDS = ["last-name", "first-name", "full-name"] as const;
+
+export type DirectorySearchField = (typeof DIRECTORY_SEARCH_FIELDS)[number];
+
+/**
+ * A dial-by-name directory, mirroring `dial_by_name_directory`.
+ *
+ * The compiler builds the digit map from the tenant's extensions and their mailboxes' recorded name
+ * greetings; there is nothing about the entries on this row, because there is nothing to store —
+ * membership is "every extension we can speak the name of", derived rather than curated.
+ */
+export interface DialByNameDirectoryInput extends RoutingEntityInput {
+	readonly name: string;
+	readonly extensionNumber?: string | null;
+	readonly searchField: DirectorySearchField;
+	readonly minDigits: number;
+	readonly greetingPromptId?: string | null;
+	readonly invalidPromptId?: string | null;
+	readonly maxFailures: number;
+	readonly timeoutDestinationType?: DestinationInput["destinationType"] | null;
+	readonly timeoutDestinationRef?: string | null;
+	readonly timeoutDestinationData?: DestinationInput["destinationData"];
+}
+
+/** An organization-wide short code, mirroring `speed_dial`. */
+export interface SpeedDialInput extends RoutingEntityInput, DestinationInput {
+	readonly code: string;
+	readonly label: string;
+}
+
 /**
  * The org settings routing reads. Everything here has a compiler default, because a tenant that
  * has never opened the settings page must still be routable.
  */
+/**
+ * The toll-fraud policy row, as the loader reads it.
+ *
+ * Every field nullable because every column is: a policy row exists to hold the ceilings somebody
+ * has actually set, and a NULL is "no ceiling on that axis" rather than a value to default. The
+ * compiler drops the NULLs, normalises the country lists and defaults nothing.
+ */
+export interface TollFraudPolicyInput {
+	readonly enabled?: boolean | null;
+	readonly maxConcurrentInternationalCalls?: number | null;
+	readonly maxInternationalMinutesPerHour?: number | null;
+	readonly maxInternationalMinutesPerDay?: number | null;
+	/** ISO-3166 alpha-2, in whatever case and order the row holds them. */
+	readonly allowedCountries?: readonly string[] | null;
+	readonly deniedCountries?: readonly string[] | null;
+	readonly holdFirstCallToNewCountry?: boolean | null;
+	readonly offHoursInternationalLock?: boolean | null;
+	readonly offHoursStartMinute?: number | null;
+	readonly offHoursEndMinute?: number | null;
+	readonly offHoursTimezone?: string | null;
+}
+
 export interface RoutingSettingsInput {
 	/** Fallback IANA zone for a time condition that does not carry one. */
 	readonly defaultTimezone?: string;
+	/**
+	 * The organization's SIP realm — the domain its handsets register under and the one an extension
+	 * B-leg is dialled at on the `apps/sipd` plane (`sip:{number}@{realm}`, design §5.1).
+	 *
+	 * It rides `settings` for the same mechanical reason `maxConcurrentCalls` does: it is a per-org
+	 * fact the engine reads out of the compiled artifact, and the artifact is the ONLY per-org surface
+	 * the engine reads — it holds no database handle. Absent (or `null`) means the tenant has set no
+	 * realm, in which case the extension B-leg carries no target and the composite refuses
+	 * `originate` by name — there is no deployment-wide fallback, because a realm names exactly one
+	 * tenant and borrowing one would dial into another organization's domain. It
+	 * lives in `org_setting` under `category='sip'`, `name='realm'` — the same row the provisioning
+	 * softphone path and sipd's realm→org mapping already read — not under the `routing` category.
+	 */
+	readonly realm?: string | null;
 	/**
 	 * Dial prefix that sends a call straight to a mailbox's greeting, e.g. `*99` + extension.
 	 * Set to `null` to disable the internal voicemail-prefix table entirely.
@@ -616,7 +1157,50 @@ export interface RoutingSettingsInput {
 	readonly voicemailCheckPrefix?: string | null;
 	/** Org-wide outbound caller id, used when neither route nor extension supplies one. */
 	readonly outboundCallerIdNumber?: string | null;
+	/**
+	 * What to do with an outbound caller id nobody has vouched for. See
+	 * {@link UnverifiedCallerIdPolicy}; `null` and absent both compile to `"allow"`, which is what
+	 * every tenant had before the attestation seam existed.
+	 */
+	readonly unverifiedCallerIdPolicy?: UnverifiedCallerIdPolicy | null;
+	/**
+	 * Whether this organization's KYC file has been approved, and whether an un-approved one
+	 * actually blocks outbound PSTN calling.
+	 *
+	 * Two flags and not one, because they are set by different people for different reasons. The
+	 * DECISION is the platform operator's and lives on the `organization_kyc` row; the ENFORCEMENT is
+	 * a policy the operator (or the tenant, on a stricter account) turns on. Collapsing them would
+	 * mean that adding the KYC feature at all instantly cut off every existing tenant whose file
+	 * nobody had reviewed yet, which is a migration and not a compliance posture.
+	 */
+	readonly kycApproved?: boolean | null;
+	readonly requireKycForOutbound?: boolean | null;
+	/**
+	 * External numbers this organization has a documented right to present, already filtered for
+	 * expiry by the loader.
+	 *
+	 * The loader does the filtering because the compiler reads no clock — two compiles of one
+	 * snapshot must be byte-identical, and an expiry evaluated at compile time would make the
+	 * artifact change without the configuration changing. A lapsed verification therefore reaches
+	 * here as an absent entry, and the call falls to {@link unverifiedCallerIdPolicy}, which is the
+	 * behaviour a lapsed document should produce.
+	 *
+	 * Numbers the organization OWNS are not listed here: they are already in
+	 * {@link RoutingSnapshotInput.phoneNumbers}, and the compiler derives the `owned` half of the
+	 * right-to-use table from that collection rather than asking the loader to send it twice.
+	 */
+	readonly verifiedCallerIds?: readonly string[];
 	readonly outboundCallerIdName?: string | null;
+	/**
+	 * The country calling code this organization's national numbers belong to — `"1"` for NANP,
+	 * `"44"` for the UK. Digits only; a leading `+` is tolerated and stripped.
+	 *
+	 * Read by nothing at call time. It exists so the compiler can canonicalise a DID or a caller id
+	 * that reached the database as a bare national number, and its absence is meaningful rather than
+	 * a default: with no code, `2125550100` is genuinely ambiguous, and `e164-ingest.ts` reports it
+	 * rather than guessing `+1` and pointing a British tenant's routing at Manhattan.
+	 */
+	readonly defaultCallingCode?: string | null;
 	/**
 	 * Hangup causes that let an outbound dial continue to the next trunk. Defaults to
 	 * `RETRYABLE_HANGUP_CAUSES` from `@optimiq-voice/telephony` — never "all causes", because
@@ -626,6 +1210,20 @@ export interface RoutingSettingsInput {
 	/** Whether an internal caller may reach outbound routes at all (org-level kill switch). */
 	readonly outboundEnabled?: boolean;
 	/**
+	 * Hold TLS-registered handsets to SDES-SRTP: their media legs are negotiated with the per-leg
+	 * policy `require` instead of the media plane's `MEDIAD_SRTP_POLICY` floor.
+	 *
+	 * Absent means `false`, and `false` is the only safe default: turning it on REFUSES the call of
+	 * any handset that signals over TLS and offers plain RTP, which is a real population on most
+	 * estates. That is a decision a tenant makes explicitly, having looked at their fleet.
+	 *
+	 * TLS-registered specifically, and not every phone: a handset that already encrypts its
+	 * signalling is one whose vendor and firmware support SRTP, so the refusal is a
+	 * misconfiguration rather than an incompatibility — and a plaintext-signalled phone offered
+	 * SRTP would be handing its keys over in the clear anyway, which buys nothing.
+	 */
+	readonly requireSrtpForTlsPhones?: boolean;
+	/**
 	 * Emergency dial strings this organization recognises **in addition to** the compiled-in NANP
 	 * set (`emergency.ts`). One row for a tenant whose handsets are not all in North America.
 	 *
@@ -633,6 +1231,85 @@ export interface RoutingSettingsInput {
 	 * compiled-in `911` is the one routing decision a tenant does not get to switch off.
 	 */
 	readonly emergencyNumbers?: readonly string[];
+	/**
+	 * Simultaneous live channels this organization may hold, across every trunk and none.
+	 *
+	 * It is a SETTING here rather than a collection of its own, and rather than a top-level sibling
+	 * of `settings`, for one mechanical reason worth stating: `canonicalizeSnapshot` hashes
+	 * `organizationId`, `settings` and the members of `SNAPSHOT_COLLECTIONS`, and it names `settings`
+	 * on an explicit line. A new top-level field would be excluded from `snapshotHash` unless that
+	 * line were extended too — which is the dead-column trap this package's loader header warns
+	 * about, one level up. Riding `settings` is hashed for free.
+	 *
+	 * `null` and absent both mean unlimited, and they arrive from different places: `null` is the
+	 * column with no ceiling set, absent is a loader that does not select it. The compiler collapses
+	 * both to an absent key.
+	 *
+	 * The cap it expresses is NOT the same as `TrunkInput.maxChannels`, which is what one carrier
+	 * will accept. This is what the tenant has bought, so it counts internal calls, conference legs
+	 * and queue callers too — none of which touch a trunk.
+	 */
+	readonly maxConcurrentCalls?: number | null;
+	/**
+	 * The organization's toll-fraud spend, velocity and geo controls, as the policy row carries them.
+	 *
+	 * Rides `settings` for the same mechanical reason `maxConcurrentCalls` does, stated two entries
+	 * up: `canonicalizeSnapshot` hashes `settings` on an explicit line, and a new top-level field
+	 * would be excluded from `snapshotHash` unless that line were extended too.
+	 *
+	 * `null` and absent both mean "this tenant has no policy row", and the compiler collapses both to
+	 * an absent key — which is what keeps the canonical snapshot of a tenant with no policy
+	 * byte-identical to what it was before this was loaded.
+	 */
+	readonly tollFraud?: TollFraudPolicyInput | null;
+	/**
+	 * What this organization asks of a call it records, before any audio is captured.
+	 *
+	 * The org-wide floor a DID or an inbound route may raise (see
+	 * {@link PhoneNumberInput.recordingConsentPolicy}). `null` and absent both compile to `"none"`,
+	 * which is what every tenant had before this setting existed: recording starts where the record
+	 * policy says it does and nobody is told. That default is deliberate and it is not a legal
+	 * position — the platform cannot know a tenant's obligations, and silently inserting an
+	 * announcement into every recorded call of every existing tenant would change what their callers
+	 * hear without anybody asking for it. The jurisdiction table
+	 * (`recordingAllPartyRegions`) is the safety net that raises it per call.
+	 */
+	readonly recordingConsentPolicy?: RecordingConsentPolicy | null;
+	/**
+	 * The prompt row the announcement plays. Absent means the engine plays the seeded system prompt
+	 * (`sound:recording-consent`), so a tenant that switches the policy on without recording anything
+	 * still announces rather than silently failing the obligation they just took on.
+	 */
+	readonly recordingConsentPromptId?: string | null;
+	/** The digit that ACCEPTS recording under `announce-and-require-keypress`. Defaults to `"1"`. */
+	readonly recordingConsentAcceptDigit?: string | null;
+	/**
+	 * The digit that DECLINES. Defaults to `"2"`.
+	 *
+	 * Configurable, and distinct from "any digit that is not the accept digit", because a decline is
+	 * a deliberate act with a consequence — no recording is started and the call continues — and a
+	 * caller who fumbles the keypad has not declined, they have not answered.
+	 */
+	readonly recordingConsentDeclineDigit?: string | null;
+	/**
+	 * The jurisdictions this organization treats as requiring BOTH parties to be told, as ISO 3166-2
+	 * subdivisions (`US-CA`) or `EU`.
+	 *
+	 * Absent compiles to `DEFAULT_ALL_PARTY_REGIONS` (`recording-consent.ts`) rather than to an empty
+	 * list, which is the
+	 * one default in this block that is not "behave as before": a tenant who has never opened the
+	 * settings page gets the safety net, because the failure mode of the empty list is a recorded
+	 * two-party call nobody was told about, and the failure mode of the seeded list is an
+	 * announcement on a call that did not need one. An explicitly empty array is respected — that is
+	 * a tenant saying they have taken their own advice.
+	 */
+	readonly recordingAllPartyRegions?: readonly string[];
+	/**
+	 * The org-wide default for pausing a recording while digits are pressed. Defaults to `false`;
+	 * {@link ExtensionInput.recordAutoPauseOnDtmf} and {@link QueueInput.recordAutoPauseOnDtmf}
+	 * override it where a tenant takes payments on some seats and not others.
+	 */
+	readonly recordingAutoPauseOnDtmf?: boolean | null;
 }
 
 /** Everything the compiler is allowed to see about one organization. */
@@ -658,10 +1335,36 @@ export interface OrgRoutingSnapshot {
 	readonly mohClasses?: readonly MohClassInput[];
 	readonly conferences: readonly ConferenceInput[];
 	readonly parkLots: readonly ParkLotInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly pagingGroups?: readonly PagingGroupInput[];
 	readonly featureCodes: readonly FeatureCodeInput[];
 	readonly callBlockRules: readonly CallBlockRuleInput[];
 	/** Optional — see the "optional collections" note in this file's header. */
 	readonly emergencyAddresses?: readonly EmergencyAddressInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly callFlows?: readonly CallFlowInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly pinSets?: readonly PinSetInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly pinSetEntries?: readonly PinSetEntryInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly translationRulesets?: readonly TranslationRulesetInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly translationRules?: readonly TranslationRuleInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly destinationAliases?: readonly DestinationAliasInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly audioStreams?: readonly AudioStreamInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly prompts?: readonly PromptInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly phraseSteps?: readonly PhraseStepInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly directories?: readonly DialByNameDirectoryInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly speedDials?: readonly SpeedDialInput[];
+	/** Optional — see the "optional collections" note in this file's header. */
+	readonly sharedLines?: readonly SharedLineInput[];
 }
 
 /**
@@ -690,9 +1393,26 @@ export const SNAPSHOT_COLLECTIONS = [
 	"mohClasses",
 	"conferences",
 	"parkLots",
+	"pagingGroups",
 	"featureCodes",
 	"callBlockRules",
 	"emergencyAddresses",
+	// The T2 admin block. Every one is optional, which is the same rollout affordance the four before
+	// them took: `packages/routing` compiles them before the API's snapshot loader learns to select
+	// them, and a tenant whose loader has not caught up compiles exactly what every release before
+	// this one did.
+	"callFlows",
+	"pinSets",
+	"pinSetEntries",
+	"translationRulesets",
+	"translationRules",
+	"destinationAliases",
+	"audioStreams",
+	"prompts",
+	"phraseSteps",
+	"directories",
+	"speedDials",
+	"sharedLines",
 ] as const satisfies readonly (keyof OrgRoutingSnapshot)[];
 
 export type SnapshotCollection = (typeof SNAPSHOT_COLLECTIONS)[number];
@@ -709,6 +1429,28 @@ export const OPTIONAL_SNAPSHOT_COLLECTIONS = [
 	"voicemailGreetings",
 	"mohClasses",
 	"emergencyAddresses",
+	// Newest of the four, and optional for exactly the reason the other three are: paging shipped
+	// after the API's snapshot loader was written, and a required field would have made this package
+	// impossible to release before the loader learned to select `paging_group`. A tenant whose
+	// loader has not caught up compiles no paging nodes, which is what every release before this one
+	// produced.
+	"pagingGroups",
+	"callFlows",
+	"pinSets",
+	"pinSetEntries",
+	"translationRulesets",
+	"translationRules",
+	"destinationAliases",
+	"audioStreams",
+	"prompts",
+	"phraseSteps",
+	"directories",
+	"speedDials",
+	// Newest of all, and optional for the reason every collection after emergency addresses is: it
+	// ships after the API's snapshot loader was written, and a required field would make this package
+	// impossible to release before the loader learns to select `shared_line`. A tenant whose loader
+	// has not caught up compiles no shared-line nodes, which is what every release before this one did.
+	"sharedLines",
 ] as const satisfies readonly SnapshotCollection[];
 
 export type OptionalSnapshotCollection = (typeof OPTIONAL_SNAPSHOT_COLLECTIONS)[number];
@@ -757,8 +1499,21 @@ export function emptySnapshot(organizationId: string): OrgRoutingSnapshot {
 		mohClasses: [],
 		conferences: [],
 		parkLots: [],
+		pagingGroups: [],
 		featureCodes: [],
 		callBlockRules: [],
 		emergencyAddresses: [],
+		callFlows: [],
+		pinSets: [],
+		pinSetEntries: [],
+		translationRulesets: [],
+		translationRules: [],
+		destinationAliases: [],
+		audioStreams: [],
+		prompts: [],
+		phraseSteps: [],
+		directories: [],
+		speedDials: [],
+		sharedLines: [],
 	};
 }

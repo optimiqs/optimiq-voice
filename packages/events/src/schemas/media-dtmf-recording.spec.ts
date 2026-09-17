@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { channelRecordStartedDataSchema, recordingConsentSchema } from "./call-events";
 import {
 	makeMediaEvent,
 	mediaDtmfReceivedDataSchema,
@@ -9,6 +10,8 @@ import {
 	mediaSendDtmfResponseSchema,
 	mediaStartRecordingRequestSchema,
 	mediaStartRecordingResponseSchema,
+	mediaPauseRecordingRequestSchema,
+	mediaPauseRecordingResponseSchema,
 	mediaStopRecordingRequestSchema,
 	mediaStopRecordingResponseSchema,
 } from "./rpc";
@@ -150,6 +153,22 @@ describe("rpc.media.v1.stop-recording", () => {
 	});
 });
 
+describe("rpc.media.v1.pause-recording", () => {
+	it("is one subject with a resume bit, and pausing is the default", () => {
+		// Both halves carry a reference and nothing else, which is `mute-session`'s argument for a
+		// bit rather than a second subject.
+		const parsed = mediaPauseRecordingRequestSchema.parse({ recordingRef: "rec-1" });
+		expect(parsed).toEqual({ recordingRef: "rec-1", resume: false });
+	});
+
+	it("treats pausing a recording that is not running as a success", () => {
+		const parsed = mediaPauseRecordingResponseSchema.parse({ ok: true, recordingRef: "rec-1" });
+		expect(parsed.ok).toBe(true);
+		expect(parsed.applied).toBe(false);
+		expect(parsed.paused).toBe(false);
+	});
+});
+
 describe("media.evt.v1 recording.finished", () => {
 	it("derives its subject from the session, not the call", () => {
 		const event = makeMediaEvent("recording.finished", {
@@ -179,6 +198,46 @@ describe("media.evt.v1 recording.finished", () => {
 			"session-ended",
 			"error",
 		]);
+	});
+
+	it("carries the paused intervals a compliance reviewer needs, against the file's timeline", () => {
+		// The whole point of pausing rather than stopping: one artifact, and the only record that
+		// the quiet stretch was deliberate.
+		const event = makeMediaEvent("recording.finished", {
+			orgId: ORG,
+			source: "mediad",
+			data: {
+				sessionId: SESSION,
+				instanceId: "mediad-7c9f",
+				callId: CALL,
+				recordingRef: "rec-1",
+				reason: "stopped",
+				durationMs: 30_000,
+				bytes: 480_044,
+				objectKey: `${ORG}/${CALL}/rec-1.wav`,
+				direction: "both",
+				pauses: [{ startMs: 8_000, endMs: 14_000 }],
+			},
+		});
+		expect(event.data.pauses).toEqual([{ startMs: 8_000, endMs: 14_000 }]);
+	});
+
+	it("still parses a recording.finished from a media plane that cannot pause", () => {
+		const event = makeMediaEvent("recording.finished", {
+			orgId: ORG,
+			source: "mediad",
+			data: {
+				sessionId: SESSION,
+				instanceId: "mediad-7c9f",
+				recordingRef: "rec-1",
+				reason: "stopped",
+				durationMs: 1_000,
+				bytes: 16_044,
+				objectKey: `${ORG}/${CALL}/rec-1.wav`,
+				direction: "both",
+			},
+		});
+		expect(event.data.pauses).toBeUndefined();
 	});
 
 	it("carries the byte count nothing else on this backbone can supply", () => {
@@ -285,5 +344,78 @@ describe("media.evt.v1 dtmf.received", () => {
 				durationMs: -1,
 			}).success,
 		).toBe(false);
+	});
+});
+
+/**
+ * Rung 5, and the reason the recording rungs above exist at all: what the caller was told before
+ * the media bug was armed. The record mirrors `RecordingConsentRecord` in `packages/routing` —
+ * mirrored rather than imported, so these assertions are what keeps the two copies honest.
+ */
+describe("channel.record.started — the consent record", () => {
+	const LEG = "018f2b7c-0000-7000-8000-0000000000cc";
+	const PROMPT = "018f2b7c-0000-7000-8000-0000000000ee";
+	const start = {
+		legId: LEG,
+		recordingId: SESSION,
+		objectKey: "recordings/org/2026/call.wav",
+		kind: "call" as const,
+	};
+
+	it("stays optional, so a producer that predates consent handling still validates", () => {
+		expect(channelRecordStartedDataSchema.parse(start)).toEqual(start);
+	});
+
+	it("carries the whole record through, jurisdictions and prompt included", () => {
+		const consent = {
+			outcome: "accepted" as const,
+			method: "keypress" as const,
+			policy: "announce-and-require-keypress" as const,
+			at: "2026-01-01T00:00:00.000Z",
+			parties: ["caller", "callee"] as ("caller" | "callee")[],
+			regions: ["US-CA", "EU"],
+			promptId: PROMPT,
+		};
+		const parsed = channelRecordStartedDataSchema.parse({ ...start, consent });
+		expect(parsed.consent).toEqual(consent);
+	});
+
+	it("mirrors routing's three vocabularies exactly", () => {
+		expect(recordingConsentSchema.shape.outcome.options).toEqual([
+			"not-required",
+			"announced",
+			"accepted",
+			"declined",
+		]);
+		expect(recordingConsentSchema.shape.method.options).toEqual([
+			"none",
+			"announcement",
+			"keypress",
+		]);
+		expect(recordingConsentSchema.shape.policy.options).toEqual([
+			"none",
+			"announce",
+			"announce-and-require-keypress",
+		]);
+	});
+
+	const base = {
+		outcome: "announced" as const,
+		method: "announcement" as const,
+		policy: "announce" as const,
+		at: "2026-01-01T00:00:00.000Z",
+		parties: ["caller"] as ("caller" | "callee")[],
+	};
+
+	it.each([
+		["an outcome outside the vocabulary", { outcome: "pending" }],
+		["a method outside the vocabulary", { method: "telepathy" }],
+		["a party that is neither end of the call", { parties: ["supervisor"] }],
+		["a timestamp that is not ISO 8601", { at: "just now" }],
+		// Bounded on purpose: a jurisdiction list is a handful of entries, and an unbounded array on
+		// a bus message is a memory budget nobody set.
+		["more regions than any tenant has", { regions: Array.from({ length: 17 }, () => "US-CA") }],
+	])("rejects %s", (_label, override) => {
+		expect(recordingConsentSchema.safeParse({ ...base, ...override }).success).toBe(false);
 	});
 });

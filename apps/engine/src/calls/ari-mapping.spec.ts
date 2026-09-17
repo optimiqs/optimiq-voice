@@ -311,13 +311,79 @@ describe("toMediaEvent", () => {
 		expect(mapped("ChannelCreated", { channel: CHANNEL })).toBeUndefined();
 		expect(mapped("ChannelDialplan", { channel: CHANNEL })).toBeUndefined();
 		expect(mapped("PlaybackStarted", { playback })).toBeUndefined();
+		// `PlaybackFinished` is NOT in this list any more — the consent gate consumes it. What still
+		// drops is a playback that names no leg: one aimed at a bridge reaches everyone in it and
+		// nobody in particular, which is not a fact about whether one PARTY was told anything.
 		expect(mapped("PlaybackFinished", { playback })).toBeUndefined();
+		expect(
+			mapped("PlaybackFinished", { playback: { ...playback, target_uri: "bridge:b1" } }),
+		).toBeUndefined();
 		expect(mapped("BridgeCreated", { bridge })).toBeUndefined();
 		expect(mapped("BridgeDestroyed", { bridge })).toBeUndefined();
 		expect(mapped("ChannelEnteredBridge", { bridge, channel: CHANNEL })).toBeUndefined();
 		expect(mapped("ChannelLeftBridge", { bridge, channel: CHANNEL })).toBeUndefined();
 		expect(mapped("Dial", { peer: CHANNEL, dialstatus: "ANSWER" })).toBeUndefined();
+		// PeerStatusChange is NOT in this list any more — the trunk write-back consumes it. What
+		// still drops is the frame that cannot name a trunk: no endpoint, or a non-PJSIP one.
 		expect(mapped("PeerStatusChange", { peer: { peer_status: "Reachable" } })).toBeUndefined();
+		expect(
+			mapped("PeerStatusChange", {
+				endpoint: { technology: "IAX2", resource: "legacy" },
+				peer: { peer_status: "Reachable" },
+			}),
+		).toBeUndefined();
+	});
+
+	it("maps PeerStatusChange to the trunk-endpoint-status the write-back publishes", () => {
+		expect(
+			mapped("PeerStatusChange", {
+				endpoint: { technology: "PJSIP", resource: "carrier-a", state: "offline" },
+				peer: { peer_status: "Unreachable", time: "1240" },
+			}),
+		).toEqual({
+			type: "trunk-endpoint-status",
+			endpoint: "carrier-a",
+			status: "down",
+			reason: "Unreachable",
+			latencyMs: 1240,
+		});
+		// Reachable carries the qualify RTT; a rider with no verdict reads as unknown, and the
+		// raw word is never invented — an empty one becomes the literal "unknown".
+		expect(
+			mapped("PeerStatusChange", {
+				endpoint: { technology: "PJSIP", resource: "carrier-a" },
+				peer: { peer_status: "Reachable", time: "24" },
+			}),
+		).toEqual({
+			type: "trunk-endpoint-status",
+			endpoint: "carrier-a",
+			status: "up",
+			reason: "Reachable",
+			latencyMs: 24,
+		});
+		expect(
+			mapped("PeerStatusChange", {
+				endpoint: { technology: "PJSIP", resource: "carrier-a" },
+				peer: {},
+			}),
+		).toEqual({
+			type: "trunk-endpoint-status",
+			endpoint: "carrier-a",
+			status: "unknown",
+			reason: "unknown",
+		});
+		// Lagged is the drivers-that-measure word for "answers, slowly": degraded, not down.
+		expect(
+			mapped("PeerStatusChange", {
+				endpoint: { technology: "PJSIP", resource: "carrier-a" },
+				peer: { peer_status: "Lagged", time: "not-a-number" },
+			}),
+		).toEqual({
+			type: "trunk-endpoint-status",
+			endpoint: "carrier-a",
+			status: "degraded",
+			reason: "Lagged",
+		});
 	});
 
 	it("accounts for EVERY ARI event type — no throw, and a decision either way", () => {
@@ -329,6 +395,7 @@ describe("toMediaEvent", () => {
 				mapped(type, {
 					channel: CHANNEL,
 					peer: CHANNEL,
+					endpoint: { technology: "PJSIP", resource: "carrier-a" },
 					bridge,
 					recording,
 					playback,
@@ -344,13 +411,19 @@ describe("toMediaEvent", () => {
 	it("can produce every member of MediaEvent from a real frame", () => {
 		const bridge = { id: "b1", technology: "simple_bridge" };
 		const recording = { name: "call-1", format: "wav", target_uri: "", state: "done" };
-		const playback = { id: "p1", media_uri: "sound:hello", target_uri: "", state: "done" };
+		const playback = {
+			id: "p1",
+			media_uri: "sound:hello",
+			target_uri: `channel:${CHANNEL.id}`,
+			state: "done",
+		};
 		const produced = new Set(
 			ARI_EVENT_TYPES.map(
 				(type) =>
 					mapped(type, {
 						channel: { ...CHANNEL, state: "Up" },
 						peer: CHANNEL,
+						endpoint: { technology: "PJSIP", resource: "carrier-a" },
 						bridge,
 						recording,
 						playback,

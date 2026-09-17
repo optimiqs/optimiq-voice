@@ -90,8 +90,8 @@ export function VoicemailPinDialog({
 						{box === null ? "Mailbox PIN" : `PIN for mailbox ${box.mailboxNumber}`}
 					</DialogTitle>
 					<DialogDescription>
-						Callers dialling <code>*97</code> from another handset are asked for this. Without
-						one, the mailbox opens for anyone calling from its own extension.
+						Callers dialling <code>*97</code> from another handset are asked for this. Without one,
+						the mailbox opens for anyone calling from its own extension.
 					</DialogDescription>
 				</DialogHeader>
 
@@ -128,9 +128,9 @@ export function VoicemailPinDialog({
 						aria-describedby={`${inputId}-help`}
 					/>
 					<p id={`${inputId}-help`} className="mt-1.5 text-xs text-muted-foreground">
-						{MIN_PIN_LENGTH}–{MAX_PIN_LENGTH} digits. A repeated digit ({"0000"}) or a straight
-						run ({"1234"}) is refused: the handset allows three attempts per call, and those are
-						the first three anyone tries.
+						{MIN_PIN_LENGTH}–{MAX_PIN_LENGTH} digits. A repeated digit ({"0000"}) or a straight run
+						({"1234"}) is refused: the handset allows three attempts per call, and those are the
+						first three anyone tries.
 					</p>
 					{localError !== null ? (
 						<p className="mt-2 text-xs text-danger">{localError}</p>

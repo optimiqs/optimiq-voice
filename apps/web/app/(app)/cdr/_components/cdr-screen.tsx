@@ -31,8 +31,11 @@ import {
 	hangupCauseTone,
 } from "~/lib/cdr/format";
 import { cn } from "~/lib/cn";
+import { usePermission } from "../../_context/session-context";
 import { useCdrList } from "../../_hooks/use-cdr-queries";
 import { CallDetail } from "./call-detail";
+import { CdrExportDialog } from "./cdr-export-dialog";
+import { CdrExportJobs } from "./cdr-export-jobs";
 import { RANGE_PRESET_LABELS, RANGE_PRESETS, useTimeRangeState } from "./time-range";
 import type { CallLegRow } from "~/lib/cdr/contracts";
 
@@ -115,6 +118,21 @@ export function CdrScreen() {
 	const list = useCdrList(query);
 	const [expanded, setExpanded] = useState<string | null>(null);
 
+	/**
+	 * The export's filters are this screen's, minus the two fields that describe a PAGE.
+	 *
+	 * Built by omission rather than by re-listing: `createCdrExportDto` IS `cdrListQuerySchema`
+	 * without `limit` and `cursor`, so a filter this screen gains is a filter the export gains in
+	 * the same edit. Sending `limit: 25` would be a plausible request and completely the wrong
+	 * answer — an export is not paged, and the worker walks the whole result set.
+	 */
+	const canExport = usePermission("cdr.export");
+	const [exportOpen, setExportOpen] = useState(false);
+	const exportFilters = useMemo(() => {
+		const { limit: _limit, cursor: _cursor, ...rest } = query;
+		return rest;
+	}, [query]);
+
 	/** Any filter change resets paging: a cursor into the previous result set means nothing here. */
 	const resetPaging = (): void => {
 		setCursors([]);
@@ -122,16 +140,20 @@ export function CdrScreen() {
 	};
 
 	const filtered =
-		search.length > 0 ||
-		direction.length > 0 ||
-		disposition.length > 0 ||
-		extension.length > 0;
+		search.length > 0 || direction.length > 0 || disposition.length > 0 || extension.length > 0;
 
 	return (
 		<>
 			<PageHeader
 				title="Call history"
 				description="One row per call leg, newest first. Expand a row to see every leg of that call — who dialled whom, which one answered, and how each ended."
+				actions={
+					canExport ? (
+						<Button variant="secondary" onClick={() => setExportOpen(true)}>
+							Export
+						</Button>
+					) : null
+				}
 			/>
 
 			<div className="flex flex-wrap items-end gap-3">
@@ -313,9 +335,34 @@ export function CdrScreen() {
 			</div>
 
 			<p className="max-w-prose text-xs text-muted-foreground">
-				Call history is an append-only record: it can be read and exported, never edited. Rows
-				are retired as whole months by the retention policy.
+				Call history is an append-only record: it can be read and exported, never edited. Rows are
+				retired as whole months by the retention policy.
 			</p>
+
+			{canExport ? (
+				<section className="space-y-3">
+					<div>
+						<h2 className="text-sm font-semibold text-foreground">Exports</h2>
+						<p className="max-w-prose text-xs text-muted-foreground">
+							An export is a snapshot of the question you asked, produced in the background. The
+							file expires on its own — it is a copy of the call ledger sitting outside the
+							ledger&rsquo;s access controls, so it is not kept indefinitely.
+						</p>
+					</div>
+					<CdrExportJobs />
+				</section>
+			) : null}
+
+			<CdrExportDialog
+				open={exportOpen}
+				onOpenChange={setExportOpen}
+				filters={exportFilters}
+				rangeLabel={
+					list.range
+						? `${new Date(list.range.from).toLocaleString()} – ${new Date(list.range.to).toLocaleString()}`
+						: RANGE_PRESET_LABELS[range.preset]
+				}
+			/>
 		</>
 	);
 }

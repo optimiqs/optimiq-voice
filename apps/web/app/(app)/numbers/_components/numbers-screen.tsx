@@ -6,6 +6,7 @@ import { Tabs, TabsIndicator, TabsList, TabsPanel, TabsTrigger } from "~/compone
 import { NUMBER_TABS, type NumberTab } from "~/lib/routes";
 import { NumbersPanel } from "./numbers-panel";
 import { OrderNumberPanel } from "./order-number-panel";
+import { PortingPanel } from "./porting-panel";
 
 /**
  * The DIDs you own, and the ones you could buy: two views of one subject, on one page.
@@ -22,6 +23,7 @@ import { OrderNumberPanel } from "./order-number-panel";
 const TAB_LABELS: Readonly<Record<NumberTab, string>> = {
 	numbers: "Your numbers",
 	order: "Order a number",
+	porting: "Port in & caller ID",
 };
 
 export function NumbersScreen() {
@@ -52,6 +54,9 @@ export function NumbersScreen() {
 				</TabsPanel>
 				<TabsPanel value="order">
 					<OrderNumberPanel />
+				</TabsPanel>
+				<TabsPanel value="porting">
+					<PortingPanel />
 				</TabsPanel>
 			</Tabs>
 		</>

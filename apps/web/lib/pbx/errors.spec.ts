@@ -1,7 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { ApiError } from "../api-client";
 import {
+	CONFERENCE_MODERATION_ERROR_CODES,
+	conferenceModerationMessage,
 	isCompileRollback,
+	isConferenceActionNotServable,
 	pbxDiagnostics,
 	pbxErrorCode,
 	pbxFieldErrors,
@@ -222,5 +225,70 @@ describe("pbxToastMessage", () => {
 	it("falls back to the server's own message for anything unrecognised", () => {
 		expect(pbxToastMessage(apiError(500, null), "Could not save")).toBe("message from the server");
 		expect(pbxToastMessage(null, "Could not save")).toBe("Could not save");
+	});
+});
+
+/**
+ * The conference-moderation taxonomy, mirrored from
+ * `apps/api/src/pbx/conferences/conference-moderation.errors.ts`.
+ *
+ * What is asserted is that each of the five leads somewhere DIFFERENT, because that is the whole
+ * reason there are five: ask an administrator, re-read the room, re-read the member, stop pressing
+ * the control, or wait. A shared message would send all five to the same place.
+ */
+describe("conference moderation failures", () => {
+	it("distinguishes a missing grant from a room nobody is in", () => {
+		expect(
+			conferenceModerationMessage(
+				apiError(403, { code: "CONFERENCE_MODERATE_FORBIDDEN", message: undefined }),
+			),
+		).toContain("conferences.moderate");
+		expect(
+			conferenceModerationMessage(apiError(404, { code: "CONFERENCE_NOT_RUNNING" })),
+		).toContain("Nobody is in this room");
+	});
+
+	it("says a participant has left rather than that the room does not exist", () => {
+		expect(
+			conferenceModerationMessage(
+				apiError(404, { code: "CONFERENCE_MEMBER_NOT_FOUND", memberRef: "leg-1" }),
+			),
+		).toContain("already left");
+	});
+
+	/**
+	 * The 503 line is the one to keep exact. `CONFERENCE_CONTROL_UNAVAILABLE` promises that NOTHING
+	 * was applied, and saying so is what stops a moderator muting somebody twice and unmuting them
+	 * by accident.
+	 */
+	it("promises that a 503 changed nothing", () => {
+		const message = conferenceModerationMessage(
+			apiError(503, { code: "CONFERENCE_CONTROL_UNAVAILABLE" }),
+		);
+
+		expect(message).toContain("nothing was changed");
+	});
+
+	/**
+	 * 501 is the one status a client may use to DISABLE a control rather than retry it: the request
+	 * is well formed and no media plane can serve it, which trying again will not change.
+	 */
+	it("is recognisable as a not-servable action without reading the body", () => {
+		const notServable = apiError(501, {
+			code: "CONFERENCE_ACTION_NOT_SERVABLE",
+			action: "volume",
+			message: "no media plane on this platform can set a per-member level",
+		});
+
+		expect(isConferenceActionNotServable(notServable)).toBe(true);
+		expect(conferenceModerationMessage(notServable)).toContain("per-member level");
+		expect(
+			isConferenceActionNotServable(apiError(503, { code: "CONFERENCE_CONTROL_UNAVAILABLE" })),
+		).toBe(false);
+	});
+
+	it("falls back without pretending to know what happened", () => {
+		expect(conferenceModerationMessage(new Error("boom"))).toContain("Try again");
+		expect(CONFERENCE_MODERATION_ERROR_CODES).toHaveLength(5);
 	});
 });

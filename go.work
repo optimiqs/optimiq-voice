@@ -16,4 +16,5 @@ use (
 	./apps/mediad
 	./apps/sipd
 	./packages/events-go
+	./packages/runtime-go
 )

@@ -1,4 +1,5 @@
 import { ariDeviceStateSchema, ariEndpointSchema } from "../models";
+import { encodeSegment } from "../url";
 import type { AriHttpClient } from "../http-client";
 import type { AriDeviceState, AriEndpoint } from "../models";
 
@@ -25,7 +26,7 @@ export class AriEndpoints {
 	/** `GET /endpoints/{tech}` — every peer of one channel technology (`PJSIP`). */
 	async listByTechnology(technology: string): Promise<readonly AriEndpoint[]> {
 		return await this.http.requestParsed(
-			{ method: "GET", path: `/endpoints/${encodeURIComponent(technology)}` },
+			{ method: "GET", path: `/endpoints/${encodeSegment(technology)}` },
 			ariEndpointSchema.array(),
 		);
 	}
@@ -35,7 +36,7 @@ export class AriEndpoints {
 		return await this.http.requestParsedOptional(
 			{
 				method: "GET",
-				path: `/endpoints/${encodeURIComponent(technology)}/${encodeURIComponent(resource)}`,
+				path: `/endpoints/${encodeSegment(technology)}/${encodeSegment(resource)}`,
 			},
 			ariEndpointSchema,
 		);
@@ -57,7 +58,7 @@ export class AriDeviceStates {
 	/** `GET /deviceStates/{name}`. */
 	async get(deviceName: string): Promise<AriDeviceState | undefined> {
 		return await this.http.requestParsedOptional(
-			{ method: "GET", path: `/deviceStates/${encodeURIComponent(deviceName)}` },
+			{ method: "GET", path: `/deviceStates/${encodeSegment(deviceName)}` },
 			ariDeviceStateSchema,
 		);
 	}

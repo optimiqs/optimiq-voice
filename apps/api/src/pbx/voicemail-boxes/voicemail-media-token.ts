@@ -95,3 +95,21 @@ export function voicemailMediaPath(token: string): string {
  * `../../etc/passwd`. Two different threats, two different checks.
  */
 export const resolveVoicemailObjectPath = resolveRecordingObjectPath;
+
+/**
+ * Content type from the object key's extension. WAV is what the engine writes today.
+ *
+ * Here rather than in each caller because both halves of the slice need it and they must not drift:
+ * the messages path feeds it to a BROWSER and the transcription path feeds it to the provider, so
+ * adding a codec in one file and not the other is a format one of the two silently mislabels.
+ */
+export function voicemailContentTypeFor(objectKey: string): string {
+	const lower = objectKey.toLowerCase();
+	if (lower.endsWith(".mp3")) {
+		return "audio/mpeg";
+	}
+	if (lower.endsWith(".ogg") || lower.endsWith(".opus")) {
+		return "audio/ogg";
+	}
+	return "audio/wav";
+}

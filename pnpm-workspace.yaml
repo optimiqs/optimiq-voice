@@ -25,6 +25,7 @@ packageExtensions:
 # NATS transport) and sharp arrives under `next` (apps/web). Dropping them turns `pnpm install`
 # into a non-zero exit with ERR_PNPM_IGNORED_BUILDS.
 onlyBuiltDependencies:
+  - "@swc/core"
   - esbuild
   - protobufjs
   - sharp
@@ -60,6 +61,7 @@ minimumReleaseAgeExclude:
   - "@aws-sdk/s3-request-presigner@3.1107.0"
 
 allowBuilds:
+  "@swc/core": true
   esbuild: true
   msgpackr-extract: true
   protobufjs: true

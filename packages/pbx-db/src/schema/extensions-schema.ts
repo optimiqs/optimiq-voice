@@ -1,12 +1,24 @@
-import { boolean, index, integer, jsonb, pgTable, text, uniqueIndex } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import {
+	boolean,
+	check,
+	index,
+	integer,
+	jsonb,
+	pgTable,
+	text,
+	uniqueIndex,
+} from "drizzle-orm/pg-core";
 import {
 	auditTimestampColumns,
 	tenantOrganizationIdColumn,
+	utcTimestamp,
 	uuidEntityId,
 	uuidV7PrimaryKey,
 } from "@optimiq-voice/db";
-import { tenantIsolationPolicy } from "../tenant";
+import { tenantCompositeForeignKey, tenantIsolationPolicy } from "../tenant";
 import { mohClass } from "./media-schema";
+import { pinSet } from "./pins-schema";
 
 /**
  * Extensions — the tenant's internal endpoints. FusionPBX carries ~55 columns here; this is the
@@ -26,6 +38,18 @@ export type RecordPolicy = (typeof RECORD_POLICIES)[number];
  */
 export const TOLL_CLASSES = ["internal", "local", "national", "international", "premium"] as const;
 export type TollClass = (typeof TOLL_CLASSES)[number];
+
+/**
+ * Whether this extension's outbound caller id is shown to the far end — CLIP/CLIR.
+ *
+ * `restricted` is the standing withhold: sipd sends the anonymous `From` of RFC 3323 §4.1.1.3 plus
+ * `Privacy: id`, and the real number still travels in `P-Asserted-Identity` so the carrier's own
+ * authorisation and any lawful-intercept path keep the identity. It is a presentation decision, not
+ * a suppression of the number, which is why it sits beside `outbound_caller_id_number` rather than
+ * replacing it. The emergency path ignores it outright: a 911 call presents the ELIN.
+ */
+export const CALLER_ID_PRESENTATIONS = ["allowed", "restricted"] as const;
+export type CallerIdPresentation = (typeof CALLER_ID_PRESENTATIONS)[number];
 
 /** How an extension_user link participates in the extension. */
 export const EXTENSION_USER_ROLES = ["primary", "shared", "delegate"] as const;
@@ -61,12 +85,50 @@ export const extension = pgTable.withRLS(
 		 */
 		sipSecretRef: text("sip_secret_ref").notNull(),
 		sipPasswordHa1: text("sip_password_ha1"),
+		/**
+		 * The handle this line authenticated with BEFORE its last rotation, kept until
+		 * {@link extension.sipSecretGraceUntil}.
+		 *
+		 * A rotation with no grace is an outage. The new password reaches the handset through a
+		 * provisioning fetch the handset decides the timing of — a reboot, a resync, its own
+		 * check-in interval — so between the moment this row changes and the moment that fetch
+		 * happens, the phone is holding a credential the platform has stopped accepting, and the
+		 * symptom is a desk phone that has silently stopped ringing. Every rotation would therefore
+		 * have to be scheduled against a reboot window, which is how credential rotation becomes a
+		 * thing nobody does.
+		 *
+		 * So both are accepted for a bounded interval and the OLD one is stored rather than the new
+		 * one being staged: the platform is authoritative for the new secret the instant the
+		 * rotation is written, which means the audit row, the provisioning render and the credential
+		 * reply all agree from that instant, and the only thing with a deadline on it is the value
+		 * that is on its way out. Staging the new one instead would leave a window in which the
+		 * rendered config and the accepted credential disagree, which is the bug this column exists
+		 * to prevent.
+		 *
+		 * NULL — which is every line that has never been rotated — means there is no second
+		 * credential, and the grace column is meaningless without it.
+		 */
+		sipSecretRefPrevious: text("sip_secret_ref_previous"),
+		/**
+		 * When the previous handle stops being accepted. NULL, or an instant already past, means it
+		 * is not accepted now.
+		 *
+		 * Read fail-CLOSED: the credential path compares against the current clock on every lookup
+		 * and never caches an answer past this instant, so a grace that has expired cannot be served
+		 * out of a cache that was warmed while it held.
+		 */
+		sipSecretGraceUntil: utcTimestamp("sip_secret_grace_until"),
 		/** Caller id presented on internal calls. */
 		callerIdName: text("caller_id_name"),
 		callerIdNumber: text("caller_id_number"),
 		/** Caller id presented to the PSTN; overridden per outbound route when set there. */
 		outboundCallerIdName: text("outbound_caller_id_name"),
 		outboundCallerIdNumber: text("outbound_caller_id_number"),
+		/** Whether that number is presented to the far end. See {@link CALLER_ID_PRESENTATIONS}. */
+		outboundCallerIdPresentation: text("outbound_caller_id_presentation")
+			.$type<CallerIdPresentation>()
+			.notNull()
+			.default("allowed"),
 		/** Caller id presented on emergency calls; must map to a validated emergency address. */
 		emergencyCallerIdName: text("emergency_caller_id_name"),
 		emergencyCallerIdNumber: text("emergency_caller_id_number"),
@@ -86,6 +148,22 @@ export const extension = pgTable.withRLS(
 		forwardUnregisteredDestination: text("forward_unregistered_destination"),
 		followMe: jsonb("follow_me").$type<FollowMeConfig>(),
 		recordPolicy: text("record_policy").$type<RecordPolicy>().notNull().default("none"),
+		/**
+		 * Pause the tap while this endpoint's caller is typing digits — the PCI-DSS 3.4 reflex.
+		 *
+		 * A card number read aloud is a problem a policy can address; a card number KEYED into an
+		 * IVR is one only the recorder can, because the DTMF is in the audio and a stored tone is a
+		 * stored PAN. So the pause is armed per endpoint rather than per call: the desks that take
+		 * payments are a stable, small set, and asking an agent to remember a feature code mid-card
+		 * is a control that fails on the calls it exists for.
+		 *
+		 * `not null default false` and NOT nullable-inherit, unlike the consent columns: this is a
+		 * behaviour, not a posture to be resolved up a hierarchy, and off is what every extension did
+		 * before the column existed. The org-level setting is the fallback the compiler applies when
+		 * the extension says nothing louder than its default — see the resolution order in the
+		 * engine's recording gate.
+		 */
+		recordAutoPauseOnDtmf: boolean("record_auto_pause_on_dtmf").notNull().default(false),
 		mohClassId: uuidEntityId("moh_class_id").references(() => mohClass.id, {
 			onDelete: "set null",
 		}),
@@ -109,6 +187,53 @@ export const extension = pgTable.withRLS(
 		 * `extensionsByNumber`, never from this table.
 		 */
 		pickupGroup: text("pickup_group"),
+		/**
+		 * Screen EXTERNAL callers before this extension is rung.
+		 *
+		 * When it is on, a caller from outside the organization is asked to record their name; the
+		 * extension hears "call from <recording>" and presses 1 to accept the call or 2 to reject it.
+		 * A rejected call takes the same branch a busy one would, so the caller meets voicemail rather
+		 * than a dead line — the screen decides who gets through, not whether the caller is served.
+		 *
+		 * Scoped to external callers only, and that is a deliberate asymmetry rather than an
+		 * unfinished feature. An internal colleague already arrives with a name and a number on the
+		 * handset's display, so the recording adds nothing a glance does not already give; screening
+		 * them would put ten extra seconds on the front of every internal call in the building, which
+		 * is how a feature that helps with one nuisance caller a week becomes the thing everybody
+		 * asks to have switched off. The engine decides "external" the same way the rest of the call
+		 * path does: a leg that did not originate from an extension of this organization.
+		 *
+		 * Default off, because it lengthens every inbound call it touches — the caller records, the
+		 * callee listens, the callee decides — and a tenant that has never opened this page must not
+		 * discover the delay by taking a call.
+		 */
+		callScreening: boolean("call_screening").notNull().default(false),
+		/**
+		 * The set of codes that may claim this extension on a shared handset — the hot-desk gate.
+		 *
+		 * A reference to `pin_set` and not a `hot_desk_pin` column of its own, because the digest
+		 * format, the attempt budget, the digit timeout, the prompt pair and the "which code was
+		 * used" identity are all already modelled there and getting a second PIN store subtly wrong
+		 * is exactly the failure `pins-schema.ts` was written to avoid. An extension whose owner
+		 * should be able to hot desk gets a set with their code in it; several extensions may share
+		 * one set, which is how a team of six that rotates desks is configured with one form.
+		 *
+		 * NULL is the ordinary state and it FAILS CLOSED: an extension with no hot-desk set cannot be
+		 * claimed, and `hot-desk.service.ts` refuses the login. That is the right default for a
+		 * feature whose whole effect is "send this person's calls to a phone they are standing at" —
+		 * the alternative, an ungated login, would let anyone in the building take anyone's calls.
+		 *
+		 * A single-column reference with `ON DELETE SET NULL`, matching `outbound_route.pin_set_id`
+		 * exactly rather than taking a tenant-composite key. The composite form is always `cascade`
+		 * (`tenant.ts` says why), and cascading here would DELETE THE EXTENSION when somebody retired
+		 * a code list. `set null` is also the fail-closed direction: losing the set stops the
+		 * extension being hot-deskable rather than making it claimable with no PIN at all. The
+		 * cross-tenant reference the composite key would have prevented is instead prevented where
+		 * `pin_set_id` already is — `assertDestinations`/the resource guard on the write path.
+		 */
+		hotDeskPinSetId: uuidEntityId("hot_desk_pin_set_id").references(() => pinSet.id, {
+			onDelete: "set null",
+		}),
 		tollClass: text("toll_class").$type<TollClass>().notNull().default("national"),
 		callTimeoutSeconds: integer("call_timeout_seconds").notNull().default(30),
 		maxRegistrations: integer("max_registrations").notNull().default(3),
@@ -123,6 +248,23 @@ export const extension = pgTable.withRLS(
 		index("extension_organization_label_idx").on(table.organizationId, table.label),
 		index("extension_organization_toll_class_idx").on(table.organizationId, table.tollClass),
 		index("extension_organization_moh_class_idx").on(table.organizationId, table.mohClassId),
+		/**
+		 * The target of the tenant-composite foreign keys that reference this table.
+		 *
+		 * PostgreSQL evaluates referential integrity with RLS bypassed, and a policy only
+		 * constrains a row's OWN `organization_id` — so a single-column reference to `id` lets one
+		 * tenant point a row at another tenant's row and nothing in the database objects. Every
+		 * child references `(organization_id, id)` instead, which needs this unique index.
+		 */
+		uniqueIndex("extension_organization_id_key").on(table.organizationId, table.id),
+		index("extension_organization_hot_desk_pin_set_idx").on(
+			table.organizationId,
+			table.hotDeskPinSetId,
+		),
+		check(
+			"extension_outbound_caller_id_presentation_check",
+			sql`outbound_caller_id_presentation in ('allowed', 'restricted')`,
+		),
 		tenantIsolationPolicy("extension"),
 	],
 );
@@ -137,9 +279,7 @@ export const extensionUser = pgTable.withRLS(
 	{
 		id: uuidV7PrimaryKey(),
 		organizationId: tenantOrganizationIdColumn(),
-		extensionId: uuidEntityId("extension_id")
-			.notNull()
-			.references(() => extension.id, { onDelete: "cascade" }),
+		extensionId: uuidEntityId("extension_id").notNull(),
 		/** `user.id` in the auth database. No FK — see the note above. */
 		userId: uuidEntityId("user_id").notNull(),
 		role: text("role").$type<ExtensionUserRole>().notNull().default("primary"),
@@ -153,6 +293,11 @@ export const extensionUser = pgTable.withRLS(
 		),
 		index("extension_user_organization_user_idx").on(table.organizationId, table.userId),
 		index("extension_user_organization_extension_idx").on(table.organizationId, table.extensionId),
+		tenantCompositeForeignKey({
+			name: "extension_user_extension_fk",
+			columns: [table.organizationId, table.extensionId],
+			foreignColumns: [extension.organizationId, extension.id],
+		}),
 		tenantIsolationPolicy("extension_user"),
 	],
 );

@@ -27,10 +27,15 @@ import { listQuerySchema } from "../shared/pagination";
  * rather than here — this schema does not know it. `z.strictObject` is deliberately NOT used: a
  * browser's `FormData` is free to carry parts this endpoint does not read, and refusing an upload
  * because a form serialised a stray field would be a hostile reading of a transport format.
+ *
+ * `kind` is deliberately absent, for the same reason `mohClassId` is documented as URL-derived: the
+ * ROUTE is the authority on what is being uploaded, and `upload()` has always taken it from
+ * `options.kind`. Accepting the field and then ignoring it is exactly the "I set it and it did
+ * nothing" bug `shared/dto.ts` warns about — and wiring it through would let an uploader stamp
+ * `kind: "phrase"` on a row with an `object_key`, the pair `prompt_object_key_kind_check` forbids.
  */
 export const uploadPromptFieldsDto = z.object({
 	name: displayName.optional(),
-	kind: z.enum(PROMPT_KINDS).optional(),
 	/** BCP 47. Stored for the day a tenant has one prompt per language. */
 	language: z
 		.string()

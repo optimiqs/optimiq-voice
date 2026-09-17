@@ -3,6 +3,8 @@ import {
 	invalidWebhookSelectors,
 	isWebhookFamily,
 	parseWebhookSelector,
+	parsedSelectorsMatch,
+	parseWebhookSelectors,
 	selectorsMatch,
 	unservedEventFamilies,
 	WEBHOOK_FAMILIES,
@@ -99,12 +101,39 @@ describe("webhook selectors", () => {
 		expect(selectorsMatch([], "call", "channel.answered")).to.equal(false);
 	});
 
+	it("gives the same answer parsed once as parsed per message", () => {
+		// The dispatcher's hot path matches against `parseWebhookSelectors` output rather than
+		// re-parsing every selector of every cached subscription on every platform event. The two
+		// halves have to stay one function.
+		const selectors = ["calls.evt.v1.>", "queues.evt.v1.caller.joined", "nonsense"];
+		const parsed = parseWebhookSelectors(selectors);
+		for (const [family, type] of [
+			["call", "channel.answered"],
+			["queue", "caller.joined"],
+			["queue", "caller.left"],
+			["cdr", "leg.written"],
+		] as const) {
+			expect(parsedSelectorsMatch(parsed, family, type)).to.equal(
+				selectorsMatch(selectors, family, type),
+			);
+		}
+	});
+
 	it("keeps the unserved families a decision rather than an omission", () => {
 		expect([...unservedEventFamilies()].sort()).to.deep.equal([
 			"audit",
 			"media",
 			"provision",
 			"registration",
+			// The SIP edge's dialog lifecycle. Unserved because `call` already carries every one of
+			// these transitions in business terms — serving both would deliver one call twice, in two
+			// vocabularies, one of which leaks SIP and pod identity. See webhook-selectors.ts.
+			"sipDialog",
+			// Deliberately unserved, not forgotten: a raw status transition is the wrong shape for
+			// the outage callback an integrator actually wants (no damping, a flap per POST). See
+			// the family-by-family note in webhook-selectors.ts; the status reaches tenants via
+			// the trunk list's persisted columns and the `trunks` live topic instead.
+			"trunk",
 		]);
 		for (const family of WEBHOOK_FAMILIES) {
 			expect(isWebhookFamily(family), family).to.equal(true);

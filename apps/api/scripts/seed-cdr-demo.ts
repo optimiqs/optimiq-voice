@@ -218,11 +218,11 @@ async function main(): Promise<void> {
 		 * is a script an operator invokes rather than a button in a UI.
 		 */
 		if (flag("purge")) {
-			await database.adminDb.delete(recordings).where(eq(recordings.organizationId, organizationId));
+			await database.adminDb
+				.delete(recordings)
+				.where(eq(recordings.organizationId, organizationId));
 			await database.adminDb.delete(callLegs).where(eq(callLegs.organizationId, organizationId));
-			process.stdout.write(
-				`${JSON.stringify({ event: "cdr_seed_purged", organizationId })}\n`,
-			);
+			process.stdout.write(`${JSON.stringify({ event: "cdr_seed_purged", organizationId })}\n`);
 			return;
 		}
 

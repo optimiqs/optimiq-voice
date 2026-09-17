@@ -38,14 +38,14 @@ import type { AppSession } from "@optimiq-voice/auth";
  * addresses they point at would render a column of ids. Writing is the decision that carries
  * regulatory weight, and writing is what the narrower permission guards.
  *
- * ## `PATCH` is a real edit, and that is a deliberate risk
+ * ## `PATCH` is a real edit, and it now re-asks the carrier
  *
- * An address that a carrier has validated and that a DID is using can be edited in place, and doing
- * so does not clear `validated` — because this API cannot revalidate and clearing the flag would
- * turn every typo fix into "this number can no longer originate 911". The honest consequence is
- * that a substantive edit leaves a `validated: true` row whose address the carrier never saw. The
- * admin UI warns on any edit to an address in use, and the real fix is the carrier-provisioning
- * path that owns the flag; see `emergency-addresses.resource.ts`.
+ * An address that a carrier has validated and that a DID is using can be edited in place. It used
+ * to keep `validated: true` through that edit — this API could not revalidate, and clearing the flag
+ * would have turned every typo fix into "this number can no longer originate 911" — which left a
+ * validated row whose address the carrier had never seen. Now `create` and `PATCH` both run the
+ * carrier validation themselves when a carrier is configured, so the flag follows the address
+ * rather than lagging behind it. See `emergency-addresses.service.ts`.
  */
 @Controller("api/v1/emergency-addresses")
 export class EmergencyAddressesController {
@@ -79,6 +79,23 @@ export class EmergencyAddressesController {
 		@Body() body: unknown,
 	) {
 		return await this.addresses.update(session, id, parseDto(updateEmergencyAddressDto, body));
+	}
+
+	/**
+	 * Asks the carrier whether this address is a dispatchable location, and records the answer.
+	 *
+	 * `numbers.emergency` rather than `numbers.read`, even though it reads like a query: it WRITES
+	 * `validated` and its three companions, and those four are the regulatory claim this whole table
+	 * exists to make.
+	 *
+	 * Answers 200 whether the carrier accepted or refused — the refusal, with the carrier's own
+	 * reason and any corrected address it offered, is the useful answer — and
+	 * `503 CARRIER_NOT_CONFIGURED` on a deployment with no `TELNYX_API_KEY`.
+	 */
+	@Post(":id/validate")
+	@RequirePermissions("numbers.emergency")
+	async validate(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
+		return await this.addresses.validateWithCarrier(session, id);
 	}
 
 	/**

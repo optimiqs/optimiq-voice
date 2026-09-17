@@ -144,16 +144,64 @@ describe("toMediaEventFromMediad", () => {
 	});
 
 	/**
-	 * A deliberate MIRROR of the ARI path, not an omission. `toMediaEvent` drops Asterisk's
-	 * `PlaybackFinished` because `MediaPort.play` returns as soon as audio has STARTED and nothing
-	 * above the seam waits for a prompt to end. Raising a member here would make the two drivers
-	 * disagree about a shape no consumer branches on — and would give the mediad driver a behaviour
-	 * a confirmation IVR was never written against.
+	 * The one number no layer above the packet path can compute.
+	 *
+	 * This mapping used to answer `undefined`, and the argument was sound for as long as nothing
+	 * above the seam waited for a prompt to end. `CallControl.announceConsent` does: it writes a
+	 * compliance record naming the parties the recording-disclosure prompt reached, and it used to
+	 * stamp that record when `MediaPort.play` RESOLVED. `play` resolves on acceptance, so a WebRTC
+	 * party still finishing ICE and DTLS was written down as announced to while this very event was
+	 * reporting `playedMs 0` on the same prompt. The fact was on the wire; the engine dropped it.
 	 */
-	it("drops playback.finished on every reason, exactly as the ARI path drops PlaybackFinished", () => {
-		for (const reason of ["completed", "stopped", "error"] as const) {
-			expect(toMediaEventFromMediad(playbackFinished(reason))).toBeUndefined();
-		}
+	it("turns playback.finished into the playback-finished the consent gate waits for", () => {
+		expect(toMediaEventFromMediad(playbackFinished("completed"))).toEqual({
+			type: "playback-finished",
+			// The session id IS the engine's channel id under this driver.
+			channelId: SESSION,
+			// Echoed back verbatim from the `start-playback` the engine sent, so a waiter can key on
+			// the reference it assigned rather than on the leg — two prompts on one leg must not see
+			// each other's completion.
+			playbackRef: "pb-1",
+			playedMs: 1_240,
+			reason: "completed",
+		});
+	});
+
+	/**
+	 * `playedMs 0` is the live failure, and it must survive the mapping as a NUMBER.
+	 *
+	 * `mediad` accepted the prompt, decoded it, scheduled 52 frames and wrote every one of them into
+	 * a transport with no peer. Nothing else about the call is wrong. If this mapped to an absent
+	 * `playedMs` the consumer could not tell it from a driver that does not measure delivery at all,
+	 * and would credit the party with an announcement it demonstrably did not receive.
+	 */
+	it("carries a playedMs of 0 through as 0, with the media plane's own reason and detail", () => {
+		const envelope = makeMediaEvent("playback.finished", {
+			orgId: ORG,
+			source: "mediad",
+			data: {
+				sessionId: SESSION,
+				instanceId: "mediad-1",
+				callId: CALL,
+				playbackRef: "pb-1",
+				reason: "error",
+				playedMs: 0,
+				detail: "rtp: sending a playback frame to 127.0.0.1:9: WebRTC media is not connected",
+			},
+		});
+		expect(toMediaEventFromMediad(envelope)).toEqual({
+			type: "playback-finished",
+			channelId: SESSION,
+			playbackRef: "pb-1",
+			playedMs: 0,
+			reason: "error",
+			detail: "rtp: sending a playback frame to 127.0.0.1:9: WebRTC media is not connected",
+		});
+	});
+
+	/** No detail is a missing KEY, not an explicit `undefined` — the shape every member here keeps. */
+	it("omits detail entirely when the media plane volunteered none", () => {
+		expect(toMediaEventFromMediad(playbackFinished("stopped"))).not.toHaveProperty("detail");
 	});
 
 	/**
@@ -169,7 +217,36 @@ describe("toMediaEventFromMediad", () => {
 			// `stopRecording(name)` and every waiter key on the same string.
 			recordingName: "rec-1",
 			durationMs: 4_000,
+			bytes: 64_044,
 		});
+	});
+
+	it("carries the PCI pause intervals through, since nothing above the seam can produce them", () => {
+		const event = makeMediaEvent("recording.finished", {
+			orgId: ORG,
+			source: "mediad",
+			data: {
+				sessionId: SESSION,
+				instanceId: "mediad-1",
+				callId: CALL,
+				recordingRef: "rec-1",
+				reason: "stopped" as const,
+				durationMs: 30_000,
+				bytes: 480_044,
+				objectKey: `${ORG}/${CALL}/rec-1.wav`,
+				direction: "both" as const,
+				pauses: [{ startMs: 8_000, endMs: 14_000 }],
+			},
+		});
+
+		expect(toMediaEventFromMediad(event)).toMatchObject({
+			type: "recording-finished",
+			pauses: [{ startMs: 8_000, endMs: 14_000 }],
+		});
+	});
+
+	it("leaves the pauses off a recording nobody paused", () => {
+		expect(toMediaEventFromMediad(recordingFinished())).not.toHaveProperty("pauses");
 	});
 
 	it("treats every complete-file ending as finished, however the recording stopped", () => {
@@ -252,14 +329,14 @@ describe("decodeMediadEvent", () => {
 		expect(decoded?.envelope.type).toBe("session.rtp-timeout");
 	});
 
-	it("validates a playback.finished without raising a domain event", () => {
-		// It still has to PARSE: the payload is written by a Go process, and a decoder that dropped
+	it("decodes a playback.finished and raises the domain event", () => {
+		// It still has to PARSE: the payload is written by a Go process, and a decoder that trusted
 		// the type before validating would hide a drift the CI gate exists to catch.
 		const envelope = playbackFinished("error");
 		const decoded = decodeMediadEvent(envelope.subject, overTheWire(envelope));
 		expect(decoded).toBeDefined();
-		expect(decoded?.event).toBeUndefined();
 		expect(decoded?.envelope.type).toBe("playback.finished");
+		expect(decoded?.event).toMatchObject({ type: "playback-finished", playedMs: 1_240 });
 		if (decoded?.envelope.type === "playback.finished") {
 			expect(decoded.envelope.data.playbackRef).toBe("pb-1");
 			expect(decoded.envelope.data.playedMs).toBe(1_240);

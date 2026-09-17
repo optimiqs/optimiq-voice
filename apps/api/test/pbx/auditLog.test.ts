@@ -5,6 +5,7 @@ import { makeTestModuleRuntime } from "@optimiq-voice/effect-runtime";
 import { API_KEY_PRINCIPAL_ROLE } from "../../src/auth/auth-http.plugin";
 import { ExtensionsService } from "../../src/pbx/extensions/extensions.service";
 import { IvrMenuOptionsService } from "../../src/pbx/ivr-menus/ivr-menus.service";
+import { OrgLimitsService } from "../../src/pbx/org-limits/org-limits.service";
 import {
 	actorFromSession,
 	asInetAddress,
@@ -50,8 +51,30 @@ function sessionFor(overrides: Partial<AppSession["user"]> = {}, ip?: string | n
 			userAgent: "Mozilla/5.0 (test)",
 		},
 		user: { id: USER_ID, email: "u@test", name: "U", emailVerified: true, ...overrides },
+		// Unscoped extension grants: these actor-threading specs are the manager/admin path, so
+		// `ExtensionsService`'s `.own` overrides pass straight through to the repository.
+		permissions: ["extensions.read", "extensions.write"],
 	};
 }
+
+/** Ownership handle for `ExtensionsService`; unused on the unscoped path (see `sessionFor`). */
+const FAKE_DB = {
+	withTenantScope: async <T>(_organizationId: string, work: (tx: never) => Promise<T>) =>
+		await work({ select: () => ({ from: () => ({ where: async () => [] }) }) } as never),
+} as unknown as import("@optimiq-voice/pbx-db").PbxDatabaseClient;
+
+/**
+ * An organization with no quotas.
+ *
+ * These specs are about the generic service's plumbing — the tenant argument, the resource
+ * descriptor, the actor — and `ExtensionsService` is the resource they happen to use. Its create
+ * path now asks about the extension quota first, so it needs one; an unlimited organization is what
+ * every tenant is until somebody sets a ceiling, and it keeps the quota out of assertions that are
+ * not about it. `orgLimits.test.ts` is where the enforcement itself is tested.
+ */
+const NO_LIMITS = {
+	assertMayCreate: async () => undefined,
+} as unknown as OrgLimitsService;
 
 describe("audit-log actor", () => {
 	it("attributes a person to their user id and leaves actor_ref for the non-user cases", () => {
@@ -207,7 +230,7 @@ function fakeRuntime(): { runtime: PbxRepositoryRuntime; calls: Recorded[] } {
 describe("audit actor threading", () => {
 	it("passes an actor as the last argument of every parent write", async () => {
 		const { runtime, calls } = fakeRuntime();
-		const service = new ExtensionsService(runtime);
+		const service = new ExtensionsService(runtime, NO_LIMITS, FAKE_DB);
 		const session = sessionFor();
 		await service.create(session, { number: "100" });
 		await service.update(session, "id", { label: "x" });
@@ -244,7 +267,7 @@ describe("audit actor threading", () => {
 	it("does not attach an actor to a read", async () => {
 		// A read is not a change, and a ledger that recorded one would bury the changes.
 		const { runtime, calls } = fakeRuntime();
-		const service = new ExtensionsService(runtime);
+		const service = new ExtensionsService(runtime, NO_LIMITS, FAKE_DB);
 		await service.list(sessionFor(), { page: 1, limit: 20 } as never);
 		await service.get(sessionFor(), "id");
 		expect(calls[0]?.args).to.have.length(3);

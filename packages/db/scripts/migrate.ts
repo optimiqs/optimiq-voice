@@ -61,6 +61,10 @@ async function main(): Promise<void> {
 		url,
 		applicationName: "optimiq-voice-migrator",
 		poolMaxConnectionsOverride: 1,
+		// DDL is not request-shaped: the runtime guardrails would abort the first index build or
+		// backfill that outlives them, mid-transaction, mid-release. 0 disables both in PostgreSQL.
+		statementTimeoutMs: 0,
+		idleInTransactionSessionTimeoutMs: 0,
 	});
 	try {
 		await migrate(drizzle({ client }), { migrationsFolder });

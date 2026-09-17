@@ -25,12 +25,20 @@
  */
 
 import { RoutingArtifactShapeError, RoutingArtifactVersionError } from "./errors";
+import type { CompiledAttestationPolicy } from "./attestation";
 import type { Diagnostic } from "./diagnostics";
 import type { CompiledFeatureCode } from "./feature-codes";
 import type { CompiledPattern } from "./patterns";
 import type { PlanNodeId, PlanNodeTable } from "./plan";
-import type { CallBlockAction, CallBlockDirection, TollClass } from "./snapshot";
+import type { RecordingConsentPolicy } from "./recording-consent";
+import type {
+	CallBlockAction,
+	CallBlockDirection,
+	CallerIdPresentation,
+	TollClass,
+} from "./snapshot";
 import type { CompiledTimeCondition } from "./time-conditions";
+import type { CompiledTranslationRuleset } from "./translations";
 
 /**
  * Artifact schema version.
@@ -38,8 +46,36 @@ import type { CompiledTimeCondition } from "./time-conditions";
  * Bump on any change to the shapes in this file or in `plan.ts` that a reader compiled against the
  * previous version could misinterpret. A reader that finds an unexpected version must discard the
  * cache entry and recompile — never walk it, never "best effort".
+ *
+ * # v1 → v2: the `paging` node kind
+ *
+ * A new OPTIONAL FIELD is not a bump — an old reader ignores it and behaves as it did before, which
+ * is why `TrunkDialPlanNode.emergency` and `ExtensionPlanNode.pickupGroup` arrived without one. A
+ * new NODE KIND is different in kind, not in degree: a v1 reader switches over `node.kind` and has
+ * no case for `"paging"`, so it meets a node it cannot execute in the middle of a live call. There
+ * is no safe default for that — falling through would drop the call silently, and guessing would
+ * dial somebody. Discarding the cache entry and recompiling is the only honest answer, and the
+ * version is what tells the reader to do it.
+ *
+ * # v2 → v3: the T2 admin block's three node kinds
+ *
+ * `call-flow`, `stream` and `dial-by-name`, for exactly the reason `paging` bumped v1 → v2: three
+ * new members of `PlanNodeKind`, and a v2 reader has a case for none of them. Everything else this
+ * wave added is either an optional FIELD (`TrunkDialPlanNode.pinSet`,
+ * `TimeConditionPlanNode`'s override handling, which a v2 reader ignores and evaluates the clock for)
+ * or a new TABLE on this envelope (`phrases`, `speedDials`, `inboundTranslations`), which a v2
+ * reader also ignores — neither of those would have been a bump on its own.
+ *
+ * # v3 → v4: the `shared-line` node kind
+ *
+ * One new member of `PlanNodeKind`, and a v3 reader has no case for it — the same argument `paging`
+ * and the T2 kinds make. The per-extension `sharedLineAppearances` projection on
+ * {@link ExtensionIndexEntry} that ships alongside it is an optional FIELD a v3 reader ignores, and
+ * the `"shared-line"` member added to {@link InternalNumberEntry}'s `kind` is a new value in an
+ * existing enum a v3 reader never reaches (it only lands on a key it compiled itself) — neither
+ * would have been a bump on its own. The node kind is what forces it.
  */
-export const ROUTING_ARTIFACT_VERSION = 1;
+export const ROUTING_ARTIFACT_VERSION = 4;
 
 /** The three routing namespaces. The rpc contract's `routingContext` is one of these. */
 export const ROUTING_CONTEXTS = ["inbound", "internal", "outbound"] as const;
@@ -86,6 +122,19 @@ export interface InboundRule {
 	readonly failoverNodeId?: PlanNodeId;
 	/** Prefixed onto the inbound caller-id name, from the DID. */
 	readonly callerIdNamePrefix?: string;
+	/**
+	 * This rule's own recording-consent policy, when the tenant set one on the route.
+	 *
+	 * Absent means INHERIT — the DID's override if it has one, otherwise
+	 * {@link CompiledRoutingSettings.recording}. Absent is what every artifact compiled before this
+	 * field carries and what every route that has not been given an override carries, so a reader
+	 * that ignores it falls back to the org policy, which before this field was the only policy
+	 * there was. That is why this is not an artifact-version bump: an old reader that never looks at
+	 * the key behaves exactly as it did.
+	 */
+	readonly recordingConsentPolicy?: RecordingConsentPolicy;
+	/** The prompt this rule announces with. Absent means the DID's, or the org's, or the seeded one. */
+	readonly recordingConsentPromptId?: string;
 }
 
 /**
@@ -101,21 +150,55 @@ export interface InboundMatchTable {
 	readonly didDefaults: Readonly<Record<string, InboundDidDefault>>;
 	/** Taken when neither a rule nor a DID default applies. */
 	readonly noMatchNodeId: PlanNodeId;
+	/**
+	 * Caller-id normalisation per trunk, keyed by `trunk.id`.
+	 *
+	 * Applied BEFORE the call-block screen and before the rule walk, which is the whole point: one
+	 * carrier presents `0044…` and the next presents `+44…`, and a tenant's blocklist should not have
+	 * to know which trunk a call arrived on. Absent for a trunk with no ruleset, which is nearly all
+	 * of them, and absent entirely in an artifact compiled before rulesets existed — a reader that
+	 * finds neither does what every release before this one did and screens the number as it arrived.
+	 */
+	readonly inboundTranslations?: Readonly<Record<string, CompiledTranslationRuleset>>;
 }
 
 export interface InboundDidDefault {
 	readonly phoneNumberId: string;
 	readonly e164: string;
+	/** Always `true`: the compiler drops a disabled number rather than writing a row for it. */
 	readonly enabled: boolean;
 	readonly recordEnabled: boolean;
 	readonly callerIdNamePrefix?: string;
 	readonly destinationNodeId: PlanNodeId;
+	/**
+	 * This DID's own recording-consent policy, when the tenant set one on the number.
+	 *
+	 * The same inherit-when-absent contract {@link InboundRule.recordingConsentPolicy} carries, and
+	 * present on the DID default as well as on the rule because a call that matched no rule still
+	 * reaches this row and still has to be told what it owes the caller.
+	 */
+	readonly recordingConsentPolicy?: RecordingConsentPolicy;
+	/** The prompt this DID announces with. Absent means the org's, or the engine's seeded one. */
+	readonly recordingConsentPromptId?: string;
 }
 
 /** What an internal number resolves to, and which entity claimed it. */
 export interface InternalNumberEntry {
 	readonly number: string;
-	readonly kind: "extension" | "ring-group" | "ivr-menu" | "queue" | "conference" | "voicemail";
+	readonly kind:
+		| "extension"
+		| "ring-group"
+		| "ivr-menu"
+		| "queue"
+		| "conference"
+		| "paging-group"
+		| "voicemail"
+		| "call-flow"
+		| "dial-by-name"
+		| "shared-line"
+		// A BARE-NUMERIC speed dial only. A star-prefixed one lives in `speedDials`, because a `*` in
+		// this map's keys would be read as an extension number by everything that walks it.
+		| "speed-dial";
 	readonly entityId: string;
 	readonly nodeId: PlanNodeId;
 }
@@ -125,6 +208,20 @@ export interface ParkSlotRange {
 	readonly parkLotId: string;
 	readonly slotStart: number;
 	readonly slotEnd: number;
+	readonly nodeId: PlanNodeId;
+}
+
+/**
+ * An organization-wide short code.
+ *
+ * Its own table rather than an entry in {@link InternalMatchTable.numbers} because the codes are not
+ * all numbers: a `*01` cannot live in a map consulted AFTER feature codes have already had their
+ * chance at anything beginning with a star. See `speed-dials-schema.ts` for the ordering argument.
+ */
+export interface SpeedDialEntry {
+	readonly speedDialId: string;
+	readonly code: string;
+	readonly label: string;
 	readonly nodeId: PlanNodeId;
 }
 
@@ -188,6 +285,14 @@ export type EmergencyMatchTable = Readonly<Record<string, EmergencyRule>>;
  * may sit in front of it. Feature codes come next because they start with `*` and no extension
  * may; voicemail prefixes come before numbers because `*99200` must not be read as an extension
  * named `*99200`.
+ *
+ * **Speed dials** sit between the voicemail prefixes and the numbers, and the position is argued at
+ * length in `speed-dials-schema.ts`: after feature codes because a feature code must always win
+ * (`*0` is seeded as eavesdrop with a required argument, so an unguarded `*01` would be swallowed as
+ * "eavesdrop on extension 1"), and before exact numbers so a numeric code is reachable at all. The
+ * compiler additionally claims numeric codes through the same duplicate-number check every dialable
+ * entity goes through, so a speed dial numbered `200` collides loudly with extension 200 rather than
+ * shadowing it.
  */
 export interface InternalMatchTable {
 	/** Consulted FIRST, ahead of `callBlock`. Absent in an artifact compiled before E911. */
@@ -197,6 +302,11 @@ export interface InternalMatchTable {
 	readonly voicemailPrefixes: readonly VoicemailPrefixEntry[];
 	/** Keyed by mailbox number, reached through a `voicemailPrefixes` entry. */
 	readonly mailboxes: Readonly<Record<string, MailboxEntry>>;
+	/**
+	 * Organization speed dials, keyed by the exact code dialed. Absent in an artifact compiled before
+	 * they existed, which a reader treats as "this tenant has none".
+	 */
+	readonly speedDials?: Readonly<Record<string, SpeedDialEntry>>;
 	/** Exact dialable numbers: extensions, ring groups, IVR menus, queues, conference rooms. */
 	readonly numbers: Readonly<Record<string, InternalNumberEntry>>;
 	readonly parkSlots: readonly ParkSlotRange[];
@@ -215,6 +325,15 @@ export interface OutboundRule {
 	readonly timeGate?: RouteTimeGate;
 	readonly recordEnabled: boolean;
 	readonly callerIdNumberOverride?: string;
+	/**
+	 * The shared rewrite, applied AFTER `stripDigits`/`prependDigits`.
+	 *
+	 * Two mechanisms rather than one because they answer different questions: the inline pair turns
+	 * what a user's fingers did into the number they meant ("strip the 9"), and the ruleset
+	 * normalises that number for the wire ("ten digits become E.164"). Absent means the route dials
+	 * what the inline pair produced, which is what every release before this one did.
+	 */
+	readonly translation?: CompiledTranslationRuleset;
 	/** The `trunk-dial` node this route dials through. */
 	readonly destinationNodeId: PlanNodeId;
 }
@@ -250,9 +369,20 @@ export interface ExtensionIndexEntry {
 	readonly extensionId: string;
 	readonly number: string;
 	readonly tollClass: TollClass;
+	/** Always `true`: the compiler drops a disabled extension rather than writing a row for it. */
 	readonly enabled: boolean;
 	readonly outboundCallerIdNumber?: string;
 	readonly outboundCallerIdName?: string;
+	/**
+	 * Withhold this extension's number on outbound calls — CLIR.
+	 *
+	 * Written ONLY when the row says `restricted`: `allowed` is the behaviour every artifact
+	 * compiled before this field had, so emitting it would rewrite every tenant's artifact to say
+	 * what its absence already said. Absent therefore means `allowed`, and a reader that predates
+	 * the field ignores it and presents the number, which is the pre-existing behaviour rather than
+	 * a silent withhold.
+	 */
+	readonly outboundCallerIdPresentation?: CallerIdPresentation;
 	readonly emergencyCallerIdNumber?: string;
 	/**
 	 * The caller's pickup group, when they are in one.
@@ -263,15 +393,207 @@ export interface ExtensionIndexEntry {
 	 * org-wide — the documented fallback, not a refusal.
 	 */
 	readonly pickupGroup?: string;
+	/**
+	 * The shared lines this extension appears on, and its appearance index on each.
+	 *
+	 * The same idiom as `pickupGroup`: a per-extension fact carried on the index so the process that
+	 * needs it — the credential responder answering a device's REGISTER — can turn an extension into
+	 * its appearance index without a second query. The responder projects the LOWEST-ordinal entry
+	 * here into the credential reply, which sipd stamps as the `Call-Info` appearance index so the
+	 * phone lights the right shared-line key. Absent means the extension is on no shared line.
+	 */
+	readonly sharedLineAppearances?: readonly ExtensionSharedLineAppearance[];
+	/**
+	 * Pause this extension's recording while digits are being pressed — the PCI rule.
+	 *
+	 * On the index as well as on the node for the reason `pickupGroup` is on both, with the roles
+	 * reversed: the DTMF handler holds the DIALLED number and needs the flag before it has walked to
+	 * a node, and this map is the only number→extension-fact lookup the engine has without a
+	 * database.
+	 *
+	 * Written only when it is `true`. Absent means "do not pause", which is what every extension did
+	 * before the flag existed, so an artifact compiled without it and an artifact compiled for a
+	 * tenant that never set it are the same bytes — and a reader that ignores the key keeps
+	 * recording through the digits exactly as it always has. Not an artifact-version bump for that
+	 * reason.
+	 */
+	readonly recordAutoPauseOnDtmf?: boolean;
 	readonly nodeId: PlanNodeId;
+}
+
+/** One shared line an extension appears on, projected per-extension for the credential path. */
+export interface ExtensionSharedLineAppearance {
+	readonly sharedLineId: string;
+	/** The shared line's dialable number, when it has one. */
+	readonly number?: string;
+	readonly appearanceIndex: number;
+}
+
+/**
+ * An ordered prompt sequence.
+ *
+ * `steps` are `prompt` row ids in play order, already filtered to enabled steps whose audio exists
+ * and is not itself a phrase — the compiler refuses nesting with a diagnostic rather than the media
+ * layer recursing. Never empty: a phrase with no playable step compiles to no entry at all, so a
+ * reader's miss means "play this id as a file" and never "play nothing".
+ */
+export interface CompiledPhrase {
+	readonly promptId: string;
+	readonly name: string;
+	readonly steps: readonly string[];
 }
 
 /** Settings baked into the artifact, already defaulted. */
 export interface CompiledRoutingSettings {
 	readonly defaultTimezone: string;
 	readonly outboundEnabled: boolean;
+	/**
+	 * Hold TLS-registered handsets to SDES-SRTP. See
+	 * {@link import("./snapshot").RoutingSettingsInput.requireSrtpForTlsPhones}.
+	 *
+	 * Optional here rather than defaulted, unlike its neighbours, because absent has to keep meaning
+	 * exactly what it meant before the field existed — the media plane's own floor decides — and
+	 * writing `false` into every artifact would change the compiled bytes for every tenant on the
+	 * platform to say what their engine already did.
+	 */
+	readonly requireSrtpForTlsPhones?: boolean;
 	readonly outboundCallerIdNumber?: string;
 	readonly outboundCallerIdName?: string;
+	/**
+	 * The organization's SIP realm, baked in so the engine can build an extension `{kind:"aor"}`
+	 * dial target (`sip:{number}@{realm}`) on the `apps/sipd` plane without a database handle it does
+	 * not have.
+	 *
+	 * Absent means the tenant configured no realm — every artifact compiled before this field existed
+	 * carries it absent, so an old reader ignores it and behaves exactly as it did, which is why this
+	 * is NOT an artifact-version bump (the same argument {@link maxConcurrentCalls} makes). There is no
+	 * deployment-wide fallback — a realm names exactly one tenant — so the engine refuses the B-leg
+	 * `originate` by name when it is absent, rather than dialling a URI it cannot resolve.
+	 */
+	readonly realm?: string;
+	/**
+	 * The organization's simultaneous-call ceiling, enforced by the engine at ADMISSION.
+	 *
+	 * Absent means unlimited, and absent is what every artifact compiled before this field existed
+	 * carries — so a reader that finds it missing admits every call, which is what every release
+	 * before this one did. That is why this is not an artifact version bump: an optional field an
+	 * old reader ignores leaves it behaving exactly as it did.
+	 *
+	 * The value is a POLICY, not a count. Who counts, and how nearly right the count is, is the
+	 * engine's problem and is documented where it counts.
+	 */
+	readonly maxConcurrentCalls?: number;
+	/**
+	 * The organization's recording-consent policy, already defaulted.
+	 *
+	 * Absent ONLY in an artifact compiled before this block existed — a fresh compile always writes
+	 * it, because every field in it has a compiler default and a half-written policy is worse than
+	 * none. A reader that finds it absent records without announcing, which is what every release
+	 * before this one did; that is why the block is optional and why adding it is not an
+	 * artifact-version bump.
+	 *
+	 * It is a nested object rather than six flat siblings because it is read as a unit: the engine's
+	 * consent gate wants the policy, the prompt and both digits at the same instant, and a
+	 * `declineDigit` that outlived its `consentPolicy` is not a setting anybody can act on.
+	 */
+	readonly recording?: CompiledRecordingPolicy;
+	/**
+	 * The organization's toll-fraud spend and velocity controls, enforced by the engine at DIAL time.
+	 *
+	 * Absent means the tenant has no policy row, which is what every artifact compiled before this
+	 * field existed carries — so a reader that finds it missing places every call it would have
+	 * placed before. That is why this is not an artifact-version bump, the same argument
+	 * {@link CompiledRoutingSettings.maxConcurrentCalls} and {@link CompiledRoutingSettings.realm}
+	 * both make.
+	 *
+	 * It is on the artifact rather than behind an RPC because the engine holds no database handle and
+	 * this is a per-org fact — the same reason the realm and the concurrency ceiling are here. What
+	 * is NOT here is the per-EXTENSION override and the rolling usage: an override belongs to one
+	 * extension and rides `ExtensionIndexEntry` when it lands, and usage is state that changes
+	 * between compiles by definition. The engine reads the ceilings from here and the counters from
+	 * the shared window (`shared_rate_window`), which is what keeps the artifact a description of
+	 * CONFIGURATION and never of the present moment.
+	 */
+	readonly tollFraud?: CompiledTollFraudPolicy;
+	/**
+	 * The outbound attestation policy, and the caller-id right-to-use table it decides against.
+	 *
+	 * Always written by a fresh compile, for the reason {@link CompiledRoutingSettings.recording} is:
+	 * every field in it has a compiler default, and a half-written policy is worse than none. Absent
+	 * means an artifact compiled before this block existed, and a reader that finds it absent decides
+	 * no attestation and refuses nothing — exactly what every release before this one did, which is
+	 * why adding it is not an artifact-version bump.
+	 *
+	 * It rides `settings` rather than sitting beside it for the mechanical reason
+	 * {@link CompiledRoutingSettings.maxConcurrentCalls} records: `canonicalizeSnapshot` hashes
+	 * `settings` on an explicit line, so a field here is covered by `snapshotHash` for free while a
+	 * new top-level sibling would silently not be.
+	 */
+	readonly attestation?: CompiledAttestationPolicy;
+}
+
+/**
+ * Spend, velocity and geo controls on international calling, as the engine reads them.
+ *
+ * Every ceiling is optional and an absent one means "no ceiling on that axis" — deliberately NOT
+ * defaulted to a number, because there is no number that is right for every tenant and a compiler
+ * that invented one would start refusing calls for organizations that never configured anything.
+ * `enabled: false` lifts all of them at once without losing what they were set to.
+ *
+ * The lists are ISO-3166 alpha-2, upper case, already de-duplicated and sorted by the compiler so
+ * two compiles of one snapshot produce the same bytes. An EMPTY list is dropped rather than carried:
+ * an empty allow list would refuse every international call, which is never what clearing a field
+ * meant.
+ */
+export interface CompiledTollFraudPolicy {
+	readonly enabled: boolean;
+	/** Simultaneous international legs across the organization. */
+	readonly maxConcurrentInternationalCalls?: number;
+	/** Whole minutes of international talk time in a rolling hour, and in a rolling day. */
+	readonly maxInternationalMinutesPerHour?: number;
+	readonly maxInternationalMinutesPerDay?: number;
+	/** When present and non-empty, a destination country NOT on this list is refused. */
+	readonly allowedCountries?: readonly string[];
+	/** When present and non-empty, a destination country ON this list is refused. */
+	readonly deniedCountries?: readonly string[];
+	/** Hold the first call this organization has ever placed to a given country. */
+	readonly holdFirstCallToNewCountry?: boolean;
+	/** Refuse international calls inside the window below. */
+	readonly offHoursInternationalLock?: boolean;
+	/**
+	 * The window, as minutes since local midnight. `start > end` is the ordinary case and WRAPS
+	 * midnight (20:00 → 07:00), which is the shape every office actually wants; a reader that
+	 * compares without allowing for the wrap will lock the wrong half of the day.
+	 */
+	readonly offHoursStartMinute?: number;
+	readonly offHoursEndMinute?: number;
+	/** The zone those two are read in. Absent means {@link CompiledRoutingSettings.defaultTimezone}. */
+	readonly offHoursTimezone?: string;
+}
+
+/**
+ * The org-wide recording-consent settings, defaulted, as the engine reads them.
+ *
+ * Every field is REQUIRED here even though every input was optional: defaulting is the compiler's
+ * job precisely so the engine — which has no database, no settings page and no opinion — never has
+ * to decide what an absent accept digit means in the middle of a call. The one exception is
+ * `consentPromptId`, whose absence is meaningful rather than undecided: it names the engine's own
+ * seeded prompt, and inventing a row id here for a row the tenant does not have would be a dangling
+ * reference the media plane would fail on.
+ */
+export interface CompiledRecordingPolicy {
+	readonly consentPolicy: RecordingConsentPolicy;
+	/** Absent means the engine plays its seeded `sound:recording-consent` stem. */
+	readonly consentPromptId?: string;
+	readonly acceptDigit: string;
+	readonly declineDigit: string;
+	/**
+	 * The jurisdictions that force all-party treatment, upgrading `none` to an announcement and
+	 * announcing to BOTH sides. Empty is a tenant that has deliberately switched the safety net off.
+	 */
+	readonly allPartyRegions: readonly string[];
+	/** The org-wide default for the PCI pause; the extension and the queue may override it. */
+	readonly autoPauseOnDtmf: boolean;
 }
 
 /**
@@ -296,6 +618,30 @@ export interface RoutingArtifact {
 	readonly internal: InternalMatchTable;
 	readonly outbound: OutboundMatchTable;
 	readonly callBlock: readonly CompiledCallBlockRule[];
+	/**
+	 * Phrases, keyed by the `prompt` row id of the phrase itself.
+	 *
+	 * The whole of "a phrase is playable anywhere a prompt is": every plan node keeps its bare
+	 * `…PromptId`, and a reader about to play one looks here first — a hit is a sequence to play in
+	 * order, a miss is a single piece of audio. That is one lookup in the media layer instead of a
+	 * second nullable field on eight node kinds.
+	 *
+	 * Absent in an artifact compiled before phrases existed; a reader that finds it absent plays
+	 * every prompt id as a single file, which is what every release before this one did.
+	 */
+	readonly phrases?: Readonly<Record<string, CompiledPhrase>>;
+	/**
+	 * Where each single-audio prompt's file is, keyed by the `prompt` row id a plan node names.
+	 *
+	 * The value is a domain `MediaRef` — `object://<objectKey>` — for the same reason a voicemail
+	 * greeting's is: the key is a key, not a path, and only the reader knows where the store is
+	 * mounted. It sits beside {@link phrases} and is read the same way: a node keeps its bare
+	 * `…PromptId`, and a reader about to play one looks here for the file. A MISS is not an error
+	 * — it is an artifact compiled before this table existed, or a phrase (whose audio is its
+	 * steps') — and the reader falls back to the deployment-wide prompt prefix, which is what every
+	 * release before this one did.
+	 */
+	readonly prompts?: Readonly<Record<string, string>>;
 	/** Calling-party lookup, keyed by extension number. */
 	readonly extensionsByNumber: Readonly<Record<string, ExtensionIndexEntry>>;
 	/** Warnings that survived the compile. Errors never reach an artifact. */

@@ -54,6 +54,27 @@ describe("engine env", () => {
 		).toBe("engine-7f3a");
 	});
 
+	/**
+	 * The placeholder is fine for a laptop and fatal for a fleet: two replicas booting as `"engine"`
+	 * each adopt the other's unexpired channel leases, which is the exact split ownership the leases
+	 * exist to prevent. Outside a container runtime nothing fills the id in, so production refuses.
+	 */
+	it("refuses the placeholder instance id in production", () => {
+		expect(() => loadEngineEnv({ ARI_PASSWORD: "x", NODE_ENV: "production" })).toThrow(
+			/ENGINE_INSTANCE_ID: must not be the default "engine" in production/,
+		);
+	});
+
+	it("accepts a supplied instance id in production", () => {
+		expect(
+			loadEngineEnv({
+				ARI_PASSWORD: "x",
+				NODE_ENV: "production",
+				ENGINE_INSTANCE_ID: "engine-7f3a",
+			}).ENGINE_INSTANCE_ID,
+		).toBe("engine-7f3a");
+	});
+
 	it("accepts the largest heartbeat interval whose third tick is before lease expiry", () => {
 		expect(
 			loadEngineEnv({ ARI_PASSWORD: "x", ENGINE_CLAIM_HEARTBEAT_MS: "29999" })

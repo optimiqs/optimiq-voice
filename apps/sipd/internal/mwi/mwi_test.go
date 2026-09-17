@@ -14,9 +14,8 @@ const (
 	testMailbox = "0192c7a1-4b8e-7f21-8b3c-9d0e1f2a3b52"
 )
 
-// envelopeFor builds the wire message apps/api's VoicemailMwiPublisher would put on the bus, through
-// the SAME contract helpers it uses — so a change to the envelope shape breaks this test rather than
-// producing a lamp that silently stops moving.
+// envelopeFor builds the wire message apps/api's VoicemailMwiPublisher would publish, through the
+// same contract helpers, so an envelope-shape change breaks this test rather than a lamp.
 func envelopeFor(t *testing.T, orgID string, data contract.VoicemailMWIUpdatedData) *nats.Msg {
 	t.Helper()
 
@@ -46,7 +45,7 @@ func newSource(t *testing.T) *NATSSource {
 }
 
 func TestSubjectMatchesOnlyTheCountEvent(t *testing.T) {
-	// `mwi.updated` is a DOTTED event name, so the subject has six tokens. A `>` after the org would
+	// `mwi.updated` is a DOTTED event name, so the subject has seven tokens. A `>` after the org would
 	// also match `message.left`, which is the engine's event about a recording and says nothing about
 	// a count.
 	if Subject != "voicemail.evt.v1.*.*.mwi.updated" {
@@ -90,8 +89,7 @@ func TestDecodeReadsTheCountsAndRemembersThem(t *testing.T) {
 
 	source.remember(update)
 	// The cache is what makes the immediate NOTIFY on a fresh subscription true: the event that
-	// established the counts may be hours old, and without it a phone with nine messages is told it
-	// has none.
+	// established the counts may be hours old.
 	if counts, found := source.Last(testOrg, "1001"); !found || counts.New != 2 {
 		t.Errorf("Last = (%#v, %v)", counts, found)
 	}
@@ -100,9 +98,8 @@ func TestDecodeReadsTheCountsAndRemembersThem(t *testing.T) {
 	}
 }
 
-// The same check the publisher side runs. An envelope whose orgId is not the org in its subject
-// would let this edge attribute a tenant's message counts to another tenant's phones — the one
-// mistake in this package that is not merely a wrong lamp.
+// An envelope whose orgId is not the org in its subject would let this edge attribute one tenant's
+// message counts to another tenant's phones.
 func TestDecodeRefusesAnEnvelopeThatDisagreesWithItsSubject(t *testing.T) {
 	source := newSource(t)
 
@@ -131,8 +128,8 @@ func TestDecodeDropsUnparsableAndEmptyEvents(t *testing.T) {
 	}
 }
 
-// apps/api leaves `extensionNumber` unset today, so the fallback to the mailbox number is the ONLY
-// thing that makes MWI match a SIP account. It is a documented approximation, and this pins it.
+// `extensionNumber` is optional and unset in practice, so the fallback to the mailbox number is the
+// only thing that makes MWI match a SIP account.
 func TestMatchesAccount(t *testing.T) {
 	cases := []struct {
 		name   string

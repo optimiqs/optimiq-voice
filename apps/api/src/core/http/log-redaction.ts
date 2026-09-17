@@ -67,14 +67,25 @@ export const HTTP_LOG_REDACT_PATHS: readonly string[] = [
 export const REDACTED = "[redacted]";
 
 /**
- * Whether the HTTP logger runs at all, from the same `LOGS_LEVEL` the winston logger reads.
+ * Whether the HTTP logger runs at all, from the same `LOG_LEVEL` the winston logger reads.
  *
  * One environment variable governs logging in this process, and a second one that only the Fastify
- * half obeyed would be a guarantee that the two disagree. `none` is what `package.json`'s `test`
- * script sets, and it means silent here too.
+ * half obeyed would be a guarantee that the two disagree — which is exactly what reading a
+ * `LOGS_LEVEL` nothing in the platform sets used to produce: `packages/logging` reads `LOG_LEVEL`,
+ * `packages/config` declares `LOG_LEVEL` and `API_LOGS_LEVEL`, and this half silently stayed at
+ * `info` through every one of them. `LOG_LEVEL=silent` is what `package.json`'s `test` script sets,
+ * and it means silent here too.
+ *
+ * `LOGS_LEVEL` is kept as a last fallback only so a deployment that already sets it is not
+ * surprised; nothing in this repository writes it.
  */
 function httpLogLevel(): string | undefined {
-	const level = (process.env.LOGS_LEVEL ?? "info").toLowerCase();
+	const level = (
+		process.env.LOG_LEVEL ??
+		process.env.API_LOGS_LEVEL ??
+		process.env.LOGS_LEVEL ??
+		"info"
+	).toLowerCase();
 	if (level === "none" || level === "off" || level === "silent") {
 		return undefined;
 	}

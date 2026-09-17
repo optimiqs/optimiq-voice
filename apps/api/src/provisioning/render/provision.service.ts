@@ -1,5 +1,6 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logging";
+import { formatDispatchableLocation } from "../../mail";
 import { SipAuthEventService } from "../../pbx/security/sip-auth-event.service";
 import { resolveSettings } from "../catalog/cascade";
 import { modelDefaults, templateFor } from "../catalog/catalog";
@@ -23,6 +24,7 @@ import {
 import { ProvisionEventPublisher } from "./provision.publisher";
 import { ProvisionRepository } from "./provision.repository";
 import type {
+	DispatchableLocation,
 	RenderContext,
 	RenderKey,
 	RenderLine,
@@ -30,7 +32,7 @@ import type {
 } from "../catalog/render-context";
 import type { VendorTemplate } from "../catalog/template";
 import type { SoftphonePayload } from "../catalog/templates/softphone";
-import type { ProvisioningEnv } from "../provisioning-env";
+import type { ConfiguredProvisioningEnv, ProvisioningEnv } from "../provisioning-env";
 import type { RenderSnapshot, TokenLookup } from "./provision.repository";
 import type { SipAuthEventType } from "@optimiq-voice/pbx-db";
 
@@ -51,19 +53,23 @@ const logger = getLogger("api.provisioning");
  *    keeps a 4 KB path segment out of a query.
  * 2. **Resolve the reference.** One indexed equality on `adminDb`, five columns. This is the only
  *    untenanted read in the area and it is what turns "a phone" into "a tenant".
- * 3. **Verify the secret, in constant time.** Everything before this point is public knowledge;
+ * 3. **Rate limit**, keyed on the resolved reference. It has to come BEFORE the secret comparison,
+ *    because every step after this one writes: a refusal publishes `device.rejected` and files an
+ *    `sip_auth_event` row. A limiter consulted after authentication is a limiter a caller holding
+ *    only the (non-secret, plaintext-stored) reference walks straight past, driving unbounded
+ *    inserts and broker publishes from an unauthenticated endpoint. The cost of this order is that
+ *    such a caller can also exhaust a real device's one-minute budget; a phone that re-polls after
+ *    the window is the price of not handing out an unbounded write.
+ * 4. **Verify the secret, in constant time.** Everything before this point is public knowledge;
  *    everything after it is authenticated.
- * 4. **Expiry.**
- * 5. **Rate limit** — deliberately AFTER authentication. A limiter consulted before it would let an
- *    unauthenticated caller exhaust a real device's budget and lock its phone out by guessing its
- *    reference, which is a denial of service handed out for free.
+ * 5. **Expiry.**
  * 6. **Device and organization state.**
  * 7. **Source-address allowlist**, when the organization has one.
  * 8. **Deployment configuration** — after all of the above, so an anonymous prober never learns
  *    which variables this deployment is missing.
  * 9. **Render.**
  *
- * Steps 3 through 8 all answer the caller with the SAME 404. See `provision.errors.ts` for why, and
+ * Steps 4 through 8 all answer the caller with the SAME 404. See `provision.errors.ts` for why, and
  * for where the real reason goes instead.
  *
  * ## Nothing here is Effect, and that is deliberate
@@ -138,7 +144,22 @@ export class ProvisionService {
 			throw new ProvisionRefusedException({ reason: "invalid-token" });
 		}
 
-		// --- 3. verify the secret ------------------------------------------------------------------
+		// --- 3. rate limit (before the secret comparison — see the class comment) -------------------
+		const verdict = this.limiter.consume(parsed.reference);
+		if (!verdict.allowed) {
+			// Only the request that crossed the limit is recorded. Filing one every time would make the
+			// limiter the source of the unbounded writes it exists to stop.
+			if (verdict.firstRefusal) {
+				await this.reject(request, found, "rate-limited", `retry in ${verdict.retryAfterSeconds}s`);
+			}
+			throw new ProvisionRateLimitedException(
+				verdict.retryAfterSeconds,
+				found.organizationId,
+				found.id,
+			);
+		}
+
+		// --- 4. verify the secret ------------------------------------------------------------------
 		if (!verifySecret(found, parsed.secret)) {
 			await this.reject(request, found, "invalid-token", "secret mismatch");
 			throw new ProvisionRefusedException({
@@ -158,24 +179,13 @@ export class ProvisionService {
 			...(found.model === null ? {} : { model: found.model }),
 		});
 
-		// --- 4. expiry ------------------------------------------------------------------------------
+		// --- 5. expiry ------------------------------------------------------------------------------
 		if (
 			found.provisioningTokenExpiresAt !== null &&
 			found.provisioningTokenExpiresAt <= new Date()
 		) {
 			await this.reject(request, found, "invalid-token", "token expired");
 			throw new ProvisionRefusedException({ reason: "invalid-token", ...identify(found) });
-		}
-
-		// --- 5. rate limit (after authentication — see the class comment) ---------------------------
-		const verdict = this.limiter.consume(parsed.reference);
-		if (!verdict.allowed) {
-			await this.reject(request, found, "rate-limited", `retry in ${verdict.retryAfterSeconds}s`);
-			throw new ProvisionRateLimitedException(
-				verdict.retryAfterSeconds,
-				found.organizationId,
-				found.id,
-			);
 		}
 
 		// --- 6. device state -------------------------------------------------------------------------
@@ -195,15 +205,20 @@ export class ProvisionService {
 				request,
 				found,
 				"ip-not-allowed",
-				allowlist.hasEntries
-					? `no allow entry matched ${request.sourceIp ?? "an unknown address"}`
-					: "PROVISION_REQUIRE_IP_ALLOWLIST is set and this organization has no allow entries",
+				allowlist.evaluable
+					? allowlist.hasEntries
+						? `no allow entry matched ${request.sourceIp ?? "an unknown address"}`
+						: "PROVISION_REQUIRE_IP_ALLOWLIST is set and this organization has no allow entries"
+					: `the source address ${request.sourceIp ?? "(none)"} is not an IP the ACL can be evaluated against`,
 			);
 			throw new ProvisionRefusedException({ reason: "ip-not-allowed", ...identify(found) });
 		}
 
 		// --- 8. deployment configuration --------------------------------------------------------------
-		if (!isRenderConfigured(this.env)) {
+		// Narrowed into a local, because `isRenderConfigured` is a type predicate and a predicate over
+		// `this.env` does not survive the call into `buildContext`.
+		const env = this.env;
+		if (!isRenderConfigured(env)) {
 			await this.reject(
 				request,
 				found,
@@ -229,7 +244,25 @@ export class ProvisionService {
 			throw new ProvisionRefusedException({ reason: "unknown-vendor", ...identify(found) });
 		}
 
-		const context = this.buildContext(found.organizationId, snapshot, request.token);
+		/**
+		 * The organization's own SIP domain — `org_setting sip/realm` — and there is NO deployment
+		 * default for it (see {@link buildContext}). A tenant that has configured none is refused
+		 * rather than rendered against another tenant's realm.
+		 */
+		const sipDomain =
+			typeof snapshot.sipRealm === "string" ? snapshot.sipRealm.trim().toLowerCase() : "";
+		if (sipDomain === "") {
+			await this.reject(request, found, "not-configured", "SIP domain not configured");
+			throw new ProvisionRefusedException({ reason: "not-configured", ...identify(found) });
+		}
+
+		const context = this.buildContext(
+			env,
+			found.organizationId,
+			snapshot,
+			request.token,
+			sipDomain,
+		);
 		return { context, template };
 	}
 
@@ -240,12 +273,23 @@ export class ProvisionService {
 	 * template stays a function of its input and a golden assertion over one stays meaningful.
 	 */
 	private buildContext(
+		env: ConfiguredProvisioningEnv,
 		organizationId: string,
 		snapshot: RenderSnapshot,
 		token: string,
+		sipDomain: string,
 	): RenderContext {
-		const sipServer = this.env.PROVISION_SIP_SERVER as string;
-		const rootKey = this.env.PROVISION_SIP_SECRET_KEY as string;
+		/**
+		 * The AOR domain, and it is the TENANT's — never the deployment's.
+		 *
+		 * `PROVISION_SIP_SERVER` names the SIP edge a packet is sent TO, which is legitimately
+		 * deployment-wide and is still the fallback for `serverAddress` below. The domain an account
+		 * registers INTO is a per-tenant claim: `sip_credentials.service.ts` maps one realm to exactly
+		 * one organization, so handing an organization that configured none the deployment default
+		 * hands it a realm that resolves to a DIFFERENT tenant, and the phone can never register.
+		 * `renderFor` resolves and refuses it, so it arrives here already checked.
+		 */
+		const rootKey = env.PROVISION_SIP_SECRET_KEY;
 
 		/**
 		 * The settings cascade, resolved ONCE and before the lines.
@@ -295,7 +339,7 @@ export class ProvisionService {
 				registerUser,
 				authUser: row.line.authUser ?? registerUser,
 				password: deriveSipPassword({ rootKey, organizationId, secretRef }),
-				serverAddress: row.line.serverAddress ?? sipServer,
+				serverAddress: row.line.serverAddress ?? env.PROVISION_SIP_SERVER,
 				/**
 				 * The port and the transport, after the organization's preference.
 				 *
@@ -308,7 +352,19 @@ export class ProvisionService {
 				transport: resolveLineTransport(settings, row.line.transport),
 				outboundProxy: this.env.PROVISION_SIP_OUTBOUND_PROXY,
 				registerExpiresSeconds: row.line.registerExpiresSeconds,
-				sharedLine: row.line.sharedLine,
+				/**
+				 * Shared line, from the rows and no longer from the flag alone.
+				 *
+				 * `device_line.shared_line` is the manual override an administrator can still tick, but the
+				 * fact that decides a shared line is the APPEARANCE: an extension that is an enabled
+				 * appearance on an enabled shared line renders `shared_line` true whether or not anyone set
+				 * the column. `snapshot.sharedLineExtensionIds` is the membership the repository loaded for
+				 * exactly this device's line extensions, so the OR is a set lookup, not a re-query.
+				 */
+				sharedLine:
+					row.line.sharedLine ||
+					(row.line.extensionId !== null &&
+						snapshot.sharedLineExtensionIds.has(row.line.extensionId)),
 				label: row.line.label ?? undefined,
 				/**
 				 * The mailbox number is the extension number.
@@ -332,7 +388,8 @@ export class ProvisionService {
 			lines,
 			keys: mergeKeys(snapshot),
 			settings,
-			sipDomain: sipServer,
+			sipDomain,
+			dispatchableLocation: dispatchableLocationOf(snapshot),
 			payloadUrl:
 				this.env.PROVISION_BASE_URL === undefined
 					? undefined
@@ -571,5 +628,36 @@ function toRenderKey(row: {
 		value: row.value ?? undefined,
 		label: row.label ?? undefined,
 		lineNumber: row.lineNumber,
+	};
+}
+
+/**
+ * The handset's dispatchable location, or `undefined` when it has none.
+ *
+ * A device carrying only a `location_detail` and no address contributes nothing here, and that is
+ * deliberate: "Desk 12" is not a dispatchable location, it is a refinement of one, and rendering it
+ * alone would put a fragment in front of somebody who needs a street. The number-level fallback
+ * still applies at notification time (`emergency-notification.service.ts` joins the two), which is
+ * the only place both facts are in hand.
+ *
+ * `formatDispatchableLocation` is the mail area's helper and is reused rather than reimplemented so
+ * the address a user reads in the softphone is character-for-character the one a responder is read
+ * off the Kari's Law notification. Two formatters would drift, and the drift would be discovered by
+ * somebody comparing them during an incident.
+ */
+function dispatchableLocationOf(snapshot: RenderSnapshot): DispatchableLocation | undefined {
+	const address = snapshot.emergencyAddress;
+	if (address === undefined) {
+		return undefined;
+	}
+	const formatted = formatDispatchableLocation(address, snapshot.device.emergencyLocationDetail);
+	if (formatted.length === 0) {
+		return undefined;
+	}
+	return {
+		addressId: address.id,
+		formatted,
+		detail: snapshot.device.emergencyLocationDetail,
+		validated: address.validated,
 	};
 }

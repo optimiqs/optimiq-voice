@@ -86,7 +86,11 @@ The rule is **"could a reader compiled against the previous version _misinterpre
 | a field's meaning or units change under one name | yes   | an old reader executes it confidently and wrongly              |
 | a field removed                                  | yes   | an old reader reads `undefined` where it required a value      |
 
-The additive optional fields in §2.5 are therefore **version 1** still. What actually forces the
+The artifact is at **version 2**. The additive optional fields in §2.5 did not move it — v1 covered
+all of them, for exactly the reason the first row of that table gives. What moved it is the
+`paging` node kind: a v1 reader switches over `node.kind`, has no case for it, and meets a node it
+cannot execute in the middle of a live call. There is no safe default for that, so the version
+tells the reader to discard the cache entry and recompile instead of guessing. What actually forces
 recompile is the other token: `snapshotHash` moves the moment the input gains a collection, so
 every cached artifact goes stale on the deploy that adds one and is rebuilt from the current
 configuration. That is the migration, and it costs one compile per organization.
@@ -113,10 +117,12 @@ Consequences worth knowing:
   reference — resolving a route is on the call path and must not copy a subgraph.
 
 Node kinds: `extension`, `ring-group`, `ivr-menu`, `queue`, `voicemail`, `conference`, `park`,
-`external`, `trunk-dial`, `application`, `playback`, `feature-code`, `time-condition`, `hangup`.
-Fourteen, and deliberately still fourteen: emergency dialing is a `trunk-dial` with `emergency:
-true` rather than a fifteenth kind, because a new kind is a version bump and three optional fields
-are not — see §7 item 12.
+`paging`, `external`, `trunk-dial`, `application`, `playback`, `feature-code`, `time-condition`,
+`hangup`. Fifteen. Emergency dialing is deliberately NOT one of them — it is a `trunk-dial` with
+`emergency: true`, because three optional fields are not a version bump and a new kind is (see §7
+item 12). `paging` is the one that did earn the bump, because a page cannot be expressed as a
+variant of anything already here: it originates many legs, auto-answers them, carries no
+continuation, and its members are numbers rather than node references.
 Terminals speak `@optimiq-voice/telephony`'s hangup-cause taxonomy verbatim.
 
 ### 2.3 Three contexts, three tables
@@ -313,10 +319,17 @@ Two rules for the loader:
 
 ### 4.1 Optional collections
 
-`mohClasses`, `voicemailGreetings` and `emergencyAddresses` are declared **optional** on
+`mohClasses`, `voicemailGreetings`, `emergencyAddresses` and `pagingGroups` are declared
+**optional** on
 `OrgRoutingSnapshot` and listed in `OPTIONAL_SNAPSHOT_COLLECTIONS`. That is a rollout affordance, not a modelling accident: they
 were added after the API's snapshot loader was written, and a required field would have made this
 package impossible to release before the loader caught up.
+
+`pagingGroups` is also the one collection that breaks rule 2 above and nests its children: a
+`paging_group_member` row is an `(extension, position)` pair with no id anything can point at, no
+destination and no timeout, so a second top-level collection would buy a `SNAPSHOT_COLLECTIONS`
+entry and an index pass to express a list. Both physical tables therefore map to `pagingGroups` in
+`ROUTING_TABLE_TO_ENTITY`, so a write to either evicts the artifact.
 
 Absent and empty mean exactly the same thing everywhere. The shape assertion skips an absent
 optional collection, `canonicalizeSnapshot` hashes it as `[]`, and the compiler's indexes read it

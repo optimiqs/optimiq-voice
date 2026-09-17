@@ -30,86 +30,139 @@ const httpUrl = z
 	// some fetch verbatim. Stripping it here means the URL the UI shows is the URL the phone gets.
 	.transform((value) => value.replace(/\/+$/u, ""));
 
-export const provisioningEnvSchema = z.object({
-	/**
-	 * The SIP registrar a provisioned phone is told to register to — the value written into
-	 * `account.1.sip_server.1.address` and its four vendor equivalents.
-	 *
-	 * A `device_line.serverAddress` overrides it per line; this is the deployment-wide default, and
-	 * it is what a device with no per-line override renders. Absent means the render endpoint has
-	 * nothing to put in the field that decides whether the phone works at all, so it refuses.
-	 */
-	PROVISION_SIP_SERVER: z.string().min(1).max(255).optional(),
+export const provisioningEnvSchema = z
+	.object({
+		PROVISION_WEBRTC_ENABLED: z
+			.stringbool({ truthy: ["true", "1"], falsy: ["false", "0", ""] })
+			.default(false),
+		PROVISION_TURN_URLS: z
+			.string()
+			.min(1)
+			.optional()
+			.transform((value) => value?.split(",").map((url) => url.trim()))
+			.refine(
+				(urls) =>
+					urls === undefined ||
+					urls.every((url) => /^turns?:[^\s/?]+(?::\d+)?(?:\?transport=(?:udp|tcp))?$/u.test(url)),
+				"must contain comma-separated TURN URLs",
+			),
+		PROVISION_TURN_SECRET: z.string().min(16).optional(),
+		PROVISION_TURN_TTL_SECONDS: z.coerce.number().int().min(600).max(86400).default(3600),
+		/**
+		 * The SIP registrar a provisioned phone is told to register to — the value written into
+		 * `account.1.sip_server.1.address` and its four vendor equivalents.
+		 *
+		 * A `device_line.serverAddress` overrides it per line; this is the deployment-wide default, and
+		 * it is what a device with no per-line override renders. Absent means the render endpoint has
+		 * nothing to put in the field that decides whether the phone works at all, so it refuses.
+		 */
+		PROVISION_SIP_SERVER: z.string().min(1).max(255).optional(),
 
-	/** The registrar's port. 5060 is the SIP default for UDP and TCP; TLS deployments use 5061. */
-	PROVISION_SIP_PORT: z.coerce.number().int().min(1).max(65_535).default(5060),
+		/** The registrar's port. 5060 is the SIP default for UDP and TCP; TLS deployments use 5061. */
+		PROVISION_SIP_PORT: z.coerce.number().int().min(1).max(65_535).default(5060),
 
-	/**
-	 * The transport a provisioned phone uses.
-	 *
-	 * Deliberately NOT defaulted to `tls`, tempting as that is: a deployment whose edge has no TLS
-	 * listener would provision every phone into a state where it cannot register, and the failure
-	 * would look like a broken template rather than a missing listener. The default is what a plain
-	 * deployment answers on, and an operator who has TLS says so.
-	 */
-	PROVISION_SIP_TRANSPORT: z.enum(["udp", "tcp", "tls"]).default("udp"),
+		/**
+		 * The transport a provisioned phone uses.
+		 *
+		 * Deliberately NOT defaulted to `tls`, tempting as that is: a deployment whose edge has no TLS
+		 * listener would provision every phone into a state where it cannot register, and the failure
+		 * would look like a broken template rather than a missing listener. The default is what a plain
+		 * deployment answers on, and an operator who has TLS says so.
+		 */
+		PROVISION_SIP_TRANSPORT: z.enum(["udp", "tcp", "tls"]).default("udp"),
 
-	/** Optional outbound proxy, when registration and media traverse a border element. */
-	PROVISION_SIP_OUTBOUND_PROXY: z.string().max(255).optional(),
+		/** Optional outbound proxy, when registration and media traverse a border element. */
+		PROVISION_SIP_OUTBOUND_PROXY: z.string().max(255).optional(),
 
-	/**
-	 * The public base URL a phone reaches this API on, used to build the provisioning URL that is
-	 * shown to an administrator once.
-	 *
-	 * It is deliberately its own variable rather than `AUTH_URL`: phones fetch their configuration
-	 * from wherever the SIP edge is published, which on a real deployment is not the hostname an
-	 * administrator signs in to, and building the URL from the admin origin would hand out a link
-	 * that resolves for the person reading it and for nobody's desk phone.
-	 */
-	PROVISION_BASE_URL: httpUrl.optional(),
+		/**
+		 * The public base URL a phone reaches this API on, used to build the provisioning URL that is
+		 * shown to an administrator once.
+		 *
+		 * It is deliberately its own variable rather than `AUTH_URL`: phones fetch their configuration
+		 * from wherever the SIP edge is published, which on a real deployment is not the hostname an
+		 * administrator signs in to, and building the URL from the admin origin would hand out a link
+		 * that resolves for the person reading it and for nobody's desk phone.
+		 */
+		PROVISION_BASE_URL: httpUrl.optional(),
 
-	/**
-	 * The root key the per-line SIP password is derived from.
-	 *
-	 * `extension.sip_secret_ref` is a HANDLE into a secret manager — the plaintext password is
-	 * deliberately not in the telephony database (see `extensions-schema.ts`) — and this deployment
-	 * has no secret manager wired to that handle yet. Rather than invent a storage location for a
-	 * password, the renderer DERIVES it: `hmac-sha256(key, "<organizationId>:<secretRef>")`, base64url,
-	 * truncated. That is deterministic (a phone re-provisioning gets the same password it registered
-	 * with), rotatable (change the key, re-provision), and stores nothing new.
-	 *
-	 * It is also a contract with the registrar, which must derive the same value — see
-	 * `render/provision-secret.ts` for the exported derivation and the follow-up that wires it into
-	 * `apps/sipd`. Absent means the render endpoint refuses rather than emitting a config with an
-	 * empty password field, because a phone that provisions with no password fails to register and
-	 * reports nothing an administrator can act on.
-	 */
-	PROVISION_SIP_SECRET_KEY: z.string().min(16).max(512).optional(),
+		/**
+		 * The `wss://` URL a BROWSER softphone opens against `apps/sipd`'s WSS listener (RFC 7118).
+		 *
+		 * Its own variable and not derived from `PROVISION_SIP_SERVER`, for the reason that server holds a
+		 * SIP host:port (`sip.example.com`, port 5060/5061) while sipd's browser transport is an HTTPS
+		 * upgrade on a different port (`wss://sip.example.com:8089` by default) — the two are related on a
+		 * single-box deployment and unrelated on a split one. Optional: when it is unset the
+		 * `GET /me/softphone` response carries `transport.wssUrl: null`, and the web shell derives a
+		 * co-located `wss://<page-host>:8089` from its own HTTPS origin (`lib/softphone/credentials.ts`).
+		 * A deployment whose sipd is not co-located with the web app sets this so the browser reaches the
+		 * right host.
+		 */
+		PROVISION_SIP_WSS_URL: z
+			.string()
+			.min(1)
+			.max(255)
+			.regex(/^wss:\/\//iu, "must be a wss:// URL")
+			.transform((value) => value.replace(/\/+$/u, ""))
+			.optional(),
 
-	/**
-	 * How many configuration fetches one token may make per minute.
-	 *
-	 * Phones fetch on boot and then on a resync schedule measured in hours, so a dozen is generous
-	 * for every legitimate pattern including an administrator power-cycling a handset repeatedly.
-	 * What it stops is a token that has leaked being used as an oracle.
-	 */
-	PROVISION_RATE_LIMIT_PER_MINUTE: z.coerce.number().int().min(1).max(600).default(12),
+		/**
+		 * The root key the per-line SIP password is derived from.
+		 *
+		 * `extension.sip_secret_ref` is a HANDLE into a secret manager — the plaintext password is
+		 * deliberately not in the telephony database (see `extensions-schema.ts`) — and this deployment
+		 * has no secret manager wired to that handle yet. Rather than invent a storage location for a
+		 * password, the renderer DERIVES it: `hmac-sha256(key, "<organizationId>:<secretRef>")`, base64url,
+		 * truncated. That is deterministic (a phone re-provisioning gets the same password it registered
+		 * with), rotatable (change the key, re-provision), and stores nothing new.
+		 *
+		 * It is also a contract with the registrar, which must derive the same value — see
+		 * `render/provision-secret.ts` for the exported derivation and the follow-up that wires it into
+		 * `apps/sipd`. Absent means the render endpoint refuses rather than emitting a config with an
+		 * empty password field, because a phone that provisions with no password fails to register and
+		 * reports nothing an administrator can act on.
+		 */
+		PROVISION_SIP_SECRET_KEY: z.string().min(16).max(512).optional(),
 
-	/**
-	 * Whether an organization with NO provisioning ACL entries refuses every request.
-	 *
-	 * Default `false`: a deployment that has not configured an allowlist gets token authentication
-	 * only, which is already the thing FusionPBX did not have. Turning it on makes the allowlist
-	 * mandatory, which is right for a deployment whose phones all sit behind known static egress and
-	 * wrong for one whose phones are on domestic broadband.
-	 */
-	PROVISION_REQUIRE_IP_ALLOWLIST: z
-		.stringbool({ truthy: ["true", "1"], falsy: ["false", "0", ""] })
-		.default(false),
+		/**
+		 * How many configuration fetches one token may make per minute.
+		 *
+		 * Phones fetch on boot and then on a resync schedule measured in hours, so a dozen is generous
+		 * for every legitimate pattern including an administrator power-cycling a handset repeatedly.
+		 * What it stops is a token that has leaked being used as an oracle.
+		 */
+		PROVISION_RATE_LIMIT_PER_MINUTE: z.coerce.number().int().min(1).max(600).default(12),
 
-	/** How long a freshly minted token stays valid. `0` means it does not expire. */
-	PROVISION_TOKEN_TTL_DAYS: z.coerce.number().int().min(0).max(3650).default(0),
-});
+		/**
+		 * Whether an organization with NO provisioning ACL entries refuses every request.
+		 *
+		 * Default `false`: a deployment that has not configured an allowlist gets token authentication
+		 * only, which is already the thing FusionPBX did not have. Turning it on makes the allowlist
+		 * mandatory, which is right for a deployment whose phones all sit behind known static egress and
+		 * wrong for one whose phones are on domestic broadband.
+		 */
+		PROVISION_REQUIRE_IP_ALLOWLIST: z
+			.stringbool({ truthy: ["true", "1"], falsy: ["false", "0", ""] })
+			.default(false),
+
+		/** How long a freshly minted token stays valid. `0` means it does not expire. */
+		PROVISION_TOKEN_TTL_DAYS: z.coerce.number().int().min(0).max(3650).default(0),
+	})
+	.superRefine((env, context) => {
+		if ((env.PROVISION_TURN_URLS === undefined) !== (env.PROVISION_TURN_SECRET === undefined)) {
+			context.addIssue({
+				code: "custom",
+				path: ["PROVISION_TURN_URLS"],
+				message: "PROVISION_TURN_URLS and PROVISION_TURN_SECRET must be configured together",
+			});
+		}
+		if (env.PROVISION_WEBRTC_ENABLED && env.PROVISION_SIP_WSS_URL === undefined) {
+			context.addIssue({
+				code: "custom",
+				path: ["PROVISION_SIP_WSS_URL"],
+				message: "PROVISION_SIP_WSS_URL is required when PROVISION_WEBRTC_ENABLED is set",
+			});
+		}
+	});
 
 export type ProvisioningEnv = z.infer<typeof provisioningEnvSchema>;
 
@@ -136,6 +189,19 @@ export function missingRenderConfiguration(env: ProvisioningEnv): readonly strin
 	return missing;
 }
 
-export function isRenderConfigured(env: ProvisioningEnv): boolean {
+/**
+ * A `ProvisioningEnv` that has the two values the render path cannot work without.
+ *
+ * The pair is optional on the schema on purpose — a deployment that provisions nothing must still
+ * boot — so this is the type that says "checked". It exists so `buildContext` can read them without
+ * a cast: an `as string` there would be the compiler taking the author's word for exactly the fact
+ * `isRenderConfigured` is in a position to prove.
+ */
+export type ConfiguredProvisioningEnv = ProvisioningEnv & {
+	readonly PROVISION_SIP_SERVER: string;
+	readonly PROVISION_SIP_SECRET_KEY: string;
+};
+
+export function isRenderConfigured(env: ProvisioningEnv): env is ConfiguredProvisioningEnv {
 	return missingRenderConfiguration(env).length === 0;
 }

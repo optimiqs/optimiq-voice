@@ -35,7 +35,7 @@ describe("event type vocabulary", () => {
 	});
 
 	it("rejects an unmodelled type", () => {
-		expect(isAriEventType("PeerStatusChange")).toBe(false);
+		expect(isAriEventType("ContactStatusChange")).toBe(false);
 	});
 
 	it("has no duplicates", () => {
@@ -205,13 +205,41 @@ describe("parseAriEvent", () => {
 		expect(event.caller).toBeUndefined();
 	});
 
+	it("parses PeerStatusChange with its endpoint and qualify verdict", () => {
+		const event = parseAriEvent(
+			frame("PeerStatusChange", {
+				endpoint: { technology: "PJSIP", resource: "carrier-a", state: "online" },
+				peer: { peer_status: "Reachable", time: "24" },
+			}),
+		);
+		if (event.type !== "PeerStatusChange") {
+			throw new Error("narrowing failed");
+		}
+		expect(event.endpoint?.resource).toBe("carrier-a");
+		expect(event.peer.peer_status).toBe("Reachable");
+		expect(event.peer.time).toBe("24");
+	});
+
+	it("tolerates a PeerStatusChange whose peer said nothing, and one with no endpoint", () => {
+		// Channel drivers disagree on which rider fields accompany which transition; a strict
+		// parse would turn a driver quirk into a dropped event. The consumer reads "" as unknown.
+		const bare = parseAriEvent(frame("PeerStatusChange", { peer: {} }));
+		if (bare.type !== "PeerStatusChange") {
+			throw new Error("narrowing failed");
+		}
+		expect(bare.peer.peer_status).toBe("");
+		expect(bare.endpoint).toBeUndefined();
+	});
+
 	it("keeps an unmodelled event as Unknown with its raw payload", () => {
-		const event = parseAriEvent(frame("PeerStatusChange", { peer: { peer_status: "Reachable" } }));
+		const event = parseAriEvent(
+			frame("ContactStatusChange", { contact_info: { uri: "sip:1001@10.0.0.5" } }),
+		);
 		if (event.type !== "Unknown") {
 			throw new Error("narrowing failed");
 		}
-		expect(event.ariType).toBe("PeerStatusChange");
-		expect(event.raw.peer).toEqual({ peer_status: "Reachable" });
+		expect(event.ariType).toBe("ContactStatusChange");
+		expect(event.raw.contact_info).toEqual({ uri: "sip:1001@10.0.0.5" });
 	});
 
 	it("rejects a frame that is not an object", () => {

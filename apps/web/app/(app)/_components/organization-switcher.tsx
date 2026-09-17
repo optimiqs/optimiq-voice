@@ -12,7 +12,7 @@ import {
 	MenuTrigger,
 } from "~/components/ui/menu";
 import { toast } from "~/components/ui/toast";
-import { authErrorMessage, organization } from "~/lib/auth-client";
+import { authQueryError, organization } from "~/lib/auth-client";
 import { cn } from "~/lib/cn";
 import { roleLabel } from "~/lib/permissions";
 import { useAppSession } from "../_context/session-context";
@@ -40,7 +40,7 @@ export function OrganizationSwitcher() {
 		mutationFn: async (organizationId: string) => {
 			const result = await organization.setActive({ organizationId });
 			if (result.error) {
-				throw new Error(authErrorMessage(result.error));
+				throw authQueryError(result.error);
 			}
 		},
 		onSuccess: async () => {

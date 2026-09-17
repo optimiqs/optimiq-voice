@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import {
+	attestationLevelLabel,
 	buildCallTree,
+	callerIdRightToUseLabel,
 	counterparty,
 	destinationTypeLabel,
 	dispositionLabel,
@@ -148,15 +150,14 @@ describe("buildCallTree", () => {
 		expect(flattenCallTree(buildCallTree(legs))).toHaveLength(1);
 	});
 
-	it("survives a cycle between two legs", () => {
-		const legs = [
-			leg({ id: "x", originatingLegId: "y" }),
-			leg({ id: "y", originatingLegId: "x" }),
-		];
+	it("survives a cycle between two legs, and still shows both", () => {
+		const legs = [leg({ id: "x", originatingLegId: "y" }), leg({ id: "y", originatingLegId: "x" })];
 
 		// Unreachable in real data (a leg is originated before it can originate), but a corrupted
-		// row must not hang the browser.
-		expect(flattenCallTree(buildCallTree(legs)).length).toBeLessThanOrEqual(2);
+		// row must not hang the browser — nor silently vanish from a screen whose job is every leg
+		// of one call. Neither leg is a root, so both would otherwise be dropped.
+		const flat = flattenCallTree(buildCallTree(legs));
+		expect(flat.map((node) => node.leg.id).sort()).toEqual(["x", "y"]);
 	});
 });
 
@@ -190,5 +191,34 @@ describe("recordingsForLeg", () => {
 		];
 
 		expect(recordingsForLeg(recordings, "a").map((entry) => entry.id)).toEqual(["r1"]);
+	});
+});
+
+describe("attestationLevelLabel", () => {
+	it("writes the letter and what the letter means, because a letter alone settles no dispute", () => {
+		expect(attestationLevelLabel("A")).toBe("A — full attestation");
+		expect(attestationLevelLabel("B")).toBe("B — partial attestation");
+		expect(attestationLevelLabel("C")).toBe("C — gateway attestation");
+	});
+
+	it("normalises case and surrounding space, since the value is stored as the wire sent it", () => {
+		expect(attestationLevelLabel(" a ")).toBe("A — full attestation");
+	});
+
+	it("returns an unknown level verbatim rather than hiding it — it is still evidence", () => {
+		expect(attestationLevelLabel("D")).toBe("D");
+		expect(attestationLevelLabel("")).toBe("");
+	});
+});
+
+describe("callerIdRightToUseLabel", () => {
+	it("answers with the justification, not the enum member", () => {
+		expect(callerIdRightToUseLabel("owned")).toBe("a number assigned to this organization");
+		expect(callerIdRightToUseLabel("verified")).toBe("an externally verified caller ID on file");
+		expect(callerIdRightToUseLabel("none")).toBe("no established right to use");
+	});
+
+	it("passes an unrecognised basis through untouched", () => {
+		expect(callerIdRightToUseLabel("carrier-loa")).toBe("carrier-loa");
 	});
 });

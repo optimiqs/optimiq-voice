@@ -57,8 +57,15 @@ import type { ConferenceClaim } from "@optimiq-voice/events";
  * participant, and only while a gate is actually closed.
  */
 
-/** One member of a room, as this instance tracks them. */
-export interface ConferenceMember {
+/**
+ * A member arriving, as the joiner describes them.
+ *
+ * Separate from {@link ConferenceMember} below, which is the same member plus the STATE the room
+ * holds about them. The split is what stops a plan walker having to invent values for four fields it
+ * has no opinion about — a caller entering a room is unmuted, undeafened and at unity, always, and
+ * the registry is the thing that knows that.
+ */
+export interface ConferenceJoin {
 	/** The media server's id for the leg. The key a member is removed by. */
 	readonly mediaChannelId: string;
 	readonly legId: string;
@@ -66,6 +73,46 @@ export interface ConferenceMember {
 	/** When the member joined, for the `conference.left` duration. */
 	readonly joinedAtMs: number;
 }
+
+/**
+ * One member of a room, as this instance tracks them: who they are, and what has been done to them.
+ *
+ * ## Why the state lives here and not on the media plane
+ *
+ * The media plane can be ASKED whether a session is muted — `mute-session` answers with the state
+ * after every command — and that is a fact about a SESSION rather than about a member of a room. The
+ * two come apart the moment a member is muted for a reason the mixer cannot see: a moderator's mute
+ * survives the member being re-pointed at a different bridge, and a participant list has to render
+ * it without a round trip per row. So the room is the record and the media plane is the effect.
+ *
+ * ## Gains are PERCENT here, not the mixer's fixed point
+ *
+ * Q8 with a unity of 256 is `apps/mediad`'s internal representation, and it stops at the wire.
+ * Percent is what the contract carries and what a slider produces, and 100 is a renderable answer
+ * ("normal") where an absent field is not — which is why these are required rather than optional.
+ */
+export interface ConferenceMember extends ConferenceJoin {
+	/** Whether the ROOM hears them. */
+	readonly muted: boolean;
+	/** Whether THEY hear the room. Independent of {@link muted}; both can be true at once. */
+	readonly deafened: boolean;
+	/** Their contribution to the mix, in percent of unity. 100 is unchanged. */
+	readonly talkGainPercent: number;
+	/** What they hear of the mix, in percent of unity. 100 is unchanged. */
+	readonly listenGainPercent: number;
+}
+
+/** What a moderation command asks to change. Absent fields are left alone. */
+export interface ConferenceMemberPatch {
+	readonly muted?: boolean;
+	readonly deafened?: boolean;
+	readonly moderator?: boolean;
+	readonly talkGainPercent?: number;
+	readonly listenGainPercent?: number;
+}
+
+/** Unity, in the percent this file and the contract speak. */
+export const CONFERENCE_UNITY_GAIN_PERCENT = 100;
 
 /**
  * A room, as the joiner sees it.
@@ -82,6 +129,14 @@ export interface ConferenceRoom {
 	readonly moderatorPresent: boolean;
 	/** Cluster-wide. Never smaller than `members.length`. */
 	readonly memberCount: number;
+	/**
+	 * Whether the room is admitting new participants. Cluster-wide when claims are shared.
+	 *
+	 * A moderator's decision, and NOT the same thing as a room at `maxMembers` even though a caller
+	 * hears the same refusal: a full room admits the next arrival the moment somebody leaves, and a
+	 * locked one admits nobody until it is unlocked.
+	 */
+	readonly locked: boolean;
 }
 
 /** What a join attempt produced. */
@@ -89,7 +144,22 @@ export type ConferenceJoinResult =
 	| { readonly kind: "joined"; readonly room: ConferenceRoom; readonly created: boolean }
 	/** The room is at `maxMembers`, counting every instance. The bridge is untouched. */
 	| { readonly kind: "full"; readonly memberCount: number }
+	/**
+	 * A moderator has closed the room. The bridge is untouched and nobody is counted.
+	 *
+	 * Distinct from `full` so the caller can say something different, which is the whole reason the
+	 * lock is a separate fact: "the meeting is full, try in a minute" and "the meeting has started"
+	 * ask the caller to do opposite things.
+	 */
+	| { readonly kind: "locked"; readonly memberCount: number }
 	/** Shared claims are configured and the bucket could not be reached. The join did NOT happen. */
+	| { readonly kind: "claims-unavailable"; readonly reason: string };
+
+/** What a lock or unlock produced. */
+export type ConferenceLockResult =
+	| { readonly kind: "set"; readonly locked: boolean; readonly memberCount: number }
+	/** Nobody on this instance is in that room. The caller should try another contributor. */
+	| { readonly kind: "unknown-conference" }
 	| { readonly kind: "claims-unavailable"; readonly reason: string };
 
 export interface ConferenceDeparture {
@@ -119,6 +189,8 @@ interface MutableRoom {
 	/** Cluster-wide, from the claim. Equals the local figures when claims are not shared. */
 	memberCount: number;
 	moderatorPresent: boolean;
+	/** Cluster-wide, from the claim. Local-only when claims are not shared. */
+	locked: boolean;
 	organizationId?: string;
 }
 
@@ -179,13 +251,14 @@ export class ConferenceRegistry {
 	 */
 	async join(
 		conferenceId: string,
-		member: ConferenceMember,
+		joining: ConferenceJoin,
 		options: {
 			readonly newBridgeId: string;
 			readonly maxMembers: number;
 			readonly organizationId?: string;
 		},
 	): Promise<ConferenceJoinResult> {
+		const member = seat(joining);
 		if (!this.bucket.isConfigured) {
 			return this.joinLocal(conferenceId, member, options);
 		}
@@ -252,6 +325,16 @@ export class ConferenceRegistry {
 			// every case — and so is `currentState`, but the compiler cannot tie two locals'
 			// undefined-ness together, so the derivation is restated rather than asserted.
 			const heldState = currentState ?? this.claimState(current.value, now);
+			// The lock is checked BEFORE the cap and before any write, on the value this attempt just
+			// read under compare-and-set — which is what makes it cluster-wide rather than a suggestion:
+			// a joiner landing on a neighbour reads the same key and is refused the same way.
+			//
+			// Before the cap, and not after, because the two are different answers to the caller and the
+			// stronger one wins: a locked room that also happens to be full is still "the meeting has
+			// started", which is the thing worth saying.
+			if (current.value.locked === true) {
+				return { kind: "locked", memberCount: heldState.memberCount };
+			}
 			if (options.maxMembers > 0 && heldState.memberCount >= options.maxMembers) {
 				return { kind: "full", memberCount: heldState.memberCount };
 			}
@@ -266,6 +349,7 @@ export class ConferenceRegistry {
 				current: current.value,
 				localMemberCount: (existing?.members.size ?? 0) + 1,
 				localModeratorPresent: existing?.moderatorPresent === true || member.moderator,
+				...lockOf(current.value),
 			});
 			const written = await this.bucket.update(key, record, current.revision);
 			if (written.kind === "unavailable") {
@@ -285,6 +369,7 @@ export class ConferenceRegistry {
 			const nextState = this.claimState(record, now);
 			room.memberCount = nextState.memberCount;
 			room.moderatorPresent = nextState.moderatorPresent;
+			room.locked = record.locked === true;
 			if (nextState.moderatorPresent) {
 				this.releaseModeratorWaiters(room);
 			}
@@ -403,6 +488,10 @@ export class ConferenceRegistry {
 		room.claim = current;
 		const state = this.claimState(current.value, this.now());
 		room.memberCount = state.memberCount;
+		// The lock travels on the same poll. A moderator who locks the room from a phone registered on
+		// another instance is exactly the case this method exists for, and a local copy that never
+		// learned would render an unlocked room in a moderation panel that had just locked it.
+		room.locked = current.value.locked === true;
 		if (state.moderatorPresent && !room.moderatorPresent) {
 			room.moderatorPresent = true;
 			this.releaseModeratorWaiters(room);
@@ -441,6 +530,9 @@ export class ConferenceRegistry {
 				current: claim.value,
 				localMemberCount: room.members.size,
 				localModeratorPresent: [...room.members.values()].some((member) => member.moderator),
+				// A heartbeat rewrites the WHOLE value, so dropping the flag here would unlock every
+				// locked room in the cluster on somebody's timer.
+				...lockOf(claim.value),
 			});
 			const written = await this.bucket.update(key, record, claim.revision);
 			if (written.kind === "written") {
@@ -448,6 +540,7 @@ export class ConferenceRegistry {
 				const state = this.claimState(record, now);
 				room.memberCount = state.memberCount;
 				room.moderatorPresent = state.moderatorPresent;
+				room.locked = record.locked === true;
 				renewed += 1;
 				continue;
 			}
@@ -458,6 +551,7 @@ export class ConferenceRegistry {
 					const state = this.claimState(written.current.value, now);
 					room.memberCount = state.memberCount;
 					room.moderatorPresent = state.moderatorPresent;
+					room.locked = written.current.value.locked === true;
 				}
 				continue;
 			}
@@ -467,6 +561,178 @@ export class ConferenceRegistry {
 			);
 		}
 		return renewed;
+	}
+
+	// -------------------------------------------------------------------------------------------
+	// Moderation: what a live room's owner can do to it
+	// -------------------------------------------------------------------------------------------
+
+	/**
+	 * A member of a room this instance holds, found by LEG id.
+	 *
+	 * By leg and not by media channel, which is what {@link leave} keys on, and the difference is the
+	 * whole reason this method exists rather than a Map lookup at the call site. A media channel id
+	 * is the engine's private handle onto a media server: it changes when the driver changes, the
+	 * control plane has never seen one, and a REST path segment carrying one would put an Asterisk-ism
+	 * in a URL. The leg id is what `conference.joined` publishes, so it is the only identifier both
+	 * ends already share.
+	 *
+	 * `undefined` means "not on this instance", which a caller reads as "ask the next contributor"
+	 * rather than as "no such participant" — see the fan-out note on the control subject.
+	 */
+	memberByLeg(
+		conferenceId: string,
+		legId: string,
+		organizationId?: string,
+	): ConferenceMember | undefined {
+		const room = this.localRoomIfUnambiguous(conferenceId, organizationId);
+		if (room === undefined) {
+			return undefined;
+		}
+		for (const member of room.members.values()) {
+			if (member.legId === legId) {
+				return member;
+			}
+		}
+		return undefined;
+	}
+
+	/**
+	 * Changes what the room believes about one member, and returns the state afterwards.
+	 *
+	 * ## State here, effect on the media plane
+	 *
+	 * This writes the RECORD and performs no media command. The caller — the conference-control
+	 * responder — issues the mute or the gain change and calls this, in that order, because a record
+	 * that says muted while the mixer disagrees is worse than a media command whose record is a
+	 * moment behind: the first is what a moderation panel renders and acts on again.
+	 *
+	 * ## Absent fields are left alone
+	 *
+	 * A patch and not a replacement, so `deaf` does not clear a mute somebody else applied. That is
+	 * the same argument the media plane's ADDITIVE mute makes one layer down, for the same reason: a
+	 * moderator lifting the wrong gate because they touched an adjacent control is how a participant
+	 * gets their audio back in a room that had a reason to take it.
+	 *
+	 * Returns `undefined` when this instance does not hold the member.
+	 */
+	setMemberState(
+		conferenceId: string,
+		legId: string,
+		patch: ConferenceMemberPatch,
+		organizationId?: string,
+	): ConferenceMember | undefined {
+		const room = this.localRoomIfUnambiguous(conferenceId, organizationId);
+		if (room === undefined) {
+			return undefined;
+		}
+		for (const [mediaChannelId, member] of room.members) {
+			if (member.legId !== legId) {
+				continue;
+			}
+			const updated: ConferenceMember = {
+				...member,
+				muted: patch.muted ?? member.muted,
+				deafened: patch.deafened ?? member.deafened,
+				moderator: patch.moderator ?? member.moderator,
+				talkGainPercent: patch.talkGainPercent ?? member.talkGainPercent,
+				listenGainPercent: patch.listenGainPercent ?? member.listenGainPercent,
+			};
+			room.members.set(mediaChannelId, updated);
+			if (updated.moderator && !room.moderatorPresent) {
+				// A promotion opens the same gate an arriving moderator does. Without this, a room whose
+				// only moderator was promoted mid-meeting would hold its `waitForModerator` callers
+				// forever, waiting for somebody who is already in the room.
+				room.moderatorPresent = true;
+				this.releaseModeratorWaiters(room);
+			}
+			return updated;
+		}
+		return undefined;
+	}
+
+	/**
+	 * Opens or closes the room to new participants, cluster-wide.
+	 *
+	 * ## The flag goes in the CLAIM, and that is the whole design
+	 *
+	 * A lock held in one instance's memory is a lock a caller can walk around by landing on a
+	 * neighbour, which on a fleet of eight happens seven times out of eight. The claim is the value
+	 * every joiner already reads on the join path — it is where the cluster-wide member count comes
+	 * from — so honouring a lock costs one field read on a read that was going to happen.
+	 *
+	 * Written under compare-and-set against the revision this instance holds, with a bounded retry,
+	 * for the reason every other write to this key is: a lock that raced a join and lost would leave
+	 * a moderator's decision unrecorded and the room open.
+	 *
+	 * ## Local rooms lock locally
+	 *
+	 * A deployment with no claim bucket is single-instance BY CHOICE, and there is no neighbour for a
+	 * caller to walk around to. The flag lives on the room and behaves identically.
+	 */
+	async setLocked(
+		conferenceId: string,
+		locked: boolean,
+		options: { readonly organizationId?: string; readonly byUserId?: string } = {},
+	): Promise<ConferenceLockResult> {
+		const room = this.localRoomIfUnambiguous(conferenceId, options.organizationId);
+		if (room === undefined) {
+			return { kind: "unknown-conference" };
+		}
+		if (!this.bucket.isConfigured || room.organizationId === undefined) {
+			room.locked = locked;
+			return { kind: "set", locked, memberCount: Math.max(room.memberCount, room.members.size) };
+		}
+
+		const key = kvKeyFor.conferenceClaim(room.organizationId, conferenceId);
+		for (let attempt = 0; attempt < CAS_ATTEMPTS; attempt += 1) {
+			const read = await this.bucket.get(key);
+			if (read.kind === "unavailable") {
+				return { kind: "claims-unavailable", reason: read.reason };
+			}
+			if (read.kind !== "present") {
+				// The claim is gone, which means the room emptied while this command was in flight.
+				return { kind: "unknown-conference" };
+			}
+			const current = read.claim;
+			const now = this.now();
+			const record: ConferenceClaim = {
+				...this.claimRecord({
+					orgId: room.organizationId,
+					conferenceId,
+					bridgeId: current.value.bridgeId,
+					claimedAt: current.value.claimedAt,
+					nowMs: now,
+					current: current.value,
+					localMemberCount: room.members.size,
+					localModeratorPresent: [...room.members.values()].some((member) => member.moderator),
+				}),
+				// NOT `lockOf(current.value)` — this is the one write that is allowed to change the flag.
+				...(locked
+					? {
+							locked: true,
+							...(options.byUserId === undefined ? {} : { lockedByUserId: options.byUserId }),
+							lockedAtMs: now,
+						}
+					: {}),
+			};
+			const written = await this.bucket.update(key, record, current.revision);
+			if (written.kind === "unavailable") {
+				return { kind: "claims-unavailable", reason: written.reason };
+			}
+			if (written.kind === "lost") {
+				continue;
+			}
+			room.claim = { value: record, revision: written.revision };
+			room.locked = locked;
+			const state = this.claimState(record, now);
+			room.memberCount = state.memberCount;
+			return { kind: "set", locked, memberCount: state.memberCount };
+		}
+		return {
+			kind: "claims-unavailable",
+			reason: `the room's claim changed under ${String(CAS_ATTEMPTS)} attempts; the lock was not recorded`,
+		};
 	}
 
 	/** Drops every room. Used by the drain and by specs. Does not touch the media server or KV. */
@@ -496,6 +762,11 @@ export class ConferenceRegistry {
 			room.memberCount = 1;
 			room.moderatorPresent = member.moderator;
 			return { kind: "joined", room: snapshot(room), created: true };
+		}
+		// Before the cap, matching the shared path exactly: a locked room that also happens to be full
+		// is still "the meeting has started", which is the stronger and more useful answer.
+		if (existing.locked) {
+			return { kind: "locked", memberCount: existing.members.size };
 		}
 		if (options.maxMembers > 0 && existing.members.size >= options.maxMembers) {
 			return { kind: "full", memberCount: existing.members.size };
@@ -532,6 +803,7 @@ export class ConferenceRegistry {
 				current: current.value,
 				localMemberCount: room.members.size,
 				localModeratorPresent: [...room.members.values()].some((member) => member.moderator),
+				...lockOf(current.value),
 			});
 			const nextState = this.claimState(record, now);
 			if (nextState.memberCount === 0) {
@@ -573,6 +845,7 @@ export class ConferenceRegistry {
 			moderatorWaiters: new Set<() => void>(),
 			memberCount: 0,
 			moderatorPresent: false,
+			locked: false,
 			...(organizationId === undefined ? {} : { organizationId }),
 		};
 		const organizationRooms = this.rooms.get(organizationId) ?? new Map<string, MutableRoom>();
@@ -626,6 +899,9 @@ export class ConferenceRegistry {
 		readonly current?: ConferenceClaim;
 		readonly localMemberCount: number;
 		readonly localModeratorPresent: boolean;
+		readonly locked?: boolean;
+		readonly lockedByUserId?: string;
+		readonly lockedAtMs?: number;
 	}): ConferenceClaim {
 		const contributions =
 			input.current === undefined
@@ -645,6 +921,17 @@ export class ConferenceRegistry {
 			conferenceId: input.conferenceId,
 			bridgeId: input.bridgeId,
 			contributions,
+			// Carried FORWARD from whatever was read, never derived from this instance's opinion. Every
+			// write to this key — a join, a leave, a heartbeat — rewrites the whole value, so a
+			// heartbeat that dropped the flag would silently unlock a room the moment anybody's timer
+			// fired. `input.locked` is what the caller read a moment ago under compare-and-set.
+			...(input.locked === true
+				? {
+						locked: true,
+						...(input.lockedByUserId === undefined ? {} : { lockedByUserId: input.lockedByUserId }),
+						...(input.lockedAtMs === undefined ? {} : { lockedAtMs: input.lockedAtMs }),
+					}
+				: {}),
 		};
 	}
 
@@ -689,5 +976,46 @@ function snapshot(room: MutableRoom): ConferenceRoom {
 		members,
 		moderatorPresent: room.moderatorPresent || members.some((member) => member.moderator),
 		memberCount: Math.max(room.memberCount, members.length),
+		locked: room.locked,
+	};
+}
+
+/**
+ * A member arriving, with the state a room starts them in.
+ *
+ * Unmuted, undeafened and at unity, always. There is no configuration for "everybody starts muted",
+ * and that is deliberate rather than missing: it is a moderation policy, and a room that applied one
+ * at join time would be applying it before the moderator who owns the policy has arrived.
+ */
+function seat(joining: ConferenceJoin): ConferenceMember {
+	return {
+		...joining,
+		muted: false,
+		deafened: false,
+		talkGainPercent: CONFERENCE_UNITY_GAIN_PERCENT,
+		listenGainPercent: CONFERENCE_UNITY_GAIN_PERCENT,
+	};
+}
+
+/**
+ * The lock fields of a claim, ready to spread into the next one.
+ *
+ * A function rather than three lines at each of the four call sites, because every write to a
+ * conference claim rewrites the WHOLE value: a join, a leave and a heartbeat all rebuild it, and the
+ * one that forgot this would silently unlock a live meeting. Four call sites and one omission is the
+ * shape of that bug.
+ */
+function lockOf(claim: ConferenceClaim): {
+	readonly locked?: boolean;
+	readonly lockedByUserId?: string;
+	readonly lockedAtMs?: number;
+} {
+	if (claim.locked !== true) {
+		return {};
+	}
+	return {
+		locked: true,
+		...(claim.lockedByUserId === undefined ? {} : { lockedByUserId: claim.lockedByUserId }),
+		...(claim.lockedAtMs === undefined ? {} : { lockedAtMs: claim.lockedAtMs }),
 	};
 }

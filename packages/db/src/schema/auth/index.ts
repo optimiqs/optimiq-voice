@@ -10,9 +10,9 @@
  */
 export { account, session, user, verification } from "./identity-schema";
 export { invitation, member, organization } from "./organization-schema";
-export { apikey, jwks, twoFactor } from "./credential-schema";
+export { apikey, jwks, rateLimit, twoFactor } from "./credential-schema";
 
-import { apikey, jwks, twoFactor } from "./credential-schema";
+import { apikey, jwks, rateLimit, twoFactor } from "./credential-schema";
 import { account, session, user, verification } from "./identity-schema";
 import { invitation, member, organization } from "./organization-schema";
 
@@ -24,6 +24,7 @@ export const authSchema = {
 	jwks,
 	member,
 	organization,
+	rateLimit,
 	session,
 	twoFactor,
 	user,

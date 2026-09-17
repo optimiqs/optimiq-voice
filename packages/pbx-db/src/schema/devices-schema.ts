@@ -6,7 +6,8 @@ import {
 	uuidEntityId,
 	uuidV7PrimaryKey,
 } from "@optimiq-voice/db";
-import { tenantIsolationPolicy } from "../tenant";
+import { tenantCompositeForeignKey, tenantIsolationPolicy } from "../tenant";
+import { emergencyAddress } from "./emergency-schema";
 import { extension } from "./extensions-schema";
 
 /**
@@ -92,6 +93,15 @@ export const deviceProfile = pgTable.withRLS(
 	(table) => [
 		uniqueIndex("device_profile_organization_name_key").on(table.organizationId, table.name),
 		index("device_profile_organization_vendor_idx").on(table.organizationId, table.vendor),
+		/**
+		 * The target of the tenant-composite foreign keys that reference this table.
+		 *
+		 * PostgreSQL evaluates referential integrity with RLS bypassed, and a policy only
+		 * constrains a row's OWN `organization_id` — so a single-column reference to `id` lets one
+		 * tenant point a row at another tenant's row and nothing in the database objects. Every
+		 * child references `(organization_id, id)` instead, which needs this unique index.
+		 */
+		uniqueIndex("device_profile_organization_id_key").on(table.organizationId, table.id),
 		tenantIsolationPolicy("device_profile"),
 	],
 );
@@ -101,9 +111,7 @@ export const deviceProfileKey = pgTable.withRLS(
 	{
 		id: uuidV7PrimaryKey(),
 		organizationId: tenantOrganizationIdColumn(),
-		deviceProfileId: uuidEntityId("device_profile_id")
-			.notNull()
-			.references(() => deviceProfile.id, { onDelete: "cascade" }),
+		deviceProfileId: uuidEntityId("device_profile_id").notNull(),
 		category: text("category").$type<DeviceKeyCategory>().notNull().default("memory"),
 		keyIndex: integer("key_index").notNull(),
 		keyType: text("key_type").$type<DeviceKeyType>().notNull().default("none"),
@@ -120,6 +128,11 @@ export const deviceProfileKey = pgTable.withRLS(
 			table.category,
 			table.keyIndex,
 		),
+		tenantCompositeForeignKey({
+			name: "device_profile_key_device_profile_fk",
+			columns: [table.organizationId, table.deviceProfileId],
+			foreignColumns: [deviceProfile.organizationId, deviceProfile.id],
+		}),
 		tenantIsolationPolicy("device_profile_key"),
 	],
 );
@@ -153,6 +166,42 @@ export const device = pgTable.withRLS(
 		 */
 		provisioningTokenHash: text("provisioning_token_hash"),
 		provisioningTokenExpiresAt: utcTimestamp("provisioning_token_expires_at"),
+		/**
+		 * Where THIS handset physically is — the RAY BAUM'S Act dispatchable location, per device.
+		 *
+		 * `phone_number.emergency_address_id` answers "where is this DID registered", and that is the
+		 * right granularity for an ELIN. It is the wrong granularity for a dispatch: two desks on
+		 * opposite ends of a floor can share one extension and one DID, and until this column existed
+		 * they shared one address too — so a responder sent to a five-storey building got the lobby
+		 * for both. §9.8 asks for the location of the CALLING PARTY, and the calling party is a
+		 * handset, not a number.
+		 *
+		 * NULL is the ordinary state and is not a gap: it means "this phone has no location of its
+		 * own", and the resolution falls back to the extension's number and then to the DID exactly
+		 * as it did before. That fallback is why this is additive rather than a `NOT NULL` with a
+		 * backfill — a fleet of provisioned phones must not start failing an emergency lookup because
+		 * a column landed.
+		 *
+		 * `ON DELETE SET NULL` matches `phone_number`: deleting an address must not delete the phone.
+		 * The consequence — a device silently losing its location — is the same one
+		 * `emergency-addresses.resource.ts` guards at the CRUD layer, and it belongs there, where the
+		 * person doing the deleting can still be told.
+		 */
+		emergencyAddressId: uuidEntityId("emergency_address_id").references(() => emergencyAddress.id, {
+			onDelete: "set null",
+		}),
+		/**
+		 * The desk-level refinement of {@link device.emergencyAddressId} — "Floor 3, Suite 310, desk
+		 * by the window".
+		 *
+		 * Separate from `emergency_address.location_detail` because the two are written by different
+		 * people at different times: the address (and its building-level detail) is validated once by
+		 * the upstream provider and must not be edited to describe one phone, while this is whatever
+		 * the person who plugged the handset in knows. Overloading the address's column would mean
+		 * moving a desk invalidates a validated address, which is the one thing `validated` exists to
+		 * prevent.
+		 */
+		emergencyLocationDetail: text("emergency_location_detail"),
 		lastProvisionedAt: utcTimestamp("last_provisioned_at"),
 		lastProvisionedIp: text("last_provisioned_ip"),
 		settings: jsonb("settings").$type<ProvisioningSettings>(),
@@ -169,6 +218,11 @@ export const device = pgTable.withRLS(
 		uniqueIndex("device_provisioning_token_hash_key").on(table.provisioningTokenHash),
 		index("device_organization_enabled_idx").on(table.organizationId, table.enabled),
 		index("device_organization_profile_idx").on(table.organizationId, table.deviceProfileId),
+		/** Mirrors `phone_number_organization_emergency_address_idx` — same question, per handset. */
+		index("device_organization_emergency_address_idx").on(
+			table.organizationId,
+			table.emergencyAddressId,
+		),
 		tenantIsolationPolicy("device"),
 	],
 );
@@ -185,9 +239,52 @@ export const deviceLine = pgTable.withRLS(
 		extensionId: uuidEntityId("extension_id").references(() => extension.id, {
 			onDelete: "set null",
 		}),
+		/**
+		 * The binding this line RETURNS TO when a hot-desk session ends. NULL means there is no
+		 * session and {@link deviceLine.extensionId} is already the home binding.
+		 *
+		 * Two columns rather than one, because a logout must RESTORE rather than GUESS. A design that
+		 * only moved `extension_id` has no record of where the handset came from, so the only
+		 * recoveries left are "leave the agent's extension on a desk they walked away from" and
+		 * "infer the home binding from the provisioning template", and the second is wrong the moment
+		 * an administrator re-points a line while somebody is logged into it.
+		 *
+		 * The pair is also the whole of what makes hot desking safe for the REGISTRAR. A rebind moves
+		 * only where CALLS go: `sip-credentials.service.ts` resolves the digest username and the
+		 * secret against `coalesce(home_extension_id, extension_id)`, so the handset keeps the
+		 * account it was provisioned with, keeps its HA1, and never has to re-provision or
+		 * re-REGISTER to stay authenticated. See the note on `findDeviceLine`.
+		 */
+		homeExtensionId: uuidEntityId("home_extension_id").references(() => extension.id, {
+			onDelete: "set null",
+		}),
+		/**
+		 * When the temporary binding lapses, in UTC. NULL alongside a NULL `home_extension_id` is the
+		 * ordinary, logged-out state.
+		 *
+		 * An expiry and not a session that lives forever, because the failure mode of hot desking is
+		 * an agent who goes home without logging out: their calls then ring a desk nobody is sitting
+		 * at, all night, and the extension is unreachable everywhere else. The sweeper that enforces
+		 * it is `hot-desk-sweeper.service.ts`; this column is the durable half, so a control plane
+		 * that restarts mid-session still expires it.
+		 */
+		hotDeskExpiresAt: utcTimestamp("hot_desk_expires_at"),
+		/** When the session began, for the audit trail and the "who is at which desk" report. */
+		hotDeskLoginAt: utcTimestamp("hot_desk_login_at"),
 		/** Auth id rendered into the config; defaults to the extension number when NULL. */
 		authUser: text("auth_user"),
 		sipSecretRef: text("sip_secret_ref"),
+		/**
+		 * The line's pre-rotation handle and the instant it stops being accepted.
+		 *
+		 * The same pair, for the same reason, as `extension.sip_secret_ref_previous` — which carries
+		 * the full argument. It is duplicated on this table rather than being read through the
+		 * extension because the two secrets are independently rotatable: the credential path resolves
+		 * `coalesce(extension.sip_secret_ref, device_line.sip_secret_ref)`, so a line whose extension
+		 * has no handle authenticates entirely from this row and would otherwise have no grace at all.
+		 */
+		sipSecretRefPrevious: text("sip_secret_ref_previous"),
+		sipSecretGraceUntil: utcTimestamp("sip_secret_grace_until"),
 		serverAddress: text("server_address"),
 		serverPort: integer("server_port").notNull().default(5060),
 		transport: text("transport").$type<SipTransport>().notNull().default("udp"),
@@ -204,6 +301,20 @@ export const deviceLine = pgTable.withRLS(
 			table.lineNumber,
 		),
 		index("device_line_organization_extension_idx").on(table.organizationId, table.extensionId),
+		/**
+		 * Lapsed hot-desk sessions, for the sweeper and for the "who is at which desk" report.
+		 *
+		 * Tenant-first, like every other index in this schema — the rule `schema.spec.ts` enforces so
+		 * the RLS predicate is always usable. The sweeper's own query is org-agnostic
+		 * (`hot_desk_expires_at <= now()`) and PostgreSQL will not skip-scan a leading column for it,
+		 * so that sweep is a scan of `device_line`; at one tick a minute over a table with one row per
+		 * physical line, that is the cheaper trade than a second, tenant-blind index whose only reader
+		 * is a timer.
+		 */
+		index("device_line_organization_hot_desk_expires_idx").on(
+			table.organizationId,
+			table.hotDeskExpiresAt,
+		),
 		tenantIsolationPolicy("device_line"),
 	],
 );

@@ -1,0 +1,1 @@
+CREATE INDEX "call_legs_queue_agent_idx" ON "call_legs" ("organization_id","queue_agent_ref","started_at" DESC NULLS LAST) WHERE queue_agent_ref is not null;

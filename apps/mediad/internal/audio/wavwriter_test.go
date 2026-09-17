@@ -9,9 +9,8 @@ import (
 	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
 )
 
-// The writer suite asserts on BYTES ON DISK, because that is what a player at the far end of a
-// download link opens. A test that checked a method was called would stay green with the data
-// length still at its placeholder zero — which produces a file every player reports as empty.
+// This suite asserts on bytes on disk: a test that only checked a method was called would stay
+// green with the data length still at its placeholder zero.
 
 func TestCreateWAVWritesToAPartialUntilItIsClosed(t *testing.T) {
 	// The final path must never name an incomplete file: apps/api's archiver stats the object key
@@ -51,9 +50,8 @@ func TestCreateWAVWritesToAPartialUntilItIsClosed(t *testing.T) {
 }
 
 func TestCreateWAVPatchesBothLengthFieldsOnClose(t *testing.T) {
-	// The two lengths are written as zero and patched at the end, because the length of a recording
-	// is not known until it stops. A patch that missed either one produces a file that opens and
-	// plays nothing.
+	// Both length fields start at zero and are patched on Close; missing either one produces a file
+	// that opens and plays nothing.
 	root := t.TempDir()
 	final := filepath.Join(root, "rec.wav")
 
@@ -62,7 +60,7 @@ func TestCreateWAVPatchesBothLengthFieldsOnClose(t *testing.T) {
 		t.Fatalf("CreateWAV: %v", err)
 	}
 	const frames = 3
-	for index := 0; index < frames; index++ {
+	for range frames {
 		if err := writer.WriteSamples(make([]int16, audio.FrameSamples)); err != nil {
 			t.Fatalf("WriteSamples: %v", err)
 		}
@@ -99,8 +97,7 @@ func TestCreateWAVPatchesBothLengthFieldsOnClose(t *testing.T) {
 }
 
 func TestCreateWAVRefusesToOverwriteAPartialInFlight(t *testing.T) {
-	// Two recordings racing for one reference is a caller bug, and truncating would make the second
-	// silently destroy the first's audio.
+	// Two recordings racing for one reference must fail rather than destroy the first's audio.
 	root := t.TempDir()
 	final := filepath.Join(root, "rec.wav")
 
@@ -145,7 +142,7 @@ func TestDurationMsCountsWhatWasWritten(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = writer.Abort() })
 
-	for index := 0; index < 50; index++ {
+	for range 50 {
 		if err := writer.WriteSamples(make([]int16, audio.FrameSamples)); err != nil {
 			t.Fatalf("WriteSamples: %v", err)
 		}
@@ -156,9 +153,7 @@ func TestDurationMsCountsWhatWasWritten(t *testing.T) {
 }
 
 func TestMixIntoSaturatesRatherThanWrapping(t *testing.T) {
-	// A wrap turns a loud moment into a full-amplitude sign flip, which is not "slightly clipped" —
-	// it is a bang. Clamping produces the mild distortion every mixer produces when two people
-	// shout at once.
+	// A wrap would turn a loud moment into a full-amplitude sign flip; the mixer must clamp.
 	destination := []int16{30000, -30000, 100}
 	audio.MixInto(destination, []int16{30000, -30000, -50})
 
@@ -183,8 +178,7 @@ func TestMixIntoStopsAtTheShorterFrame(t *testing.T) {
 }
 
 func TestDecodeLinearRoundTripsThroughBothLaws(t *testing.T) {
-	// The recorder writes linear, so a frame that came in as G.711 has to come back out recognisably.
-	// G.711 is lossy, so this asserts proximity rather than equality — a decoder with a sign error
+	// G.711 is lossy, so this asserts proximity rather than equality; a decoder with a sign error
 	// would be nowhere near.
 	for _, encoding := range []audio.Encoding{audio.EncodingULaw, audio.EncodingALaw} {
 		for _, sample := range []int16{0, 1000, -1000, 16000, -16000} {

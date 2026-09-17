@@ -79,11 +79,30 @@ export class AriHttpError extends AriError {
 export class AriTransportError extends AriError {
 	readonly method: string;
 	readonly path: string;
+	/**
+	 * Whether OUR timeout fired, as opposed to never reaching Asterisk at all.
+	 *
+	 * The distinction is the same one {@link AriHttpError.isRetryable} exists for: "never connected"
+	 * is safe to retry, "timed out mid-request" may already have placed the call. Collapsing both
+	 * into "could not reach Asterisk" left a retry policy above this seam nothing to decide on.
+	 */
+	readonly timedOut: boolean;
 
-	constructor(method: string, path: string, options?: { readonly cause?: unknown }) {
-		super(`ARI ${method} ${path} could not reach Asterisk`, options);
+	constructor(
+		method: string,
+		path: string,
+		options?: { readonly cause?: unknown; readonly timedOut?: boolean },
+	) {
+		const timedOut = options?.timedOut ?? false;
+		super(
+			timedOut
+				? `ARI ${method} ${path} timed out`
+				: `ARI ${method} ${path} could not reach Asterisk`,
+			options,
+		);
 		this.method = method;
 		this.path = path;
+		this.timedOut = timedOut;
 	}
 }
 

@@ -12,9 +12,6 @@
 # `apps/asterisk` is not here. It has its own `publish-asterisk.yaml`: a self-contained image built
 # from `apps/asterisk` alone, on its own cadence, pushed to a different registry.
 #
-# `apps/sipd` and `apps/mediad` are not here either — neither Go app has a Dockerfile yet. Add a
-# matrix entry when one lands; nothing else in this file needs to change.
-#
 # Deployment is deliberately out of scope. This workflow's whole job is to put an image in GHCR.
 name: publish images
 
@@ -34,6 +31,9 @@ on:
           - api
           - engine
           - web
+          - sipd
+          - mediad
+          - migrations
 
 concurrency:
   group: publish-images-${{ github.ref }}
@@ -51,9 +51,7 @@ jobs:
       # filtered downstream — the selection has to happen before the matrix is expanded.
       #
       # `platforms` is per app, not global:
-      #   api    — amd64 only. Its Dockerfile downloads `dockerize-linux-amd64` by a hardcoded URL,
-      #            so an arm64 image would ship an amd64 binary as its entrypoint wrapper and fail
-      #            to exec. Widen this the moment that download becomes arch-aware.
+      #   api / migrations — architecture-specific dockerize download uses TARGETARCH.
       #   engine — node:22-slim on both arches, no arch-specific fetches.
       #   web    — same; Next's standalone output is portable.
       - name: Select images
@@ -63,9 +61,12 @@ jobs:
         run: |
           set -euo pipefail
           all='[
-            {"app":"api","platforms":"linux/amd64"},
+            {"app":"api","platforms":"linux/amd64,linux/arm64"},
+            {"app":"migrations","dockerfile":"apps/api/Dockerfile","target":"migrations","platforms":"linux/amd64,linux/arm64"},
             {"app":"engine","platforms":"linux/amd64,linux/arm64"},
-            {"app":"web","platforms":"linux/amd64,linux/arm64"}
+            {"app":"web","platforms":"linux/amd64,linux/arm64"},
+            {"app":"sipd","platforms":"linux/amd64,linux/arm64"},
+            {"app":"mediad","platforms":"linux/amd64,linux/arm64"}
           ]'
           if [ "$SELECTION" = "all" ]; then
             matrix="$(jq -c . <<<"$all")"
@@ -131,7 +132,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: apps/${{ matrix.app }}/Dockerfile
+          file: ${{ matrix.dockerfile || format('apps/{0}/Dockerfile', matrix.app) }}
+          target: ${{ matrix.target || '' }}
           platforms: ${{ matrix.platforms }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}

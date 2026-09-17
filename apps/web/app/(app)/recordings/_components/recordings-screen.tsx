@@ -30,7 +30,7 @@ import {
 	useTimeRangeState,
 } from "../../cdr/_components/time-range";
 import { RecordingPlayer } from "./recording-player";
-import type { RecordingRow } from "~/lib/cdr/contracts";
+import type { RecordingConsent, RecordingRow } from "~/lib/cdr/contracts";
 
 const KINDS = ["", "call", "voicemail", "conference"] as const;
 
@@ -223,6 +223,24 @@ export function RecordingsScreen() {
 				</Link>{" "}
 				and expand the call — every leg shows its own media.
 			</p>
+
+			{/*
+			 * The retention column shows the window each row was STAMPED with when it was written, not
+			 * the policy in force now — the two differ for every recording made before the policy last
+			 * changed, which is why the link says "for new recordings" rather than "the policy".
+			 */}
+			<p className="max-w-prose text-xs text-muted-foreground">
+				The retention column is the window each recording was stamped with when it was written.
+				Changing{" "}
+				<Link
+					href={routes.recordingSettings}
+					className="text-primary underline-offset-4 hover:underline"
+				>
+					how long recordings are kept
+				</Link>{" "}
+				applies to new recordings and never re-stamps these. Deleting one removes the audio
+				immediately and leaves the row behind as a record that it existed.
+			</p>
 		</>
 	);
 }
@@ -264,6 +282,7 @@ function RecordingsTable({
 						<TableHead>Kind</TableHead>
 						<TableHead className="text-right">Length</TableHead>
 						<TableHead className="text-right">Size</TableHead>
+						<TableHead>Consent</TableHead>
 						<TableHead>Retention</TableHead>
 						<TableHead>Media</TableHead>
 					</TableRow>
@@ -283,6 +302,9 @@ function RecordingsTable({
 							<TableCell className="text-right whitespace-nowrap" data-tabular>
 								{formatBytes(row.sizeBytes)}
 							</TableCell>
+							<TableCell>
+								<ConsentCell consent={row.consent ?? null} />
+							</TableCell>
 							<TableCell className="text-sm text-muted-foreground whitespace-nowrap">
 								{row.deletedAt !== null
 									? "Purged"
@@ -300,3 +322,50 @@ function RecordingsTable({
 		</TableContainer>
 	);
 }
+
+/**
+ * What the parties were told before this object was made.
+ *
+ * ## An absent record renders as nothing, never as "unknown"
+ *
+ * `consent` is absent on every recording made before the consent gate existed, and on any made
+ * where the engine wrote no record. A blank cell is the truth about those rows; "unknown" reads
+ * like a failure to look, and would put a question mark beside years of perfectly ordinary audio.
+ *
+ * `not-required` is the opposite case and it IS shown: the gate ran, and it decided nothing needed
+ * to be said. That is a fact about the call, and the difference between it and a blank cell is
+ * exactly the difference between "we checked" and "this predates checking".
+ *
+ * `declined` is the only tone that is not neutral. A declined call has NO recording of its own —
+ * the row exists because the refusal is what the record is for — so a reader who sees it beside a
+ * missing play button is seeing the feature work rather than a purge.
+ */
+function ConsentCell({ consent }: { consent: RecordingConsent | null }) {
+	if (consent === null) {
+		return null;
+	}
+	return (
+		<div className="flex flex-col gap-0.5">
+			<Badge tone={CONSENT_TONES[consent.outcome] ?? "neutral"}>
+				{CONSENT_LABELS[consent.outcome] ?? consent.outcome}
+			</Badge>
+			{consent.regions !== undefined && consent.regions.length > 0 ? (
+				<span className="text-xs text-muted-foreground">{consent.regions.join(", ")}</span>
+			) : null}
+		</div>
+	);
+}
+
+const CONSENT_LABELS: Record<string, string> = {
+	"not-required": "Not required",
+	announced: "Announced",
+	accepted: "Accepted",
+	declined: "Declined",
+};
+
+const CONSENT_TONES: Record<string, "neutral" | "success" | "warning"> = {
+	"not-required": "neutral",
+	announced: "neutral",
+	accepted: "success",
+	declined: "warning",
+};

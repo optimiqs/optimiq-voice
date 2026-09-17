@@ -62,6 +62,55 @@ function setting(name: string, index: number, value: string | number, readOnly =
 	return `\t\t<${xmlEscape(name)} idx="${index}" perm="${readOnly ? "R" : "RW"}">${xmlValue(value)}</${xmlEscape(name)}>`;
 }
 
+/**
+ * A GLOBAL phone setting — no `idx`.
+ *
+ * The whole of {@link setting} above assumes an index, because every identity parameter has one.
+ * Snom's phone-wide settings do not: they are written `<name perm="FLAG">value</name>`, and adding
+ * an `idx="0"` to one is not a harmless extra attribute — the identity settings are 1-based, so
+ * index 0 is a value the firmware has no slot for. Two helpers rather than an optional argument,
+ * because the difference is which KIND of setting this is and a defaulted parameter would let a
+ * caller pick the wrong one without noticing.
+ */
+function globalSetting(name: string, value: string | number, readOnly = false): string {
+	return `\t\t<${xmlEscape(name)} perm="${readOnly ? "R" : "RW"}">${xmlValue(value)}</${xmlEscape(name)}>`;
+}
+
+/**
+ * Auto-answer, which on Snom is `answer_after_policy` and is OFF by default.
+ *
+ * Snom is the second of the five that documents the `info=alert-autoanswer` token by name — its own
+ * examples show `Alert-Info: <http://www.notused.com>;info=alert-autoanswer;delay=0`, where the URI
+ * is decorative (the example says so) and the `info=` parameter is what is matched. An INVITE
+ * carrying it "does not ring but goes directly to connected, if the situation and this setting
+ * allow it".
+ *
+ * The default changed to `off` at firmware 7.1.39 and has stayed there, which is the reason this is
+ * written at all: on a modern D-series the feature is disabled until somebody provisions it, so a
+ * template that relies on the default provisions a fleet that ignores every page.
+ *
+ * ## `idle` and not `always` or `not_busy`
+ *
+ * The four values are `off`, `idle` (auto-connect only from the idle screen), `not_busy`
+ * (auto-connect unless there is an active call — a HELD call still allows the interruption) and
+ * `always` (no restrictions, and with call-waiting enabled it will interrupt a conversation).
+ *
+ * `idle` is the conservative one and the one that matches what the other four templates in this
+ * catalogue are configured to do: Yealink and Fanvil both have `Intercom Barge` left off, which is
+ * the same rule expressed in those vendors' vocabulary. A deployment that wants emergency paging to
+ * cut through overrides this through the settings cascade — which is the right place for a decision
+ * that ends with somebody's customer call being interrupted.
+ *
+ * `auto_connect_indication` is `on` for the reason every template here gives: a phone that opens its
+ * microphone silently is a phone whose owner cannot tell that it did.
+ */
+function autoAnswerSettings(): readonly string[] {
+	return [
+		globalSetting("answer_after_policy", "idle"),
+		globalSetting("auto_connect_indication", "on"),
+	];
+}
+
 function renderAccount(line: RenderLine): readonly string[] {
 	const index = line.lineNumber;
 	const host =
@@ -141,6 +190,7 @@ export const SNOM_TEMPLATE: VendorTemplate = {
 			"<settings>",
 			"\t<phone-settings>",
 			...context.lines.flatMap((line) => renderAccount(line)),
+			...autoAnswerSettings(),
 			...(settings.length === 0 ? [] : [settings]),
 			"\t</phone-settings>",
 			...(context.keys.length === 0
@@ -160,11 +210,15 @@ export const SNOM_TEMPLATE: VendorTemplate = {
 		"Snom Service Hub — `<functionKeys>` tag: `<fkey idx context label perm>` attribute syntax and keyword set",
 		"Snom Service Hub — Auto Provisioning: `{mac}`, `%MACD`, `{phone_type}`, `{firmware_version}` URL placeholders",
 		"BroadSoft Partner Configuration Guide, Snom 10.1.51.12 (Cisco-hosted) — `user_pname` / `user_outbound` / `user_expiry` cross-check",
+		"Snom Service Hub — `answer_after_policy` (`off` / `idle` / `not_busy` / `always`, default `off` since 7.1.39) and `auto_connect_indication`; and the Intercom/Paging page's `Alert-Info: <http://www.notused.com>;info=alert-autoanswer;delay=0` example",
 	],
 	caveats: [
 		"`<fkey idx>` is 0-based while identities are 1-based; the template decrements so a `keyIndex` of 1 is the phone's first programmable key.",
 		"There is no transport parameter on this firmware line — the transport is a `;udp` / `;tcp` / `;tls` suffix on `user_outbound`, and this template always emits `user_outbound` for that reason even when no proxy is configured.",
 		'`perm` is written as `R` / `RW` rather than the whitespace forms, because `perm=""` and `perm=" "` mean opposite things and a stray trim would invert every credential\'s protection.',
+		"`answer_after_policy` is set to `idle`, so an intercom or page is answered only from the idle screen and will not interrupt a call in progress. A deployment that wants emergency paging to cut through must override it with `not_busy` or `always` through the settings cascade.",
+		'`answer_after_policy` and `auto_connect_indication` are phone-wide settings and carry NO `idx` attribute, unlike every `user_*` parameter above them — identity indices are 1-based, so an `idx="0"` here would address a slot that does not exist.',
+		"UNVERIFIED: `intercom_connect_type` — which of handset, headset or handsfree an auto-answered intercom uses — is documented but its exact accepted values could not be corroborated for firmware 10, so it is not written and the phone's own default applies.",
 		"`dtmf` has no documented Snom keyword and renders as `none` rather than a guess.",
 		"If a deployment's Setting URL omits `{mac}`, the phone also requests a `-<MAC>` filename variant; plan the server route for both.",
 		"Not validated against physical hardware.",

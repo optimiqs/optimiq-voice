@@ -1,0 +1,70 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"legId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"instanceId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"orgId": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"callId": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"role": {
+			"type": "string",
+			"enum": ["uas", "uac"]
+		},
+		"sipCallId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 256
+		},
+		"localTag": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"remoteTag": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"state": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 32
+		},
+		"remoteAddress": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"transport": {
+			"type": "string",
+			"enum": ["udp", "tcp", "tls", "ws", "wss"]
+		},
+		"trunkId": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"profile": {
+			"type": "string",
+			"maxLength": 64
+		},
+		"createdAt": {
+			"type": "number"
+		},
+		"expiresAt": {
+			"type": "number"
+		}
+	},
+	"required": ["legId", "instanceId", "role", "sipCallId", "state", "createdAt", "expiresAt"],
+	"additionalProperties": {}
+}

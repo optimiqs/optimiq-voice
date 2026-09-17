@@ -1,13 +1,25 @@
-import { Inject, Injectable, type OnApplicationShutdown, type OnModuleInit } from "@nestjs/common";
+import {
+	Inject,
+	Injectable,
+	Optional,
+	type OnApplicationShutdown,
+	type OnModuleInit,
+} from "@nestjs/common";
 import { AckPolicy, connect, DeliverPolicy, type NatsConnection } from "nats";
 import { natsConnectionOptions } from "@optimiq-voice/config/nats-credentials";
+import { encryptSecret, loadSecretKey, openStoredSecret } from "@optimiq-voice/db";
 import { getLogger } from "@optimiq-voice/logging";
 import { and, eq, sql, webhookSubscription } from "@optimiq-voice/pbx-db";
 import { PBX_DATABASE, PBX_ENV } from "../shared/pbx.tokens";
 import { deliverWebhook, type WebhookFetch } from "./webhook-delivery";
-import { isWebhookFamily, selectorsMatch, WEBHOOK_FAMILY_ROOTS } from "./webhook-selectors";
+import {
+	isWebhookFamily,
+	parsedSelectorsMatch,
+	parseWebhookSelectors,
+	WEBHOOK_FAMILY_ROOTS,
+} from "./webhook-selectors";
 import type { PbxEnv } from "../shared/pbx-env";
-import type { WebhookFamily } from "./webhook-selectors";
+import type { ParsedSelector, WebhookFamily } from "./webhook-selectors";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
 const logger = getLogger("api.webhooks");
@@ -16,11 +28,11 @@ const logger = getLogger("api.webhooks");
  * One durable per STREAM, all feeding one delivery queue.
  *
  * A JetStream consumer belongs to exactly one stream, so "one consumer for the API" is not
- * expressible across four families that live on four streams — what IS expressible, and what this
+ * expressible across six families that live on six streams — what IS expressible, and what this
  * is, is one consumer per stream rather than one per subscription. The distinction matters: the
  * thing to avoid is a broker-side consumer whose lifetime is a tenant's configuration row, which
  * would put subscription CRUD in the path of JetStream asset management and leave orphaned durables
- * behind every delete. Here the broker sees four durables on a running deployment and four on an
+ * behind every delete. Here the broker sees six durables on a running deployment and six on an
  * idle one, whatever the tenants do.
  *
  * The filters are the family roots, so the consumers deliver every tenant's events and the
@@ -57,6 +69,18 @@ const WEBHOOK_CONSUMERS: readonly {
 		durable: "pbx-webhook-cdr",
 		filter: `${WEBHOOK_FAMILY_ROOTS.cdr}.*`,
 	},
+	{
+		family: "security",
+		stream: "SECURITY",
+		durable: "pbx-webhook-security",
+		filter: `${WEBHOOK_FAMILY_ROOTS.security}.>`,
+	},
+	{
+		family: "messaging",
+		stream: "MESSAGING",
+		durable: "pbx-webhook-messaging",
+		filter: `${WEBHOOK_FAMILY_ROOTS.messaging}.>`,
+	},
 ];
 
 /**
@@ -74,9 +98,21 @@ const MAX_DELIVER = 3;
 interface CachedSubscription {
 	readonly id: string;
 	readonly url: string;
+	/** OPENED at fill time — the column is a `v1.` envelope; an HMAC needs the key itself. */
 	readonly secret: string;
-	readonly eventSelectors: readonly string[];
+	/** Parsed once at cache-fill time; the dispatcher's hot path never re-parses a string. */
+	readonly selectors: readonly ParsedSelector[];
 }
+
+/**
+ * How many tenants' subscriptions are held at once.
+ *
+ * The cache holds every subscription's plaintext signing secret, so an unbounded map is both memory
+ * that grows with tenant count forever and a store of every tenant's HMAC keys that outlives the
+ * tenant. Bounded with LRU eviction: a busy platform keeps its busy tenants and a deleted one falls
+ * out on its own.
+ */
+const CACHE_MAX_ORGANIZATIONS = 1_000;
 
 interface CacheEntry {
 	readonly subscriptions: readonly CachedSubscription[];
@@ -143,6 +179,7 @@ export class WebhookDispatcher implements OnModuleInit, OnApplicationShutdown {
 		 * The transport. Injected rather than closed over so a spec drives every delivery path without
 		 * a socket, and so a deployment that needs a proxy has one seam to change.
 		 */
+		@Optional()
 		private readonly fetchImpl: WebhookFetch = globalThis.fetch as unknown as WebhookFetch,
 	) {}
 
@@ -243,6 +280,23 @@ export class WebhookDispatcher implements OnModuleInit, OnApplicationShutdown {
 				deliver_policy: DeliverPolicy.New,
 				filter_subject: spec.filter,
 				max_deliver: MAX_DELIVER,
+				/**
+				 * The ack clock has to cover the QUEUE, not just the POST.
+				 *
+				 * A message is delivered the moment JetStream hands it over, and the loop then parks in
+				 * `awaitSlot` while earlier fan-outs finish — so the default 30 s can expire on a message
+				 * this process has not started. A redelivery re-POSTs to EVERY subscription of the
+				 * tenant, including the ones that already succeeded (the same argument the header makes
+				 * against NAKing), and after `MAX_DELIVER` the event is dropped. So the window is the
+				 * worst-case fan-out with room for the wait in front of it.
+				 */
+				ack_wait: this.ackWaitNanos(),
+				/**
+				 * The broker stops prefetching what the loop cannot start. Without it JetStream pushes a
+				 * batch whose ack timers all run while the in-flight set is full — the queueing that
+				 * burns the window above.
+				 */
+				max_ack_pending: this.env.PBX_WEBHOOK_CONCURRENCY,
 			});
 		} catch (error) {
 			if (!/consumer already exists/iu.test(String(error))) {
@@ -284,6 +338,20 @@ export class WebhookDispatcher implements OnModuleInit, OnApplicationShutdown {
 		this.running = Math.max(0, this.running - 1);
 	}
 
+	/**
+	 * The `ack_wait` window, in nanoseconds, derived from the delivery budget rather than guessed.
+	 *
+	 * One fan-out is at most `MAX_ATTEMPTS x TIMEOUT_MS` of POSTs plus the backoff between them, and
+	 * a message can wait behind `CONCURRENCY` of those before it starts. Floored at 60 s so a
+	 * deployment with tight per-attempt timeouts still has a window wider than JetStream's default.
+	 */
+	private ackWaitNanos(): number {
+		const oneFanOut =
+			this.env.PBX_WEBHOOK_MAX_ATTEMPTS * this.env.PBX_WEBHOOK_TIMEOUT_MS +
+			this.env.PBX_WEBHOOK_MAX_ATTEMPTS * this.env.PBX_WEBHOOK_MAX_BACKOFF_MS;
+		return Math.max(60_000, oneFanOut * 2) * 1_000_000;
+	}
+
 	private async awaitSlot(): Promise<void> {
 		while (this.inFlight.size >= this.env.PBX_WEBHOOK_CONCURRENCY && !this.stopped) {
 			await new Promise<void>((resolve) => {
@@ -293,11 +361,11 @@ export class WebhookDispatcher implements OnModuleInit, OnApplicationShutdown {
 	}
 
 	private releaseSlot(): void {
-		const waiters = this.waiters;
-		this.waiters = [];
-		for (const waiter of waiters) {
-			waiter();
-		}
+		// One waiter per released slot. Draining the whole array woke all four family loops on one
+		// free slot, and all four passed the `awaitSlot` re-check before any had called `spawn` — so
+		// the bound documented as exact was actually `concurrency + 3`.
+		const waiter = this.waiters.shift();
+		waiter?.();
 	}
 
 	private spawn(message: DispatchMessage, family: WebhookFamily): void {
@@ -392,7 +460,7 @@ export class WebhookDispatcher implements OnModuleInit, OnApplicationShutdown {
 		}
 
 		const targets = subscriptions.filter((subscription) =>
-			selectorsMatch(subscription.eventSelectors, parsed.family, type),
+			parsedSelectorsMatch(subscription.selectors, parsed.family, type),
 		);
 		if (targets.length === 0) {
 			message.ack();
@@ -534,8 +602,15 @@ export class WebhookDispatcher implements OnModuleInit, OnApplicationShutdown {
 	private async subscriptionsFor(organizationId: string): Promise<readonly CachedSubscription[]> {
 		const cached = this.cache.get(organizationId);
 		const now = Date.now();
-		if (cached !== undefined && now - cached.readAt < this.env.PBX_WEBHOOK_CACHE_TTL_MS) {
-			return cached.subscriptions;
+		if (cached !== undefined) {
+			if (now - cached.readAt < this.env.PBX_WEBHOOK_CACHE_TTL_MS) {
+				// Re-inserting moves the key to the end of the Map's insertion order, which is what makes
+				// the eviction below least-recently-USED rather than least-recently-filled.
+				this.cache.delete(organizationId);
+				this.cache.set(organizationId, cached);
+				return cached.subscriptions;
+			}
+			this.cache.delete(organizationId);
 		}
 		const rows = await this.database.withTenantScope(organizationId, async (transaction) => {
 			return await transaction
@@ -554,13 +629,49 @@ export class WebhookDispatcher implements OnModuleInit, OnApplicationShutdown {
 				)
 				.limit(200);
 		});
-		const subscriptions = rows.map((row) => ({
-			id: row.id,
-			url: row.url,
-			secret: row.secret,
-			eventSelectors: Array.isArray(row.eventSelectors) ? row.eventSelectors : [],
-		}));
+		const key = loadSecretKey();
+		const subscriptions: CachedSubscription[] = [];
+		for (const row of rows) {
+			const { plaintext, wasEncrypted } = openStoredSecret(row.secret, key);
+			// The lazy half of the migration, and this is the right place for it: the fill already runs
+			// once per cache window rather than once per delivery, so both the unwrap and this write are
+			// amortised across every event the tenant produces. Best-effort for the reason the SSO
+			// reader states — a read-only replica must not stop a tenant's webhooks to finish a
+			// migration `scripts/` can also do. A row with NO key configured is signed with as-is: a
+			// deployment that never set PLATFORM_SECRET_ENCRYPTION_KEY keeps working.
+			if (!wasEncrypted && key) {
+				try {
+					await this.database.withTenantScope(organizationId, async (transaction) => {
+						await transaction
+							.update(webhookSubscription)
+							.set({ secret: encryptSecret(plaintext, key) })
+							.where(eq(webhookSubscription.id, row.id));
+					});
+				} catch (error) {
+					logger.warn(
+						{ err: error, organizationId, subscriptionId: row.id },
+						"could not seal a legacy webhook secret",
+					);
+				}
+			}
+			subscriptions.push({
+				id: row.id,
+				url: row.url,
+				secret: plaintext,
+				selectors: parseWebhookSelectors(
+					Array.isArray(row.eventSelectors) ? row.eventSelectors : [],
+				),
+			});
+		}
 		this.cache.set(organizationId, { subscriptions, readAt: now });
+		// Oldest first, because a Map iterates in insertion order and every hit above re-inserts.
+		while (this.cache.size > CACHE_MAX_ORGANIZATIONS) {
+			const oldest = this.cache.keys().next();
+			if (oldest.done === true) {
+				break;
+			}
+			this.cache.delete(oldest.value);
+		}
 		return subscriptions;
 	}
 }

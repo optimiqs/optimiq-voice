@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { dataEnvelope, listEnvelope, telnyxTimestamp } from "../schemas";
+import type { ListMeta } from "../schemas";
 import type { TelnyxTransport } from "../transport";
 
 /**
@@ -13,6 +14,10 @@ import type { TelnyxTransport } from "../transport";
  *   written there but not read back, and `connection_id` is the opposite — it is set on the parent
  *   resource. They therefore get two schemas, not one, because a single "voice settings" type
  *   would quietly promise a round trip that does not exist.
+ *
+ * That asymmetry is not an academic note: it makes "show me this number's CNAM listing" a
+ * **two-request** operation, which is why {@link PhoneNumbersResource.getCnamListing} exists
+ * rather than being left for each caller to rediscover. See its doc comment.
  */
 
 /**
@@ -118,6 +123,72 @@ export const telnyxVoiceSettingsSchema = z.looseObject({
 
 export type TelnyxVoiceSettings = z.infer<typeof telnyxVoiceSettingsSchema>;
 
+/**
+ * A number's caller-ID-name (CNAM) listing, assembled from the two places Telnyx keeps it.
+ *
+ * `enabled` — whether outbound calls from this DID present a name at all — is written on
+ * `PATCH …/voice` as `caller_id_name_enabled` and read from `GET /phone_numbers/{id}`. `listing`
+ * — the string carriers actually display, and whether the listing itself is switched on — lives in
+ * the `cnam_listing` group on `GET …/voice`. Neither endpoint returns both halves, and a caller
+ * that read only one of them would render a listing as "off" whenever the *other* half was the one
+ * that was off.
+ *
+ * So this type is the merged view, and the two methods below are the only supported way to get it.
+ */
+export interface TelnyxCnamListing {
+	/** `caller_id_name_enabled` — present a name on outbound calls. Read from the parent resource. */
+	readonly enabled: boolean;
+	/** `cnam_listing.cnam_listing_enabled` — the listing record itself. Read from `…/voice`. */
+	readonly listingEnabled: boolean;
+	/** `cnam_listing.cnam_listing_details` — the 15-character name carriers display. */
+	readonly listingDetails: string | null;
+}
+
+/**
+ * The writable half. Every field optional, and an empty input is a legitimate no-op PATCH.
+ *
+ * `details` is capped at 15 characters by the NANP CNAM database, not by Telnyx — which accepts a
+ * longer string and silently truncates it downstream, so the caller would never learn that the
+ * name shown to the called party is not the name they typed. {@link assertCnamDetails} refuses it
+ * here instead, before the round trip.
+ */
+export interface UpdateCnamListingInput {
+	readonly enabled?: boolean;
+	readonly listingEnabled?: boolean;
+	readonly details?: string;
+}
+
+/** The NANP CNAM field width. Fifteen characters, and the fifteenth is not negotiable. */
+export const TELNYX_CNAM_DETAILS_MAX_LENGTH = 15;
+
+/**
+ * Refuses a CNAM string the carrier network cannot carry, before a request is built.
+ *
+ * Client-side because the failure mode is silence: Telnyx accepts an over-long or
+ * non-ASCII-printable `cnam_listing_details` and the name simply arrives mangled — or not at all —
+ * at the called party, weeks later, reported as "our calls show up wrong". A local throw turns
+ * that into an error message next to the field.
+ */
+export class TelnyxCnamFormatError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "TelnyxCnamFormatError";
+	}
+}
+
+export function assertCnamDetails(details: string): void {
+	if (details.length > TELNYX_CNAM_DETAILS_MAX_LENGTH) {
+		throw new TelnyxCnamFormatError(
+			`A CNAM listing is at most ${TELNYX_CNAM_DETAILS_MAX_LENGTH} characters; "${details}" is ${details.length}.`,
+		);
+	}
+	if (!/^[\x20-\x7E]*$/u.test(details)) {
+		throw new TelnyxCnamFormatError(
+			"A CNAM listing may only contain printable ASCII; the CNAM database cannot carry anything else.",
+		);
+	}
+}
+
 const numberResponse = dataEnvelope(telnyxPhoneNumberSchema);
 const numberListResponse = listEnvelope(telnyxPhoneNumberSchema);
 const voiceResponse = dataEnvelope(telnyxVoiceSettingsSchema);
@@ -150,6 +221,15 @@ export interface UpdateVoiceSettingsInput {
 	readonly techPrefixEnabled?: boolean;
 	readonly translatedNumber?: string;
 	readonly callerIdNameEnabled?: boolean;
+	/**
+	 * The `cnam_listing` group. Accepted by `PATCH …/voice` and returned by `GET …/voice`, unlike
+	 * `callerIdNameEnabled` above, which is write-only here — the two travel together in one
+	 * request and are read back from two different ones.
+	 */
+	readonly cnamListing?: {
+		readonly cnamListingEnabled?: boolean;
+		readonly cnamListingDetails?: string;
+	};
 	readonly usagePaymentMethod?: "pay-per-minute" | "channel";
 	readonly inboundCallScreening?: "disabled" | "reject_calls" | "flag_calls";
 	readonly callForwarding?: {
@@ -170,7 +250,23 @@ export interface UpdateVoiceSettingsInput {
 }
 
 export interface PhoneNumbersResource {
+	/**
+	 * One page of numbers. Truncation is silent unless the caller looks: without `page[size]` Telnyx
+	 * answers with its own default page and nothing in the array says there are more.
+	 */
 	readonly list: (query?: ListPhoneNumbersQuery) => Promise<readonly TelnyxPhoneNumber[]>;
+	/**
+	 * The same call, with the page metadata Telnyx sent.
+	 *
+	 * `list` throws `meta` away, which is right for `resolveCarrierNumberId` (one E.164, one match)
+	 * and wrong for anything admin-facing: a "list our DIDs" caller needs `total_pages` to know its
+	 * answer is short. Kept beside `list` rather than replacing it so the common single-number
+	 * lookup stays a one-liner.
+	 */
+	readonly listPage: (query?: ListPhoneNumbersQuery) => Promise<{
+		readonly data: readonly TelnyxPhoneNumber[];
+		readonly meta: ListMeta;
+	}>;
 	readonly get: (numberId: string) => Promise<TelnyxPhoneNumber>;
 	readonly update: (numberId: string, input: UpdatePhoneNumberInput) => Promise<TelnyxPhoneNumber>;
 	readonly getVoiceSettings: (numberId: string) => Promise<TelnyxVoiceSettings>;
@@ -178,28 +274,64 @@ export interface PhoneNumbersResource {
 		numberId: string,
 		input: UpdateVoiceSettingsInput,
 	) => Promise<TelnyxVoiceSettings>;
+	/**
+	 * The merged CNAM view. **Two requests**, because Telnyx splits the answer across two
+	 * endpoints — see {@link TelnyxCnamListing}. The cost is paid here, once, rather than by every
+	 * caller who would otherwise read one endpoint and believe it.
+	 */
+	readonly getCnamListing: (numberId: string) => Promise<TelnyxCnamListing>;
+	/**
+	 * Writes both halves in one `PATCH …/voice`, then re-reads to return the merged view — which
+	 * is a second request for the same reason the read is two: the PATCH response carries
+	 * `cnam_listing` but not `caller_id_name_enabled`, so echoing it back would report the flag the
+	 * caller just set as whatever it happened to be before.
+	 */
+	readonly updateCnamListing: (
+		numberId: string,
+		input: UpdateCnamListingInput,
+	) => Promise<TelnyxCnamListing>;
 	/** `DELETE` — the release. Returns the record so the caller can log the resulting status. */
 	readonly release: (numberId: string) => Promise<TelnyxPhoneNumber>;
 }
 
-export function makePhoneNumbers(transport: TelnyxTransport): PhoneNumbersResource {
+/**
+ * Folds the two halves into the merged view.
+ *
+ * Both flags default to `false` when absent rather than to `undefined`: "Telnyx did not send the
+ * field" and "the feature is off" are the same thing to a caller deciding whether to bill for CNAM,
+ * and a tri-state here would push that decision onto every one of them.
+ */
+function mergeCnam(number: TelnyxPhoneNumber, voice: TelnyxVoiceSettings): TelnyxCnamListing {
 	return {
-		list: async (query = {}) => {
-			const response = await transport.request({
-				method: "GET",
-				path: "/phone_numbers",
-				query: {
-					"filter[phone_number]": query.phoneNumber,
-					"filter[status]": query.status,
-					"filter[connection_id]": query.connectionId,
-					"filter[customer_reference]": query.customerReference,
-					"page[size]": query.pageSize,
-					"page[number]": query.pageNumber,
-				},
-				schema: numberListResponse,
-			});
-			return response.data;
-		},
+		enabled: number.caller_id_name_enabled ?? false,
+		listingEnabled:
+			voice.cnam_listing?.cnam_listing_enabled ?? number.cnam_listing_enabled ?? false,
+		listingDetails: voice.cnam_listing?.cnam_listing_details ?? null,
+	};
+}
+
+export function makePhoneNumbers(transport: TelnyxTransport): PhoneNumbersResource {
+	const listPage = async (query: ListPhoneNumbersQuery = {}) => {
+		const response = await transport.request({
+			method: "GET",
+			path: "/phone_numbers",
+			query: {
+				"filter[phone_number]": query.phoneNumber,
+				"filter[status]": query.status,
+				"filter[connection_id]": query.connectionId,
+				"filter[customer_reference]": query.customerReference,
+				"page[size]": query.pageSize,
+				"page[number]": query.pageNumber,
+			},
+			schema: numberListResponse,
+		});
+		return { data: response.data, meta: response.meta };
+	};
+
+	return {
+		listPage,
+
+		list: async (query = {}) => (await listPage(query)).data,
 
 		get: async (numberId) => {
 			const response = await transport.request({
@@ -253,6 +385,18 @@ export function makePhoneNumbers(transport: TelnyxTransport): PhoneNumbersResour
 					...(input.callerIdNameEnabled === undefined
 						? {}
 						: { caller_id_name_enabled: input.callerIdNameEnabled }),
+					...(input.cnamListing === undefined
+						? {}
+						: {
+								cnam_listing: {
+									...(input.cnamListing.cnamListingEnabled === undefined
+										? {}
+										: { cnam_listing_enabled: input.cnamListing.cnamListingEnabled }),
+									...(input.cnamListing.cnamListingDetails === undefined
+										? {}
+										: { cnam_listing_details: input.cnamListing.cnamListingDetails }),
+								},
+							}),
 					...(input.usagePaymentMethod === undefined
 						? {}
 						: { usage_payment_method: input.usagePaymentMethod }),
@@ -320,6 +464,63 @@ export function makePhoneNumbers(transport: TelnyxTransport): PhoneNumbersResour
 				schema: voiceResponse,
 			});
 			return response.data;
+		},
+
+		getCnamListing: async (numberId) => {
+			// Two reads, in parallel: they are independent and a CNAM screen should not pay for them
+			// serially. See TelnyxCnamListing for why one of them is not enough.
+			const [number, voice] = await Promise.all([
+				transport.request({
+					method: "GET",
+					path: `/phone_numbers/${encodeURIComponent(numberId)}`,
+					schema: numberResponse,
+				}),
+				transport.request({
+					method: "GET",
+					path: `/phone_numbers/${encodeURIComponent(numberId)}/voice`,
+					schema: voiceResponse,
+				}),
+			]);
+			return mergeCnam(number.data, voice.data);
+		},
+
+		updateCnamListing: async (numberId, input) => {
+			if (input.details !== undefined) {
+				assertCnamDetails(input.details);
+			}
+			await transport.request({
+				method: "PATCH",
+				path: `/phone_numbers/${encodeURIComponent(numberId)}/voice`,
+				body: {
+					...(input.enabled === undefined ? {} : { caller_id_name_enabled: input.enabled }),
+					...(input.listingEnabled === undefined && input.details === undefined
+						? {}
+						: {
+								cnam_listing: {
+									...(input.listingEnabled === undefined
+										? {}
+										: { cnam_listing_enabled: input.listingEnabled }),
+									...(input.details === undefined ? {} : { cnam_listing_details: input.details }),
+								},
+							}),
+				},
+				schema: voiceResponse,
+			});
+			// The PATCH response cannot answer "is caller_id_name_enabled on now?" — it is write-only
+			// on this endpoint. Re-read rather than report the request back as if it were the state.
+			const [number, voice] = await Promise.all([
+				transport.request({
+					method: "GET",
+					path: `/phone_numbers/${encodeURIComponent(numberId)}`,
+					schema: numberResponse,
+				}),
+				transport.request({
+					method: "GET",
+					path: `/phone_numbers/${encodeURIComponent(numberId)}/voice`,
+					schema: voiceResponse,
+				}),
+			]);
+			return mergeCnam(number.data, voice.data);
 		},
 
 		release: async (numberId) => {

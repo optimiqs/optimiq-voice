@@ -3,26 +3,19 @@
 // Every envelope is built from packages/events-go, so the subject, the payload shape and the
 // session-id-matches-subject invariant are the ones the TypeScript services enforce. This package
 // adds only the transport: a JetStream publish with the envelope id as Nats-Msg-Id, which is what
-// makes a retried publish idempotent inside the MEDIA stream's duplicate window. It is deliberately
-// the same shape as apps/sipd/internal/events.
+// makes a retried publish idempotent inside the MEDIA stream's duplicate window.
 //
-// # Why JetStream when the commands are core
-//
-// "Ask over core, tell over JetStream", the split the whole backbone uses. A command is a
-// synchronous question inside a call setup whose answer is worthless a second later. A session
-// ending is a fact about a call that outlives the moment it happened — it is the evidence for "why
-// did that call go quiet", asked hours later by somebody holding a support ticket. Fire-and-forget
-// would make that evidence the one thing a broker restart deletes.
-//
-// The engine still reads these with a CORE subscription, and that is not a contradiction: a
-// JetStream publish IS a publish, so a core subscriber sees it live while the stream keeps it for
-// whoever needs it later. The engine wants the former — a leg to tear down NOW — and must not pay
-// for a durable consumer's ack round trip on the call path to get it.
+// "Ask over core, tell over JetStream": a command is a synchronous question whose answer is
+// worthless a second later, while a session ending is evidence that outlives the moment it happened.
+// The engine still reads these with a CORE subscription — a JetStream publish is a publish, so a
+// core subscriber sees it live while the stream keeps it for whoever needs it later, without paying
+// for a durable consumer's ack round trip on the call path.
 package events
 
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -53,10 +46,9 @@ type JetStreamPublisher struct {
 var _ Publisher = (*JetStreamPublisher)(nil)
 
 // NewJetStreamPublisher wraps an established JetStream context.
-//
 // It does NOT create the MEDIA stream. Stream provisioning is `ensureStreams` in packages/events,
-// run once by the control plane; a data-plane process that created its own streams could silently
-// bring one up with the wrong retention and lose events nobody notices.
+// run once by the control plane; a data-plane process creating its own streams could silently bring
+// one up with the wrong retention and lose events nobody notices.
 func NewJetStreamPublisher(js jetstream.JetStream) *JetStreamPublisher {
 	return &JetStreamPublisher{js: js}
 }
@@ -123,14 +115,11 @@ func publish[T any](
 }
 
 // PublishTimeout bounds one publish.
-//
-// A session ending must not be able to block a drain: the whole point of announcing it is that
-// somebody downstream learns about a call that has already lost audio, and waiting on a sick broker
-// to say so would turn one failure into two.
+// A session ending must not be able to block a drain: waiting on a sick broker to announce a call
+// that has already lost audio would turn one failure into two.
 const PublishTimeout = 2 * time.Second
 
-// RecordingPublisher captures envelopes in memory instead of publishing them. It backs the unit
-// tests, exactly as sipd's does.
+// RecordingPublisher captures envelopes in memory instead of publishing them, for the unit tests.
 type RecordingPublisher struct {
 	mu         sync.Mutex
 	ended      []contract.Envelope[contract.MediaSessionEndedData]
@@ -204,33 +193,33 @@ func (p *RecordingPublisher) DtmfReceived(
 func (p *RecordingPublisher) DtmfEvents() []contract.Envelope[contract.MediaDtmfReceivedData] {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]contract.Envelope[contract.MediaDtmfReceivedData](nil), p.digits...)
+	return slices.Clone(p.digits)
 }
 
 // RecordingEvents returns a copy of the recorded `recording.finished` events.
 func (p *RecordingPublisher) RecordingEvents() []contract.Envelope[contract.MediaRecordingFinishedData] {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]contract.Envelope[contract.MediaRecordingFinishedData](nil), p.recordings...)
+	return slices.Clone(p.recordings)
 }
 
 // PlaybackEvents returns a copy of the recorded `playback.finished` events.
 func (p *RecordingPublisher) PlaybackEvents() []contract.Envelope[contract.MediaPlaybackFinishedData] {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]contract.Envelope[contract.MediaPlaybackFinishedData](nil), p.playbacks...)
+	return slices.Clone(p.playbacks)
 }
 
 // EndedEvents returns a copy of the recorded `session.ended` events.
 func (p *RecordingPublisher) EndedEvents() []contract.Envelope[contract.MediaSessionEndedData] {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]contract.Envelope[contract.MediaSessionEndedData](nil), p.ended...)
+	return slices.Clone(p.ended)
 }
 
 // TimeoutEvents returns a copy of the recorded `session.rtp-timeout` events.
 func (p *RecordingPublisher) TimeoutEvents() []contract.Envelope[contract.MediaSessionRTPTimeoutData] {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]contract.Envelope[contract.MediaSessionRTPTimeoutData](nil), p.timedOut...)
+	return slices.Clone(p.timedOut)
 }

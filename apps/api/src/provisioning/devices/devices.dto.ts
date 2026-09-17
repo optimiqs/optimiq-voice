@@ -77,6 +77,27 @@ export const createDeviceDto = z.strictObject({
 	model: z.string().max(64).nullish(),
 	label: displayName.nullish(),
 	deviceProfileId: z.uuid().nullish(),
+	/**
+	 * Where this handset physically is — the RAY BAUM'S dispatchable location, per device.
+	 *
+	 * A reference into `emergency_address` rather than a copy of one: the address is validated once
+	 * by the upstream provider and `emergency_address.validated` is the gate an emergency caller id
+	 * is allowed through, so a device that carried its own street lines would be a second, unvalidated
+	 * source of truth for the one field a dispatcher acts on.
+	 *
+	 * Writing either of these needs `numbers.emergency` on top of `devices.write` — see the
+	 * controller. `devices.write` is "who may configure a phone", which is deliberately a wider set
+	 * than "who may say where a 911 call comes from".
+	 */
+	emergencyAddressId: z.uuid().nullish(),
+	/**
+	 * The desk-level refinement of the address: "Floor 3, Suite 310, desk by the window".
+	 *
+	 * 255 rather than the address's own room for prose, because this is read aloud by a front desk
+	 * with thirty seconds. Anything longer is a note, and a note that reaches a dispatcher as part of
+	 * an address is a note that delays them.
+	 */
+	emergencyLocationDetail: z.string().max(255).nullish(),
 	settings: provisioningSettingsField,
 	enabled: z.boolean().optional(),
 });

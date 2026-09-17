@@ -2,6 +2,7 @@ import { apiKey } from "@better-auth/api-key";
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { admin, bearer, jwt, openAPI, organization, twoFactor } from "better-auth/plugins";
+import { genericOAuth } from "better-auth/plugins/generic-oauth";
 import { createEntityId } from "@optimiq-voice/identifiers";
 import {
 	buildOrganizationAccessControl,
@@ -121,6 +122,14 @@ export interface CreateAuthOptions {
 	readonly invitationExpiresInSeconds?: number;
 	readonly jwt?: AuthJwtOptions;
 	readonly rateLimitEnabled?: boolean;
+	/**
+	 * Where the rate-limit counters live. Defaults to `"database"` — the `rate_limit` table in the
+	 * auth schema — so every replica shares one window; `"secondary-storage"` is correct instead
+	 * once a host supplies better-auth a Redis/valkey `secondaryStorage`. `"memory"` is per
+	 * process: it is only honest for a single-replica dev run.
+	 * @default "database"
+	 */
+	readonly rateLimitStorage?: "database" | "memory" | "secondary-storage";
 	/** Serves the auth OpenAPI document at `/api/auth/reference`. */
 	readonly openApiEnabled?: boolean;
 	readonly requireEmailVerification?: boolean;
@@ -131,6 +140,212 @@ export interface CreateAuthOptions {
 	 * three built-in roles and nothing else.
 	 */
 	readonly organizationRoles?: boolean | { readonly creatorRole?: SystemRoleId };
+	/**
+	 * The OIDC identity providers to register for federated sign-in, read from the enabled rows in
+	 * `organization_sso_provider` at boot.
+	 *
+	 * These become `genericOAuth` provider configs, which is what makes the SSO surface LIVE rather
+	 * than merely stored: with them registered, `/api/auth/sign-in/oauth2` starts a login against a
+	 * provider and `/api/auth/oauth2/callback/:providerId` completes it — the same catch-all that
+	 * serves email/password forwards both, and the same `databaseHooks.session.create.before` stamps
+	 * the tenant claim on the session it issues. Empty (or omitted) registers no `genericOAuth` plugin
+	 * at all, which is the pre-wiring behaviour.
+	 *
+	 * The set is a boot-time snapshot: `genericOAuth`'s config is fixed at `betterAuth()` construction,
+	 * so a provider added through the CRUD API takes effect on the next process start. That is the
+	 * `genericOAuth` model (better-auth's DB-backed dynamic `sso` plugin is a separate, not-installed
+	 * package); the CRUD surface and this feed together make configured-at-boot providers work
+	 * end-to-end, which is the honest scope.
+	 */
+	readonly ssoProviders?: readonly SsoProviderConfig[];
+	/**
+	 * Called once, after an organization row and its owner membership exist.
+	 *
+	 * The seam is here because a tenant is BORN empty: better-auth writes `organization` and
+	 * `member` and nothing else, so anything the platform considers part of "an organization"
+	 * — the default star codes, today — has to be written by somebody who is told a new one
+	 * appeared. This package has no database of its own beyond the auth tables and no opinion
+	 * about what a tenant should contain, so it forwards the fact and the host does the work,
+	 * exactly as {@link AuthEmailDelivery} forwards a message and the host sends it.
+	 *
+	 * **A throw here never fails organization creation.** The callback is invoked inside a
+	 * `try`/`catch` that swallows: a new organization missing its defaults is recoverable by one
+	 * idempotent re-seed, whereas a sign-up that 500s after the row was already written is not.
+	 * The host's callback is therefore responsible for LOGGING its own failure — this package
+	 * carries no logger, and a silent swallow is only honest if the other side is noisy.
+	 */
+	readonly onOrganizationCreated?: (event: OrganizationCreatedEvent) => Promise<void>;
+}
+
+/** What {@link CreateAuthOptions.onOrganizationCreated} is told about a newly created tenant. */
+export interface OrganizationCreatedEvent {
+	readonly organizationId: string;
+	readonly organizationName: string;
+	readonly organizationSlug: string | undefined;
+	/** The creator, who is the organization's owner member. */
+	readonly userId: string;
+	readonly userEmail: string;
+}
+
+/**
+ * Rate limiting, on a store every replica shares.
+ *
+ * The default is `"database"` rather than better-auth's in-memory map: with N replicas that map
+ * gives an attacker N times the limit and every deploy resets the window. The two credential
+ * paths get their own, much tighter rules — the global default is sized for an API surface, not
+ * for guessing a password or a six-digit code.
+ */
+function buildRateLimitOptions(options: CreateAuthOptions) {
+	return {
+		enabled: options.rateLimitEnabled ?? true,
+		storage: options.rateLimitStorage ?? ("database" as const),
+		customRules: {
+			"/sign-in/email": { window: 60, max: 10 },
+			"/two-factor/verify-otp": { window: 60, max: 5 },
+			"/two-factor/verify-totp": { window: 60, max: 5 },
+			"/two-factor/verify-backup-code": { window: 60, max: 5 },
+			"/forget-password": { window: 60, max: 5 },
+		},
+	};
+}
+
+/** One OIDC provider, as the auth boot hands it to `genericOAuth`. */
+export interface SsoProviderConfig {
+	/** The slug in the callback URL: `/api/auth/oauth2/callback/<providerId>`. */
+	readonly providerId: string;
+	/**
+	 * The tenant that owns the provider row.
+	 *
+	 * `genericOAuth`'s config is platform-wide, so this is the only thing that ties an identity
+	 * asserted by tenant A's IdP back to tenant A. The callback path must compare it against the
+	 * organization the resolved session landed in — see {@link assertSsoProviderOrganization}.
+	 */
+	readonly organizationId: string;
+	readonly clientId: string;
+	readonly clientSecret: string;
+	/** The issuer; the discovery document is derived from it when `discoveryUrl` is absent. */
+	readonly issuer: string;
+	readonly discoveryUrl?: string;
+	/** Defaults to `openid email profile` when the provider row named none. */
+	readonly scopes?: readonly string[];
+	/**
+	 * The mail domain this provider is authoritative for. REQUIRED: a provider registered without
+	 * one may assert any address at all, and a tenant admin configures their own IdP.
+	 */
+	readonly emailDomain: string;
+}
+
+const DEFAULT_SSO_SCOPES = ["openid", "email", "profile"] as const;
+
+/** Raised at boot for a provider row that cannot be registered safely. */
+export class SsoProviderConfigError extends Error {
+	readonly _tag = "SsoProviderConfigError" as const;
+	readonly providerId: string;
+
+	constructor(providerId: string, message: string) {
+		super(`SSO provider "${providerId}" ${message}`);
+		this.name = "SsoProviderConfigError";
+		this.providerId = providerId;
+	}
+}
+
+function normalizeEmailDomain(value: string): string {
+	return value.trim().toLowerCase().replace(/^@/u, "");
+}
+
+/** True when `email` is inside `domain` — the domain itself, not a subdomain of it. */
+export function emailMatchesDomain(email: string, domain: string): boolean {
+	const at = email.lastIndexOf("@");
+	if (at === -1) {
+		return false;
+	}
+	return (
+		email
+			.slice(at + 1)
+			.trim()
+			.toLowerCase() === normalizeEmailDomain(domain)
+	);
+}
+
+/**
+ * The tenant a provider slug belongs to, or `undefined` when the slug is unknown.
+ *
+ * The sign-in and callback routes use this to assert the session they are about to issue is
+ * scoped to the SAME organization that configured the IdP.
+ */
+export function resolveSsoProviderOrganizationId(
+	providers: readonly SsoProviderConfig[] | undefined,
+	providerId: string,
+): string | undefined {
+	return providers?.find((provider) => provider.providerId === providerId)?.organizationId;
+}
+
+/**
+ * Throws unless `organizationId` is the tenant that owns `providerId`.
+ *
+ * `genericOAuth` links an identity by email, and `activeOrganizationId` is then resolved from the
+ * matched user's OWN membership — so without this check tenant A's IdP can mint a session in
+ * tenant B by asserting a B address. Account linking is disabled as the first layer; this is the
+ * second, and the one that survives a future decision to re-enable it.
+ */
+export function assertSsoProviderOrganization(input: {
+	readonly providers: readonly SsoProviderConfig[] | undefined;
+	readonly providerId: string;
+	readonly organizationId: string | null | undefined;
+}): void {
+	const owner = resolveSsoProviderOrganizationId(input.providers, input.providerId);
+	if (!owner) {
+		throw new SsoProviderConfigError(input.providerId, "is not a registered provider");
+	}
+	if (input.organizationId !== owner) {
+		throw new SsoProviderConfigError(
+			input.providerId,
+			`is owned by another organization than the session it resolved (${String(input.organizationId)})`,
+		);
+	}
+}
+
+/** Map the stored provider set to `genericOAuth`'s config, filling the OIDC defaults. */
+function buildGenericOAuthConfig(providers: readonly SsoProviderConfig[]) {
+	return providers.map((provider) => {
+		const domain = normalizeEmailDomain(provider.emailDomain ?? "");
+		if (domain.length === 0) {
+			throw new SsoProviderConfigError(
+				provider.providerId,
+				"has no email domain; a provider that may assert any address is a cross-tenant takeover",
+			);
+		}
+		return {
+			providerId: provider.providerId,
+			clientId: provider.clientId,
+			clientSecret: provider.clientSecret,
+			issuer: provider.issuer,
+			discoveryUrl:
+				provider.discoveryUrl ??
+				`${provider.issuer.replace(/\/+$/u, "")}/.well-known/openid-configuration`,
+			scopes: [
+				...(provider.scopes && provider.scopes.length > 0 ? provider.scopes : DEFAULT_SSO_SCOPES),
+			],
+			// PKCE for every provider: it is a strict security improvement and every modern OIDC IdP
+			// supports it, so there is no reason to make it a per-provider toggle.
+			pkce: true,
+			/**
+			 * Runs on the IdP profile before better-auth looks up or creates a user, so a provider
+			 * that asserts an address outside the domain it was registered for never reaches the
+			 * lookup at all.
+			 */
+			mapProfileToUser: (profile: Record<string, unknown>) => {
+				const email = typeof profile.email === "string" ? profile.email : "";
+				if (!emailMatchesDomain(email, domain)) {
+					throw new SsoProviderConfigError(
+						provider.providerId,
+						`asserted an email outside its registered domain "${domain}"`,
+					);
+				}
+				return {};
+			},
+		};
+	});
 }
 
 function resolveKeyPairConfig(algorithm: NonNullable<AuthJwtOptions["algorithm"]>) {
@@ -203,6 +418,7 @@ export function createAuth(options: CreateAuthOptions) {
 	// Captured once so the plugin's option object can be built conditionally without re-reading a
 	// possibly-undefined member inside the callback.
 	const sendTwoFactorOtp = options.email.sendTwoFactorOtp;
+	const onOrganizationCreated = options.onOrganizationCreated;
 
 	const rolesOption = options.organizationRoles ?? true;
 	const accessControl = rolesOption === false ? undefined : buildOrganizationAccessControl();
@@ -264,7 +480,18 @@ export function createAuth(options: CreateAuthOptions) {
 				}
 			: {}),
 
-		rateLimit: { enabled: options.rateLimitEnabled ?? true },
+		/**
+		 * A generic-OAuth identity may never attach itself to a pre-existing local user.
+		 *
+		 * Provider rows are self-service: any org admin holding the SSO write permission can point
+		 * one at an IdP they control. With linking on, `email_verified: true` from that IdP is
+		 * enough for better-auth to hand them the account that already owns the address — in any
+		 * tenant. The email-domain check in `buildGenericOAuthConfig` and the organization
+		 * assertion in `assertSsoProviderOrganization` are the other two layers.
+		 */
+		account: { accountLinking: { enabled: false } },
+
+		rateLimit: buildRateLimitOptions(options),
 
 		trustedOrigins: [...(options.trustedOrigins ?? [])],
 
@@ -295,6 +522,34 @@ export function createAuth(options: CreateAuthOptions) {
 					options.invitationExpiresInSeconds ?? DEFAULT_INVITATION_EXPIRES_IN_SECONDS,
 				requireEmailVerificationOnInvitation: true,
 				cancelPendingInvitationsOnReInvite: true,
+				/**
+				 * `organizationHooks.afterCreateOrganization` — the plugin's own option name in
+				 * 1.6.23 — runs after the organization and the owner `member` are committed and
+				 * before the response is written, which is the only point where "this tenant is new"
+				 * is known exactly once. Registered only when the host supplied a callback, so a
+				 * host with nothing to seed composes the plugin exactly as it did before.
+				 */
+				...(onOrganizationCreated === undefined
+					? {}
+					: {
+							organizationHooks: {
+								afterCreateOrganization: async (data) => {
+									try {
+										await onOrganizationCreated({
+											organizationId: data.organization.id,
+											organizationName: data.organization.name,
+											organizationSlug: data.organization.slug ?? undefined,
+											userId: data.user.id,
+											userEmail: data.user.email,
+										});
+									} catch {
+										// Deliberately swallowed; see `onOrganizationCreated` for why, and note
+										// that the host logs. Re-throwing would turn a missing default into a
+										// failed sign-up with the organization already on disk.
+									}
+								},
+							},
+						}),
 				sendInvitationEmail: async (data) => {
 					await options.email.sendInvite({
 						email: data.email,
@@ -348,6 +603,16 @@ export function createAuth(options: CreateAuthOptions) {
 			}),
 			jwt(buildJwtPluginOptions(options.jwt)),
 			bearer(),
+			/**
+			 * SSO, registered only when there is at least one enabled provider.
+			 *
+			 * `genericOAuth` adds the initiate and callback routes that turn the stored provider rows
+			 * into a working sign-in; with no providers the plugin is omitted so the routes do not exist
+			 * rather than existing and answering "no such provider".
+			 */
+			...(options.ssoProviders && options.ssoProviders.length > 0
+				? [genericOAuth({ config: buildGenericOAuthConfig(options.ssoProviders) })]
+				: []),
 			...((options.openApiEnabled ?? true) ? [openAPI()] : []),
 		],
 	});

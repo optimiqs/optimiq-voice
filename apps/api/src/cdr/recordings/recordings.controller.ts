@@ -1,5 +1,6 @@
 import {
 	Controller,
+	Delete,
 	Get,
 	Header,
 	Inject,
@@ -13,7 +14,7 @@ import {
 import { PublicRoute } from "../../auth/public-route.decorator";
 import { RequirePermissions } from "../../auth/require-permissions.decorator";
 import { Session } from "../../auth/session.decorator";
-import { applyMediaResponse, readRangeHeader } from "../../media/media-http";
+import { applyMediaResponse, readMediaClient, readRangeHeader } from "../../media/media-http";
 import { parseDto } from "../../pbx/shared/dto";
 import { recordingListQuerySchema } from "../query/cdr.dto";
 import { RecordingsService } from "./recordings.service";
@@ -68,7 +69,13 @@ export class CdrRecordingsController {
 	) {
 		return applyMediaResponse(
 			reply,
-			await this.recordings.openSignedMedia(token ?? "", readRangeHeader(request)),
+			// The client facts go with the request: the ledger row for an anonymous fetch has no
+			// person to name, so the address and user-agent are all it can honestly record.
+			await this.recordings.openSignedMedia(
+				token ?? "",
+				readRangeHeader(request),
+				readMediaClient(request),
+			),
 		);
 	}
 
@@ -92,5 +99,23 @@ export class CdrRecordingsController {
 	@RequirePermissions("recordings.download")
 	async downloadUrl(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
 		return await this.recordings.mintDownloadLink(session, id);
+	}
+
+	/**
+	 * Deletes the media and tombstones the row.
+	 *
+	 * `recordings.delete` — the permission that had no endpoint. It is a separate grant from
+	 * `recordings.download` for the reason the registry gives every delete its own entry: one of
+	 * these lets you hear a conversation and the other destroys the only copy of it. A role that
+	 * reviews calls is not, by that fact, a role that may remove them from the record.
+	 *
+	 * The response is the id rather than a `204`, matching every other mutation on this platform
+	 * (`DELETE … -> { "data": { "id": "…" } }`). A bare 204 would be tidier HTTP and would make the
+	 * one client that needs to reconcile its cache guess which row it just removed.
+	 */
+	@Delete(":id")
+	@RequirePermissions("recordings.delete")
+	async remove(@Session() session: AppSession, @Param("id", ParseUUIDPipe) id: string) {
+		return await this.recordings.delete(session, id);
 	}
 }

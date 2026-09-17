@@ -70,6 +70,9 @@ COPY --from=builder --chown=appuser:appuser /work/apps/web/.next/standalone ./
 # The static chunks are deliberately excluded from the standalone trace — nothing imports them,
 # the browser fetches them — so they must be copied in separately or every page loads unstyled.
 COPY --from=builder --chown=appuser:appuser /work/apps/web/.next/static ./apps/web/.next/static
+# `public/` is not traced either — `output: "standalone"` never copies it — so without this the
+# favicon works in `next dev` and 404s in the image.
+COPY --from=builder --chown=appuser:appuser /work/apps/web/public ./apps/web/public
 
 USER appuser
 

@@ -1,0 +1,40 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"aor": {
+			"type": "string",
+			"minLength": 3,
+			"maxLength": 256
+		},
+		"aorHash": {
+			"type": "string",
+			"pattern": "^[0-9a-f]{32}$"
+		},
+		"transport": {
+			"type": "string",
+			"enum": ["udp", "tcp", "tls", "ws", "wss"]
+		},
+		"sourceAddress": {
+			"type": "string",
+			"maxLength": 64
+		},
+		"userAgent": {
+			"type": "string",
+			"maxLength": 256
+		},
+		"username": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"reason": {
+			"type": "string",
+			"enum": ["bad-credentials", "stale-nonce"]
+		},
+		"locked": {
+			"type": "boolean"
+		}
+	},
+	"required": ["aor", "aorHash", "transport", "username", "reason"],
+	"additionalProperties": false
+}

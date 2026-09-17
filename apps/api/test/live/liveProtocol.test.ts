@@ -33,9 +33,9 @@ describe("parseClientFrame", () => {
 	});
 
 	it("accepts unsubscribe and ping", () => {
-		expect(parseClientFrame(JSON.stringify({ op: "unsubscribe", topics: ["x"] })).frame?.op).to.equal(
-			"unsubscribe",
-		);
+		expect(
+			parseClientFrame(JSON.stringify({ op: "unsubscribe", topics: ["x"] })).frame?.op,
+		).to.equal("unsubscribe");
 		expect(parseClientFrame(JSON.stringify({ op: "ping" })).frame?.op).to.equal("ping");
 	});
 

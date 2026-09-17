@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { actionForStatus, AGENT_SESSION_ACTIONS } from "./agent-session";
+import { actionForStatus, agentStateFromSession, AGENT_SESSION_ACTIONS } from "./agent-session";
+import type { AgentSessionView } from "./agent-session";
 
 /**
  * Which button the console offers for which status.
@@ -32,6 +33,70 @@ describe("the mirror", () => {
 				expect(plan.outcome, `${status} + ${intent} -> ${action}`).not.toBe("refused");
 			}
 		}
+	});
+
+	/**
+	 * The wallboard's supervise button and the console's wrap-up panel read these off the socket and
+	 * fall back to this endpoint. A field the bucket stops carrying is a fallback that silently stops
+	 * working, which is exactly the failure the fallback exists to prevent.
+	 */
+	it("names the live call fields the agent-state bucket carries", async () => {
+		const shared = await import("../../../../packages/events/src/schemas/queue-state");
+		const carried = Object.keys(shared.agentStateEntrySchema.shape);
+		for (const field of [
+			"callId",
+			"queueId",
+			"dispositionCallId",
+			"dispositionCode",
+			"dispositionRequired",
+			"reason",
+			"availableAt",
+		]) {
+			expect(carried, field).toContain(field);
+		}
+	});
+});
+
+describe("agentStateFromSession", () => {
+	const seat: AgentSessionView = {
+		agentId: "019fd3c2-2222-76be-a6b3-b0f1914e39b6",
+		name: "Ada Lovelace",
+		userId: null,
+		enabled: true,
+		status: "wrap-up",
+		since: "2026-09-10T09:00:00.000Z",
+		reason: null,
+		unavailableReason: null,
+		availableAt: "2026-09-10T09:00:10.000Z",
+		source: "engine",
+		callId: null,
+		queueId: "019fd3c2-6666-76be-a6b3-b0f1914e39b6",
+		dispositionCallId: "019fd3c2-5555-76be-a6b3-b0f1914e39b6",
+		dispositionCode: null,
+		dispositionRequired: true,
+		live: true,
+		self: true,
+		canManage: false,
+		canManageSelf: true,
+	};
+
+	it("carries the wrap-up call across so the panel opens without a socket", () => {
+		const entry = agentStateFromSession(seat);
+		expect(entry.dispositionCallId).toBe(seat.dispositionCallId ?? undefined);
+		expect(entry.queueId).toBe(seat.queueId ?? undefined);
+		expect(entry.dispositionRequired).toBe(true);
+		expect(entry.availableAt).toBe(seat.availableAt ?? undefined);
+	});
+
+	/**
+	 * The bucket OMITS a key it has no value for; the endpoint answers `null`. A `null` left in place
+	 * would read as a value to every `?? fallback` and every `!== undefined` in the components.
+	 */
+	it("drops the endpoint's nulls rather than passing them through", () => {
+		const entry = agentStateFromSession(seat);
+		expect("callId" in entry).toBe(false);
+		expect("dispositionCode" in entry).toBe(false);
+		expect("reason" in entry).toBe(false);
 	});
 });
 

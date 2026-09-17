@@ -8,9 +8,13 @@ import {
 	deviceLine,
 	deviceProfile,
 	deviceProfileKey,
+	emergencyAddress,
 	eq,
 	extension,
+	inArray,
 	orgSetting,
+	sharedLine,
+	sharedLineAppearance,
 	sql,
 	type PbxDatabaseClient,
 } from "@optimiq-voice/pbx-db";
@@ -120,13 +124,43 @@ export class ProvisionRepository {
 			 * drop it from the rendered config. The renderer needs to SEE that line so it can leave the
 			 * account disabled rather than shifting every subsequent account up by one — which would
 			 * hand line 3's credentials to the key labelled line 2.
+			 *
+			 * ## The join is on the HOME binding, and hot desking is why
+			 *
+			 * `coalesce(home_extension_id, extension_id)` — the same expression
+			 * `sip-credentials.service.ts` resolves a registration through, and it must stay the same
+			 * one. A hot-desk login moves `extension_id` to the agent who logged in; the handset keeps
+			 * its OWN SIP credentials, and only routing follows the new binding. Joining on the live
+			 * `extension_id` instead would make a config resync mid-session render the agent's digest
+			 * username and secret into the phone's account — so the phone would re-provision, re-REGISTER
+			 * as somebody else, and stop being reachable the moment they logged out.
 			 */
 			const lineRows = await transaction
 				.select({ line: deviceLine, extension })
 				.from(deviceLine)
-				.leftJoin(extension, eq(deviceLine.extensionId, extension.id))
+				.leftJoin(
+					extension,
+					sql`${extension.id} = coalesce(${deviceLine.homeExtensionId}, ${deviceLine.extensionId})`,
+				)
 				.where(eq(deviceLine.deviceId, deviceId))
 				.orderBy(asc(deviceLine.lineNumber));
+
+			/**
+			 * The handset's own dispatchable location, if it has one.
+			 *
+			 * A second read rather than a join onto the device query, because it is conditional: the
+			 * column is NULL on every device that has not been given a desk-level address, which is the
+			 * common case, and a left join would put an eight-column address on every row of a query
+			 * that runs on every config fetch a fleet makes.
+			 */
+			const emergencyAddressRows =
+				deviceRow.emergencyAddressId === null
+					? []
+					: await transaction
+							.select()
+							.from(emergencyAddress)
+							.where(eq(emergencyAddress.id, deviceRow.emergencyAddressId))
+							.limit(1);
 
 			const keyRows = await transaction
 				.select()
@@ -152,9 +186,46 @@ export class ProvisionRepository {
 			 * means it does not participate.
 			 */
 			const settingRows = await transaction
-				.select({ name: orgSetting.name, value: orgSetting.value })
+				.select({ category: orgSetting.category, name: orgSetting.name, value: orgSetting.value })
 				.from(orgSetting)
-				.where(and(eq(orgSetting.category, "provision"), eq(orgSetting.enabled, true)));
+				.where(
+					and(
+						sql`(${orgSetting.category} = 'provision' OR (${orgSetting.category} = 'sip' AND ${orgSetting.name} = 'realm'))`,
+						eq(orgSetting.enabled, true),
+					),
+				);
+
+			/**
+			 * Which of this device's line extensions are appearances on an enabled shared line.
+			 *
+			 * This is what makes `device_line.shared_line` more than a manual flag: an extension that
+			 * is a shared-line appearance must render as a shared line even when nobody ticked the box,
+			 * because the appearance is what the credential path lights and sipd stamps into `Call-Info`.
+			 * `provision.service.ts` ORs the row's own flag with membership in this set.
+			 *
+			 * Keyed on the device's own line extensions, so it is a single indexed `IN` over at most a
+			 * handful of ids rather than a scan. Both the line and the appearance must be enabled — a
+			 * disabled line is not a shared line for anyone, and a disabled appearance is a button
+			 * switched off. The extension itself may be disabled and still be an appearance; that is the
+			 * line's problem, not this membership's, and the ordinary line-skip logic already handles it.
+			 */
+			const lineExtensionIds = lineRows
+				.map((row) => row.line.extensionId)
+				.filter((id): id is string => id !== null);
+			const sharedLineMemberRows =
+				lineExtensionIds.length === 0
+					? []
+					: await transaction
+							.selectDistinct({ extensionId: sharedLineAppearance.extensionId })
+							.from(sharedLineAppearance)
+							.innerJoin(sharedLine, eq(sharedLine.id, sharedLineAppearance.sharedLineId))
+							.where(
+								and(
+									inArray(sharedLineAppearance.extensionId, lineExtensionIds),
+									eq(sharedLineAppearance.enabled, true),
+									eq(sharedLine.enabled, true),
+								),
+							);
 
 			return {
 				device: deviceRow,
@@ -162,7 +233,10 @@ export class ProvisionRepository {
 				lines: lineRows,
 				keys: keyRows,
 				profileKeys: profileKeyRows,
-				organizationSettings: toSettings(settingRows),
+				emergencyAddress: emergencyAddressRows[0],
+				organizationSettings: toSettings(settingRows.filter((row) => row.category !== "sip")),
+				sipRealm: settingRows.find((row) => row.category === "sip" && row.name === "realm")?.value,
+				sharedLineExtensionIds: new Set(sharedLineMemberRows.map((row) => row.extensionId)),
 			} as RenderSnapshot;
 		});
 	}
@@ -181,10 +255,17 @@ export class ProvisionRepository {
 	 */
 	async checkAllowlist(organizationId: string, sourceIp: string): Promise<AllowlistVerdict> {
 		if (isIP(sourceIp) === 0) {
-			// Not an address we can match. Treated as "no entries applied" rather than as a denial: the
-			// caller decides what an unmatched request means, and refusing here would make a deployment
-			// behind a proxy that reports a hostname unprovisionable with no diagnostic.
-			return { hasEntries: false, allowed: false, matched: undefined };
+			// Not an address we can match. `evaluable: false` says exactly that, and `hasEntries` is
+			// still answered honestly — collapsing "I could not evaluate the ACL" into "this
+			// organization has no ACL" is what let an unparsable source address silently skip a strict
+			// allowlist. The caller decides what an unmatched request means; it can only do that if the
+			// two states are distinguishable.
+			return {
+				hasEntries: await this.hasAllowlistEntries(organizationId),
+				evaluable: false,
+				allowed: false,
+				matched: undefined,
+			};
 		}
 
 		return await this.database.withTenantScope(organizationId, async (transaction) => {
@@ -224,10 +305,23 @@ export class ProvisionRepository {
 				row?.decision === undefined || row.decision === null ? undefined : String(row.decision);
 			return {
 				hasEntries: entryCount > 0,
+				evaluable: true,
 				allowed: decision === "allow",
 				matched:
 					row?.matched === null || row?.matched === undefined ? undefined : String(row.matched),
 			};
+		});
+	}
+
+	/** Whether the organization has any enabled provisioning ACL entry, independent of any address. */
+	private async hasAllowlistEntries(organizationId: string): Promise<boolean> {
+		return await this.database.withTenantScope(organizationId, async (transaction) => {
+			const result = await transaction.execute(sql`
+				select count(*) as entry_count
+				from sip_acl_entry
+				where scope = 'provisioning' and enabled
+			`);
+			return Number(readRow(result)?.entry_count ?? 0) > 0;
 		});
 	}
 
@@ -266,6 +360,12 @@ export interface TokenLookup {
 export interface AllowlistVerdict {
 	/** Whether the organization has any enabled provisioning ACL entries at all. */
 	readonly hasEntries: boolean;
+	/**
+	 * Whether the ACL could be evaluated at all. `false` means the source address was not an IP the
+	 * database can match — a unix-socket listener, a proxy reporting a hostname — and `allowed` is
+	 * then a refusal, not an answer.
+	 */
+	readonly evaluable: boolean;
 	/** Whether the winning entry was an `allow`. Meaningless when `hasEntries` is false. */
 	readonly allowed: boolean;
 	readonly matched: string | undefined;
@@ -282,7 +382,25 @@ export interface RenderSnapshot {
 	readonly lines: readonly SnapshotLineRow[];
 	readonly keys: readonly (typeof deviceKey.$inferSelect)[];
 	readonly profileKeys: readonly (typeof deviceProfileKey.$inferSelect)[];
+	/**
+	 * The `emergency_address` this DEVICE points at, when it points at one.
+	 *
+	 * `undefined` is the ordinary state and means the handset has no location of its own — the
+	 * dispatch falls back to the extension's number and then to the DID, exactly as it did before
+	 * `device.emergency_address_id` existed. See the column's own comment for why per-device
+	 * granularity is what RAY BAUM'S §9.8 asks for.
+	 */
+	readonly emergencyAddress: typeof emergencyAddress.$inferSelect | undefined;
 	readonly organizationSettings: ProvisioningSettings;
+	readonly sipRealm?: unknown;
+	/**
+	 * The subset of this device's line extension ids that are appearances on an enabled shared line.
+	 *
+	 * A membership set, not a per-line flag: `provision.service.ts` ORs a line's own
+	 * `device_line.shared_line` with `has(extensionId)`, so a line whose extension is a shared-line
+	 * appearance renders as a shared line even when the manual flag was never set.
+	 */
+	readonly sharedLineExtensionIds: ReadonlySet<string>;
 }
 
 /** Re-exported so templates and the service can name key shapes without a schema import. */

@@ -1,23 +1,32 @@
 import { describe, expect, it } from "bun:test";
 import { kvKeyFor } from "@optimiq-voice/events";
 import { makeFakeMediaPort } from "../media/media-port.fake";
+import { PlaybackSignalBus, playbackSignalKey } from "../media/playback-signals";
 import { FakeClaimBucket } from "../nats/claim-store.fake";
 import { CallSignalBus, legSignalKey, recordingSignalKey } from "../routing/call-signals";
 import { CLAIM_LEASE_MS, ParkRegistry } from "../routing/park-registry";
-import { CallControl, pickupGroupFilter } from "./call-control";
+import { CallControl, pickupGroupFilter, tapSidesFor } from "./call-control";
 import { ParkHandoffError } from "./park-handoff";
+import type { TapRequest } from "../media/media-port";
 import type { FakeMediaPortOptions } from "../media/media-port.fake";
 import type { ClaimBucket } from "../nats/claim-store";
 import type {
 	CallControlHost,
+	CallControlSettings,
 	ControlledLeg,
 	ParkLot,
 	PickupCandidate,
 	RouteOutcome,
 	RouteRequest,
+	SharedLine,
+	SharedLineControlPort,
+	SharedLineStateView,
+	SupervisionTarget,
 } from "./call-control";
 import type { ParkHandoffClient } from "./park-handoff";
-import type { CallEvent, ParkClaim } from "@optimiq-voice/events";
+import type { ResolvedRecordingConsent } from "./recording-consent";
+import type { CallEvent, ParkClaim, TapMode } from "@optimiq-voice/events";
+import type { RecordingConsentRecord } from "@optimiq-voice/routing";
 import type { CallState, ChannelFlag, ChannelState, HangupCause } from "@optimiq-voice/telephony";
 
 /**
@@ -78,6 +87,7 @@ function fakeLeg(id: string, overrides: Partial<FakeLeg> = {}): FakeLeg {
 		bridgeId: undefined,
 		peerMediaChannelId: undefined,
 		callerIdNumber: `n-${id}`,
+		side: "a",
 		flags: new Set<ChannelFlag>(),
 		channelStates: [],
 		callStates: [],
@@ -135,6 +145,8 @@ interface HarnessOptions {
 	/** How the router answers. Defaults to bridging the leg to a freshly minted peer. */
 	readonly route?: (leg: ControlledLeg, request: RouteRequest) => Promise<RouteOutcome>;
 	readonly ringing?: readonly PickupCandidate[];
+	/** Answered calls `*0` can find, oldest first — what the orchestrator's registry scan produces. */
+	readonly monitorable?: readonly SupervisionTarget[];
 	readonly lot?: ParkLot | undefined;
 	/** Shared park claims, for the specs that need two instances on one bucket. */
 	readonly claims?: ClaimBucket<ParkClaim>;
@@ -144,16 +156,49 @@ interface HarnessOptions {
 	readonly parkHandoff?: ParkHandoffClient;
 	/** The clock, shared by call control and the claim leases. */
 	readonly now?: () => number;
+	/** The tap is created and never enters the application — the race `openTap` guards against. */
+	readonly tapNeverArrives?: boolean;
+	/** The shared-line registry, for the mid-call half. Absent is an engine without shared lines. */
+	readonly sharedLines?: SharedLineControlPort;
+	/** The line the artifact describes, for the recall's appearance numbers. */
+	readonly sharedLine?: SharedLine;
+	/** Deployment knobs a case needs to move — the consent budget, mostly. */
+	readonly settings?: Partial<CallControlSettings>;
+	/**
+	 * Channels whose playbacks the media plane reports as having delivered NO audio (`playedMs 0`).
+	 *
+	 * The live failure, in a fake: `mediad` accepts the prompt, schedules it, writes every frame into
+	 * a transport with no peer, and says so afterwards. Everything about the call looks healthy and
+	 * one number is zero.
+	 */
+	readonly silentChannels?: readonly string[];
+	/** Channels whose playbacks never finish at all — the media plane went quiet mid-prompt. */
+	readonly neverFinishingChannels?: readonly string[];
+	/**
+	 * Channels whose media path comes UP after this many attempts — a browser finishing its DTLS.
+	 *
+	 * The live sequence, as a fake: the first prompts are accepted, written and delivered to nobody,
+	 * and then the handshake completes and the same prompt lands.
+	 */
+	readonly deliversAfterAttempts?: Readonly<Record<string, number>>;
 }
 
 function harness(options: HarnessOptions = {}) {
 	const signals = new CallSignalBus();
+	const playbacks = new PlaybackSignalBus();
+	/** Channels the media plane currently delivers nothing to. Mutable: a handshake completes. */
+	const silent = new Set(options.silentChannels ?? []);
+	const attemptsPerChannel = new Map<string, number>();
 	const now = options.now ?? (() => 1_000);
 	const parks = new ParkRegistry();
 	if (options.claims !== undefined) {
 		parks.bindClaims(options.claims, options.instanceId ?? "engine-a", now);
 	}
 	const published: PublishedEvent[] = [];
+	/** Every `markRecording` the runtime made, in order — the snapshot flags a live surface reads. */
+	const recordingFlags: { legId: string; active: boolean; paused: boolean }[] = [];
+	/** Every consent verdict the runtime filed, in order — what the CDR's four columns are built from. */
+	const consentRecords: { legId: string; record: RecordingConsentRecord }[] = [];
 	const routes: RouteRequest[] = [];
 	const legs = new Map<string, FakeLeg>(
 		(options.legs ?? []).map((leg) => [leg.mediaChannelId, leg]),
@@ -164,6 +209,47 @@ function harness(options: HarnessOptions = {}) {
 		onSnoop: (request) => {
 			signals.emit(legSignalKey(request.snoopChannelId), { kind: "entered" });
 			options.media?.onSnoop?.(request);
+		},
+		// A tap reaches Stasis before the HTTP response returns, which is exactly why the runtime
+		// subscribes first. Emitting synchronously from inside the call reproduces that race; a fake
+		// that emitted later would let a runtime that subscribed too late pass its specs.
+		onTap: (request) => {
+			if (options.tapNeverArrives !== true) {
+				signals.emit(legSignalKey(request.tapChannelId), { kind: "entered" });
+			}
+			options.media?.onTap?.(request);
+		},
+	});
+
+	// The media plane's account of what it DELIVERED, which is what the consent gate now waits for.
+	// Installed as an accessor rather than by wrapping the method once, so that a case which replaces
+	// `play` outright — several do, to make one channel refuse — still gets the completion for the
+	// channels that did play. A fake that only reported delivery on the default `play` would make
+	// those cases prove the opposite of what they say.
+	let play = media.play.bind(media);
+	Object.defineProperty(media, "play", {
+		configurable: true,
+		get: () => async (channelId: string, request: { readonly playbackRef: string }) => {
+			const result = await play(channelId, request as never);
+			attemptsPerChannel.set(channelId, (attemptsPerChannel.get(channelId) ?? 0) + 1);
+			const comesUpAfter = options.deliversAfterAttempts?.[channelId];
+			if (comesUpAfter !== undefined && (attemptsPerChannel.get(channelId) ?? 0) >= comesUpAfter) {
+				silent.delete(channelId);
+			}
+			if (options.neverFinishingChannels?.includes(channelId) !== true) {
+				playbacks.emit(playbackSignalKey(request.playbackRef), {
+					kind: "playback-finished",
+					playbackRef: request.playbackRef,
+					// `frames written`, as mediad counts them. Zero is a real answer and the one this
+					// whole rung exists to catch.
+					playedMs: silent.has(channelId) ? 0 : 1_040,
+					reason: silent.has(channelId) ? "error" : "completed",
+				});
+			}
+			return result;
+		},
+		set: (replacement: typeof play) => {
+			play = replacement;
 		},
 	});
 
@@ -178,9 +264,17 @@ function harness(options: HarnessOptions = {}) {
 
 	const host: CallControlHost = {
 		legFor: (mediaChannelId) => legs.get(mediaChannelId),
+		legByLegId: (legId) => [...legs.values()].find((leg) => leg.legId === legId),
 		ringingFor: async () => options.ringing ?? [],
+		activeCallsFor: () => options.monitorable ?? [],
 		publish: async (leg, type, data) => {
 			published.push({ type, legId: leg.legId, data });
+		},
+		markRecording: (leg, state) => {
+			recordingFlags.push({ legId: leg.legId, ...state });
+		},
+		markConsent: (leg, record) => {
+			consentRecords.push({ legId: leg.legId, record });
 		},
 		route: async (leg, request) => {
 			routes.push(request);
@@ -198,17 +292,53 @@ function harness(options: HarnessOptions = {}) {
 		},
 		parkLotFor: async () => ("lot" in options ? options.lot : LOT),
 		parkLotForSlot: async () => ("lot" in options ? options.lot : LOT),
+		sharedLineFor: async () => options.sharedLine,
 	};
 
 	const timers: { fn: () => void; ms: number }[] = [];
+	const supervisionKeys = new Map<string, (mode: TapMode) => Promise<void>>();
 	let counter = 0;
 	const control = new CallControl({
 		media,
 		signals,
+		playbacks,
 		parks,
 		host,
 		...(options.parkHandoff === undefined ? {} : { parkHandoff: options.parkHandoff }),
-		settings: { application: "optimiq-engine", recordingFormat: "wav" },
+		...(options.sharedLines === undefined ? {} : { sharedLines: options.sharedLines }),
+		// The real seam, not a stub: the mode keys are armed by this class and the spec has to be able
+		// to press them, which is what the escalation tests do through `supervisionKeys.press`.
+		supervisionKeys: {
+			arm: (mediaChannelId, escalate) => {
+				supervisionKeys.set(mediaChannelId, escalate);
+			},
+			disarm: (mediaChannelId) => {
+				supervisionKeys.delete(mediaChannelId);
+			},
+		},
+		// A short snoop budget, because two specs deliberately let a tap never arrive and the production
+		// default would make each of them wait five real seconds for a timer that has already been
+		// proved correct by the ones that do arrive.
+		settings: {
+			application: "optimiq-engine",
+			recordingFormat: "wav",
+			snoopTimeoutMs: 100,
+			// A short consent budget for the same reason: the decline-by-timeout case would otherwise
+			// wait ten real seconds for a timer the accept case has already proved fires correctly.
+			consentKeypressTimeoutMs: 50,
+			// And a short readiness budget, for the third time and the same reason: the spec that
+			// proves a peer who never comes up is left out of the record would otherwise sit through
+			// the production two seconds to watch a timer the ready cases already exercise.
+			consentPeerReadyTimeoutMs: 50,
+			// And a short delivery budget, for the fourth time and the same reason: the spec that
+			// proves a prompt which never finishes is left out of the record would otherwise sit
+			// through the production eight seconds.
+			consentPlaybackTimeoutMs: 50,
+			// And a retry gap far shorter than that, so the cases about a party the media plane never
+			// delivers to exercise the retry loop rather than the budget alone.
+			consentPlaybackRetryMs: 5,
+			...options.settings,
+		},
 		newId: () => `id-${String(++counter)}`,
 		now,
 		setTimer: (fn, ms) => {
@@ -221,11 +351,17 @@ function harness(options: HarnessOptions = {}) {
 		control,
 		media,
 		signals,
+		playbacks,
+		silent,
+		attemptsPerChannel,
 		parks,
 		published,
+		recordingFlags,
+		consentRecords,
 		routes,
 		timers,
 		legs,
+		supervisionKeys,
 		eventsOf: (type: CallEvent) => published.filter((event) => event.type === type),
 	};
 }
@@ -333,6 +469,115 @@ describe("park", () => {
 			timeoutMs: 60_000,
 		});
 		expect(h.timers[0]?.ms).toBe(60_000);
+	});
+
+	it("remembers the parker, not the party parked, when the parker is on an originated leg", async () => {
+		// The live shape: 1203 called 1201, the engine originated a leg to reach 1201, and 1201 parked
+		// the caller. On that leg `callerIdNumber` is still 1203 — the party being parked.
+		const caller = fakeLeg("c", { callerIdNumber: "1203" });
+		const parker = fakeLeg("p", {
+			side: "b",
+			callerIdNumber: "1203",
+			destinationNumber: "1201",
+		});
+		bridgePair(parker, caller);
+		const h = harness({ legs: [parker, caller] });
+
+		await h.control.park(caller);
+		expect(h.parks.at(LOT.parkLotId, 401)?.parkedByNumber).toBe("1201");
+
+		h.timers[0]?.fn();
+		await flush();
+		expect(h.routes[0]?.destination).toBe("1201");
+	});
+
+	it("still remembers the parker by caller id when their leg arrived", async () => {
+		const caller = fakeLeg("c", { callerIdNumber: "1203" });
+		const parker = fakeLeg("p", { callerIdNumber: "1201" });
+		bridgePair(parker, caller);
+		const h = harness({ legs: [parker, caller] });
+
+		await h.control.park(caller);
+		expect(h.parks.at(LOT.parkLotId, 401)?.parkedByNumber).toBe("1201");
+
+		h.timers[0]?.fn();
+		await flush();
+		expect(h.routes[0]?.destination).toBe("1201");
+	});
+
+	it("leaves the call parked rather than routing it back to itself when the parker has no number", async () => {
+		const caller = fakeLeg("c", { callerIdNumber: "1203" });
+		const parker = fakeLeg("p", { side: "b", callerIdNumber: "1203" });
+		bridgePair(parker, caller);
+		const h = harness({ legs: [parker, caller] });
+
+		await h.control.park(caller);
+		expect(h.parks.at(LOT.parkLotId, 401)?.parkedByNumber).toBeUndefined();
+
+		h.timers[0]?.fn();
+		await flush();
+		expect(h.routes).toEqual([]);
+		expect(h.parks.at(LOT.parkLotId, 401)?.mediaChannelId).toBe("c");
+	});
+
+	it("parks the OTHER party and rings the presser back, whichever side pressed *5", async () => {
+		// The live shape both ways round: 1203 dialled 1201, so the arriving leg carries 1203 and the
+		// originated leg was dialled to reach 1201. Whoever presses `*5`, the far end goes into the
+		// orbit and the presser is the one the timeout rings.
+		for (const presserId of ["a", "b"] as const) {
+			const arrived = fakeLeg("a", { callerIdNumber: "1203" });
+			const originated = fakeLeg("b", {
+				side: "b",
+				callerIdNumber: "1203",
+				destinationNumber: "1201",
+			});
+			bridgePair(arrived, originated);
+			const h = harness({ legs: [arrived, originated] });
+
+			const presser = presserId === "a" ? arrived : originated;
+			const parked = presserId === "a" ? originated : arrived;
+			const outcome = await h.control.parkPeer(presser);
+
+			expect(outcome.result.ok).toBe(true);
+			expect(h.parks.at(LOT.parkLotId, 401)?.mediaChannelId).toBe(parked.mediaChannelId);
+			expect(h.parks.at(LOT.parkLotId, 401)?.parkedByNumber).toBe(
+				presserId === "a" ? "1203" : "1201",
+			);
+			expect(parked.flags.has("park")).toBe(true);
+			expect(presser.flags.has("park")).toBe(false);
+
+			// The presser is OFF the call. Leaving their leg up is what put every recall in the
+			// parker's own voicemail: the timeout routes at the parker's number, found the extension
+			// occupied by the very leg they parked from, and fell through the ladder.
+			expect(h.media.hungUp()).toEqual([
+				{ channelId: presser.mediaChannelId, cause: "NORMAL_CLEARING" },
+			]);
+
+			h.timers[0]?.fn();
+			await flush();
+			expect(h.routes[0]?.destination).toBe(presserId === "a" ? "1203" : "1201");
+		}
+	});
+
+	it("leaves both legs alone when the park itself was refused", async () => {
+		const arrived = fakeLeg("a", { callerIdNumber: "1203" });
+		const originated = fakeLeg("b", { side: "b", destinationNumber: "1201" });
+		bridgePair(arrived, originated);
+		const h = harness({ legs: [arrived, originated] });
+
+		const refused = await h.control.parkPeer(arrived, { orbit: "999" });
+
+		expect(refused.result.ok).toBe(false);
+		// The presser is still on the call, which is what lets their phone report "that lot is full".
+		expect(h.media.hungUp()).toEqual([]);
+	});
+
+	it("refuses to park a peer that is not there", async () => {
+		const h = harness({ legs: [] });
+		expect((await h.control.parkPeer(fakeLeg("c"))).result).toEqual({
+			ok: false,
+			reason: "this leg has nobody on the other side to park",
+		});
 	});
 
 	it("honours an explicit orbit and refuses one that is taken", async () => {
@@ -1061,9 +1306,167 @@ describe("attended transfer", () => {
 	});
 });
 
+/**
+ * The other attended transfer: the one a SOFTPHONE brokered on its own second line and handed over
+ * with a `REFER` carrying `Replaces`. There is no consultation record to complete — both halves are
+ * ordinary calls of this engine's — so the whole of the state lives in the two legs the transferor
+ * holds and the two peers that survive them.
+ */
+describe("an attended transfer completed by a phone's REFER", () => {
+	function referred(options: HarnessOptions = {}) {
+		const transferor = fakeLeg("t1");
+		const transferee = fakeLeg("e");
+		bridgePair(transferor, transferee, "bridge-original");
+		const consultation = fakeLeg("t2");
+		const target = fakeLeg("g");
+		bridgePair(consultation, target, "bridge-consult");
+		return {
+			transferor,
+			transferee,
+			consultation,
+			target,
+			h: harness({ ...options, legs: [transferor, transferee, consultation, target] }),
+		};
+	}
+
+	it("joins the transferee to the consultation's bridge and releases both transferor legs", async () => {
+		const { transferor, transferee, consultation, target, h } = referred();
+
+		const result = await h.control.completeAttendedRefer(transferor, consultation, "1003");
+
+		expect(result.ok).toBe(true);
+		// The target's media never stops: the transferee comes to the bridge it is already in.
+		expect(transferee.bridgeId).toBe("bridge-consult");
+		expect(h.media.methods()).toContain("removeFromBridge");
+		expect(transferee.bridgePeers.at(-1)).toBe("leg-g");
+		expect(target.bridgePeers.at(-1)).toBe("leg-e");
+		// Both of the transferor's legs go, and both say what happened to them rather than reading as
+		// a party who simply hung up.
+		expect(h.media.hungUp()).toEqual([
+			{ channelId: "t1", cause: "ATTENDED_TRANSFER" },
+			{ channelId: "t2", cause: "ATTENDED_TRANSFER" },
+		]);
+		expect(transferor.hangupCause).toBe("ATTENDED_TRANSFER");
+		expect(consultation.hangupCause).toBe("ATTENDED_TRANSFER");
+		// Cleared before the hangups, or the orchestrator would follow each one into the call that
+		// was just handed over.
+		expect(transferor.bridgePeers.at(-1)).toBeUndefined();
+		expect(consultation.bridgePeers.at(-1)).toBeUndefined();
+		expect(h.eventsOf("call.transferred")[0]?.data).toEqual({
+			legId: "leg-e",
+			kind: "attended",
+			destination: "1003",
+			transferorLegId: "leg-t1",
+			targetLegId: "leg-g",
+		});
+	});
+
+	it("leaves the original call intact when the media plane refuses the join", async () => {
+		const { transferor, transferee, consultation, h } = referred({
+			media: {
+				addToBridgeFails: (bridgeId) =>
+					bridgeId === "bridge-consult" ? new Error("mediad refused") : undefined,
+			},
+		});
+
+		const result = await h.control.completeAttendedRefer(transferor, consultation, "1003");
+
+		expect(result).toEqual({
+			ok: false,
+			reason: "the transferee could not be joined to the target: Error: mediad refused",
+		});
+		// Nobody is hung up and the transferee is back with the transferor, which is the whole point
+		// of committing nothing until the join has succeeded.
+		expect(h.media.hungUp()).toEqual([]);
+		expect(h.media.calls.filter((call) => call.method === "addToBridge").at(-1)?.args).toEqual([
+			"bridge-original",
+			["e"],
+		]);
+		expect(transferee.bridgePeers).toEqual([]);
+		expect(h.eventsOf("call.transferred")).toHaveLength(0);
+	});
+
+	it("refuses when the consulted party hung up first, leaving the original call up", async () => {
+		const { transferor, consultation, target, h } = referred();
+		target.isTearingDown = true;
+
+		const result = await h.control.completeAttendedRefer(transferor, consultation, "1003");
+
+		expect(result).toEqual({
+			ok: false,
+			reason: "the consultation is not connected to anybody, so there is nobody to hand to",
+		});
+		expect(h.media.hungUp()).toEqual([]);
+	});
+
+	it("refuses when the transferor is no longer bridged to anybody", async () => {
+		const { transferor, consultation, h } = referred();
+		transferor.peerMediaChannelId = undefined;
+
+		const result = await h.control.completeAttendedRefer(transferor, consultation, "1003");
+
+		expect(result.ok).toBe(false);
+		expect(h.media.hungUp()).toEqual([]);
+	});
+
+	it("refuses a Replaces that names the very dialog the REFER arrived in", async () => {
+		const { transferor, h } = referred();
+
+		const result = await h.control.completeAttendedRefer(transferor, transferor, "1003");
+
+		expect(result).toEqual({
+			ok: false,
+			reason: "the Replaces named the very dialog the REFER arrived in",
+		});
+	});
+
+	it("refuses when both dialogs lead back to the same party", async () => {
+		const transferor = fakeLeg("t1");
+		const transferee = fakeLeg("e");
+		bridgePair(transferor, transferee, "bridge-original");
+		const consultation = fakeLeg("t2");
+		consultation.bridgeId = "bridge-consult";
+		consultation.peerMediaChannelId = "e";
+		const h = harness({ legs: [transferor, transferee, consultation] });
+
+		const result = await h.control.completeAttendedRefer(transferor, consultation, "1003");
+
+		expect(result).toEqual({
+			ok: false,
+			reason: "both dialogs name the same party, so there is nothing to join",
+		});
+	});
+
+	it("refuses a leg that is tearing down or has not answered", async () => {
+		const { transferor, consultation, h } = referred();
+		consultation.isAnswered = false;
+		expect((await h.control.completeAttendedRefer(transferor, consultation, "1003")).ok).toBe(
+			false,
+		);
+		consultation.isAnswered = true;
+		transferor.isTearingDown = true;
+		expect((await h.control.completeAttendedRefer(transferor, consultation, "1003")).ok).toBe(
+			false,
+		);
+		expect(h.media.hungUp()).toEqual([]);
+	});
+
+	it("refuses while a consultation this class brokered is still in progress on the leg", async () => {
+		const { transferor, consultation, h } = referred();
+		await h.control.transfer(transferor, { kind: "attended", destination: "1002" });
+
+		const result = await h.control.completeAttendedRefer(transferor, consultation, "1003");
+
+		expect(result).toEqual({ ok: false, reason: "this leg already has a transfer in progress" });
+	});
+});
+
 describe("pickup", () => {
 	function ringing() {
-		const caller = fakeLeg("caller");
+		// The caller of a ringing phone has NOT been answered — they are hearing ringback. The
+		// fixture used to hand them back answered, which is why the missing `answer` below went
+		// unnoticed until a split-plane deployment refused the bridge with `unknown_session`.
+		const caller = fakeLeg("caller", { isAnswered: false });
 		const ringingLeg = fakeLeg("ringing", { destinationNumber: "200", isAnswered: false });
 		bridgePair(caller, ringingLeg, "no-bridge");
 		caller.bridgeId = undefined;
@@ -1101,7 +1504,13 @@ describe("pickup", () => {
 
 		await h.control.pickup(picker, { kind: "directed", extension: "200" });
 
-		expect(h.media.methods()).toEqual(["hangup", "answer", "createBridge", "addToBridge"]);
+		expect(h.media.methods()).toEqual([
+			"hangup",
+			"answer",
+			"answer",
+			"createBridge",
+			"addToBridge",
+		]);
 		expect(h.eventsOf("call.picked-up")[0]?.data).toMatchObject({
 			legId: "leg-picker",
 			pickedUpLegId: "leg-caller",
@@ -1110,6 +1519,31 @@ describe("pickup", () => {
 			abandonedLegId: "leg-ringing",
 		});
 		expect(h.eventsOf("channel.bridged")).toHaveLength(1);
+	});
+
+	it("answers the caller too, because bridging an unanswered leg has no session to bridge", async () => {
+		const { caller, ringingLeg } = ringing();
+		const picker = fakeLeg("picker", { isAnswered: false });
+		const h = harness({
+			legs: [caller, ringingLeg, picker],
+			ringing: [{ ringingLeg, callerLeg: caller, ringingSinceMs: 0 }],
+		});
+
+		expect((await h.control.pickup(picker, { kind: "directed", extension: "200" })).ok).toBe(true);
+		expect(h.media.answered()).toEqual(["picker", "caller"]);
+	});
+
+	it("does not re-answer a caller that is already answered", async () => {
+		const { caller, ringingLeg } = ringing();
+		caller.isAnswered = true;
+		const picker = fakeLeg("picker", { isAnswered: false });
+		const h = harness({
+			legs: [caller, ringingLeg, picker],
+			ringing: [{ ringingLeg, callerLeg: caller, ringingSinceMs: 0 }],
+		});
+
+		expect((await h.control.pickup(picker, { kind: "directed", extension: "200" })).ok).toBe(true);
+		expect(h.media.answered()).toEqual(["picker"]);
 	});
 
 	it("says nothing is ringing rather than guessing", async () => {
@@ -1195,6 +1629,23 @@ describe("the pickup group filter", () => {
 });
 
 describe("on-demand recording", () => {
+	it("records a native media conversation and stops without hanging up the active call", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg], media: { bridgeMode: "proxy-media" } });
+		Object.assign(h.media, {
+			recordConversation: h.media.record.bind(h.media),
+		});
+		const outcome = await h.control.startRecording(leg);
+		expect(outcome.result.ok).toBe(true);
+		expect(h.media.methods()).not.toContain("snoop");
+		expect(h.media.calls.find((call) => call.method === "record")?.args[0]).toBe(
+			leg.mediaChannelId,
+		);
+		const stopped = await h.control.stopRecording(leg);
+		expect(stopped.ok).toBe(true);
+		expect(h.media.methods()).not.toContain("hangup");
+		expect(h.eventsOf("channel.record.stopped")).toHaveLength(1);
+	});
 	it("taps both directions and files the object exactly the way voicemail does", async () => {
 		const leg = fakeLeg("c");
 		const h = harness({ legs: [leg] });
@@ -1280,12 +1731,655 @@ describe("on-demand recording", () => {
 		expect(h.control.recordingFor("c")).toBeUndefined();
 	});
 
+	it("retains finalized media details when session release finishes before call cleanup", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+		await h.control.startRecording(leg);
+		h.signals.emit(recordingSignalKey("id-1"), {
+			kind: "recording-finished",
+			durationMs: 4200,
+			bytes: 67244,
+		});
+		await h.control.onLegEnded("c");
+		expect(h.eventsOf("channel.record.stopped")[0]?.data).toMatchObject({
+			durationMs: 4200,
+			bytes: 67244,
+			reason: "completed",
+		});
+		expect(h.media.methods()).not.toContain("stopRecording");
+		expect(h.signals.isWatched(recordingSignalKey("id-1"))).toBe(false);
+	});
+
+	it("pauses and resumes without ending the file, and is idempotent on both edges", async () => {
+		// PCI: the caller reads a card number and the recording stays ONE artifact. A pause that
+		// stopped the recording would end the object at exactly the interesting moment.
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+		await h.control.startRecording(leg);
+
+		expect(await h.control.pauseRecording(leg, true)).toMatchObject({ ok: true });
+		expect(await h.control.pauseRecording(leg, true)).toMatchObject({ ok: true });
+		expect(await h.control.pauseRecording(leg, false)).toMatchObject({ ok: true });
+
+		const pauseCalls = h.media.calls.filter((call) => call.method === "pauseRecording");
+		expect(pauseCalls.map((call) => call.args[1])).toEqual([true, false]);
+		// The recording is still the one that started: no stop, and no second object key.
+		expect(h.media.methods()).not.toContain("stopRecording");
+		expect(h.control.recordingFor("c")?.recordingId).toBe("id-1");
+	});
+
+	it("carries the recorder's state onto the leg's snapshot at every edge", async () => {
+		// The ONLY thing that tells a wallboard or a softphone that a call is being recorded. Without
+		// it the pause control has nothing to render from and the platform's PCI pause is a route
+		// nobody can find.
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+		await h.control.startRecording(leg);
+		await h.control.pauseRecording(leg, true);
+		await h.control.pauseRecording(leg, false);
+		await h.control.stopRecording(leg);
+
+		expect(h.recordingFlags).toEqual([
+			{ legId: "leg-c", active: true, paused: false },
+			{ legId: "leg-c", active: true, paused: true },
+			{ legId: "leg-c", active: true, paused: false },
+			{ legId: "leg-c", active: false, paused: false },
+		]);
+	});
+
+	it("does not flag a leg whose pause the media plane refused", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+		await h.control.startRecording(leg);
+		(
+			h.media as { pauseRecording: (name: string, paused: boolean) => Promise<void> }
+		).pauseRecording = async () => {
+			throw new Error("no");
+		};
+
+		await h.control.pauseRecording(leg, true);
+
+		// Only the `start`. A `paused: true` here would be a live surface promising an agent that a
+		// card number is safe from a recorder that never stopped writing.
+		expect(h.recordingFlags).toEqual([{ legId: "leg-c", active: true, paused: false }]);
+		expect(h.control.recordingFor("c")?.paused).toBe(false);
+	});
+
+	it("keeps the paused state unchanged when the media plane refuses", async () => {
+		// A runtime that believed a pause it never got would tell an agent the card number is safe
+		// while it is being written to disk.
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+		await h.control.startRecording(leg);
+		(
+			h.media as { pauseRecording: (name: string, paused: boolean) => Promise<void> }
+		).pauseRecording = async () => {
+			throw new Error("this media plane cannot pause");
+		};
+
+		const refused = await h.control.pauseRecording(leg, true);
+
+		expect(refused).toMatchObject({ ok: false });
+		expect(refused.ok ? undefined : refused.reason).toContain("cannot pause a recording");
+	});
+
+	it("carries the paused intervals into channel.record.stopped", async () => {
+		// The gap in the audio is deliberate, and the CDR row is the only place that says so.
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+		await h.control.startRecording(leg);
+		h.signals.emit(recordingSignalKey("id-1"), {
+			kind: "recording-finished",
+			durationMs: 30_000,
+			bytes: 480_044,
+			pauses: [{ startMs: 8_000, endMs: 14_000 }],
+		});
+
+		await h.control.stopRecording(leg);
+
+		expect(h.eventsOf("channel.record.stopped")[0]?.data).toMatchObject({
+			pauses: [{ startMs: 8_000, endMs: 14_000 }],
+		});
+	});
+
+	it("leaves the pauses off a recording nobody paused", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+		await h.control.startRecording(leg);
+
+		await h.control.stopRecording(leg);
+
+		expect(h.eventsOf("channel.record.stopped")[0]?.data).not.toHaveProperty("pauses");
+	});
+
+	it("refuses to pause a recording that is not running", async () => {
+		const h = harness();
+		expect(await h.control.pauseRecording(fakeLeg("c"), true)).toEqual({
+			ok: false,
+			reason: "this leg is not being recorded",
+		});
+	});
+
 	it("refuses to stop a recording that is not running", async () => {
 		const h = harness();
 		expect(await h.control.stopRecording(fakeLeg("c"))).toEqual({
 			ok: false,
 			reason: "this leg is not being recorded",
 		});
+	});
+});
+
+/**
+ * The consent gate.
+ *
+ * Every case here drives the REAL `startRecording`, so what is asserted is the whole sequence — the
+ * prompt at the right party, the digit on the right key, the recording that did or did not start,
+ * and the record filed either way. The resolution that produces a `ResolvedRecordingConsent` is
+ * proved separately in `recording-consent.spec.ts`; here it is a fixture, because what is under
+ * test is what the gate DOES with one.
+ */
+function consent(overrides: Partial<ResolvedRecordingConsent> = {}): ResolvedRecordingConsent {
+	return {
+		policy: "announce",
+		acceptDigit: "1",
+		declineDigit: "2",
+		parties: ["caller"],
+		regions: [],
+		...overrides,
+	};
+}
+
+/** Every channel a consent prompt was played at, in order. */
+function playedAt(h: ReturnType<typeof harness>): string[] {
+	return h.media.calls
+		.filter((call) => call.method === "play")
+		.map((call) => call.args[0] as string);
+}
+
+describe("recording consent", () => {
+	it("records exactly as before when the policy is `none`, and says so", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+
+		const outcome = await h.control.startRecording(leg, {
+			consent: consent({ policy: "none", parties: [] }),
+		});
+
+		expect(outcome.result.ok).toBe(true);
+		expect(playedAt(h)).toEqual([]);
+		expect(outcome.consent).toMatchObject({
+			outcome: "not-required",
+			method: "none",
+			policy: "none",
+			parties: [],
+		});
+		expect(h.consentRecords).toHaveLength(1);
+		expect(h.eventsOf("channel.record.started")[0]?.data).toMatchObject({
+			consent: { outcome: "not-required" },
+		});
+	});
+
+	it("behaves like every release before the gate when no consent is supplied at all", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+
+		const outcome = await h.control.startRecording(leg);
+
+		expect(outcome.result.ok).toBe(true);
+		expect(outcome.consent).toBeUndefined();
+		expect(h.consentRecords).toEqual([]);
+		expect(h.eventsOf("channel.record.started")[0]?.data).not.toHaveProperty("consent");
+	});
+
+	it("announces to the recorded leg alone when only one party is owed it", async () => {
+		const agent = fakeLeg("a");
+		const caller = fakeLeg("c");
+		bridgePair(agent, caller);
+		const h = harness({ legs: [agent, caller] });
+
+		const outcome = await h.control.startRecording(agent, { consent: consent() });
+
+		expect(playedAt(h)).toEqual(["a"]);
+		expect(outcome.consent).toMatchObject({ outcome: "announced", method: "announcement" });
+		expect(outcome.consent?.parties).toEqual(["caller"]);
+	});
+
+	it("announces to BOTH parties on an all-party call, and names the region that forced it", async () => {
+		const agent = fakeLeg("a");
+		const caller = fakeLeg("c");
+		bridgePair(agent, caller);
+		const h = harness({ legs: [agent, caller] });
+
+		const outcome = await h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"], regions: ["US-CA"] }),
+		});
+
+		expect(playedAt(h)).toEqual(["a", "c"]);
+		expect(outcome.consent?.regions).toEqual(["US-CA"]);
+	});
+
+	it("announces to the FAR END of an outbound recorded call, which is the peer leg", async () => {
+		// The agent's own leg is what the walk put the recorder on; the customer is the peer, and the
+		// customer is the party the announcement exists for.
+		const agent = fakeLeg("agent");
+		const customer = fakeLeg("customer");
+		bridgePair(agent, customer);
+		const h = harness({ legs: [agent, customer] });
+
+		await h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+
+		expect(playedAt(h)).toContain("customer");
+	});
+
+	it("plays the tenant's prompt when it has one, and the seeded stem otherwise", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+		await h.control.startRecording(leg, {
+			consent: consent({ promptId: "prompt-row", promptMedia: "sound:tenant/consent" }),
+		});
+		expect(h.media.calls.find((call) => call.method === "play")?.args[1]).toMatchObject({
+			media: ["sound:tenant/consent"],
+		});
+
+		const bare = harness({ legs: [fakeLeg("d")] });
+		await bare.control.startRecording(fakeLeg("d"), { consent: consent() });
+		expect(bare.media.calls.find((call) => call.method === "play")?.args[1]).toMatchObject({
+			media: ["sound:recording-consent"],
+		});
+	});
+
+	it("still records when one of two parties could not be reached", async () => {
+		const agent = fakeLeg("a");
+		const caller = fakeLeg("c");
+		bridgePair(agent, caller);
+		const h = harness({ legs: [agent, caller] });
+		Object.assign(h.media, {
+			play: async (channelId: string) => {
+				if (channelId === "c") {
+					throw new Error("the media plane refused a playback");
+				}
+				return { playbackRef: "p" };
+			},
+		});
+
+		const outcome = await h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+
+		expect(outcome.result.ok).toBe(true);
+		// Only the party that ACTUALLY heard it is reported as having heard it.
+		expect(outcome.consent?.parties).toEqual(["caller"]);
+	});
+
+	it("waits for a peer whose media is not up yet, then announces to it", async () => {
+		// The live failure this exists for: the legs bridge, the gate runs, and the WebRTC far end has
+		// signalled its answer but is still finishing ICE. Playing there writes into a transport with
+		// no peer. So the gate holds until the leg reports `active`, and only then plays.
+		const agent = fakeLeg("a");
+		const customer = fakeLeg("customer", { isAnswered: false });
+		bridgePair(agent, customer);
+		const h = harness({ legs: [agent, customer] });
+
+		const started = h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+		await flush();
+		// Nothing is played while either party is still coming up: the two waits overlap and the
+		// prompt reaches both sides together.
+		expect(playedAt(h)).toEqual([]);
+
+		h.signals.emit(legSignalKey("customer"), { kind: "answered" });
+		const outcome = await started;
+
+		expect(playedAt(h)).toEqual(["a", "customer"]);
+		expect(outcome.result.ok).toBe(true);
+		expect(outcome.consent?.parties).toEqual(["caller", "callee"]);
+	});
+
+	it("leaves a peer that never comes up OUT of the parties, and records anyway", async () => {
+		const agent = fakeLeg("a");
+		const customer = fakeLeg("customer", { isAnswered: false });
+		bridgePair(agent, customer);
+		const h = harness({ legs: [agent, customer] });
+
+		const outcome = await h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+
+		expect(playedAt(h)).toEqual(["a"]);
+		expect(outcome.result.ok).toBe(true);
+		// The claim the record makes is exactly the set of parties a prompt was accepted for.
+		expect(outcome.consent?.parties).toEqual(["caller"]);
+	});
+
+	it("gives up on a peer that hangs up mid-wait rather than sitting out the budget", async () => {
+		const agent = fakeLeg("a");
+		const customer = fakeLeg("customer", { isAnswered: false });
+		bridgePair(agent, customer);
+		const h = harness({ legs: [agent, customer] });
+
+		const started = h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+		await flush();
+		h.signals.emit(legSignalKey("customer"), {
+			kind: "ended",
+			cause: "NORMAL_CLEARING",
+			causeCode: 16,
+		});
+		const outcome = await started;
+
+		expect(playedAt(h)).toEqual(["a"]);
+		expect(outcome.consent?.parties).toEqual(["caller"]);
+	});
+
+	it("clears the readiness watcher on every exit, so a recorded call leaks no listener", async () => {
+		const readyKey = legSignalKey("ready");
+		const lateKey = legSignalKey("late");
+		const goneKey = legSignalKey("gone");
+		const agent = fakeLeg("a");
+		const ready = fakeLeg("ready", { isAnswered: false });
+		const late = fakeLeg("late", { isAnswered: false });
+		const gone = fakeLeg("gone", { isAnswered: false });
+		const h = harness({ legs: [agent, ready, late, gone] });
+
+		// Answered while waiting.
+		bridgePair(agent, ready);
+		const first = h.control.startRecording(agent, {
+			consent: consent({ parties: ["callee"] }),
+		});
+		await flush();
+		h.signals.emit(readyKey, { kind: "answered" });
+		await first;
+		expect(h.signals.isWatched(readyKey)).toBe(false);
+
+		// Budget expired.
+		await h.control.stopRecording(agent);
+		bridgePair(agent, late);
+		await h.control.startRecording(agent, { consent: consent({ parties: ["callee"] }) });
+		expect(h.signals.isWatched(lateKey)).toBe(false);
+
+		// Hung up while waiting.
+		await h.control.stopRecording(agent);
+		bridgePair(agent, gone);
+		const third = h.control.startRecording(agent, {
+			consent: consent({ parties: ["callee"] }),
+		});
+		await flush();
+		h.signals.emit(goneKey, { kind: "ended", cause: "NORMAL_CLEARING", causeCode: 16 });
+		await third;
+		expect(h.signals.isWatched(goneKey)).toBe(false);
+	});
+
+	it("counts a party only when the media plane reports it delivered audio", async () => {
+		// The live failure this whole rung exists for, in one case. The peer is answered, bridged and
+		// perfectly healthy; `play` is accepted; and `mediad` then reports it wrote nothing, because
+		// the browser had not finished ICE and DTLS. The old gate counted the party the moment `play`
+		// resolved and filed a compliance record naming somebody who heard silence.
+		const agent = fakeLeg("a");
+		const customer = fakeLeg("customer");
+		bridgePair(agent, customer);
+		const h = harness({ legs: [agent, customer], silentChannels: ["customer"] });
+
+		const outcome = await h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+
+		// The prompt WAS played at both — the failure is invisible at the command, which is why it
+		// went unnoticed for as long as it did. The peer is then retried until the budget runs out,
+		// because a prompt written into a transport with no peer is not queued anywhere.
+		expect(playedAt(h)).toContain("a");
+		expect(playedAt(h).filter((id) => id === "customer").length).toBeGreaterThan(1);
+		expect(outcome.result.ok).toBe(true);
+		expect(outcome.consent?.parties).toEqual(["caller"]);
+	});
+
+	it("plays again when the media plane says it delivered nothing, and counts the party once it does", async () => {
+		// The live sequence, in a fake. The peer is a browser that answered and has not finished its
+		// DTLS handshake: the first prompts are accepted, decoded, written, and reach nobody. Waiting
+		// would not help — those frames are not queued anywhere — so the gate plays again, and stops
+		// the moment the media plane reports it delivered audio. An RTP endpoint delivers on its first
+		// attempt and pays none of this.
+		const agent = fakeLeg("a");
+		const customer = fakeLeg("customer");
+		bridgePair(agent, customer);
+		const h = harness({
+			legs: [agent, customer],
+			silentChannels: ["customer"],
+			deliversAfterAttempts: { customer: 3 },
+		});
+
+		const outcome = await h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+
+		expect(outcome.result.ok).toBe(true);
+		expect(outcome.consent?.parties).toEqual(["caller", "callee"]);
+		// Three attempts at the peer, and exactly one at the party that heard it first time.
+		expect(h.attemptsPerChannel.get("customer")).toBe(3);
+		expect(h.attemptsPerChannel.get("a")).toBe(1);
+	});
+
+	it("leaves out a party whose playback never finishes, and does not wait forever for it", async () => {
+		const agent = fakeLeg("a");
+		const customer = fakeLeg("customer");
+		bridgePair(agent, customer);
+		const h = harness({ legs: [agent, customer], neverFinishingChannels: ["customer"] });
+
+		const outcome = await h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+
+		expect(outcome.result.ok).toBe(true);
+		expect(outcome.consent?.parties).toEqual(["caller"]);
+	});
+
+	it("refuses the recording when the media plane delivered audio to NOBODY", async () => {
+		// Not a media failure anywhere the engine can see: both plays were accepted. The only evidence
+		// that nobody was told is the number the media plane reported afterwards, and it is enough to
+		// stop the recording — which is the contract the gate held before and still holds.
+		const agent = fakeLeg("a");
+		const customer = fakeLeg("customer");
+		bridgePair(agent, customer);
+		const h = harness({
+			legs: [agent, customer],
+			silentChannels: ["a", "customer"],
+		});
+
+		const outcome = await h.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+
+		expect(outcome.result.ok).toBe(false);
+		expect(h.media.methods()).not.toContain("snoop");
+		expect(h.control.recordingFor("a")).toBeUndefined();
+		expect(outcome.consent).toMatchObject({ outcome: "declined", parties: [] });
+	});
+
+	it("clears every playback watcher, on delivery, on silence, on a refused play and on the budget", async () => {
+		const agent = fakeLeg("a");
+		const customer = fakeLeg("customer");
+		bridgePair(agent, customer);
+
+		// Delivered, and reported as delivering nothing.
+		const delivered = harness({ legs: [agent, customer], silentChannels: ["customer"] });
+		await delivered.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+		expect(delivered.playbacks.watchedKeyCount).toBe(0);
+
+		// Never finished: the budget is what ends the wait, and it must take its watcher with it.
+		const stalled = harness({ legs: [agent, customer], neverFinishingChannels: ["customer"] });
+		await stalled.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+		expect(stalled.playbacks.watchedKeyCount).toBe(0);
+
+		// `play` threw: no signal is ever coming, and the watcher was registered before the throw.
+		const refused = harness({ legs: [agent, customer] });
+		Object.assign(refused.media, {
+			play: async () => {
+				throw new Error("the media plane refused a playback");
+			},
+		});
+		await refused.control.startRecording(agent, {
+			consent: consent({ parties: ["caller", "callee"] }),
+		});
+		expect(refused.playbacks.watchedKeyCount).toBe(0);
+	});
+
+	it("subscribes before it plays, so a prompt that finishes instantly is not missed", async () => {
+		// The fake emits the completion synchronously from inside `play`, which is the race a waiter
+		// registered after the command would lose every time on a fast local transport.
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+
+		const outcome = await h.control.startRecording(leg, { consent: consent() });
+
+		expect(outcome.result.ok).toBe(true);
+		expect(outcome.consent?.parties).toEqual(["caller"]);
+	});
+
+	it("refuses the recording when the ONLY party owed the prompt never came up", async () => {
+		const agent = fakeLeg("a");
+		const customer = fakeLeg("customer", { isAnswered: false });
+		bridgePair(agent, customer);
+		const h = harness({ legs: [agent, customer] });
+
+		const outcome = await h.control.startRecording(agent, {
+			consent: consent({ parties: ["callee"] }),
+		});
+
+		expect(outcome.result.ok).toBe(false);
+		expect(h.media.methods()).not.toContain("snoop");
+		expect(h.control.recordingFor("a")).toBeUndefined();
+		expect(outcome.consent).toMatchObject({ outcome: "declined", parties: [] });
+	});
+
+	it("refuses the recording outright when NOBODY could be told", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+		Object.assign(h.media, {
+			play: async () => {
+				throw new Error("the media plane refused a playback");
+			},
+		});
+
+		const outcome = await h.control.startRecording(leg, { consent: consent() });
+
+		expect(outcome.result.ok).toBe(false);
+		expect(outcome.result.ok ? "" : outcome.result.reason).toContain("not recorded");
+		expect(h.media.methods()).not.toContain("snoop");
+		expect(h.control.recordingFor("c")).toBeUndefined();
+		expect(outcome.consent).toMatchObject({ outcome: "declined", parties: [] });
+		expect(h.consentRecords).toHaveLength(1);
+	});
+
+	it("starts the recording when the accept digit is pressed", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+
+		const started = h.control.startRecording(leg, {
+			consent: consent({ policy: "announce-and-require-keypress" }),
+		});
+		await flush();
+		h.signals.emit(legSignalKey("c"), { kind: "dtmf", digit: "1" });
+		const outcome = await started;
+
+		expect(outcome.result.ok).toBe(true);
+		expect(outcome.consent).toMatchObject({ outcome: "accepted", method: "keypress" });
+		expect(h.control.recordingFor("c")).toMatchObject({ paused: false });
+	});
+
+	it("ignores a digit that is neither accept nor decline", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+
+		const started = h.control.startRecording(leg, {
+			consent: consent({ policy: "announce-and-require-keypress" }),
+		});
+		await flush();
+		h.signals.emit(legSignalKey("c"), { kind: "dtmf", digit: "#" });
+		h.signals.emit(legSignalKey("c"), { kind: "dtmf", digit: "1" });
+		const outcome = await started;
+
+		expect(outcome.consent?.outcome).toBe("accepted");
+	});
+
+	it("starts NOTHING when the decline digit is pressed, and still files the verdict", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+
+		const started = h.control.startRecording(leg, {
+			consent: consent({ policy: "announce-and-require-keypress" }),
+		});
+		await flush();
+		h.signals.emit(legSignalKey("c"), { kind: "dtmf", digit: "2" });
+		const outcome = await started;
+
+		expect(outcome.result.ok).toBe(false);
+		expect(outcome.recordingId).toBeUndefined();
+		expect(h.control.recordingFor("c")).toBeUndefined();
+		expect(h.media.methods()).not.toContain("snoop");
+		expect(h.eventsOf("channel.record.started")).toEqual([]);
+		// The whole point: no recording, and a provable decline anyway.
+		expect(outcome.consent).toMatchObject({ outcome: "declined", method: "keypress" });
+		expect(h.consentRecords[0]?.record.outcome).toBe("declined");
+	});
+
+	it("treats the timeout as a decline, files it, and leaves no watcher behind", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+
+		const outcome = await h.control.startRecording(leg, {
+			consent: consent({ policy: "announce-and-require-keypress" }),
+		});
+
+		expect(outcome.result.ok).toBe(false);
+		expect(outcome.result.ok ? "" : outcome.result.reason).toContain("no consent digit");
+		expect(outcome.consent).toMatchObject({ outcome: "declined", method: "keypress" });
+		expect(h.control.recordingFor("c")).toBeUndefined();
+		expect(h.signals.isWatched(legSignalKey("c"))).toBe(false);
+	});
+
+	it("drops the watcher on an accept too, so a recorded call leaks nothing", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+		const started = h.control.startRecording(leg, {
+			consent: consent({ policy: "announce-and-require-keypress" }),
+		});
+		await flush();
+		h.signals.emit(legSignalKey("c"), { kind: "dtmf", digit: "1" });
+		await started;
+
+		expect(h.signals.isWatched(legSignalKey("c"))).toBe(false);
+	});
+
+	it("settles as a decline when the party hangs up mid-question", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+		const started = h.control.startRecording(leg, {
+			consent: consent({ policy: "announce-and-require-keypress" }),
+		});
+		await flush();
+		h.signals.emit(legSignalKey("c"), { kind: "ended", cause: "NORMAL_CLEARING", causeCode: 16 });
+		const outcome = await started;
+
+		expect(outcome.result.ok).toBe(false);
+		expect(outcome.consent?.outcome).toBe("declined");
+	});
+
+	it("reports the PCI rule back on the running recording", async () => {
+		const leg = fakeLeg("c");
+		const h = harness({ legs: [leg] });
+		await h.control.startRecording(leg, { autoPauseOnDtmf: true });
+		expect(h.control.recordingFor("c")).toMatchObject({ autoPauseOnDtmf: true });
+
+		const plain = harness({ legs: [fakeLeg("d")] });
+		await plain.control.startRecording(fakeLeg("d"));
+		expect(plain.control.recordingFor("d")).toMatchObject({ autoPauseOnDtmf: false });
 	});
 });
 
@@ -1337,5 +2431,761 @@ describe("teardown", () => {
 		expect(h.control.activeOperationCount).toBe(1);
 		h.control.clear();
 		expect(h.control.activeOperationCount).toBe(0);
+	});
+});
+
+// =================================================================================================
+// Supervision — `*0`, and the mode keys
+// =================================================================================================
+
+/**
+ * The mode table, pinned directly.
+ *
+ * Everything around a tap — minting ids, waiting for it to enter the application, publishing —
+ * would look the same whichever mode was asked for, so a suite that only exercised taps end to end
+ * would pass with the two `speakTo` values swapped. This is the one place where a value in the wrong
+ * column puts a supervisor's coaching into a CUSTOMER's ear, so it is asserted as a table.
+ */
+describe("tapSidesFor", () => {
+	it("is silent for eavesdrop, whatever side the monitored party is on", () => {
+		expect(tapSidesFor("eavesdrop", "a")).toEqual({ hear: "both", speakTo: "none" });
+		expect(tapSidesFor("eavesdrop", "b")).toEqual({ hear: "both", speakTo: "none" });
+	});
+
+	it("speaks ONLY to the monitored party for whisper, following which side they are", () => {
+		// The whole reason `monitoredSide` is a parameter: "coach the agent" is a statement about a
+		// PARTY, and the agent is the b-leg on a call they received and the a-leg on one they placed.
+		expect(tapSidesFor("whisper", "b")).toEqual({ hear: "both", speakTo: "b" });
+		expect(tapSidesFor("whisper", "a")).toEqual({ hear: "both", speakTo: "a" });
+	});
+
+	it("speaks to everybody for barge", () => {
+		expect(tapSidesFor("barge", "a")).toEqual({ hear: "both", speakTo: "both" });
+		expect(tapSidesFor("barge", "b")).toEqual({ hear: "both", speakTo: "both" });
+	});
+
+	it("always hears both parties — there is no product for half a conversation", () => {
+		for (const mode of ["eavesdrop", "whisper", "barge"] as const) {
+			for (const side of ["a", "b"] as const) {
+				expect(tapSidesFor(mode, side).hear).toBe("both");
+			}
+		}
+	});
+});
+
+describe("monitor", () => {
+	/** A supervisor's idle leg and the agent's live one, as the orchestrator's scan would offer them. */
+	function supervision(overrides: { readonly targetSide?: "a" | "b" } = {}) {
+		const supervisor = fakeLeg("sup", { isAnswered: false, callerIdNumber: "1900" });
+		const agent = fakeLeg("agent", { callerIdNumber: "2002" });
+		const customer = fakeLeg("cust");
+		bridgePair(agent, customer, "live-bridge");
+		return {
+			supervisor,
+			agent,
+			customer,
+			options: {
+				legs: [supervisor, agent, customer],
+				monitorable: [
+					{ leg: agent, side: overrides.targetSide ?? ("b" as const), startedAtMs: 100 },
+				],
+			},
+		};
+	}
+
+	it("taps the monitored leg and bridges the supervisor to it", async () => {
+		const s = supervision();
+		const h = harness(s.options);
+
+		const result = await h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+
+		expect(result.ok).toBe(true);
+		const tap = h.media.taps()[0];
+		expect(tap?.targetChannelId).toBe("agent");
+		expect(tap?.supervisorChannelId).toBe("sup");
+		expect(tap?.targetSide).toBe("b");
+		expect(tap?.hear).toBe("both");
+		expect(tap?.speakTo).toBe("none");
+		// The supervisor's leg is answered and put in the tap's bridge. `*0` is dialled from an idle
+		// handset, so nobody answered it before there was something to connect it to.
+		expect(h.media.methods()).toContain("answer");
+		expect(s.supervisor.bridgeId).toBe(tap?.bridgeId);
+		// And NOT given a bridge peer: the thing on the other side is a tap, which has no leg id.
+		expect(s.supervisor.bridgePeers).toEqual([]);
+	});
+
+	it("uses an existing native supervisor session without waiting for a virtual channel", async () => {
+		const s = supervision();
+		const h = harness({
+			...s.options,
+			tapNeverArrives: true,
+			media: { bridgeMode: "proxy-media" },
+		});
+		Object.assign(h.media, {
+			supportsSupervision: true,
+			tap: async (request: TapRequest) => ({
+				tapId: request.tapId,
+				tapChannelId: request.supervisorChannelId,
+				bridgeId: request.bridgeId,
+			}),
+		});
+		expect(
+			(
+				await h.control.monitor(s.supervisor, {
+					extension: "2002",
+					mode: "eavesdrop",
+					supervisorExtension: "1900",
+				})
+			).ok,
+		).toBe(true);
+		expect(h.media.methods()).not.toContain("hangup");
+	});
+
+	it("subscribes to the tap BEFORE creating it", async () => {
+		// The fake emits `entered` from inside `tap`, which is what a real snoop does — it reaches
+		// Stasis before the HTTP response. A runtime that subscribed afterwards would hang here.
+		const s = supervision();
+		const h = harness(s.options);
+		const result = await h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+		expect(result.ok).toBe(true);
+	});
+
+	it("publishes call.tap.started on the MONITORED call, naming the supervisor's leg", async () => {
+		const s = supervision();
+		const h = harness(s.options);
+		await h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+
+		const started = h.eventsOf("call.tap.started")[0];
+		// The envelope is the monitored call's — that is what makes "was this conversation monitored?"
+		// answerable from a call id somebody has in front of them.
+		expect(started?.legId).toBe("leg-agent");
+		expect(started?.data).toEqual({
+			legId: "leg-sup",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+			targetExtension: "2002",
+			targetLegId: "leg-agent",
+			supervisorCallId: "call-sup",
+		});
+		// No `previousMode` on the first start: that is what distinguishes "began monitoring" from
+		// "changed how they were monitoring".
+		expect(started?.data.previousMode).toBeUndefined();
+	});
+
+	it("refuses on a media plane that never decodes, without touching it", async () => {
+		const s = supervision();
+		const h = harness({ ...s.options, media: { bridgeMode: "proxy-media" } });
+
+		const result = await h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+
+		expect(result).toEqual({
+			ok: false,
+			reason:
+				"this media plane bridges in proxy-media mode, which never decodes the audio, so a call on it cannot be monitored",
+		});
+		expect(h.media.taps()).toEqual([]);
+	});
+
+	it("refuses when nobody at the extension is on a call this engine holds", async () => {
+		const supervisor = fakeLeg("sup", { isAnswered: false });
+		const h = harness({ legs: [supervisor], monitorable: [] });
+
+		const result = await h.control.monitor(supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+
+		expect(result).toEqual({
+			ok: false,
+			reason: "nobody at extension 2002 is on a call this engine is handling",
+		});
+	});
+
+	it("refuses a second tap on the same supervising leg", async () => {
+		const s = supervision();
+		const h = harness(s.options);
+		const request = {
+			extension: "2002",
+			mode: "eavesdrop" as const,
+			supervisorExtension: "1900",
+		};
+		await h.control.monitor(s.supervisor, request);
+
+		expect(await h.control.monitor(s.supervisor, request)).toEqual({
+			ok: false,
+			reason: "this leg is already monitoring a call",
+		});
+	});
+
+	it("cleans up and refuses when the tap never reaches the application", async () => {
+		const s = supervision();
+		const h = harness({ ...s.options, tapNeverArrives: true });
+
+		const result = await h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+
+		expect(result.ok).toBe(false);
+		expect(h.media.methods()).toContain("stopTap");
+		// The tap channel is hung up, and the monitored legs are untouched.
+		expect(h.media.hungUp().map((entry) => entry.channelId)).not.toContain("agent");
+		expect(h.control.tapFor("sup")).toBeUndefined();
+	});
+
+	it("refuses when the media plane rejects the tap outright, and never throws", async () => {
+		const s = supervision();
+		const h = harness({ ...s.options, media: { tapFails: true } });
+
+		const result = await h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+
+		expect(result.ok).toBe(false);
+		expect(result.ok === false ? result.reason : "").toContain("refused a tap on extension 2002");
+	});
+
+	it("whispers to the a-leg when the monitored extension PLACED the call", async () => {
+		const s = supervision({ targetSide: "a" });
+		const h = harness(s.options);
+
+		await h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "whisper",
+			supervisorExtension: "1900",
+		});
+
+		expect(h.media.taps()[0]?.speakTo).toBe("a");
+	});
+});
+
+describe("the supervisor's mode keys", () => {
+	function supervising() {
+		const supervisor = fakeLeg("sup", { isAnswered: false, callerIdNumber: "1900" });
+		const agent = fakeLeg("agent");
+		const customer = fakeLeg("cust");
+		bridgePair(agent, customer, "live-bridge");
+		const h = harness({
+			legs: [supervisor, agent, customer],
+			monitorable: [{ leg: agent, side: "b" as const, startedAtMs: 100 }],
+		});
+		return { h, supervisor, agent };
+	}
+
+	it("arms the escalation on the SUPERVISOR's leg and disarms it when the tap ends", async () => {
+		const s = supervising();
+		await s.h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+		expect(s.h.supervisionKeys.has("sup")).toBe(true);
+		// And on that leg only: nothing is armed on the people being listened to.
+		expect(s.h.supervisionKeys.has("agent")).toBe(false);
+
+		await s.h.control.onLegEnded("sup");
+		expect(s.h.supervisionKeys.has("sup")).toBe(false);
+	});
+
+	it("re-taps on an escalation, because a snoop's whisper direction is fixed at creation", async () => {
+		const s = supervising();
+		await s.h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+
+		await (s.h.supervisionKeys.get("sup") as (mode: TapMode) => Promise<void>)("whisper");
+
+		const taps = s.h.media.taps();
+		expect(taps).toHaveLength(2);
+		expect(taps[0]?.speakTo).toBe("none");
+		expect(taps[1]?.speakTo).toBe("b");
+		// The old one is taken down first, so the supervisor is never in two bridges at once.
+		const methods = s.h.media.methods();
+		expect(methods.indexOf("stopTap")).toBeLessThan(methods.lastIndexOf("tap"));
+		expect(s.h.control.tapFor("sup")?.mode).toBe("whisper");
+	});
+
+	it("publishes ended{escalated} and then started{previousMode}", async () => {
+		const s = supervising();
+		await s.h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+		await (s.h.supervisionKeys.get("sup") as (mode: TapMode) => Promise<void>)("barge");
+
+		// The pair, not a single `changed` event: each interval a call was monitored is bounded by its
+		// own start and end with the mode that applied during it.
+		const ended = s.h.eventsOf("call.tap.ended");
+		expect(ended).toHaveLength(1);
+		expect(ended[0]?.data).toMatchObject({
+			mode: "eavesdrop",
+			reason: "escalated",
+			targetExtension: "2002",
+		});
+
+		const started = s.h.eventsOf("call.tap.started");
+		expect(started).toHaveLength(2);
+		expect(started[1]?.data).toMatchObject({ mode: "barge", previousMode: "eavesdrop" });
+		// Both on the monitored call, exactly as the first one was.
+		expect(started[1]?.legId).toBe("leg-agent");
+	});
+
+	it("does nothing at all when the supervisor presses the mode they are already on", async () => {
+		// Tearing the audio down and building it back would put a gap in their ear for nothing.
+		const s = supervising();
+		await s.h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+		await (s.h.supervisionKeys.get("sup") as (mode: TapMode) => Promise<void>)("eavesdrop");
+
+		expect(s.h.media.taps()).toHaveLength(1);
+		expect(s.h.eventsOf("call.tap.ended")).toEqual([]);
+	});
+
+	it("refuses an escalation on a leg with no tap", async () => {
+		const s = supervising();
+		expect(await s.h.control.escalate("sup", "barge")).toEqual({
+			ok: false,
+			reason: "this leg is not monitoring a call",
+		});
+	});
+});
+
+describe("a tap ending", () => {
+	function supervising() {
+		const supervisor = fakeLeg("sup", { isAnswered: false, callerIdNumber: "1900" });
+		const agent = fakeLeg("agent");
+		const customer = fakeLeg("cust");
+		bridgePair(agent, customer, "live-bridge");
+		const h = harness({
+			legs: [supervisor, agent, customer],
+			monitorable: [{ leg: agent, side: "b" as const, startedAtMs: 100 }],
+		});
+		return { h, supervisor, agent, customer };
+	}
+
+	it("leaves the monitored call ALIVE when the supervisor hangs up", async () => {
+		// The invariant `MediaPort.stopTap` states, and the one worth a spec of its own: getting it
+		// wrong drops live customer calls every time somebody stops listening.
+		const s = supervising();
+		await s.h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+		s.h.media.calls.length = 0;
+
+		await s.h.control.onLegEnded("sup");
+
+		expect(s.h.media.methods()).toContain("stopTap");
+		// Nothing was hung up: not the agent, not the customer, and not the supervisor (whose leg is
+		// already going away — hanging it up again would be a second teardown).
+		expect(s.h.media.hungUp()).toEqual([]);
+		expect(s.agent.hangupCause).toBeUndefined();
+		expect(s.customer.hangupCause).toBeUndefined();
+
+		const ended = s.h.eventsOf("call.tap.ended")[0];
+		expect(ended?.data).toMatchObject({ reason: "supervisor-ended", mode: "eavesdrop" });
+		expect(ended?.data.durationMs).toBe(0);
+		expect(s.h.control.tapFor("sup")).toBeUndefined();
+	});
+
+	it("drops the supervisor when the MONITORED call ends", async () => {
+		const s = supervising();
+		await s.h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+		s.h.media.calls.length = 0;
+
+		s.h.signals.emit(legSignalKey("agent"), {
+			kind: "ended",
+			cause: "NORMAL_CLEARING",
+			causeCode: 16,
+		});
+		await flush();
+
+		// A supervisor left holding a line with nothing on it would believe they were still listening.
+		expect(s.h.media.hungUp().map((entry) => entry.channelId)).toEqual(["sup"]);
+		expect(s.h.eventsOf("call.tap.ended")[0]?.data).toMatchObject({ reason: "target-ended" });
+	});
+
+	it("counts a live tap, so a drain can wait for it", async () => {
+		const s = supervising();
+		await s.h.control.monitor(s.supervisor, {
+			extension: "2002",
+			mode: "eavesdrop",
+			supervisorExtension: "1900",
+		});
+		expect(s.h.control.activeOperationCount).toBe(1);
+		s.h.control.clear();
+		expect(s.h.control.activeOperationCount).toBe(0);
+	});
+});
+
+/**
+ * A shared-line registry, in memory, with the compare-and-set left out.
+ *
+ * `SharedLineRegistry` is specced against its own claim bucket in `routing/shared-line-registry.spec.ts`.
+ * What is under test HERE is the mid-call half's use of it: that a phone-pressed hold moves the line
+ * and arms the recall, that a retrieval bridges the party who was on it, and that a call ending frees
+ * the appearance. So the state is a plain object and every write succeeds.
+ */
+function fakeSharedLines(initial?: Partial<SharedLineStateView>) {
+	const state: { value: SharedLineStateView | undefined } = {
+		value:
+			initial === undefined
+				? undefined
+				: {
+						orgId: ORG,
+						sharedLineId: "sl-1",
+						state: "seized",
+						heldByExtensionId: "ext-a",
+						heldByAppearanceIndex: 1,
+						callId: "call-c",
+						legId: "leg-c",
+						...initial,
+					},
+	};
+	const recalls: { timeoutMs: number; fire: () => void }[] = [];
+	let released = false;
+	const port: SharedLineControlPort = {
+		seizureForCall: (callId) =>
+			state.value !== undefined && state.value.callId === callId
+				? { sharedLineId: state.value.sharedLineId, value: state.value }
+				: undefined,
+		held: (_orgId, sharedLineId) =>
+			state.value !== undefined && state.value.sharedLineId === sharedLineId
+				? state.value
+				: undefined,
+		hold: async () => {
+			if (state.value === undefined) {
+				return { kind: "not-held" };
+			}
+			state.value = { ...state.value, state: "held" };
+			return { kind: "held" };
+		},
+		resume: async (_orgId, _sharedLineId, seizing) => {
+			if (state.value === undefined) {
+				return { kind: "not-held" };
+			}
+			state.value = {
+				...state.value,
+				state: "seized",
+				...(seizing === undefined
+					? {}
+					: {
+							heldByExtensionId: seizing.extensionId,
+							heldByAppearanceIndex: seizing.appearanceIndex,
+							callId: seizing.callId,
+							legId: seizing.legId,
+						}),
+			};
+			return { kind: "held" };
+		},
+		releaseOwn: async () => {
+			released = true;
+			state.value = undefined;
+			return true;
+		},
+		armRecall: (_orgId, _sharedLineId, timeoutMs, onRecall) => {
+			recalls.push({ timeoutMs, fire: onRecall });
+		},
+		cancelRecall: () => {
+			recalls.length = 0;
+		},
+	};
+	return {
+		port,
+		recalls,
+		get state(): SharedLineStateView | undefined {
+			return state.value;
+		},
+		get released(): boolean {
+			return released;
+		},
+	};
+}
+
+const SHARED_LINE: SharedLine = {
+	sharedLineId: "sl-1",
+	holdRecallTimeoutSeconds: 45,
+	appearances: [
+		{ appearanceIndex: 1, extensionId: "ext-a", extensionNumber: "1001" },
+		{ appearanceIndex: 2, extensionId: "ext-b", extensionNumber: "1002" },
+	],
+};
+
+describe("shared lines, mid-call", () => {
+	it("moves the line to held and arms the recall when an appearance presses hold", async () => {
+		const lines = fakeSharedLines({});
+		const appearance = fakeLeg("a", { callId: "call-c" });
+		const h = harness({ legs: [appearance], sharedLines: lines.port, sharedLine: SHARED_LINE });
+
+		await h.control.onSharedLineHold(appearance, true);
+
+		// The KV write IS the publication: `held` is what the other appearances' lamps read.
+		expect(lines.state?.state).toBe("held");
+		expect(lines.recalls).toEqual([{ timeoutMs: 45_000, fire: expect.any(Function) }]);
+	});
+
+	it("puts the line back and cancels the recall when the same appearance takes it off hold", async () => {
+		const lines = fakeSharedLines({ state: "held" });
+		const appearance = fakeLeg("a", { callId: "call-c" });
+		const h = harness({ legs: [appearance], sharedLines: lines.port, sharedLine: SHARED_LINE });
+
+		await h.control.onSharedLineHold(appearance, true);
+		await h.control.onSharedLineHold(appearance, false);
+
+		expect(lines.state?.state).toBe("seized");
+		expect(lines.recalls).toEqual([]);
+	});
+
+	it("leaves a call that is not on a shared line completely alone", async () => {
+		const lines = fakeSharedLines({ callId: "some-other-call" });
+		const appearance = fakeLeg("a", { callId: "call-c" });
+		const h = harness({ legs: [appearance], sharedLines: lines.port, sharedLine: SHARED_LINE });
+
+		await h.control.onSharedLineHold(appearance, true);
+
+		expect(lines.state?.state).toBe("seized");
+		expect(lines.recalls).toEqual([]);
+	});
+
+	it("re-bridges the held party to the appearance that retrieved the line", async () => {
+		const caller = fakeLeg("c", { callId: "call-c" });
+		// Dialled the LINE, which is what a retrieve is: the appearance is the party on the leg, so
+		// it is `callerIdNumber` that names it and `destinationNumber` that names the line.
+		const retriever = fakeLeg("b", {
+			callId: "call-b",
+			callerIdNumber: "1002",
+			destinationNumber: "4500",
+		});
+		const lines = fakeSharedLines({ state: "held", legId: caller.legId });
+		const h = harness({
+			legs: [caller, retriever],
+			sharedLines: lines.port,
+			sharedLine: SHARED_LINE,
+		});
+
+		const result = await h.control.retrieveSharedLine(retriever, { sharedLineId: "sl-1" });
+
+		expect(result.ok).toBe(true);
+		// The SAME conversation, on the second phone: nothing was re-dialled.
+		expect(retriever.bridgePeers).toContain(caller.legId);
+		expect(caller.bridgePeers).toContain(retriever.legId);
+		expect(h.media.methods()).toContain("stopMusicOnHold");
+		// Re-pointed rather than released and re-taken, so a third appearance never sees it free.
+		expect(lines.state).toMatchObject({
+			state: "seized",
+			heldByAppearanceIndex: 2,
+			heldByExtensionId: "ext-b",
+			legId: caller.legId,
+		});
+	});
+
+	/**
+	 * Regression, and the reason retrieve had never worked once on the wire.
+	 *
+	 * A second appearance retrieves by DIALLING the line, so this arrives on a leg the walk has
+	 * deliberately not answered yet. `refuseIfUnusable`'s `isAnswered` check refused every one of
+	 * them with "the leg has not answered, so it cannot be used for shared-line retrieve", and the
+	 * walk fell through to its timeout branch and hung the retriever up.
+	 */
+	it("answers the retrieving appearance instead of refusing it for not having answered", async () => {
+		const caller = fakeLeg("c", { callId: "call-c" });
+		const retriever = fakeLeg("b", {
+			callId: "call-b",
+			callerIdNumber: "1002",
+			destinationNumber: "4500",
+			isAnswered: false,
+		});
+		const lines = fakeSharedLines({ state: "held", legId: caller.legId });
+		const h = harness({
+			legs: [caller, retriever],
+			sharedLines: lines.port,
+			sharedLine: SHARED_LINE,
+		});
+
+		const result = await h.control.retrieveSharedLine(retriever, { sharedLineId: "sl-1" });
+
+		expect(result.ok).toBe(true);
+		// Answered at the moment there IS something to connect them to — without it the bridge is
+		// refused `unknown_session` on a split media plane and the appearance hears ringback.
+		expect(h.media.methods()).toContain("answer");
+		expect(retriever.bridgePeers).toContain(caller.legId);
+	});
+
+	/**
+	 * Regression: after a retrieve the line was never recallable again.
+	 *
+	 * Two halves, both about the appearance that retrieved. The lamp kept naming the appearance that
+	 * had PUT the call on hold, because the retrieving leg was matched on `destinationNumber` — which
+	 * is the LINE's number, never an appearance's. And the seizure is filed under the caller's call,
+	 * while a retrieving appearance dialled in as a call of its own, so its hold was not recognised
+	 * as a shared-line hold at all and no recall was ever armed.
+	 */
+	it("re-arms the recall at the retrieving appearance when it holds the line in turn", async () => {
+		const caller = fakeLeg("c", { callId: "call-c" });
+		const first = fakeLeg("a", { callId: "call-c" });
+		bridgePair(first, caller);
+		const retriever = fakeLeg("b", {
+			callId: "call-b",
+			callerIdNumber: "1002",
+			destinationNumber: "4500",
+		});
+		const lines = fakeSharedLines({ legId: caller.legId });
+		const h = harness({
+			legs: [caller, first, retriever],
+			sharedLines: lines.port,
+			sharedLine: SHARED_LINE,
+		});
+
+		await h.control.onSharedLineHold(first, true);
+		expect(lines.recalls).toHaveLength(1);
+
+		expect((await h.control.retrieveSharedLine(retriever, { sharedLineId: "sl-1" })).ok).toBe(true);
+		// The lamp now names the appearance that is actually on the line.
+		expect(lines.state).toMatchObject({
+			state: "seized",
+			heldByExtensionId: "ext-b",
+			heldByAppearanceIndex: 2,
+		});
+		expect(lines.recalls).toEqual([]);
+		// What the aggregate does on a real bridge, which the fake leg cannot derive from a leg id.
+		retriever.peerMediaChannelId = caller.mediaChannelId;
+		caller.peerMediaChannelId = retriever.mediaChannelId;
+
+		await h.control.onSharedLineHold(retriever, true);
+
+		expect(lines.state?.state).toBe("held");
+		expect(lines.recalls).toEqual([{ timeoutMs: 45_000, fire: expect.any(Function) }]);
+
+		lines.recalls[0]?.fire();
+		await Promise.resolve();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		// Back to the SECOND appearance, not the first.
+		expect(h.routes.map((route) => route.destination)).toEqual(["1002"]);
+	});
+
+	it("refuses to retrieve a line that is in use rather than on hold", async () => {
+		const caller = fakeLeg("c", { callId: "call-c" });
+		const retriever = fakeLeg("b", { callId: "call-b", destinationNumber: "1002" });
+		const lines = fakeSharedLines({ legId: caller.legId });
+		const h = harness({
+			legs: [caller, retriever],
+			sharedLines: lines.port,
+			sharedLine: SHARED_LINE,
+		});
+
+		expect(await h.control.retrieveSharedLine(retriever, { sharedLineId: "sl-1" })).toEqual({
+			ok: false,
+			reason: "shared line sl-1 is in use, not on hold",
+		});
+	});
+
+	it("frees the line when the party who was on it hangs up, and only then", async () => {
+		const caller = fakeLeg("c", { callId: "call-c" });
+		const lines = fakeSharedLines({ legId: caller.legId });
+		const h = harness({ legs: [caller], sharedLines: lines.port, sharedLine: SHARED_LINE });
+
+		// The APPEARANCE's leg ending is a blind transfer or a recall re-ring, not the end of the call.
+		await h.control.releaseSharedLine(ORG, "call-c", "leg-a");
+		expect(lines.released).toBe(false);
+
+		await h.control.releaseSharedLine(ORG, "call-c", caller.legId);
+		expect(lines.released).toBe(true);
+	});
+
+	it("recalls a forgotten held line to the appearance that put it there", async () => {
+		const caller = fakeLeg("c", { callId: "call-c" });
+		const appearance = fakeLeg("a", { callId: "call-c" });
+		const lines = fakeSharedLines({ legId: caller.legId });
+		const h = harness({
+			legs: [caller, appearance],
+			sharedLines: lines.port,
+			sharedLine: SHARED_LINE,
+		});
+
+		await h.control.onSharedLineHold(appearance, true);
+		lines.recalls[0]?.fire();
+		// The recall runs detached from the timer, exactly as the park timeout does.
+		await Promise.resolve();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		// Through the ordinary routing path, at the seizing appearance's NUMBER — its leg is long gone.
+		expect(h.routes.map((route) => route.destination)).toEqual(["1001"]);
+	});
+
+	/**
+	 * Regression: the recall ended `hangup` every time.
+	 *
+	 * A shared-line hold is a desk phone re-INVITEing `sendonly` — nothing tears its dialog down —
+	 * so the appearance that held the line was still in this call when the timer fired, and routing
+	 * the caller at that appearance's own extension dialled a number this very call was occupying.
+	 * Same shape as the park recall landing in the parker's voicemail.
+	 */
+	it("releases the holding appearance's own leg so the recall reaches an idle extension", async () => {
+		const caller = fakeLeg("c", { callId: "call-c" });
+		const appearance = fakeLeg("a", { callId: "call-c" });
+		bridgePair(appearance, caller);
+		const lines = fakeSharedLines({ legId: caller.legId });
+		const h = harness({
+			legs: [caller, appearance],
+			sharedLines: lines.port,
+			sharedLine: SHARED_LINE,
+		});
+
+		await h.control.onSharedLineHold(appearance, true);
+		// The BRIDGE as well as the peer pointer, and both before the hangup. The walk that built this
+		// bridge is still watching the other side of it, and its `onPeerEnded` hangs its own leg up —
+		// the caller this recall is about to dial for — unless the leg has visibly left the bridge
+		// first. That cascade is what ended every recall in the last E2E round three milliseconds
+		// before its own dial began. The route re-bridges the caller afterwards, so the fact worth
+		// pinning is the ORDER: the caller was out of the bridge before the holder's leg went.
+		const bridges: (string | undefined)[] = [];
+		const setBridge = caller.setBridge.bind(caller);
+		caller.setBridge = (bridgeId): void => {
+			bridges.push(bridgeId);
+			setBridge(bridgeId);
+		};
+		lines.recalls[0]?.fire();
+		await Promise.resolve();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(bridges[0]).toBeUndefined();
+		expect(h.media.hungUp()).toEqual([{ channelId: "a", cause: "NORMAL_CLEARING" }]);
+		expect(appearance.hangupCause).toBe("NORMAL_CLEARING");
+		// And the caller is NOT taken down with them: the peer link is cut before the hangup, which
+		// is the same order `park` uses and for the same reason.
+		expect(caller.bridgePeers.at(-1)).toBeUndefined();
+		expect(h.routes.map((route) => route.destination)).toEqual(["1001"]);
 	});
 });

@@ -39,6 +39,17 @@ export {
 	type UnbridgeReason,
 } from "./bridge";
 export {
+	describeE164Rejection,
+	E164_REJECTIONS,
+	isE164,
+	normalizeE164,
+	normalizeE164Message,
+	toE164,
+	type E164Options,
+	type E164Rejection,
+	type E164Result,
+} from "./e164";
+export {
 	aggregateDeviceState,
 	ALERTING_CALL_STATES,
 	assertCallStateTransition,
@@ -225,6 +236,7 @@ export {
 	type TransferState,
 } from "./transfer";
 export {
+	ANSWERED_VERBS,
 	DIAL_STRATEGIES,
 	DIAL_TARGET_KINDS,
 	GATHER_SOURCES,
@@ -241,6 +253,7 @@ export {
 	TRANSFER_KINDS,
 	VERB_END_REASONS,
 	VERB_NAMES,
+	verbRequiresAnswer,
 	verbRequiresMediaPath,
 	type AcknowledgedResult,
 	type AnswerVerb,
@@ -262,6 +275,7 @@ export {
 	type MuteDirection,
 	type MuteVerb,
 	type ParkVerb,
+	type PauseRecordVerb,
 	type PlaybackAction,
 	type PlaybackControlVerb,
 	type PlaybackResult,
@@ -270,6 +284,7 @@ export {
 	type RecordFormat,
 	type RecordResult,
 	type RecordVerb,
+	type ResumeRecordVerb,
 	type RingingVerb,
 	type SayVerb,
 	type SetVariableVerb,

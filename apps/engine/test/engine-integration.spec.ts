@@ -33,6 +33,7 @@ import { ChannelOrchestrator } from "../src/calls/channel-orchestrator.service";
 import { ParkHandoffError } from "../src/calls/park-handoff";
 import { AriConnectionService } from "../src/media/ari-connection.service";
 import { makeFakeMediaPort } from "../src/media/media-port.fake";
+import { PlaybackSignalBus } from "../src/media/playback-signals";
 import { KvClaimBucket } from "../src/nats/claim-store";
 import { ParkHandoffService } from "../src/nats/park-handoff.service";
 import { CallSignalBus } from "../src/routing/call-signals";
@@ -213,7 +214,10 @@ function seedArtifact(): RoutingArtifact {
 			maxWaitNoAgentSeconds: 0,
 			announcePositionEnabled: false,
 			announceFrequencySeconds: 60,
-			recordEnabled: false,
+			recordPolicy: "none",
+			priority: 0,
+			abandonedResumeAllowed: false,
+			discardAbandonedAfterSeconds: 0,
 			timeoutNodeId: "hangup:NORMAL_CLEARING",
 		} as PlanNode,
 		{
@@ -224,7 +228,7 @@ function seedArtifact(): RoutingArtifact {
 			requiresPin: false,
 			maxMembers: 0,
 			waitForModerator: false,
-			recordEnabled: false,
+			recordPolicy: "none",
 		} as PlanNode,
 		{
 			id: `queue:${EMPTY_QUEUE_ID}`,
@@ -236,7 +240,10 @@ function seedArtifact(): RoutingArtifact {
 			maxWaitNoAgentSeconds: 2,
 			announcePositionEnabled: false,
 			announceFrequencySeconds: 60,
-			recordEnabled: false,
+			recordPolicy: "none",
+			priority: 0,
+			abandonedResumeAllowed: false,
+			discardAbandonedAfterSeconds: 0,
 			timeoutNodeId: "hangup:NORMAL_CLEARING",
 		} as PlanNode,
 	];
@@ -1292,6 +1299,7 @@ function itLeg(id: string): ControlledLeg & { bridgeId: string | undefined } {
 		bridgeId: undefined as string | undefined,
 		peerMediaChannelId: undefined,
 		callerIdNumber: `n-${id}`,
+		side: "a" as const,
 		moveTo: () => true,
 		moveCallStateTo: () => true,
 		setBridge: (bridgeId: string | undefined) => {
@@ -1346,15 +1354,21 @@ async function parkInstance(natsUrl: string, instanceId: string) {
 	const media = makeFakeMediaPort();
 	const host: CallControlHost = {
 		legFor: (mediaChannelId) => legs.get(mediaChannelId),
+		legByLegId: (legId) => [...legs.values()].find((leg) => leg.legId === legId),
 		ringingFor: async () => [],
+		activeCallsFor: () => [],
 		publish: async () => undefined,
+		markRecording: () => undefined,
+		markConsent: () => undefined,
 		route: async () => ({ status: "aborted", notes: [] }),
 		parkLotFor: async () => PARK_IT_LOT,
 		parkLotForSlot: async () => PARK_IT_LOT,
+		sharedLineFor: async () => undefined,
 	};
 	const control = new CallControl({
 		media,
 		signals: new CallSignalBus(),
+		playbacks: new PlaybackSignalBus(),
 		parks,
 		host,
 		parkHandoff: handoffs,

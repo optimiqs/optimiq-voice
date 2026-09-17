@@ -1,4 +1,5 @@
 import { ariPlaybackSchema } from "../models";
+import { encodeSegment } from "../url";
 import type { AriHttpClient } from "../http-client";
 import type { AriPlayback } from "../models";
 
@@ -25,7 +26,7 @@ export class AriPlaybacks {
 	/** `GET /playbacks/{id}` — `undefined` once the playback has finished. */
 	async get(playbackId: string): Promise<AriPlayback | undefined> {
 		return await this.http.requestParsedOptional(
-			{ method: "GET", path: `/playbacks/${encodeURIComponent(playbackId)}` },
+			{ method: "GET", path: `/playbacks/${encodeSegment(playbackId)}` },
 			ariPlaybackSchema,
 		);
 	}
@@ -39,7 +40,7 @@ export class AriPlaybacks {
 	async stop(playbackId: string): Promise<void> {
 		await this.http.requestVoid({
 			method: "DELETE",
-			path: `/playbacks/${encodeURIComponent(playbackId)}`,
+			path: `/playbacks/${encodeSegment(playbackId)}`,
 			tolerateNotFound: true,
 		});
 	}
@@ -48,7 +49,7 @@ export class AriPlaybacks {
 	async control(playbackId: string, operation: AriPlaybackOperation): Promise<void> {
 		await this.http.requestVoid({
 			method: "POST",
-			path: `/playbacks/${encodeURIComponent(playbackId)}/control`,
+			path: `/playbacks/${encodeSegment(playbackId)}/control`,
 			query: { operation },
 			tolerateNotFound: true,
 		});

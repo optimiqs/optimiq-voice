@@ -3,13 +3,10 @@ package events
 // Registration event constructors — the Go mirror of makeRegistrationEvent in
 // packages/events/src/schemas/registration-events.ts.
 //
-// The AOR hash is derived from the payload's AOR here, exactly as it is there, so a caller cannot
-// publish a payload whose AOR disagrees with its subject. sipd is the only producer of these
-// today; the engine and the admin API are consumers.
-//
-// Three explicit constructors rather than one generic: the payloads are distinct generated structs
-// with no common interface, and a type-set constraint cannot reach their fields. Explicit beats
-// clever, and there will only ever be three.
+// Each derives the AOR hash from the payload's AOR, exactly as TypeScript does, so a caller cannot
+// publish a payload whose AOR disagrees with its subject. They are written out one per event type
+// rather than generically because the payloads are distinct generated structs with no common
+// interface, and a type-set constraint cannot reach their fields.
 
 func registrationEnvelope[T any](
 	eventType string,
@@ -62,6 +59,20 @@ func NewRegistrationExpiredEnvelope(
 	envelope, hash, err := registrationEnvelope(EventTypeRegistrationExpired, in.Data.AOR, in)
 	if err != nil {
 		return Envelope[RegistrationExpiredData]{}, err
+	}
+	envelope.Data.AORHash = hash
+	return envelope, nil
+}
+
+// NewRegistrationAuthFailedEnvelope builds an `auth-failed` event — a REGISTER whose digest did not
+// verify. Only raised once the account has been resolved, because the subject needs an
+// organization and an unresolved account has none.
+func NewRegistrationAuthFailedEnvelope(
+	in EnvelopeInput[RegistrationAuthFailedData],
+) (Envelope[RegistrationAuthFailedData], error) {
+	envelope, hash, err := registrationEnvelope(EventTypeRegistrationAuthFailed, in.Data.AOR, in)
+	if err != nil {
+		return Envelope[RegistrationAuthFailedData]{}, err
 	}
 	envelope.Data.AORHash = hash
 	return envelope, nil

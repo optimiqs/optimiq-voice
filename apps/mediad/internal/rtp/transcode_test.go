@@ -1,0 +1,266 @@
+package rtp_test
+
+import (
+	"errors"
+	"math"
+	"testing"
+
+	pionrtp "github.com/pion/rtp"
+
+	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/audio"
+	"github.com/optimiqs/optimiq-voice/apps/mediad/internal/rtp"
+)
+
+// Transcoding at the bridge boundary. Two opposite properties: a mismatched bridge must translate,
+// and a matched one must not, because passthrough is the fast path.
+
+func TestTranscoderRefusesTheIdentityTranslation(t *testing.T) {
+	t.Parallel()
+
+	// A transcoder for two legs that agreed would decode and re-encode every frame for no change in
+	// the bytes, turning the fast path into the slow one invisibly.
+	if _, err := rtp.NewTranscoder(audio.FormatULaw, audio.FormatULaw); err == nil {
+		t.Error("NewTranscoder accepted a translation from a codec to itself")
+	}
+}
+
+func TestTranscoderTranslatesBetweenEveryPairItCanDecode(t *testing.T) {
+	t.Parallel()
+
+	// Nine ordered pairs over three codecs, minus the identities. Asserted on level rather than
+	// bytes: the right byte count at the wrong amplitude is one party sounding faint.
+	formats := []audio.Format{audio.FormatULaw, audio.FormatALaw, audio.FormatG722}
+
+	for _, from := range formats {
+		for _, to := range formats {
+			if from == to {
+				continue
+			}
+			t.Run(from.String()+" to "+to.String(), func(t *testing.T) {
+				t.Parallel()
+
+				coder, err := rtp.NewTranscoder(from, to)
+				if err != nil {
+					t.Fatalf("NewTranscoder(%s, %s): %v", from, to, err)
+				}
+				sourceEncoder, err := audio.NewFrameEncoder(from)
+				if err != nil {
+					t.Fatalf("NewFrameEncoder: %v", err)
+				}
+				destinationDecoder, err := audio.NewFrameDecoder(to)
+				if err != nil {
+					t.Fatalf("NewFrameDecoder: %v", err)
+				}
+
+				in := sine(audio.FrameSamples*10, 1000, 8000, audio.SampleRate)
+				var out []int16
+				for offset := 0; offset < len(in); offset += audio.FrameSamples {
+					payload := sourceEncoder.EncodeFrame(in[offset : offset+audio.FrameSamples])
+					translated, ok := coder.Translate(payload)
+					if !ok {
+						t.Fatal("Translate refused a full frame")
+					}
+					if len(translated) != audio.FrameSamples {
+						t.Fatalf("translated frame is %d bytes, want %d: every codec here packs 20 ms "+
+							"into 160 octets, which is why no repacketisation is needed",
+							len(translated), audio.FrameSamples)
+					}
+					out = append(out, destinationDecoder.DecodeFrame(translated)...)
+				}
+
+				want := goertzel(in[400:], 1000, audio.SampleRate)
+				got := goertzel(out[400:], 1000, audio.SampleRate)
+				if ratio := got / want; ratio < 0.8 || ratio > 1.2 {
+					t.Errorf("a 1 kHz tone survived %s→%s at %.3f×", from, to, ratio)
+				}
+			})
+		}
+	}
+}
+
+func TestTranscoderRefusesACodecItCannotDecode(t *testing.T) {
+	t.Parallel()
+
+	// Opus: the refusal is by name, which is what routes such a call to Asterisk.
+	_, err := rtp.NewTranscoder(audio.FormatOpus, audio.FormatULaw)
+	if !errors.Is(err, rtp.ErrCannotTranscode) {
+		t.Errorf("NewTranscoder(opus, PCMU) = %v, want ErrCannotTranscode", err)
+	}
+	_, err = rtp.NewTranscoder(audio.FormatULaw, audio.FormatOpus)
+	if !errors.Is(err, rtp.ErrCannotTranscode) {
+		t.Errorf("NewTranscoder(PCMU, opus) = %v, want ErrCannotTranscode", err)
+	}
+}
+
+func TestABridgedMismatchIsTranslatedOnTheWire(t *testing.T) {
+	// End to end over real sockets: the bytes changed and the sound did not, which a passthrough
+	// relay would fail in opposite directions.
+	rig := newBridgeRigWithTypes(t, 60000, 60039,
+		rtp.PayloadTypePCMU, rtp.PayloadTypeTelephoneEvent,
+		rtp.PayloadTypePCMA, rtp.PayloadTypeTelephoneEvent)
+	rig.latch(t)
+	if err := rig.manager.Bridge("bridge-1", rig.aID, rig.bID); err != nil {
+		t.Fatalf("Bridge: %v", err)
+	}
+
+	const level = 4000
+	encoded := audio.LinearToULaw(level)
+	payload := make([]byte, audio.FrameSamples)
+	for index := range payload {
+		payload[index] = encoded
+	}
+
+	rig.aPhone.send(t, pionrtp.Packet{
+		Header: pionrtp.Header{
+			Version: 2, PayloadType: rtp.PayloadTypePCMU, SSRC: 111,
+			SequenceNumber: 1, Timestamp: 160,
+		},
+		Payload: payload,
+	})
+
+	got, ok := rig.bPhone.receive(t)
+	if !ok {
+		t.Fatal("the A-law leg heard nothing across a transcoded bridge")
+	}
+	if got.PayloadType != rtp.PayloadTypePCMA {
+		t.Errorf("payload type = %d, want %d: a translated frame must be labelled with the codec it "+
+			"is actually in", got.PayloadType, rtp.PayloadTypePCMA)
+	}
+	if got.Payload[0] == encoded {
+		t.Error("the payload byte was passed through unchanged; the far end would hear a rasp")
+	}
+	if decoded := audio.ALawToLinear(got.Payload[0]); !closeEnough(decoded, audio.ULawToLinear(encoded)) {
+		t.Errorf("the translated level is %d, want about %d", decoded, audio.ULawToLinear(encoded))
+	}
+	// The timestamp survives because every codec here shares an 8 kHz RTP clock — including G.722,
+	// whose 16 kHz sampling and 8000 clock rate are RFC 3551 §4.5.2's erratum.
+	if got.Timestamp != 160 {
+		t.Errorf("Timestamp = %d, want the original 160", got.Timestamp)
+	}
+	if stats := mustSession(t, rig, rig.bID).Stats(); stats.Transcoded == 0 {
+		t.Error("the Transcoded counter did not move; the passthrough/translate ratio is the one " +
+			"diagnostic that says a deployment's endpoints are misconfigured")
+	}
+}
+
+func TestDtmfStillCrossesATranscodedBridgeUntouched(t *testing.T) {
+	// A telephone-event payload is bytes whatever the audio codec is, so it takes the renumber path:
+	// through a codec it would become four bytes of noise and no digit.
+	rig := newBridgeRigWithTypes(t, 60040, 60079,
+		rtp.PayloadTypePCMU, 96,
+		rtp.PayloadTypeG722, 101)
+	rig.latch(t)
+	if err := rig.manager.Bridge("bridge-1", rig.aID, rig.bID); err != nil {
+		t.Fatalf("Bridge: %v", err)
+	}
+
+	digit := []byte{0x04, 0x0a, 0x00, 0xa0}
+	rig.aPhone.send(t, pionrtp.Packet{
+		Header: pionrtp.Header{
+			Version: 2, PayloadType: 96, SSRC: 111, SequenceNumber: 1, Timestamp: 320, Marker: true,
+		},
+		Payload: digit,
+	})
+
+	got, ok := rig.bPhone.receive(t)
+	if !ok {
+		t.Fatal("the digit did not cross a transcoded bridge")
+	}
+	if got.PayloadType != 101 {
+		t.Errorf("payload type = %d, want 101: the telephone-event type is renumbered, not translated",
+			got.PayloadType)
+	}
+	if string(got.Payload) != string(digit) {
+		t.Errorf("payload = %v, want the digit's four bytes verbatim", got.Payload)
+	}
+	if !got.Marker {
+		t.Error("the start-of-event marker was dropped; an IVR cannot detect the keypress")
+	}
+}
+
+func TestUnbridgingClearsTheTranslation(t *testing.T) {
+	// A translation belongs to the bridge it was built for: left installed, it would leave codec
+	// state a later bridge resumes mid-stream.
+	rig := newBridgeRigWithTypes(t, 60080, 60119,
+		rtp.PayloadTypePCMU, rtp.PayloadTypeTelephoneEvent,
+		rtp.PayloadTypePCMA, rtp.PayloadTypeTelephoneEvent)
+	if err := rig.manager.Bridge("bridge-1", rig.aID, rig.bID); err != nil {
+		t.Fatalf("Bridge: %v", err)
+	}
+	if mustSession(t, rig, rig.aID).Transcoder() == nil {
+		t.Fatal("a mismatched bridge installed no translation")
+	}
+
+	if _, ok := rig.manager.Unbridge("bridge-1"); !ok {
+		t.Fatal("Unbridge reported nothing to unbridge")
+	}
+	for _, id := range []string{rig.aID, rig.bID} {
+		if mustSession(t, rig, id).Transcoder() != nil {
+			t.Errorf("%s kept its translation after the bridge ended", id)
+		}
+	}
+}
+
+// sine and goertzel are restated from internal/audio's suite, since a test package cannot import
+// another. A Goertzel filter answers "how much 1 kHz is in this?" in one pass.
+func sine(samples int, hertz, amplitude float64, rate int) []int16 {
+	out := make([]int16, samples)
+	for i := range out {
+		out[i] = int16(amplitude * math.Sin(2*math.Pi*hertz*float64(i)/float64(rate)))
+	}
+	return out
+}
+
+func goertzel(samples []int16, hertz float64, rate int) float64 {
+	omega := 2 * math.Pi * hertz / float64(rate)
+	coefficient := 2 * math.Cos(omega)
+
+	var s1, s2 float64
+	for _, sample := range samples {
+		s0 := float64(sample) + coefficient*s1 - s2
+		s2, s1 = s1, s0
+	}
+	power := s1*s1 + s2*s2 - coefficient*s1*s2
+	if power < 0 {
+		return 0
+	}
+	return math.Sqrt(power) / float64(len(samples))
+}
+
+func mustSession(t *testing.T, rig *bridgeRig, id string) *rtp.Session {
+	t.Helper()
+	session, ok := rig.manager.Get(id)
+	if !ok {
+		t.Fatalf("session %s is gone", id)
+	}
+	return session
+}
+
+func TestTranscoderPreservesTheSendersPacketisation(t *testing.T) {
+	// 10, 20, 30 and 60 ms at 8 kHz. An SDP ptime is a preference, not permission to truncate
+	// (RFC 3264 §6.1).
+	for _, samples := range []int{80, 160, 240, 480} {
+		payload := make([]byte, samples)
+		for index := range payload {
+			payload[index] = 0x7f
+		}
+		for _, pair := range [][2]audio.Format{
+			{audio.FormatULaw, audio.FormatALaw},
+			{audio.FormatULaw, audio.FormatG722},
+			{audio.FormatG722, audio.FormatULaw},
+		} {
+			coder, err := rtp.NewTranscoder(pair[0], pair[1])
+			if err != nil {
+				t.Fatalf("NewTranscoder(%s, %s): %v", pair[0], pair[1], err)
+			}
+			translated, ok := coder.Translate(payload)
+			if !ok {
+				t.Fatalf("%s to %s refused a %d-sample payload", pair[0], pair[1], samples)
+			}
+			if len(translated) != samples {
+				t.Errorf("%s to %s turned %d samples into %d; media time must survive the translation",
+					pair[0], pair[1], samples, len(translated))
+			}
+		}
+	}
+}

@@ -14,15 +14,21 @@ import {
 	CONFERENCE_CLAIMS_KV,
 	conferenceClaimSchema,
 	DID_INDEX_KV,
+	ENGINE_INSTANCES_KV,
 	ensureKvBuckets,
 	ensureStreams,
 	kvKeyFor,
 	PARK_CLAIMS_KV,
 	parkClaimSchema,
 	QUEUE_MEMBERSHIP_KV,
+	QUEUE_WAITING_KV,
 	ROUTING_CACHE_KV,
+	SIP_DIALOGS_KV,
+	SIP_INSTANCES_KV,
+	sharedLineStateSchema,
 	subjectFor,
 } from "@optimiq-voice/events";
+import { SHARED_LINE_STATE_KV } from "@optimiq-voice/events/streams";
 import { getLogger } from "@optimiq-voice/logging";
 import {
 	CHANNEL_OWNERSHIP_LEASE_MS,
@@ -37,6 +43,7 @@ import type {
 	CdrLegWriteEnvelope,
 	ConferenceClaim,
 	ParkClaim,
+	SharedLineState,
 	VoicemailEventEnvelope,
 } from "@optimiq-voice/events";
 import type { ChannelSnapshot } from "@optimiq-voice/telephony";
@@ -77,9 +84,15 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	private didIndexKv: KV | undefined;
 	private queueMembershipKv: KV | undefined;
 	private agentStateKv: KV | undefined;
+	private queueWaitingKv: KV | undefined;
+	private sipInstancesKv: KV | undefined;
+	private sipDialogsKv: KV | undefined;
+	private engineInstancesKv: KV | undefined;
 	private parkClaimsBucket: ClaimBucket<ParkClaim> = new UnclaimedBucket<ParkClaim>();
 	private conferenceClaimsBucket: ClaimBucket<ConferenceClaim> =
 		new UnclaimedBucket<ConferenceClaim>();
+	private sharedLineStateBucket: ClaimBucket<SharedLineState> =
+		new UnclaimedBucket<SharedLineState>();
 	/** Last channels-KV revision this replica proved it owns, by canonical channel key. */
 	private readonly channelRevisions = new Map<string, number>();
 	/** Lease expiry written by the last acknowledged create/update for each locally-owned channel. */
@@ -87,8 +100,15 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	/** Serializes each channel's CAS chain so two local events cannot race on the same revision. */
 	private readonly channelOperations = new Map<string, Promise<unknown>>();
 	private ready = false;
+	/** Permission violations the broker has reported on this connection. `/healthz` does not read it. */
+	private permissionViolations = 0;
 
 	constructor(@Inject(ENGINE_ENV) private readonly env: EngineEnv) {}
+
+	/** How many `PERMISSIONS_ERROR`s the broker has raised on this connection since boot. */
+	get permissionViolationCount(): number {
+		return this.permissionViolations;
+	}
 
 	/** Whether the JetStream side is usable. What `/healthz` reports. */
 	get isReady(): boolean {
@@ -124,6 +144,8 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 			maxReconnectAttempts: -1,
 			reconnectTimeWait: 1_000,
 		});
+
+		this.watchConnectionStatus(this.connection);
 
 		const manager: JetStreamManager = await this.connection.jetstreamManager();
 
@@ -167,6 +189,28 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		// plane has ever run does not discover their absence on its first queued caller.
 		this.queueMembershipKv = await this.jetstream.views.kv(QUEUE_MEMBERSHIP_KV.name);
 		this.agentStateKv = await this.jetstream.views.kv(AGENT_STATE_KV.name);
+		// The waiting line. Written by EVERY engine instance holding a caller for the queue, which is
+		// what makes it the one ACD bucket whose write discipline is not optional — see
+		// `queue-waiting.store.ts`. Opened here for the same reason the two above it are: an engine
+		// that boots before the control plane has ever run must not discover the bucket's absence
+		// from its first queued caller.
+		this.queueWaitingKv = await this.jetstream.views.kv(QUEUE_WAITING_KV.name);
+		// `sip-instances` — written by every `apps/sipd` and read here. It is the only way this engine
+		// learns that a signalling edge died without taking the broker with it, and the calls that
+		// died with it are calls nobody else can end. Opening the view creates the bucket with the
+		// same definition `ensureKvBuckets` applies, so an engine that boots before any `sipd` has
+		// does not discover its absence from the first crash.
+		this.sipInstancesKv = await this.jetstream.views.kv(SIP_INSTANCES_KV.name);
+		// `sip-dialogs` — written by `apps/sipd`, read here and NEVER written. It is the edge's own
+		// record of which dialogs exist, and it is the only thing that can tell an engine that has
+		// ADOPTED a never-answered leg whether that leg is a call still ringing or one the edge
+		// refused seconds after its owner died. See `reconcileAdoptedLegs`.
+		this.sipDialogsKv = await this.jetstream.views.kv(SIP_DIALOGS_KV.name);
+		// `engine-instances` — the symmetric bucket, written and read by every instance of THIS app. It
+		// is what lets a survivor know that a peer died rather than merely that a channel lease lapsed,
+		// which is the difference between adopting a stranded call in seconds and adopting it in the
+		// ninety the channel lease is deliberately sized at.
+		this.engineInstancesKv = await this.jetstream.views.kv(ENGINE_INSTANCES_KV.name);
 		// The two CLAIM buckets. Both are written and read by this engine and by every other instance
 		// of it, and by nothing else — see `claim-store.ts` for why they are wrapped in a
 		// compare-and-set surface rather than exposed raw the way the read-mostly buckets are.
@@ -179,6 +223,15 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 			await this.jetstream.views.kv(CONFERENCE_CLAIMS_KV.name),
 			conferenceClaimSchema as never,
 			CONFERENCE_CLAIMS_KV.name,
+		);
+		// The shared-line seizure bucket. Written and read by this engine and by every other instance of
+		// it, and by nothing else — see `claim-store.ts` and `SharedLineRegistry` for why a shared line
+		// is seized under compare-and-set exactly as a park orbit is. The bucket itself is created by
+		// `ensureKvBuckets` above, since `SHARED_LINE_STATE_KV` is in `KV_BUCKETS`.
+		this.sharedLineStateBucket = new KvClaimBucket<SharedLineState>(
+			await this.jetstream.views.kv(SHARED_LINE_STATE_KV.name),
+			sharedLineStateSchema as never,
+			SHARED_LINE_STATE_KV.name,
 		);
 		this.ready = true;
 	}
@@ -223,6 +276,56 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	 */
 	get routingCache(): KV | undefined {
 		return this.routingCacheKv;
+	}
+
+	/**
+	 * The `sip-instances` bucket, raw, for {@link import("../media/sipd-liveness.service").SipdLivenessService}.
+	 *
+	 * Raw for the same reason as `routing-cache`: its consumer needs BOTH a long-lived watch and a
+	 * point listing at boot, and a watch is an async iterator whose lifetime belongs to its consumer.
+	 *
+	 * `undefined` before `onModuleInit` has run, or after shutdown.
+	 */
+	get sipInstances(): KV | undefined {
+		return this.sipInstancesKv;
+	}
+
+	/**
+	 * Whether the SIP edge still has a dialog for this leg.
+	 *
+	 * `true` / `false` are answers; **`undefined` means the question could not be asked** — no view,
+	 * a refused read, a broker blip — and callers must treat it as "leave the call alone". The whole
+	 * point of this read is to end a leg no plane knows about, and a read failure is not evidence of
+	 * that: acting on one would hang up live calls every time the broker hiccuped.
+	 */
+	async sipDialogExists(legId: string): Promise<boolean | undefined> {
+		const kv = this.sipDialogsKv;
+		if (kv === undefined) {
+			return undefined;
+		}
+		try {
+			const entry = await kv.get(kvKeyFor.sipDialog(legId));
+			// A KV delete leaves a tombstone whose operation is not `PUT`; `sipd` deletes a dialog's
+			// claim when the dialog ends, so a tombstone is exactly the "the edge knows this is over"
+			// answer this method exists to surface.
+			return entry !== null && entry.operation === "PUT";
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * The `engine-instances` bucket, raw, for
+	 * {@link import("../media/engine-liveness.service").EngineLivenessService}.
+	 *
+	 * Raw for the same reason as `sip-instances`: its consumer both WRITES this process's own lease
+	 * and holds a long-lived watch over its peers', and a watch is an async iterator whose lifetime
+	 * belongs to its consumer.
+	 *
+	 * `undefined` before `onModuleInit` has run, or after shutdown.
+	 */
+	get engineInstances(): KV | undefined {
+		return this.engineInstancesKv;
 	}
 
 	/**
@@ -278,6 +381,23 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	}
 
 	/**
+	 * The `queue-waiting` bucket, for {@link import("../queue/queue-waiting.store").QueueWaitingStore}.
+	 *
+	 * Raw, and not wrapped as a {@link ClaimBucket} the way the two claim buckets are, because the
+	 * record is JOINTLY held: `create` never means "I won", deleting the key would evict every other
+	 * instance's callers, and the operation that matters is read-modify-write rather than claim.
+	 * Wrapping it in the claim vocabulary would have made the store translate between two meanings of
+	 * "lost" on every write.
+	 *
+	 * `undefined` before `onModuleInit` has run, or after shutdown — which the store reads as "no
+	 * shared line configured" and answers from an in-process record, exactly as a single-instance
+	 * deployment should.
+	 */
+	get queueWaiting(): KV | undefined {
+		return this.queueWaitingKv;
+	}
+
+	/**
 	 * The `park-claims` bucket, as a compare-and-set surface.
 	 *
 	 * Wrapped rather than raw — the opposite decision from `routingCache` and `queueMembership` —
@@ -295,6 +415,11 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 	/** The `conference-claims` bucket. Same contract, same reasoning, as {@link parkClaims}. */
 	get conferenceClaims(): ClaimBucket<ConferenceClaim> {
 		return this.conferenceClaimsBucket;
+	}
+
+	/** The `shared-line-state` bucket. Same contract, same reasoning, as {@link parkClaims}. */
+	get sharedLineState(): ClaimBucket<SharedLineState> {
+		return this.sharedLineStateBucket;
 	}
 
 	/**
@@ -392,20 +517,32 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		return await this.serializeChannelOperation(key, async () => {
 			const expiresAt = now + CHANNEL_OWNERSHIP_LEASE_MS;
 			const owned = withChannelOwnership(snapshot, this.env.ENGINE_INSTANCE_ID, expiresAt);
-			try {
-				const revision = await kv.create(key, encodeChannel(owned));
-				this.rememberChannelOwnership(key, revision, expiresAt);
-				return "claimed";
-			} catch (error) {
-				if (isConflict(error)) {
-					return await this.adoptChannelAt(kv, key, now, false);
+			const create = async (): Promise<ChannelClaimResult | "vanished"> => {
+				try {
+					const revision = await kv.create(key, encodeChannel(owned));
+					this.rememberChannelOwnership(key, revision, expiresAt);
+					return "claimed";
+				} catch (error) {
+					if (isConflict(error)) {
+						return await this.adoptChannelAt(kv, key, now, false);
+					}
+					this.logger.warn(
+						{ key, err: String(error) },
+						"failed to claim a channel; admission is closed to prevent duplicate ownership",
+					);
+					return "unavailable";
 				}
-				this.logger.warn(
-					{ key, err: String(error) },
-					"failed to claim a channel; admission is closed to prevent duplicate ownership",
-				);
-				return "unavailable";
+			};
+			const first = await create();
+			if (first !== "vanished") {
+				return first;
 			}
+			// The key was deleted between the losing `create` and the read that followed it — a leg
+			// that ended, not one somebody else owns. Answering "owned" here would leave the arriving
+			// channel up in Stasis with no aggregate, no duration ceiling and no teardown path, since
+			// `onLegArrived` deliberately never hangs up on a lost claim. One retry, then give up.
+			const second = await create();
+			return second === "vanished" ? "unavailable" : second;
 		});
 	}
 
@@ -416,10 +553,95 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 			return "unavailable";
 		}
 		const key = kvKeyFor.channel(snapshot.organizationId, snapshot.callId, snapshot.channelId);
-		return await this.serializeChannelOperation(
-			key,
-			async () => await this.adoptChannelAt(kv, key, now, true),
-		);
+		return await this.serializeChannelOperation(key, async () => {
+			const result = await this.adoptChannelAt(kv, key, now, true);
+			// Nothing left to adopt: the snapshot this pass read is already gone from the bucket.
+			return result === "vanished" ? "owned" : result;
+		});
+	}
+
+	/**
+	 * Contests a channel whose owning ENGINE INSTANCE has been proved dead.
+	 *
+	 * ## Why this exists beside {@link adoptChannel}
+	 *
+	 * `adoptChannel` will not touch a lease that has not expired, and that refusal is correct: an
+	 * unexpired lease is a live replica's claim and the only evidence a survivor has. But
+	 * `CHANNEL_OWNERSHIP_LEASE_MS` is ninety seconds, because it is renewed by a heartbeat that
+	 * rewrites every live channel on the replica — so a SIGKILLed engine's calls sit unowned for up
+	 * to a minute and a half, with media still flowing and no aggregate anywhere in the fleet to end
+	 * them on. Measured live: the survivor adopted nothing for the whole forty seconds a stranded
+	 * call was observed, and the call was never billed.
+	 *
+	 * `engine-instances` supplies the missing evidence. When that lease has lapsed the owner is not
+	 * slow, it is gone, and its channel lease is a promise nobody is left to keep — so this method
+	 * ignores the expiry and takes the snapshot on the strength of the instance lease instead.
+	 *
+	 * ## What still makes it safe
+	 *
+	 * Three fences, and none of them is the channel expiry:
+	 *
+	 * 1. The caller must name the dead instance, and a snapshot owned by ANYONE else is refused
+	 *    (`"owned"`) — including one the dead instance's replacement has already taken. A survivor
+	 *    cannot use a peer's death to take a third party's calls.
+	 * 2. The write is a revision-fenced `update` at the revision this pass read, so when several
+	 *    survivors contest the same channel exactly one wins and the rest get `"owned"`.
+	 * 3. A key that vanished between the read and the write reads as `"vanished"`, not as a claim.
+	 */
+	async adoptChannelFromInstance(
+		snapshot: ChannelSnapshot,
+		deadInstanceId: string,
+		now = Date.now(),
+	): Promise<ChannelClaimResult | "vanished"> {
+		const kv = this.channelsKv;
+		if (kv === undefined) {
+			return "unavailable";
+		}
+		const key = kvKeyFor.channel(snapshot.organizationId, snapshot.callId, snapshot.channelId);
+		return await this.serializeChannelOperation(key, async () => {
+			let current: { readonly snapshot: ChannelSnapshot; readonly revision: number };
+			try {
+				const entry = await kv.get(key);
+				if (entry === null || entry.value.length === 0) {
+					return "vanished";
+				}
+				const value = JSON.parse(decoder.decode(entry.value)) as ChannelSnapshot;
+				const expectedKey = kvKeyFor.channel(value.organizationId, value.callId, value.channelId);
+				if (expectedKey !== key) {
+					throw new Error(`snapshot belongs at ${expectedKey}`);
+				}
+				current = { snapshot: value, revision: entry.revision };
+			} catch (error) {
+				this.logger.warn({ key, err: String(error) }, "failed to read a dead peer's channel");
+				return "unavailable";
+			}
+
+			const ownership = channelOwnershipOf(current.snapshot);
+			if (ownership?.instanceId !== deadInstanceId) {
+				// Somebody else's — a live replica's, or the survivor that beat us to this one. Read
+				// FRESH rather than from the caller's snapshot, which is why the re-read above is not
+				// redundant with the listing that produced it.
+				return "owned";
+			}
+			const expiresAt = now + CHANNEL_OWNERSHIP_LEASE_MS;
+			try {
+				const revision = await kv.update(
+					key,
+					encodeChannel(
+						withChannelOwnership(current.snapshot, this.env.ENGINE_INSTANCE_ID, expiresAt),
+					),
+					current.revision,
+				);
+				this.rememberChannelOwnership(key, revision, expiresAt);
+				return "claimed";
+			} catch (error) {
+				if (isConflict(error)) {
+					return "owned";
+				}
+				this.logger.warn({ key, err: String(error) }, "failed to adopt a dead peer's channel");
+				return "unavailable";
+			}
+		});
 	}
 
 	/** Extends one locally-owned lease while preserving its latest aggregate snapshot. */
@@ -483,7 +705,7 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		if (entry === null || entry.value.length === 0) {
 			return undefined;
 		}
-		return JSON.parse(new TextDecoder().decode(entry.value)) as ChannelSnapshot;
+		return JSON.parse(decoder.decode(entry.value)) as ChannelSnapshot;
 	}
 
 	/** Iterates the current `channels` values once so the orchestrator can rebuild its local cache. */
@@ -493,28 +715,48 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 			return;
 		}
 
-		const keys = await kv.keys();
-		for await (const key of keys) {
-			const entry = await kv.get(key);
-			if (entry === null || entry.value.length === 0) {
-				continue;
-			}
-			try {
-				const snapshot = JSON.parse(new TextDecoder().decode(entry.value)) as ChannelSnapshot;
-				const expectedKey = kvKeyFor.channel(
-					snapshot.organizationId,
-					snapshot.callId,
-					snapshot.channelId,
-				);
-				if (key !== expectedKey) {
-					throw new Error(`snapshot belongs at ${expectedKey}`);
+		// The key listing is DRAINED before the first value is fetched, and this is a correctness
+		// fix rather than a style preference. `kv.keys()` is an ordered push consumer; awaiting a
+		// `kv.get` — itself a JetStream request on the same connection — inside its `for await`
+		// makes the ordered consumer see a gap and terminate, so the loop ended after ONE key.
+		// Measured against a real broker with 300 live channels: 300 keys listed, 1 snapshot
+		// yielded. That silently reduced failover recovery, and the adoption half of every
+		// ownership-maintenance tick, to a single channel.
+		const keys: string[] = [];
+		for await (const key of await kv.keys()) {
+			keys.push(key);
+		}
+
+		// Reads then go out in bounded-concurrency batches instead of one at a time. The bucket is
+		// cluster-wide, so this loop is N round trips per replica per heartbeat; 64 in flight turns
+		// 300 serial round trips into 5 batches (40.8ms → 5.5ms on loopback) while still bounding
+		// what one pass can put on the connection. Order is not relied on — every consumer of this
+		// generator keys off the snapshot's own identity.
+		for (let index = 0; index < keys.length; index += SNAPSHOT_READ_BATCH) {
+			const batch = keys.slice(index, index + SNAPSHOT_READ_BATCH);
+			const entries = await Promise.all(batch.map(async (key) => await kv.get(key)));
+			for (const [offset, entry] of entries.entries()) {
+				const key = batch[offset];
+				if (key === undefined || entry === null || entry.value.length === 0) {
+					continue;
 				}
-				yield snapshot;
-			} catch (error) {
-				this.logger.warn(
-					{ key, err: String(error) },
-					"ignored an invalid channel recovery snapshot",
-				);
+				try {
+					const snapshot = JSON.parse(decoder.decode(entry.value)) as ChannelSnapshot;
+					const expectedKey = kvKeyFor.channel(
+						snapshot.organizationId,
+						snapshot.callId,
+						snapshot.channelId,
+					);
+					if (key !== expectedKey) {
+						throw new Error(`snapshot belongs at ${expectedKey}`);
+					}
+					yield snapshot;
+				} catch (error) {
+					this.logger.warn(
+						{ key, err: String(error) },
+						"ignored an invalid channel recovery snapshot",
+					);
+				}
 			}
 		}
 	}
@@ -524,14 +766,15 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		key: string,
 		now: number,
 		allowSameOwner: boolean,
-	): Promise<ChannelClaimResult> {
+	): Promise<ChannelClaimResult | "vanished"> {
 		let current: { readonly snapshot: ChannelSnapshot; readonly revision: number } | undefined;
 		try {
 			const entry = await kv.get(key);
 			if (entry === null || entry.value.length === 0) {
-				return "owned";
+				// "nobody owns it", which is NOT "somebody does" — the caller decides what to do.
+				return "vanished";
 			}
-			const snapshot = JSON.parse(new TextDecoder().decode(entry.value)) as ChannelSnapshot;
+			const snapshot = JSON.parse(decoder.decode(entry.value)) as ChannelSnapshot;
 			const expectedKey = kvKeyFor.channel(
 				snapshot.organizationId,
 				snapshot.callId,
@@ -612,7 +855,7 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		}
 		await jetstream.publish(
 			subjectFor.cdrLeg(envelope.orgId),
-			new TextEncoder().encode(JSON.stringify(envelope)),
+			encoder.encode(JSON.stringify(envelope)),
 			{ msgID: envelope.id },
 		);
 	}
@@ -634,9 +877,86 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		if (jetstream === undefined) {
 			throw new Error("JetStream is not connected; cannot publish a voicemail event.");
 		}
-		await jetstream.publish(envelope.subject, new TextEncoder().encode(JSON.stringify(envelope)), {
+		await jetstream.publish(envelope.subject, encoder.encode(JSON.stringify(envelope)), {
 			msgID: envelope.id,
 		});
+	}
+
+	/**
+	 * Drains the connection's status feed to the log.
+	 *
+	 * Nothing else in this process consumes it, and until it did, an entire class of broker refusal
+	 * was invisible: `nats.js` reports a publish the broker rejected as a `PERMISSIONS_ERROR` on
+	 * this async iterator ONLY. It is not an error on the publishing call — a core publish is
+	 * fire-and-forget — and it is not an error on the subscription the refusal belongs to. A watch
+	 * whose flow-control reply is refused therefore goes quiet with every other signal saying it is
+	 * healthy, which is exactly how a stalled `routing-cache` watch cost an hour of stale routing
+	 * with nothing in the engine's log to point at.
+	 *
+	 * Fire-and-forget on purpose: the iterator ends when the connection closes, and awaiting it
+	 * would never return.
+	 */
+	/**
+	 * Re-applies the JetStream definitions after a reconnect, because a broker that restarted has
+	 * lost every MEMORY-backed one.
+	 *
+	 * `presence` is `storage: "memory"` — deliberately, it is a 5-minute-TTL read model — so a broker
+	 * restart destroys the stream while this process keeps a `KV` handle bound to it. Every write
+	 * then fails `503` for ever and `apps/sipd`'s watch retries `stream not found` for ever, so BLF
+	 * goes dark platform-wide until something reboots. Nothing else recreates it: `ensureKvBuckets`
+	 * ran once, at boot.
+	 *
+	 * Idempotent, and the file-backed buckets survived, so this is a no-op in the common case. A
+	 * failure is logged rather than thrown: the reconnect itself already succeeded, and throwing out
+	 * of a status iterator would end the feed that is the only thing watching the connection.
+	 */
+	private async reapplyDefinitions(): Promise<void> {
+		const connection = this.connection;
+		if (connection === undefined || !this.env.ENGINE_ENSURE_STREAMS) {
+			return;
+		}
+		try {
+			const manager = await connection.jetstreamManager();
+			const buckets = await ensureKvBuckets(manager);
+			const created = buckets.filter((outcome) => outcome.created).map((outcome) => outcome.name);
+			if (created.length > 0) {
+				// The KV handles are bound to the stream by NAME, so a recreated bucket is usable
+				// again through the existing view without reopening it.
+				this.logger.warn({ buckets: created }, "recreated KV buckets the broker had lost");
+			}
+		} catch (error) {
+			this.logger.error({ err: String(error) }, "could not re-apply JetStream definitions");
+		}
+	}
+
+	private watchConnectionStatus(connection: NatsConnection): void {
+		void (async () => {
+			try {
+				for await (const status of connection.status()) {
+					if (status.type === "error" && String(status.data).includes("Permissions")) {
+						this.permissionViolations += 1;
+						// ERROR and not WARN: a refused publish is a deployment that cannot do its
+						// job, and the subject in the message names the exact missing grant.
+						this.logger.error(
+							{ detail: String(status.data), total: this.permissionViolations },
+							"the broker refused an operation on this connection; a NATS permission is missing",
+						);
+						continue;
+					}
+					if (status.type === "disconnect" || status.type === "reconnect") {
+						this.logger.warn(
+							{ event: status.type, server: String(status.data) },
+							"nats connection event",
+						);
+					}
+					if (status.type === "reconnect") {
+						await this.reapplyDefinitions();
+					}
+				}
+			} catch (error) {
+				this.logger.warn({ err: String(error) }, "the nats status feed ended");
+			}
+		})();
 	}
 
 	async onApplicationShutdown(): Promise<void> {
@@ -650,8 +970,13 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 		this.didIndexKv = undefined;
 		this.queueMembershipKv = undefined;
 		this.agentStateKv = undefined;
+		this.queueWaitingKv = undefined;
+		this.sipInstancesKv = undefined;
+		this.sipDialogsKv = undefined;
+		this.engineInstancesKv = undefined;
 		this.parkClaimsBucket = new UnclaimedBucket<ParkClaim>();
 		this.conferenceClaimsBucket = new UnclaimedBucket<ConferenceClaim>();
+		this.sharedLineStateBucket = new UnclaimedBucket<SharedLineState>();
 		this.channelRevisions.clear();
 		this.channelLeaseExpiries.clear();
 		this.channelOperations.clear();
@@ -667,6 +992,14 @@ export class JetStreamService implements OnModuleInit, OnApplicationShutdown {
 export type ChannelClaimResult = "claimed" | "owned" | "unavailable";
 export type ChannelRenewResult = "renewed" | "lost" | "unavailable";
 
+// One codec pair for the module. `TextEncoder`/`TextDecoder` are stateless and re-entrant, and
+// constructing one per KV write put an allocation on every lease renewal of every live leg.
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+/** How many `channels` values one recovery pass fetches concurrently. See `channelSnapshots`. */
+const SNAPSHOT_READ_BATCH = 64;
+
 function encodeChannel(snapshot: ChannelSnapshot): Uint8Array {
-	return new TextEncoder().encode(JSON.stringify(snapshot));
+	return encoder.encode(JSON.stringify(snapshot));
 }

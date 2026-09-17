@@ -73,6 +73,16 @@ describe("invalidation contract", () => {
 		expect(affectsRouting("ivr_menu_option")).toBe(true);
 	});
 
+	it("evicts on a change to either half of a paging group", () => {
+		// The membership table is not a snapshot collection of its own — the snapshot nests members
+		// inside their group — so nothing derives its eviction for us. Moving one handset out of a
+		// group changes who hears an announcement, which is a compiled fact, and a cached artifact
+		// that survived the move would page the wrong building.
+		expect(affectsRouting("paging_group")).toBe(true);
+		expect(affectsRouting("paging_group_member")).toBe(true);
+		expect(ROUTING_TABLE_TO_ENTITY.paging_group_member).toBe("pagingGroups");
+	});
+
 	it("evicts on a greeting or a music-on-hold rename", () => {
 		// Both are compiled INTO plan nodes, so a cached artifact survives a rename as a name nobody
 		// changed and a greeting nobody re-recorded. That is exactly the class of staleness this
@@ -80,6 +90,14 @@ describe("invalidation contract", () => {
 		// the derived "every kind has a table" check above to have caught the omission.
 		expect(affectsRouting("voicemail_greeting")).toBe(true);
 		expect(affectsRouting("moh_class")).toBe(true);
+	});
+
+	it("evicts on a device-line rebind, which is where a hot-desk login lands", () => {
+		// The whole of what makes `*31` reach a running engine on the commit rather than on a TTL.
+		// `device` itself stays out: nothing on the parent row is a binding.
+		expect(affectsRouting("device_line")).toBe(true);
+		expect(affectsRouting("device")).toBe(false);
+		expect(ROUTING_TABLE_TO_ENTITY.device_line).toBe("extensions");
 	});
 
 	it("ignores a table routing does not read", () => {

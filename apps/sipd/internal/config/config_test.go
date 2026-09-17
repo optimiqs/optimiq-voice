@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -282,5 +283,270 @@ func TestLoadLeavesTLSOffUnlessConfigured(t *testing.T) {
 	}
 	if withTLS.NATSTLSCA != "/etc/nats/certs/ca.pem" || !withTLS.NATSTLSEnabled {
 		t.Errorf("tls = %q / %v", withTLS.NATSTLSCA, withTLS.NATSTLSEnabled)
+	}
+}
+
+// The transports added with the INVITE wave: TLS, WS and WSS, each off by default and each with a
+// bind address of its own so a deployment can use the conventional ports.
+func TestTransportDefaults(t *testing.T) {
+	cfg, err := config.Load(env(minimal(nil)))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.EnableTLS || cfg.EnableWS || cfg.EnableWSS {
+		t.Error("the secure and websocket transports must be opt-in")
+	}
+	if cfg.TLSListenAddr != "0.0.0.0:5061" || cfg.WSSListenAddr != "0.0.0.0:8089" {
+		t.Errorf("addresses = %q / %q, want the conventional SIP TLS and WSS ports",
+			cfg.TLSListenAddr, cfg.WSSListenAddr)
+	}
+	if cfg.EnableInvite {
+		t.Error("the INVITE surface must stay off until an engine serves rpc.sip.v1.invite: " +
+			"with no responder a 503 is a worse answer than the registrar's honest 501")
+	}
+	if cfg.EnableSessionTimers {
+		t.Error("session timers must be opt-in: a one-sided timer is worse than none")
+	}
+	if cfg.MaxContactsPerAOR != 5 {
+		t.Errorf("MaxContactsPerAOR = %d, want 5", cfg.MaxContactsPerAOR)
+	}
+	if cfg.InstanceID == "" {
+		t.Error("an instance id is required: a dialog lives on one process and its commands must reach it")
+	}
+}
+
+func TestTransportConfigurationIsValidated(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{
+			name: "TLS with no certificate",
+			env:  map[string]string{"SIPD_TLS": "true"},
+			want: "SIPD_TLS_CERT_FILE and SIPD_TLS_KEY_FILE are both required",
+		},
+		{
+			name: "WSS with no certificate",
+			env:  map[string]string{"SIPD_WSS": "true"},
+			want: "SIPD_TLS_CERT_FILE and SIPD_TLS_KEY_FILE are both required",
+		},
+		{
+			name: "a certificate with no secure transport enabled",
+			env: map[string]string{
+				"SIPD_TLS_CERT_FILE": "/etc/sipd/tls.crt",
+				"SIPD_TLS_KEY_FILE":  "/etc/sipd/tls.key",
+			},
+			want: "this deployment is plaintext and believes it is not",
+		},
+		{
+			name: "every listener disabled",
+			env:  map[string]string{"SIPD_UDP": "false", "SIPD_TCP": "false"},
+			want: "sipd would accept no traffic at all",
+		},
+		{
+			name: "two transports on one address",
+			env: map[string]string{
+				"SIPD_WS":             "true",
+				"SIPD_WS_LISTEN_ADDR": "0.0.0.0:5060",
+			},
+			want: "one socket cannot serve two transports",
+		},
+		{
+			// The collision is between sockets of the same family. With UDP off, TCP owns
+			// SIPD_LISTEN_ADDR on its own and a WS listener on the same address is the exact
+			// "one binds, the other fails in a goroutine nobody watches" failure.
+			name: "TCP and WS on one address with UDP disabled",
+			env: map[string]string{
+				"SIPD_UDP":            "false",
+				"SIPD_TCP":            "true",
+				"SIPD_WS":             "true",
+				"SIPD_WS_LISTEN_ADDR": "0.0.0.0:5060",
+			},
+			want: "one socket cannot serve two transports",
+		},
+		{
+			name: "a session interval below the RFC 4028 floor",
+			env:  map[string]string{"SIPD_SESSION_TIMERS": "true", "SIPD_MIN_SE": "30"},
+			want: "at least 90 seconds",
+		},
+		{
+			name: "a session interval below the negotiated floor",
+			env: map[string]string{
+				"SIPD_SESSION_TIMERS":  "true",
+				"SIPD_MIN_SE":          "600",
+				"SIPD_SESSION_EXPIRES": "120",
+			},
+			want: "must not be below SIPD_MIN_SE",
+		},
+		{
+			name: "a zero contact cap",
+			env:  map[string]string{"SIPD_MAX_CONTACTS": "0"},
+			want: "SIPD_MAX_CONTACTS must be positive",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := config.Load(env(minimal(tc.env)))
+			if err == nil {
+				t.Fatal("Load must refuse this configuration")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestSecureTransportsLoadWhenFullyConfigured(t *testing.T) {
+	cfg, err := config.Load(env(minimal(map[string]string{
+		"SIPD_TLS":             "true",
+		"SIPD_WS":              "true",
+		"SIPD_WSS":             "true",
+		"SIPD_TLS_CERT_FILE":   "/etc/sipd/tls.crt",
+		"SIPD_TLS_KEY_FILE":    "/etc/sipd/tls.key",
+		"SIPD_INVITE":          "true",
+		"SIPD_INSTANCE_ID":     "sipd-7c9f",
+		"SIPD_SESSION_TIMERS":  "true",
+		"SIPD_SESSION_EXPIRES": "900",
+		"SIPD_MIN_SE":          "120",
+		"SIPD_MAX_CONTACTS":    "3",
+		"SIPD_TRUNK_ACL":       "203.0.113.0/24=trunk-telnyx",
+	})))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.EnableTLS || !cfg.EnableWS || !cfg.EnableWSS || !cfg.EnableInvite {
+		t.Error("every enabled transport must survive Load")
+	}
+	if cfg.InstanceID != "sipd-7c9f" {
+		t.Errorf("InstanceID = %q", cfg.InstanceID)
+	}
+	if cfg.SessionExpires != 900*time.Second || cfg.MinSE != 120*time.Second {
+		t.Errorf("session timers = %s / %s", cfg.SessionExpires, cfg.MinSE)
+	}
+	if cfg.MaxContactsPerAOR != 3 {
+		t.Errorf("MaxContactsPerAOR = %d", cfg.MaxContactsPerAOR)
+	}
+	if cfg.TrunkACL != "203.0.113.0/24=trunk-telnyx" {
+		t.Errorf("TrunkACL = %q", cfg.TrunkACL)
+	}
+}
+
+// UDP and TCP are different sockets, so they legitimately share SIPD_LISTEN_ADDR. The family key
+// must not turn that into a boot failure.
+func TestUDPAndTCPMayShareOneAddress(t *testing.T) {
+	cfg, err := config.Load(env(minimal(map[string]string{
+		"SIPD_UDP": "true",
+		"SIPD_TCP": "true",
+	})))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.EnableUDP || !cfg.EnableTCP {
+		t.Fatal("both transports must be enabled")
+	}
+}
+
+// Load's failure must carry ErrInvalid, or the sentinel is a documented capability that does not
+// exist.
+func TestLoadFailuresWrapErrInvalid(t *testing.T) {
+	_, err := config.Load(env(minimal(map[string]string{"SIPD_MAX_CONTACTS": "0"})))
+	if !errors.Is(err, config.ErrInvalid) {
+		t.Fatalf("err = %v, want it to wrap config.ErrInvalid", err)
+	}
+}
+
+// pprof rides the private health listener, so the loopback gate that used to guard its own address
+// now guards the health address.
+func TestPprofRequiresALoopbackHealthListener(t *testing.T) {
+	for name, pairs := range map[string]map[string]string{
+		"no health listener": {"SIPD_PPROF": "true"},
+		"wildcard health":    {"SIPD_PPROF": "true", "SIPD_HEALTH_ADDR": "0.0.0.0:8080"},
+		"external health":    {"SIPD_PPROF": "true", "SIPD_HEALTH_ADDR": "10.0.0.4:8080"},
+		"retired pprof addr": {"SIPD_PPROF_ADDR": "127.0.0.1:6060"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := config.Load(env(minimal(pairs))); err == nil {
+				t.Fatal("Load accepted a configuration that exposes pprof")
+			}
+		})
+	}
+
+	cfg, err := config.Load(env(minimal(map[string]string{
+		"SIPD_PPROF": "true", "SIPD_HEALTH_ADDR": "127.0.0.1:8080",
+	})))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.PProfEnabled {
+		t.Error("SIPD_PPROF=true left pprof disabled")
+	}
+}
+
+func TestTLSFloorDefaultsTo13AndIsValidated(t *testing.T) {
+	cfg, err := config.Load(env(minimal(nil)))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TLSMinVersion != "1.3" {
+		t.Errorf("TLSMinVersion = %q, want the 1.3 default", cfg.TLSMinVersion)
+	}
+	if cfg.TLSReloadInterval != 30*time.Second {
+		t.Errorf("TLSReloadInterval = %v, want 30s", cfg.TLSReloadInterval)
+	}
+
+	lowered, err := config.Load(env(minimal(map[string]string{"SIPD_TLS_MIN_VERSION": "1.2"})))
+	if err != nil {
+		t.Fatalf("Load with a lowered floor: %v", err)
+	}
+	if lowered.TLSMinVersion != "1.2" {
+		t.Errorf("TLSMinVersion = %q, want 1.2", lowered.TLSMinVersion)
+	}
+
+	_, err = config.Load(env(minimal(map[string]string{"SIPD_TLS_MIN_VERSION": "1.1"})))
+	if err == nil || !strings.Contains(err.Error(), "SIPD_TLS_MIN_VERSION must be 1.3 or 1.2") {
+		t.Fatalf("a TLS 1.1 floor was accepted: %v", err)
+	}
+}
+
+func TestMutualTLSConfigurationIsCoherent(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{
+			name: "a client CA without a TLS listener",
+			env:  map[string]string{"SIPD_TLS_CLIENT_CA_FILE": "/etc/sipd/carriers.pem"},
+			want: "SIPD_TLS_CLIENT_CA_FILE is set but neither SIPD_TLS nor SIPD_WSS is on",
+		},
+		{
+			name: "requiring a client certificate with nothing to verify it against",
+			env: map[string]string{
+				"SIPD_TLS":                     "true",
+				"SIPD_TLS_CERT_FILE":           "/etc/sipd/tls.crt",
+				"SIPD_TLS_KEY_FILE":            "/etc/sipd/tls.key",
+				"SIPD_TLS_REQUIRE_CLIENT_CERT": "true",
+			},
+			want: "SIPD_TLS_REQUIRE_CLIENT_CERT needs SIPD_TLS_CLIENT_CA_FILE",
+		},
+		{
+			name: "half a trunk client certificate",
+			env:  map[string]string{"SIPD_TRUNK_TLS_CERT_FILE": "/etc/sipd/edge.crt"},
+			want: "SIPD_TRUNK_TLS_CERT_FILE and SIPD_TRUNK_TLS_KEY_FILE must be set together",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := config.Load(env(minimal(testCase.env)))
+			if err == nil || !strings.Contains(err.Error(), testCase.want) {
+				t.Fatalf("Load error = %v, want it to contain %q", err, testCase.want)
+			}
+			if err != nil && !errors.Is(err, config.ErrInvalid) {
+				t.Errorf("the error does not wrap ErrInvalid")
+			}
+		})
 	}
 }

@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { createEntityId } from "@optimiq-voice/identifiers";
 import {
 	aorSubjectToken,
+	applicationSubjectToken,
 	CALL_EVENTS,
 	EVENT_FAMILIES,
 	eventFamilyForSubject,
@@ -10,8 +11,11 @@ import {
 	isEventName,
 	isQueueEvent,
 	isRegistrationEvent,
+	isMessagingEvent,
 	isSubjectToken,
+	isTrunkEvent,
 	matchesSubject,
+	MESSAGING_EVENTS,
 	parseSubject,
 	parseSubjectOrThrow,
 	QUEUE_EVENTS,
@@ -23,12 +27,16 @@ import {
 	subjectFilterFor,
 	subjectFor,
 	SubjectTokenError,
+	TRUNK_EVENTS,
 	UnknownSubjectError,
 } from "./subjects";
 
 const ORG = "018f2b7c-0000-7000-8000-0000000000aa";
 const CALL = "018f2b7c-0000-7000-8000-0000000000bb";
 const QUEUE = "018f2b7c-0000-7000-8000-0000000000cc";
+const TRUNK = "018f2b7c-0000-7000-8000-0000000000dd";
+const LEG = "018f2b7c-0000-7000-8000-0000000000ee";
+const CONVERSATION = "018f2b7c-0000-7000-8000-0000000000ff";
 const AOR_HASH = aorSubjectToken("sip:1001@acme.example.com");
 
 describe("subject roots", () => {
@@ -37,10 +45,14 @@ describe("subject roots", () => {
 		expect(SUBJECT_ROOTS).toEqual({
 			call: "calls.evt.v1",
 			registration: "sip.reg.v1",
+			sipDialog: "sip.evt.v1",
 			queue: "queue.evt.v1",
 			voicemail: "voicemail.evt.v1",
 			media: "media.evt.v1",
+			messaging: "messaging.evt.v1",
+			trunk: "trunk.evt.v1",
 			cdrLeg: "cdr.leg.v1",
+			security: "security.evt.v1",
 			audit: "audit.evt.v1",
 			provision: "provision.evt.v1",
 		});
@@ -48,9 +60,28 @@ describe("subject roots", () => {
 			routingResolve: "rpc.routing.v1.resolve",
 			authzCheck: "rpc.authz.v1.check",
 			voicemailList: "rpc.voicemail.v1.list",
+			pbxAuthorizeOutbound: "rpc.pbx.v1.authorize-outbound",
+			pbxExtensionFeature: "rpc.pbx.v1.extension-feature",
+			pbxToggleFeature: "rpc.pbx.v1.toggle-feature",
+			pbxHotDesk: "rpc.pbx.v1.hot-desk",
+			pbxLastCaller: "rpc.pbx.v1.last-caller",
+			pbxFileGreeting: "rpc.pbx.v1.file-greeting",
+			pbxQueueDisposition: "rpc.pbx.v1.queue-disposition",
+			pbxQueueSurvey: "rpc.pbx.v1.queue-survey",
 			sipCredential: "rpc.sip.v1.credential",
+			sipTrunkCredential: "rpc.sip.v1.trunk-credential",
 			sipTransfer: "rpc.sip.v1.transfer",
+			sipInvite: "rpc.sip.v1.invite",
+			sipRing: "rpc.sip.v1.ring",
+			sipAnswer: "rpc.sip.v1.answer",
+			sipHangup: "rpc.sip.v1.hangup",
+			sipReinvite: "rpc.sip.v1.reinvite",
+			sipOriginate: "rpc.sip.v1.originate",
+			sipResolveTarget: "rpc.sip.v1.resolve-target",
+			engineRenegotiate: "rpc.engine.v1.renegotiate",
 			mediaAllocateSession: "rpc.media.v1.allocate-session",
+			mediaCreateOffer: "rpc.media.v1.create-offer",
+			mediaAcceptAnswer: "rpc.media.v1.accept-answer",
 			mediaBridgeSessions: "rpc.media.v1.bridge-sessions",
 			mediaUnbridgeSessions: "rpc.media.v1.unbridge-sessions",
 			mediaReleaseSession: "rpc.media.v1.release-session",
@@ -59,8 +90,18 @@ describe("subject roots", () => {
 			mediaSendDtmf: "rpc.media.v1.send-dtmf",
 			mediaStartRecording: "rpc.media.v1.start-recording",
 			mediaStopRecording: "rpc.media.v1.stop-recording",
+			mediaPauseRecording: "rpc.media.v1.pause-recording",
+			mediaTapSession: "rpc.media.v1.tap-session",
+			mediaUntapSession: "rpc.media.v1.untap-session",
+			mediaMuteSession: "rpc.media.v1.mute-session",
+			mediaHoldSession: "rpc.media.v1.hold-session",
 			engineOriginate: "rpc.engine.v1.originate",
+			engineQueueCallback: "rpc.engine.v1.queue-callback",
 			engineParkHandoff: "rpc.engine.v1.park-handoff",
+			engineSessionVerb: "rpc.engine.v1.session-verb",
+			engineConferenceControl: "rpc.engine.v1.conference-control",
+			engineCallControl: "rpc.engine.v1.call-control",
+			sessionAnnounce: "rpc.session.v1.announce",
 		});
 	});
 
@@ -79,9 +120,13 @@ describe("subject roots", () => {
 			"call",
 			"cdr",
 			"media",
+			"messaging",
 			"provision",
 			"queue",
 			"registration",
+			"security",
+			"sipDialog",
+			"trunk",
 			"voicemail",
 		]);
 	});
@@ -95,14 +140,26 @@ describe("subjectFor", () => {
 		expect(subjectFor.registration(ORG, AOR_HASH, "registered")).toBe(
 			`sip.reg.v1.${ORG}.${AOR_HASH}.registered`,
 		);
+		expect(subjectFor.sipDialog(ORG, LEG, "dialog.terminated")).toBe(
+			`sip.evt.v1.${ORG}.${LEG}.dialog.terminated`,
+		);
 		expect(subjectFor.queue(ORG, QUEUE, "caller.joined")).toBe(
 			`queue.evt.v1.${ORG}.${QUEUE}.caller.joined`,
+		);
+		expect(subjectFor.trunk(ORG, TRUNK, "status.changed")).toBe(
+			`trunk.evt.v1.${ORG}.${TRUNK}.status.changed`,
+		);
+		expect(subjectFor.messaging(ORG, CONVERSATION, "message.received")).toBe(
+			`messaging.evt.v1.${ORG}.${CONVERSATION}.message.received`,
 		);
 		expect(subjectFor.cdrLeg(ORG)).toBe(`cdr.leg.v1.${ORG}`);
 		expect(subjectFor.audit(ORG)).toBe(`audit.evt.v1.${ORG}`);
 		expect(subjectFor.provision(ORG)).toBe(`provision.evt.v1.${ORG}`);
 		expect(subjectFor.routingResolveRpc()).toBe("rpc.routing.v1.resolve");
 		expect(subjectFor.authzCheckRpc()).toBe("rpc.authz.v1.check");
+		expect(subjectFor.pbxExtensionFeatureRpc()).toBe("rpc.pbx.v1.extension-feature");
+		expect(subjectFor.pbxLastCallerRpc()).toBe("rpc.pbx.v1.last-caller");
+		expect(subjectFor.pbxFileGreetingRpc()).toBe("rpc.pbx.v1.file-greeting");
 		expect(subjectFor.sipCredentialRpc()).toBe("rpc.sip.v1.credential");
 		expect(subjectFor.sipTransferRpc()).toBe("rpc.sip.v1.transfer");
 	});
@@ -195,6 +252,163 @@ describe("subjectFor.engineParkHandoffRpc", () => {
 	});
 });
 
+describe("the sipd command surface", () => {
+	it("keeps admission and originate FLAT, because neither has an owner yet", () => {
+		expect(subjectFor.sipInviteRpc()).toBe("rpc.sip.v1.invite");
+		expect(subjectFor.sipOriginateRpc()).toBe("rpc.sip.v1.originate");
+	});
+
+	it("addresses the four dialog commands at the instance HOLDING the dialog", () => {
+		expect(subjectFor.sipRingRpc("sipd-7c9f")).toBe("rpc.sip.v1.ring.sipd-7c9f");
+		expect(subjectFor.sipAnswerRpc("sipd-7c9f")).toBe("rpc.sip.v1.answer.sipd-7c9f");
+		expect(subjectFor.sipHangupRpc("sipd-7c9f")).toBe("rpc.sip.v1.hangup.sipd-7c9f");
+		expect(subjectFor.sipReinviteRpc("sipd-7c9f")).toBe("rpc.sip.v1.reinvite.sipd-7c9f");
+	});
+
+	it("hashes an instance id that is not one token, so both ends still agree", () => {
+		expect(subjectFor.sipAnswerRpc("sipd.eu-west.internal")).toBe(
+			`${RPC_SUBJECTS.sipAnswer}.${instanceSubjectToken("sipd.eu-west.internal")}`,
+		);
+	});
+
+	it("is covered by the one-token wildcard nats.conf grants", () => {
+		for (const [prefix, build] of [
+			[RPC_SUBJECTS.sipRing, subjectFor.sipRingRpc],
+			[RPC_SUBJECTS.sipAnswer, subjectFor.sipAnswerRpc],
+			[RPC_SUBJECTS.sipHangup, subjectFor.sipHangupRpc],
+			[RPC_SUBJECTS.sipReinvite, subjectFor.sipReinviteRpc],
+		] as const) {
+			expect(matchesSubject(`${prefix}.*`, build("sipd-1"))).toBe(true);
+		}
+	});
+});
+
+describe("subjectFor.engineSessionVerbRpc", () => {
+	it("addresses the instance that owns the leg", () => {
+		expect(subjectFor.engineSessionVerbRpc("engine-2")).toBe("rpc.engine.v1.session-verb.engine-2");
+	});
+
+	it("uses the SAME token the park handoff does, so one grant covers both shapes", () => {
+		const id = "engine.eu-west.internal";
+		expect(subjectFor.engineSessionVerbRpc(id)).toBe(
+			`${RPC_SUBJECTS.engineSessionVerb}.${instanceSubjectToken(id)}`,
+		);
+		expect(
+			matchesSubject(`${RPC_SUBJECTS.engineSessionVerb}.*`, subjectFor.engineSessionVerbRpc(id)),
+		).toBe(true);
+	});
+});
+
+describe("subjectFor.engineCallControlRpc", () => {
+	it("addresses the instance the channels bucket says owns the leg", () => {
+		expect(subjectFor.engineCallControlRpc("engine-2")).toBe("rpc.engine.v1.call-control.engine-2");
+	});
+
+	it("uses the SAME token every other instance-addressed subject does", () => {
+		const id = "engine.eu-west.internal";
+		expect(subjectFor.engineCallControlRpc(id)).toBe(
+			`${RPC_SUBJECTS.engineCallControl}.${instanceSubjectToken(id)}`,
+		);
+		expect(
+			matchesSubject(`${RPC_SUBJECTS.engineCallControl}.*`, subjectFor.engineCallControlRpc(id)),
+		).toBe(true);
+	});
+});
+
+describe("subjectFor.engineConferenceControlRpc", () => {
+	it("addresses an instance that holds members of the room", () => {
+		expect(subjectFor.engineConferenceControlRpc("engine-2")).toBe(
+			"rpc.engine.v1.conference-control.engine-2",
+		);
+	});
+
+	it("uses the SAME token the other two instance-addressed subjects do", () => {
+		const id = "engine.eu-west.internal";
+		expect(subjectFor.engineConferenceControlRpc(id)).toBe(
+			`${RPC_SUBJECTS.engineConferenceControl}.${instanceSubjectToken(id)}`,
+		);
+		expect(
+			matchesSubject(
+				`${RPC_SUBJECTS.engineConferenceControl}.*`,
+				subjectFor.engineConferenceControlRpc(id),
+			),
+		).toBe(true);
+	});
+});
+
+describe("subjectFilterFor.conferenceEventsInOrg", () => {
+	it("matches every conference event, whatever its token depth", () => {
+		const filter = subjectFilterFor.conferenceEventsInOrg(ORG);
+		expect(filter).toBe(`calls.evt.v1.${ORG}.*.conference.>`);
+		for (const event of ["conference.joined", "conference.participant.updated"] as const) {
+			expect(matchesSubject(filter, subjectFor.call(ORG, CALL, event))).toBe(true);
+		}
+	});
+
+	it("does NOT match the channel events on the same root", () => {
+		// The whole reason it is a narrower filter than `callsInOrg`: a subscriber holding
+		// `conferences.read` and not `cdr.read` must not be handed every channel transition.
+		const filter = subjectFilterFor.conferenceEventsInOrg(ORG);
+		for (const event of ["channel.answered", "call.parked"] as const) {
+			expect(matchesSubject(filter, subjectFor.call(ORG, CALL, event))).toBe(false);
+		}
+	});
+
+	it("does not cross tenants", () => {
+		const filter = subjectFilterFor.conferenceEventsInOrg(ORG);
+		expect(matchesSubject(filter, subjectFor.call(QUEUE, CALL, "conference.joined"))).toBe(false);
+	});
+});
+
+describe("applicationSubjectToken", () => {
+	it("passes a plain application name through, so an operator can read the subject", () => {
+		expect(applicationSubjectToken("autopilot")).toBe("autopilot");
+		expect(applicationSubjectToken("  crm-screenpop  ")).toBe("crm-screenpop");
+	});
+
+	/**
+	 * The whole reason the helper exists: a name with a dot would become two subject tokens, so the
+	 * announce would be published on a subject with one more token than anybody subscribes to and
+	 * the call would silently take the failure path.
+	 */
+	it("hashes anything that is not one token", () => {
+		const token = applicationSubjectToken("Sales IVR (new)");
+		expect(token).toMatch(/^[0-9a-f]{32}$/u);
+		expect(applicationSubjectToken("app.one")).toMatch(/^[0-9a-f]{32}$/u);
+	});
+
+	/**
+	 * Case is NOT folded. Two names that differ only in case are two registrations, because folding
+	 * them would deliver one tenant's `Support` calls to whoever claimed `support` first.
+	 */
+	it("keeps case, so two spellings are two applications", () => {
+		expect(applicationSubjectToken("Support")).not.toBe(applicationSubjectToken("support"));
+	});
+
+	it("rejects an empty application name", () => {
+		expect(() => applicationSubjectToken("   ")).toThrow(SubjectTokenError);
+	});
+});
+
+describe("subjectFor.sessionAnnounceRpc", () => {
+	it("puts the organization before the application, so a tenant's names are its own", () => {
+		expect(subjectFor.sessionAnnounceRpc(ORG, "autopilot")).toBe(
+			`rpc.session.v1.announce.${ORG}.autopilot`,
+		);
+	});
+
+	it("separates the same application name in two organizations", () => {
+		const other = "018f2b7c-0000-7000-8000-0000000000ff";
+		expect(subjectFor.sessionAnnounceRpc(ORG, "crm")).not.toBe(
+			subjectFor.sessionAnnounceRpc(other, "crm"),
+		);
+	});
+
+	it("refuses an org id that is not a subject token", () => {
+		expect(() => subjectFor.sessionAnnounceRpc("*", "crm")).toThrow(SubjectTokenError);
+	});
+});
+
 describe("parseSubject round trip", () => {
 	it("reverses a call subject", () => {
 		const subject = subjectFor.call(ORG, CALL, "channel.record.stopped");
@@ -219,12 +433,30 @@ describe("parseSubject round trip", () => {
 		expect(subjectFor.registration(parsed.orgId, parsed.aorHash, parsed.event)).toBe(subject);
 	});
 
+	it("reverses a sip dialog subject", () => {
+		const subject = subjectFor.sipDialog(ORG, LEG, "dialog.terminated");
+		const parsed = parseSubjectOrThrow(subject);
+		if (parsed.kind !== "sip-dialog") throw new Error("unreachable");
+		expect(parsed.legId).toBe(LEG);
+		expect(parsed.family).toBe("sipDialog");
+		expect(subjectFor.sipDialog(parsed.orgId, parsed.legId, parsed.event)).toBe(subject);
+	});
+
 	it("reverses a queue subject", () => {
 		const subject = subjectFor.queue(ORG, QUEUE, "agent.state");
 		const parsed = parseSubjectOrThrow(subject);
 		if (parsed.kind !== "queue") throw new Error("unreachable");
 		expect(parsed.queueId).toBe(QUEUE);
 		expect(subjectFor.queue(parsed.orgId, parsed.queueId, parsed.event)).toBe(subject);
+	});
+
+	it("reverses a trunk subject, rejoining the dotted event tail", () => {
+		const subject = subjectFor.trunk(ORG, TRUNK, "status.changed");
+		const parsed = parseSubjectOrThrow(subject);
+		if (parsed.kind !== "trunk") throw new Error("unreachable");
+		expect(parsed.trunkId).toBe(TRUNK);
+		expect(parsed.event).toBe("status.changed");
+		expect(subjectFor.trunk(parsed.orgId, parsed.trunkId, parsed.event)).toBe(subject);
 	});
 
 	it.each([
@@ -246,6 +478,25 @@ describe("parseSubject round trip", () => {
 			version: "v1",
 			service: "routing",
 			method: "resolve",
+		});
+	});
+
+	it("reverses an instance-addressed rpc subject", () => {
+		expect(parseSubjectOrThrow(subjectFor.sipRingRpc("sipd-2"))).toEqual({
+			kind: "rpc",
+			family: "rpc",
+			version: "v1",
+			service: "sip",
+			method: "ring",
+			target: "sipd-2",
+		});
+		expect(parseSubjectOrThrow(subjectFor.sessionAnnounceRpc(ORG, "app-1"))).toEqual({
+			kind: "rpc",
+			family: "rpc",
+			version: "v1",
+			service: "session",
+			method: "announce",
+			target: `${ORG}.app-1`,
 		});
 	});
 
@@ -292,6 +543,7 @@ describe("subject filters", () => {
 		expect(subjectFilterFor.allCalls()).toBe("calls.evt.v1.>");
 		expect(subjectFilterFor.allRegistrations()).toBe("sip.reg.v1.>");
 		expect(subjectFilterFor.allQueues()).toBe("queue.evt.v1.>");
+		expect(subjectFilterFor.allTrunks()).toBe("trunk.evt.v1.>");
 		expect(subjectFilterFor.allCdrLegs()).toBe("cdr.leg.v1.*");
 		expect(subjectFilterFor.allAudit()).toBe("audit.evt.v1.*");
 		expect(subjectFilterFor.allProvision()).toBe("provision.evt.v1.*");
@@ -302,6 +554,7 @@ describe("subject filters", () => {
 			[subjectFilterFor.allCalls(), subjectFor.call(ORG, CALL, "channel.record.started")],
 			[subjectFilterFor.allRegistrations(), subjectFor.registration(ORG, AOR_HASH, "registered")],
 			[subjectFilterFor.allQueues(), subjectFor.queue(ORG, QUEUE, "caller.joined")],
+			[subjectFilterFor.allTrunks(), subjectFor.trunk(ORG, TRUNK, "status.changed")],
 			[subjectFilterFor.allCdrLegs(), subjectFor.cdrLeg(ORG)],
 			[subjectFilterFor.allAudit(), subjectFor.audit(ORG)],
 			[subjectFilterFor.allProvision(), subjectFor.provision(ORG)],
@@ -356,6 +609,25 @@ describe("subject filters", () => {
 		).toBe(false);
 	});
 
+	it("scopes trunks to one org, and status transitions across its trunks", () => {
+		const otherOrg = "018f2b7c-0000-7000-8000-0000000000ff";
+		const mine = subjectFor.trunk(ORG, TRUNK, "status.changed");
+		expect(matchesSubject(subjectFilterFor.trunksInOrg(ORG), mine)).toBe(true);
+		expect(
+			matchesSubject(
+				subjectFilterFor.trunksInOrg(ORG),
+				subjectFor.trunk(otherOrg, TRUNK, "status.changed"),
+			),
+		).toBe(false);
+		// The dotted-tail arithmetic the filter's own comment describes: the event is TWO tokens,
+		// so the trunk wildcard is a `*` followed by the literal tail, never a `>`.
+		expect(subjectFilterFor.trunkStatusInOrg(ORG)).toBe(`trunk.evt.v1.${ORG}.*.status.changed`);
+		expect(matchesSubject(subjectFilterFor.trunkStatusInOrg(ORG), mine)).toBe(true);
+		expect(
+			matchesSubject(subjectFilterFor.trunkStatusInOrg(ORG), `trunk.evt.v1.${ORG}.${TRUNK}.other`),
+		).toBe(false);
+	});
+
 	it("scopes single-token families to one org", () => {
 		expect(subjectFilterFor.cdrLegsInOrg(ORG)).toBe(subjectFor.cdrLeg(ORG));
 		expect(subjectFilterFor.auditInOrg(ORG)).toBe(subjectFor.audit(ORG));
@@ -386,7 +658,9 @@ describe("event-name guards", () => {
 		expect(CALL_EVENTS.every(isCallEvent)).toBe(true);
 		expect(REGISTRATION_EVENTS.every(isRegistrationEvent)).toBe(true);
 		expect(QUEUE_EVENTS.every(isQueueEvent)).toBe(true);
+		expect(TRUNK_EVENTS.every(isTrunkEvent)).toBe(true);
 		expect(isCallEvent("channel.teleported")).toBe(false);
+		expect(isTrunkEvent("status.qualified")).toBe(false);
 	});
 
 	it("accepts hierarchical event names but not malformed ones", () => {
@@ -416,11 +690,58 @@ describe("event-name guards", () => {
 			// sees them. See README's evolution rules.
 			"conference.joined",
 			"conference.left",
+			"conference.participant.updated",
+			"conference.locked",
+			"conference.unlocked",
 			"call.parked",
 			"call.unparked",
 			"call.transferred",
 			"call.picked-up",
 			"call.emergency.dialed",
+			"call.tap.started",
+			"call.tap.ended",
+			"call.paging.started",
+			"call.paging.ended",
 		]);
+	});
+});
+
+describe("messaging subjects", () => {
+	it("round-trips every builder through parseSubject", () => {
+		for (const event of MESSAGING_EVENTS) {
+			const subject = subjectFor.messaging(ORG, CONVERSATION, event);
+			expect(parseSubject(subject)).toEqual({
+				kind: "messaging",
+				family: "messaging",
+				version: SUBJECT_VERSION,
+				orgId: ORG,
+				conversationId: CONVERSATION,
+				event,
+			});
+			expect(eventFamilyForSubject(subject)).toBe("messaging");
+		}
+	});
+
+	it("builds filters that match the subjects they are meant to", () => {
+		const subject = subjectFor.messaging(ORG, CONVERSATION, "message.delivered");
+		expect(matchesSubject(subjectFilterFor.allMessaging(), subject)).toBe(true);
+		expect(matchesSubject(subjectFilterFor.messagingInOrg(ORG), subject)).toBe(true);
+		expect(matchesSubject(subjectFilterFor.messagingConversation(ORG, CONVERSATION), subject)).toBe(
+			true,
+		);
+		expect(
+			matchesSubject(subjectFilterFor.messagingEventInOrg(ORG, "message.delivered"), subject),
+		).toBe(true);
+		// The per-event filter is one event name, not the family: `message.received` must miss.
+		expect(
+			matchesSubject(subjectFilterFor.messagingEventInOrg(ORG, "message.received"), subject),
+		).toBe(false);
+		expect(matchesSubject(subjectFilterFor.messagingInOrg(CALL), subject)).toBe(false);
+	});
+
+	it("narrows only the event names it declares", () => {
+		expect(isMessagingEvent("message.received")).toBe(true);
+		expect(isMessagingEvent("message.delivered")).toBe(true);
+		expect(isMessagingEvent("message.failed")).toBe(false);
 	});
 });

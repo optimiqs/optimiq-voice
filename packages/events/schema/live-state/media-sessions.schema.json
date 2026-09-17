@@ -1,0 +1,67 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"sessionId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"instanceId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"orgId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"callId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"legId": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"address": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 64
+		},
+		"rtpPort": {
+			"type": "integer",
+			"minimum": 1,
+			"maximum": 65534
+		},
+		"rtcpPort": {
+			"type": "integer",
+			"minimum": 1,
+			"maximum": 65535
+		},
+		"codec": {
+			"type": "string",
+			"maxLength": 32
+		},
+		"bridgeId": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"allocatedAt": {
+			"type": "number"
+		}
+	},
+	"required": [
+		"sessionId",
+		"instanceId",
+		"orgId",
+		"callId",
+		"address",
+		"rtpPort",
+		"rtcpPort",
+		"allocatedAt"
+	],
+	"additionalProperties": {}
+}

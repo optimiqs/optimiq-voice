@@ -35,6 +35,17 @@ export interface TenantRlsPreflightPlan {
 	/** @default "public" */
 	readonly schemaName?: string;
 	readonly expectations: readonly TenantRlsTableExpectation[];
+	/**
+	 * Tables that carry an `organization_id` column and are deliberately NOT tenant-scoped —
+	 * operator surfaces the tenant role holds no grant on (`cdr_write_quarantine`, whose column is
+	 * nullable because half its rows have no resolvable organization).
+	 *
+	 * The introspector reads every org-scoped table in the schema, not just the planned ones, so
+	 * that a tenant table added by a migration and never added to the plan is REPORTED rather than
+	 * silently skipped. This list is the explicit, reviewable exception to that — a table only
+	 * leaves the gate by being named here.
+	 */
+	readonly unscopedTables?: readonly string[];
 }
 
 /** One row of the PostgreSQL catalogue snapshot the evaluator reasons about. */
@@ -211,6 +222,9 @@ export function createPostgresTenantRlsIntrospector(databaseUrl: string): Tenant
 		// `postgres.js` cannot bind an empty array to `in (...)`, so keep an impossible sentinel.
 		const appendOnlyNames = appendOnly.length > 0 ? appendOnly : ["__tenant_rls_no_tables__"];
 		const noDeleteNames = noDelete.length > 0 ? noDelete : ["__tenant_rls_no_tables__"];
+		const planNames = tableNames.length > 0 ? tableNames : ["__tenant_rls_no_tables__"];
+		const unscoped = plan.unscopedTables ?? [];
+		const unscopedNames = unscoped.length > 0 ? unscoped : ["__tenant_rls_no_tables__"];
 
 		const client = postgres(databaseUrl, { max: 1 });
 		try {
@@ -266,18 +280,27 @@ export function createPostgresTenantRlsIntrospector(databaseUrl: string): Tenant
 						then pg_has_role(current_user, ${plan.roleName}, 'SET')
 						else false
 					end as "tenantRoleCanSet",
-					has_schema_privilege(${plan.roleName}, namespace.nspname, 'USAGE')
-						as "tenantRoleHasSchemaUsage",
-					has_table_privilege(
-						${plan.roleName},
-						format('%I.%I', namespace.nspname, class.relname),
-						case
-							when class.relname in ${client(appendOnlyNames)} then 'SELECT,INSERT'
-							when class.relname in ${client(noDeleteNames)} then 'SELECT,INSERT,UPDATE'
-							else 'SELECT,INSERT,UPDATE,DELETE'
-						end
-					) as "tenantRoleHasTablePrivileges",
 					case
+						when not exists(select 1 from pg_roles where rolname = ${plan.roleName})
+						then false
+						else has_schema_privilege(${plan.roleName}, namespace.nspname, 'USAGE')
+					end as "tenantRoleHasSchemaUsage",
+					case
+						when not exists(select 1 from pg_roles where rolname = ${plan.roleName})
+						then false
+						else has_table_privilege(
+							${plan.roleName},
+							format('%I.%I', namespace.nspname, class.relname),
+							case
+								when class.relname in ${client(appendOnlyNames)} then 'SELECT,INSERT'
+								when class.relname in ${client(noDeleteNames)} then 'SELECT,INSERT,UPDATE'
+								else 'SELECT,INSERT,UPDATE,DELETE'
+							end
+						)
+					end as "tenantRoleHasTablePrivileges",
+					case
+						when not exists(select 1 from pg_roles where rolname = ${plan.roleName})
+						then false
 						when class.relname in ${client(appendOnlyNames)}
 						then has_table_privilege(
 								${plan.roleName},
@@ -301,7 +324,25 @@ export function createPostgresTenantRlsIntrospector(databaseUrl: string): Tenant
 				join pg_roles as owner_role on owner_role.oid = class.relowner
 				join pg_roles as current_role_row on current_role_row.rolname = current_user
 				where namespace.nspname = ${schemaName}
-					and class.relname in ${client(tableNames)}
+					and class.relkind in ('r', 'p')
+					-- Partitions are reached only through their parent, whose policies apply; the
+					-- plans deliberately do not list them.
+					and not class.relispartition
+					-- Every org-scoped table, not just the planned ones, so a tenant table that was
+					-- added by a migration but never added to the plan is reported rather than
+					-- silently skipped.
+					and class.relname not in ${client(unscopedNames)}
+					and (
+						class.relname in ${client(planNames)}
+						or exists (
+							select 1
+							from pg_attribute as attribute
+							where attribute.attrelid = class.oid
+								and attribute.attname = 'organization_id'
+								and attribute.attnum > 0
+								and not attribute.attisdropped
+						)
+					)
 				order by class.relname
 			`;
 			return rows;

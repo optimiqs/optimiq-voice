@@ -49,6 +49,65 @@
 		"detail": {
 			"type": "string",
 			"maxLength": 512
+		},
+		"quality": {
+			"type": "object",
+			"properties": {
+				"inboundJitterMs": {
+					"type": "number",
+					"minimum": 0
+				},
+				"reportedLossFraction": {
+					"type": "number",
+					"minimum": 0,
+					"maximum": 1
+				},
+				"reportedLossTotal": {
+					"type": "integer",
+					"minimum": 0,
+					"maximum": 9007199254740991
+				},
+				"reportedJitterMs": {
+					"type": "number",
+					"minimum": 0
+				},
+				"roundTripMs": {
+					"type": "number",
+					"minimum": 0
+				},
+				"reportsReceived": {
+					"type": "integer",
+					"minimum": 0,
+					"maximum": 9007199254740991
+				},
+				"reportsSent": {
+					"type": "integer",
+					"minimum": 0,
+					"maximum": 9007199254740991
+				},
+				"malformed": {
+					"type": "integer",
+					"minimum": 0,
+					"maximum": 9007199254740991
+				},
+				"lastReportUnixMs": {
+					"type": "integer",
+					"minimum": 0,
+					"maximum": 9007199254740991
+				}
+			},
+			"required": [
+				"inboundJitterMs",
+				"reportedLossFraction",
+				"reportedLossTotal",
+				"reportedJitterMs",
+				"roundTripMs",
+				"reportsReceived",
+				"reportsSent",
+				"malformed",
+				"lastReportUnixMs"
+			],
+			"additionalProperties": false
 		}
 	},
 	"required": [

@@ -31,6 +31,28 @@ describe("referenceHref", () => {
 	});
 
 	/**
+	 * A phrase, and the one kind here that CANNOT fall back to a prefilled list.
+	 *
+	 * `phrase_step.prompt_id` is the only `on delete restrict` column in the PBX schema — cascading
+	 * would silently shorten a sentence — so deleting a recording a phrase plays is a 409 whose
+	 * referrers are `kind: "phrase"`. `PROMPT_RESOURCE` declares the site with `idColumn: "phrase_id"`
+	 * and `nameColumn: null`, which decides both halves of this: the id is the PHRASE's, because a
+	 * step has no screen and a phrase does, and there is no name at all to put in a search box.
+	 *
+	 * A list fallback would therefore have landed the user on a page of phrases with nothing
+	 * indicating which one is holding the delete — the exact dead end the 409 exists to avoid.
+	 */
+	it("links a refused prompt delete straight at the phrase that refused it", () => {
+		expect(referenceHref(reference("phrase", null))).toBe(
+			"/media/phrases/0193f2aa-0000-7000-8000-000000000002",
+		);
+		// …and still does when the server one day starts sending a name.
+		expect(referenceHref(reference("phrase", "Queue position"))).toBe(
+			"/media/phrases/0193f2aa-0000-7000-8000-000000000002",
+		);
+	});
+
+	/**
 	 * `park-lot` used to land on `/routing` — the closest thing to a home it had while lots were
 	 * unmanageable. It has its own route now, and a stale mapping would send someone refused a
 	 * delete to a page their lot is not on, which is worse than no link at all.
@@ -49,6 +71,12 @@ describe("referenceHref", () => {
 	it("has no listing for kinds the API never emits as a reference", () => {
 		expect(referenceHref(reference("queue-agent"))).toBeUndefined();
 		expect(referenceHref(reference("queue-tier"))).toBeUndefined();
+		/**
+		 * `phrase-step` belongs with these and not with `phrase`. The reference site declares
+		 * `idColumn: "phrase_id"`, so the server names the PHRASE — a mapping for the step would be one
+		 * nobody can reach and nobody can check, which is the same argument that keeps an agent out.
+		 */
+		expect(referenceHref(reference("phrase-step"))).toBeUndefined();
 	});
 
 	/**

@@ -7,6 +7,7 @@ import { ORIGINATE_RPC } from "@optimiq-voice/events/schemas";
 import { subjectFor } from "@optimiq-voice/events/subjects";
 import { getLogger } from "@optimiq-voice/logging";
 import { PBX_ENV } from "../shared/pbx.tokens";
+import { SharedRateWindowService } from "../shared/shared-rate-window";
 import { originateRateLimitedException, originateUnavailableException } from "./calls.errors";
 import { OriginateRateLimiter } from "./originate-rate-limit";
 import { interpretOriginateReply } from "./originate-reply";
@@ -63,8 +64,11 @@ export class CallsService implements OnModuleInit, OnApplicationShutdown {
 	private originated = 0;
 	private refused = 0;
 
-	constructor(@Inject(PBX_ENV) private readonly env: PbxEnv) {
-		this.limiter = new OriginateRateLimiter(env.PBX_ORIGINATE_RATE_LIMIT_PER_MINUTE);
+	constructor(
+		@Inject(PBX_ENV) private readonly env: PbxEnv,
+		windows: SharedRateWindowService,
+	) {
+		this.limiter = new OriginateRateLimiter(env.PBX_ORIGINATE_RATE_LIMIT_PER_MINUTE, windows);
 	}
 
 	get stats(): {
@@ -127,15 +131,19 @@ export class CallsService implements OnModuleInit, OnApplicationShutdown {
 	): Promise<OriginatedCall> {
 		const organizationId = requireActiveOrganizationId(session);
 
-		const verdict = this.limiter.consume(organizationId);
-		if (!verdict.allowed) {
-			this.refused += 1;
-			throw originateRateLimitedException(verdict.retryAfterSeconds);
-		}
-
+		// Availability before the budget: what the limiter bounds is money, and a request that reached
+		// no engine spent none. With the two the other way round, sixty requests during a broker
+		// outage — none of which placed a call — exhausted the tenant's window. Authorization still
+		// precedes both.
 		const connection = this.connection;
 		if (connection === undefined || connection.isClosed()) {
 			throw originateUnavailableException("the control plane has no broker connection");
+		}
+
+		const verdict = await this.limiter.consume(organizationId);
+		if (!verdict.allowed) {
+			this.refused += 1;
+			throw originateRateLimitedException(verdict.retryAfterSeconds);
 		}
 
 		/**

@@ -1,4 +1,5 @@
 import { ariLiveRecordingSchema, ariStoredRecordingSchema } from "../models";
+import { encodeSegment } from "../url";
 import type { AriHttpClient } from "../http-client";
 import type { AriLiveRecording, AriStoredRecording } from "../models";
 
@@ -18,7 +19,7 @@ export class AriRecordings {
 	/** `GET /recordings/live/{name}` — `undefined` once the recording has finished. */
 	async getLive(name: string): Promise<AriLiveRecording | undefined> {
 		return await this.http.requestParsedOptional(
-			{ method: "GET", path: `/recordings/live/${encodeURIComponent(name)}` },
+			{ method: "GET", path: `/recordings/live/${encodeSegment(name)}` },
 			ariLiveRecordingSchema,
 		);
 	}
@@ -27,7 +28,7 @@ export class AriRecordings {
 	async stop(name: string): Promise<void> {
 		await this.http.requestVoid({
 			method: "POST",
-			path: `/recordings/live/${encodeURIComponent(name)}/stop`,
+			path: `/recordings/live/${encodeSegment(name)}/stop`,
 			tolerateNotFound: true,
 		});
 	}
@@ -36,7 +37,7 @@ export class AriRecordings {
 	async cancel(name: string): Promise<void> {
 		await this.http.requestVoid({
 			method: "DELETE",
-			path: `/recordings/live/${encodeURIComponent(name)}`,
+			path: `/recordings/live/${encodeSegment(name)}`,
 			tolerateNotFound: true,
 		});
 	}
@@ -45,7 +46,7 @@ export class AriRecordings {
 	async pause(name: string): Promise<void> {
 		await this.http.requestVoid({
 			method: "POST",
-			path: `/recordings/live/${encodeURIComponent(name)}/pause`,
+			path: `/recordings/live/${encodeSegment(name)}/pause`,
 		});
 	}
 
@@ -53,14 +54,14 @@ export class AriRecordings {
 	async unpause(name: string): Promise<void> {
 		await this.http.requestVoid({
 			method: "DELETE",
-			path: `/recordings/live/${encodeURIComponent(name)}/pause`,
+			path: `/recordings/live/${encodeSegment(name)}/pause`,
 		});
 	}
 
 	/** `GET /recordings/stored/{name}` — a finished recording on the media server's disk. */
 	async getStored(name: string): Promise<AriStoredRecording | undefined> {
 		return await this.http.requestParsedOptional(
-			{ method: "GET", path: `/recordings/stored/${encodeURIComponent(name)}` },
+			{ method: "GET", path: `/recordings/stored/${encodeSegment(name)}` },
 			ariStoredRecordingSchema,
 		);
 	}
@@ -69,7 +70,7 @@ export class AriRecordings {
 	async deleteStored(name: string): Promise<void> {
 		await this.http.requestVoid({
 			method: "DELETE",
-			path: `/recordings/stored/${encodeURIComponent(name)}`,
+			path: `/recordings/stored/${encodeSegment(name)}`,
 			tolerateNotFound: true,
 		});
 	}

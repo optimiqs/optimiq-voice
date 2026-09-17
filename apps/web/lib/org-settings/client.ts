@@ -1,4 +1,6 @@
 import { apiFetch } from "../api-client";
+import { RECORDING_CONSENT_POLICIES } from "../pbx/contracts";
+import type { RecordingConsentPolicy } from "../pbx/contracts";
 
 /**
  * The organization settings cascade — `/api/v1/org-settings`.
@@ -78,8 +80,97 @@ export interface RoutingSettings {
 	readonly emergencyNumbers: readonly string[];
 }
 
+/**
+ * The recording policy, typed.
+ *
+ * One setting, and `0` is not a missing value — it means KEEP INDEFINITELY, on exactly the terms
+ * the platform's own `CDR_RECORDING_RETENTION_DAYS` environment variable uses. The two vocabularies
+ * are identical on purpose: two spellings for one number is how a tenant sets "30" and gets a month
+ * while an operator reads "30" and expects a fortnight. So this is a plain `number` rather than a
+ * `number | null`, and the form's empty state has to be a real zero rather than a blank.
+ */
+export interface RecordingSettings {
+	readonly retentionDays: number;
+	/**
+	 * The voicemail half of the same posture, in the SAME units and with the same bounds.
+	 *
+	 * Deliberately identical vocabulary, because the failure mode of two retention settings on one
+	 * screen is an administrator who reads the second one in the first one's units. It differs in
+	 * one way that matters and the copy says so: the voicemail sweep evaluates the window against a
+	 * message's received date every time it runs, so shortening it DOES purge messages that are
+	 * already older — where shortening the recording window never re-stamps existing audio.
+	 */
+	readonly voicemailRetentionDays: number;
+	/** What the parties are told before recording starts. `none` says nothing HERE, not "never". */
+	readonly consentPolicy: RecordingConsentPolicy;
+	/** The tenant's own disclosure recording. `null` plays the built-in announcement. */
+	readonly consentPromptId: string | null;
+	readonly consentAcceptDigit: string;
+	readonly consentDeclineDigit: string;
+	/**
+	 * The jurisdictions this organization treats as requiring EVERY party to be told.
+	 *
+	 * A configurable policy default and NOT legal advice — `docs/recording-compliance.md` says so in
+	 * as many words, and so does the screen. A call whose caller id or destination resolves into one
+	 * of these is announced to on both sides even when {@link consentPolicy} is `none`.
+	 */
+	readonly allPartyRegions: readonly string[];
+	/** Pause the recorder while a caller is pressing keys, so a card number is not captured. */
+	readonly autoPauseOnDtmf: boolean;
+}
+
+/**
+ * What happens to an outbound call whose caller ID this organization has not proved it may use.
+ *
+ * `replace` is the middle answer and the one most tenants want: the call goes out under the
+ * organization's default number instead of being refused. `refuse` fails the call; `allow` lets it
+ * through unchanged, which means it is signed `C` at best and is the setting a carrier will ask
+ * about first.
+ */
+export const UNVERIFIED_CALLER_ID_POLICIES = ["allow", "replace", "refuse"] as const;
+export type UnverifiedCallerIdPolicy = (typeof UNVERIFIED_CALLER_ID_POLICIES)[number];
+
+export interface ComplianceSettings {
+	readonly unverifiedCallerIdPolicy: UnverifiedCallerIdPolicy;
+	/** When on, an organization whose KYC record is not `approved` cannot dial out at all. */
+	readonly requireKycForOutbound: boolean;
+}
+
 export const NOTIFICATIONS_CATEGORY = "notifications";
 export const ROUTING_CATEGORY = "routing";
+export const RECORDINGS_CATEGORY = "recordings";
+export const COMPLIANCE_CATEGORY = "compliance";
+
+/** The server's bound on `retentionDays`: ten years, and `0` for "for ever". */
+export const RECORDING_RETENTION_MAX_DAYS = 3_650;
+
+/**
+ * The all-party consent regions the platform ships as its default, mirroring
+ * `DEFAULT_ALL_PARTY_REGIONS` in `@optimiq-voice/routing`.
+ *
+ * ISO 3166-2 for US states, `EU` for the Union. Restated here so the screen can offer "put the
+ * platform's list back" without a round trip — and it is a POLICY DEFAULT rather than a legal rule:
+ * a tenant whose counsel reads a state differently changes the list.
+ */
+export const DEFAULT_ALL_PARTY_REGIONS: readonly string[] = [
+	"US-CA",
+	"US-DE",
+	"US-FL",
+	"US-IL",
+	"US-MD",
+	"US-MA",
+	"US-MI",
+	"US-MT",
+	"US-NV",
+	"US-NH",
+	"US-OR",
+	"US-PA",
+	"US-WA",
+	"EU",
+];
+
+/** One DTMF digit, as the catalogue's own regex spells it. */
+export const DTMF_DIGIT_PATTERN = /^[0-9*#]$/u;
 
 /**
  * The hangup causes the compiler will accept for `trunkContinueOnCauses`, offered as choices.
@@ -184,6 +275,126 @@ export function toRoutingSettings(data: Record<string, unknown>): RoutingSetting
 	};
 }
 
+/**
+ * Narrows the category's untyped answer to {@link RecordingSettings}.
+ *
+ * The fallback is `0` — the catalogue's own default, which means keep for ever — rather than a
+ * guessed window. Inventing a number here would be the worst possible failure of a version skew:
+ * a screen claiming this organization purges recordings after N days when nothing does.
+ *
+ * A negative or fractional value falls back too, because the column takes an integer between 0 and
+ * 3,650 and a stored value outside that is a row the server itself would resolve to the default.
+ */
+export function toRecordingSettings(data: Record<string, unknown>): RecordingSettings {
+	const policy = data.consentPolicy;
+	return {
+		retentionDays: retentionDays(data.retentionDays),
+		voicemailRetentionDays: retentionDays(data.voicemailRetentionDays),
+		consentPolicy: RECORDING_CONSENT_POLICIES.includes(policy as RecordingConsentPolicy)
+			? (policy as RecordingConsentPolicy)
+			: "none",
+		consentPromptId: typeof data.consentPromptId === "string" ? data.consentPromptId : null,
+		consentAcceptDigit: dtmfDigit(data.consentAcceptDigit, "1"),
+		consentDeclineDigit: dtmfDigit(data.consentDeclineDigit, "2"),
+		allPartyRegions: Array.isArray(data.allPartyRegions)
+			? stringList(data.allPartyRegions)
+			: DEFAULT_ALL_PARTY_REGIONS,
+		autoPauseOnDtmf: data.autoPauseOnDtmf === true,
+	};
+}
+
+/** A retention window, or the catalogue's `0` when the stored value is one the server would reject. */
+function retentionDays(value: unknown): number {
+	return typeof value === "number" &&
+		Number.isInteger(value) &&
+		value >= 0 &&
+		value <= RECORDING_RETENTION_MAX_DAYS
+		? value
+		: 0;
+}
+
+function dtmfDigit(value: unknown, fallback: string): string {
+	return typeof value === "string" && DTMF_DIGIT_PATTERN.test(value) ? value : fallback;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The user level of the cascade — `GET /org-settings/me`
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The categories that have at least one user-scoped setting, mirroring `USER_SCOPED_CATEGORIES`.
+ *
+ * One today, and the list is stated rather than derived from the response so the screen can render
+ * a section it knows how to word even before the request resolves — and, more usefully, so a
+ * category the server starts exposing that this build has no copy for is a visible omission rather
+ * than an untitled block of raw JSON.
+ */
+export const USER_SCOPED_CATEGORIES: readonly string[] = [NOTIFICATIONS_CATEGORY];
+
+/**
+ * The settings one person may override for themselves, in the `notifications` category.
+ *
+ * Deliberately a strict subset of {@link NotificationSettings}, and which fields are absent is the
+ * whole design. `voicemailToEmailEnabled` is the organization's kill switch and is NOT here: the
+ * per-person answer to "do I want voicemail email at all?" already lives on
+ * `voicemail_box.email_mode`, and a `user_setting` row for the same question would be a second
+ * source of truth that disagreed with the mailbox the first time somebody changed one. `fromName`
+ * and `replyTo` are not here because they are what the ORGANIZATION appears to be.
+ *
+ * What is left is exactly the two presentation preferences: whether MY notification carries a
+ * playback link and whether it carries the transcript. Neither narrows or widens anybody else's
+ * mail, and neither has a compliance dimension — the org decides whether audio may leave at all.
+ *
+ * A name the catalogue does not mark user-scoped is refused by the server with a 400 NAMING the
+ * setting rather than being written into a row the resolver would ignore for ever, so this mirror
+ * being wrong is a visible failure rather than a silent one.
+ */
+export interface OwnNotificationSettings {
+	readonly voicemailToEmailIncludeLink: boolean;
+	readonly voicemailToEmailIncludeTranscription: boolean;
+}
+
+/** `GET /org-settings/me` — every user-scoped setting, grouped by category and fully resolved. */
+export interface OwnSettingsEnvelope {
+	readonly data: Readonly<Record<string, Record<string, unknown>>>;
+}
+
+export async function fetchOwnSettings(): Promise<OwnSettingsEnvelope> {
+	return await apiFetch<OwnSettingsEnvelope>("/org-settings/me");
+}
+
+export async function patchOwnCategory(
+	category: string,
+	patch: Readonly<Record<string, unknown>>,
+): Promise<SettingCategoryMutation> {
+	return await apiFetch<SettingCategoryMutation>(
+		`/org-settings/me/categories/${encodeURIComponent(category)}`,
+		{ method: "PATCH", body: JSON.stringify(patch) },
+	);
+}
+
+/**
+ * Narrows the `notifications` block of `GET …/me` to {@link OwnNotificationSettings}.
+ *
+ * The values are RESOLVED through all three levels — code default, then the organization's row,
+ * then this person's — so a `true` here may be the organization's answer rather than one this user
+ * chose. That is the correct thing to bind a switch to: the control shows what is in force for
+ * them, and touching it writes the override that makes it theirs.
+ *
+ * The fallbacks repeat the catalogue's own defaults rather than inventing new ones, on the same
+ * terms as {@link toNotificationSettings}: the API always sends every user-scoped name, so they are
+ * belt-and-braces against a version skew rather than an expected path.
+ */
+export function toOwnNotificationSettings(
+	data: Readonly<Record<string, Record<string, unknown>>>,
+): OwnNotificationSettings {
+	const category = data[NOTIFICATIONS_CATEGORY] ?? {};
+	return {
+		voicemailToEmailIncludeLink: category.voicemailToEmailIncludeLink !== false,
+		voicemailToEmailIncludeTranscription: category.voicemailToEmailIncludeTranscription !== false,
+	};
+}
+
 /** Value equality for a settings payload: scalars by identity, arrays element-wise and in order. */
 function sameSettingValue(a: unknown, b: unknown): boolean {
 	if (Array.isArray(a) || Array.isArray(b)) {
@@ -223,4 +434,28 @@ export function changedSettings<T extends object>(loaded: T, next: T): Record<st
 		}
 	}
 	return patch;
+}
+
+/**
+ * Narrows the category's untyped answer to {@link ComplianceSettings}, on the same terms as
+ * {@link toNotificationSettings}: the API always sends every catalogued name, so the fallbacks
+ * repeat the catalogue's own defaults rather than inventing new ones.
+ *
+ * Both fallbacks are the SAFE end of their setting — `replace` rather than `allow`, and
+ * `false` rather than `true` — but for opposite reasons, and neither is a guess about policy. A
+ * version skew that made this screen claim unverified caller IDs pass through untouched would be a
+ * claim about what the platform does on the wire, and it is the one claim not worth being wrong
+ * about; `requireKycForOutbound` defaults off because reporting a gate nothing enforces would send
+ * somebody hunting for a block that is not there.
+ */
+export function toComplianceSettings(data: Record<string, unknown>): ComplianceSettings {
+	const policy = data.unverifiedCallerIdPolicy;
+	return {
+		unverifiedCallerIdPolicy: UNVERIFIED_CALLER_ID_POLICIES.includes(
+			policy as UnverifiedCallerIdPolicy,
+		)
+			? (policy as UnverifiedCallerIdPolicy)
+			: "replace",
+		requireKycForOutbound: data.requireKycForOutbound === true,
+	};
 }

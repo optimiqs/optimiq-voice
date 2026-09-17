@@ -18,17 +18,21 @@ definitions to an already-connected `JetStreamManager`. That is config applicati
 
 Every subject carries its MAJOR version. Nothing outside `subjects.ts` concatenates one.
 
-| Subject                                    | Stream         | Event names (subject tail)                                                                                                                                                                            |
-| ------------------------------------------ | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `calls.evt.v1.<orgId>.<callId>.<event>`    | `CALLS`        | `channel.created` · `channel.ringing` · `channel.early-media` · `channel.answered` · `channel.bridged` · `channel.unbridged` · `channel.held` · `channel.unheld` · `channel.dtmf` · `channel.record.started` · `channel.record.stopped` · `channel.hangup` · `channel.destroyed` |
-| `sip.reg.v1.<orgId>.<aorHash>.<event>`     | `REGISTRATIONS`| `registered` · `unregistered` · `expired`                                                                                                                                                             |
-| `queue.evt.v1.<orgId>.<queueId>.<event>`   | `QUEUES`       | `caller.joined` · `caller.answered` · `caller.abandoned` · `agent.state`                                                                                                                              |
-| `cdr.leg.v1.<orgId>`                       | `CDR`          | type only: `cdr.leg.write`                                                                                                                                                                            |
-| `audit.evt.v1.<orgId>`                     | `AUDIT`        | type only: `audit.recorded`                                                                                                                                                                           |
-| `provision.evt.v1.<orgId>`                 | `PROVISION`    | type only: `device.requested` · `device.rendered` · `device.rejected`                                                                                                                                 |
-| `rpc.routing.v1.resolve`                   | — (core NATS)  | request-reply                                                                                                                                                                                         |
-| `rpc.authz.v1.check`                       | — (core NATS)  | request-reply                                                                                                                                                                                         |
-| `rpc.voicemail.v1.list`                    | — (core NATS)  | request-reply                                                                                                                                                                                         |
+| Subject                                                      | Stream          | Event names (subject tail)                                                                                                                                                                                                                                                       |
+| ------------------------------------------------------------ | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `calls.evt.v1.<orgId>.<callId>.<event>`                      | `CALLS`         | `channel.created` · `channel.ringing` · `channel.early-media` · `channel.answered` · `channel.bridged` · `channel.unbridged` · `channel.held` · `channel.unheld` · `channel.dtmf` · `channel.record.started` · `channel.record.stopped` · `channel.hangup` · `channel.destroyed` |
+| `sip.reg.v1.<orgId>.<aorHash>.<event>`                       | `REGISTRATIONS` | `registered` · `unregistered` · `expired`                                                                                                                                                                                                                                        |
+| `sip.evt.v1.<orgId>.<legId>.<event>`                         | `SIP`           | `dialog.progressed` · `dialog.answered` · `dialog.held` · `dialog.resumed` · `dialog.terminated` · `dialog.dtmf`                                                                                                                                                                 |
+| `queue.evt.v1.<orgId>.<queueId>.<event>`                     | `QUEUES`        | `caller.joined` · `caller.answered` · `caller.abandoned` · `agent.state`                                                                                                                                                                                                         |
+| `cdr.leg.v1.<orgId>`                                         | `CDR`           | type only: `cdr.leg.write`                                                                                                                                                                                                                                                       |
+| `audit.evt.v1.<orgId>`                                       | `AUDIT`         | type only: `audit.recorded`                                                                                                                                                                                                                                                      |
+| `provision.evt.v1.<orgId>`                                   | `PROVISION`     | type only: `device.requested` · `device.rendered` · `device.rejected`                                                                                                                                                                                                            |
+| `rpc.routing.v1.resolve`                                     | — (core NATS)   | request-reply                                                                                                                                                                                                                                                                    |
+| `rpc.authz.v1.check`                                         | — (core NATS)   | request-reply                                                                                                                                                                                                                                                                    |
+| `rpc.voicemail.v1.list`                                      | — (core NATS)   | request-reply                                                                                                                                                                                                                                                                    |
+| `rpc.sip.v1.invite`                                          | — (core NATS)   | request-reply; **Go caller, TypeScript responder** — admission only                                                                                                                                                                                                              |
+| `rpc.sip.v1.{ring,answer,hangup,reinvite}.<sipdInstanceTok>` | — (core NATS)   | request-reply; TypeScript caller, **Go responder**, addressed at ONE instance                                                                                                                                                                                                    |
+| `rpc.sip.v1.originate`                                       | — (core NATS)   | request-reply; TypeScript caller, **Go responder**, flat and queue-grouped                                                                                                                                                                                                       |
 
 Notes:
 
@@ -38,6 +42,14 @@ Notes:
   and `:` and is PII-adjacent, so it is never a raw subject token. The full AOR is in the payload.
 - **`_all`** (`QUEUE_SCOPE_ALL`) is the reserved queue token for an `agent.state` that is not
   specific to one queue.
+- **Two roots begin `sip.`, and they are different families.** `sip.reg` is the registrar's
+  transitions, keyed by a hashed AOR; `sip.evt` is a dialog's lifecycle, keyed by the LEG id. They
+  are separate roots and separate streams because they differ by two orders of magnitude in volume
+  and because a `dialog.terminated` is CDR evidence where a `registered` is presence.
+- **`rpc.sip.v1.*` crosses the language border in BOTH directions.** `invite` is a Go caller asking
+  a TypeScript responder; the five commands are TypeScript callers asking Go responders. Every one
+  of them is served RAW — a Nest `@MessagePattern` waits for framing a Go peer never sends, and on
+  `invite` that means every INVITE times out into a `503`.
 - **`type` is unique within a family, not globally.** The subject selects the family; `registered`
   means nothing without `sip.reg.v1.…` around it. `validateEvent(subject, payload)` does exactly
   that resolution.
@@ -53,14 +65,15 @@ matchesSubject("calls.evt.v1.>", subject); // NATS wildcard semantics, no broker
 
 ## Streams
 
-| Stream          | Subjects                 | Retention | Discard | Max age | Max bytes | Dedupe window |
-| --------------- | ------------------------ | --------- | ------- | ------- | --------- | ------------- |
-| `CALLS`         | `calls.evt.v1.>`         | limits    | old     | 72 h    | 8 GiB     | 2 min         |
-| `REGISTRATIONS` | `sip.reg.v1.>`           | limits    | old     | 24 h    | 1 GiB     | 2 min         |
-| `QUEUES`        | `queue.evt.v1.>`         | limits    | old     | 7 d     | 2 GiB     | 2 min         |
-| `CDR`           | `cdr.leg.v1.*`           | limits    | **new** | 30 d    | 16 GiB    | 10 min        |
-| `AUDIT`         | `audit.evt.v1.*`         | limits    | **new** | 400 d   | 16 GiB    | 2 min         |
-| `PROVISION`     | `provision.evt.v1.*`     | limits    | old     | 30 d    | 1 GiB     | 2 min         |
+| Stream          | Subjects             | Retention | Discard | Max age | Max bytes | Dedupe window |
+| --------------- | -------------------- | --------- | ------- | ------- | --------- | ------------- |
+| `CALLS`         | `calls.evt.v1.>`     | limits    | old     | 72 h    | 8 GiB     | 2 min         |
+| `REGISTRATIONS` | `sip.reg.v1.>`       | limits    | old     | 24 h    | 1 GiB     | 2 min         |
+| `SIP`           | `sip.evt.v1.>`       | limits    | old     | 7 d     | 4 GiB     | 2 min         |
+| `QUEUES`        | `queue.evt.v1.>`     | limits    | old     | 7 d     | 2 GiB     | 2 min         |
+| `CDR`           | `cdr.leg.v1.*`       | limits    | **new** | 30 d    | 16 GiB    | 10 min        |
+| `AUDIT`         | `audit.evt.v1.*`     | limits    | **new** | 400 d   | 16 GiB    | 2 min         |
+| `PROVISION`     | `provision.evt.v1.*` | limits    | old     | 30 d    | 1 GiB     | 2 min         |
 
 `discard: new` on `CDR` and `AUDIT` is deliberate. The other streams are live-state feeds where
 dropping the oldest message is correct. Those two are ledgers — billing and compliance — so under
@@ -72,17 +85,30 @@ All definitions ship `numReplicas: 1` (single-node dev). Production wraps them:
 
 ## KV buckets
 
-| Bucket          | TTL   | Storage | Key                              | Holds                                    |
-| --------------- | ----- | ------- | -------------------------------- | ---------------------------------------- |
-| `registrations` | 1 h   | file    | `<orgId>.<aorHash>`              | AOR → contact bindings                   |
-| `channels`      | 6 h   | file    | `<orgId>.<callId>.<legId>`       | live channel state for failover/drain    |
-| `presence`      | 5 min | memory  | `<orgId>.<extensionId>`          | BLF / device state                       |
-| `agent-state`   | 12 h  | file    | `<orgId>.<agentId>`              | ACD agent availability                   |
-| `routing-cache` | 1 h   | file    | `<orgId>.<artifact>[.<disc>]`    | compiled routing artifacts               |
+| Bucket          | TTL   | Storage | Key                             | Holds                                 |
+| --------------- | ----- | ------- | ------------------------------- | ------------------------------------- |
+| `registrations` | 1 h   | file    | `<orgId>.<aorHash>`             | AOR → contact bindings                |
+| `channels`      | 6 h   | file    | `<orgId>.<callId>.<legId>`      | live channel state for failover/drain |
+| `presence`      | 5 min | memory  | `<orgId>.<extensionId>`         | BLF / device state                    |
+| `agent-state`   | 12 h  | file    | `<orgId>.<agentId>`             | ACD agent availability                |
+| `routing-cache` | 1 h   | file    | `<orgId>.<artifact>[.<disc>]`   | compiled routing artifacts            |
+| `sip-dialogs`   | 6 h   | file    | `<legId>`                       | dialog → owning `sipd`, under a lease |
+| `trunks`        | **0** | file    | `<orgId>.<trunkId>`             | carrier config the SIP edge dials     |
+| `sip-acl`       | **0** | file    | `<network>` (`.` and `/` → `-`) | source networks the edge admits       |
+
+Three of these keys are **not** organization-scoped — `did-index`, `media-sessions`, `sip-dialogs`
+and `sip-acl` — always for the same reason: the READER does not know the tenant. An inbound INVITE
+carries a dialled number and a source address and nothing else; a survivor reaping a dead `sipd`'s
+claims has a leg id and nothing else. The org travels in the value.
+
+A **TTL of `0` means never expire**, and it marks a CONFIGURATION bucket rather than a live-state
+one. An expiring `did-index` or `trunks` entry is an outage produced by a timer rather than by a
+change, and an expiring `sip-acl` `deny` entry is worse than that — it is a security boundary
+failing OPEN.
 
 Buckets hold **live state, never history**; the streams above are the replayable log. Every TTL is
 a self-healing backstop so a crashed writer's entries evaporate instead of lying forever. For
-`routing-cache` the TTL is *only* a backstop — correctness comes from the compiler deleting keys
+`routing-cache` the TTL is _only_ a backstop — correctness comes from the compiler deleting keys
 on save.
 
 Build keys with `kvKeyFor.*`; the same "never concatenate at a call site" rule as subjects.
@@ -91,15 +117,15 @@ Build keys with `kvKeyFor.*`; the same "never concatenate at a call site" rule a
 
 ```jsonc
 {
-  "id": "018f…",                      // uuid v7 — also the Nats-Msg-Id dedupe key
-  "at": "2026-08-05T10:00:00.000Z",   // when it HAPPENED (UTC, offsets rejected)
-  "orgId": "…",                       // must equal the subject's org token
-  "subject": "calls.evt.v1.…",        // self-describing: survives a replay to a file
-  "type": "channel.answered",         // unique within its family
-  "source": "engine",                 // kebab-case service name
-  "traceId": "…",                     // optional
-  "correlationId": "…",               // optional
-  "data": {}
+	"id": "018f…", // uuid v7 — also the Nats-Msg-Id dedupe key
+	"at": "2026-08-05T10:00:00.000Z", // when it HAPPENED (UTC, offsets rejected)
+	"orgId": "…", // must equal the subject's org token
+	"subject": "calls.evt.v1.…", // self-describing: survives a replay to a file
+	"type": "channel.answered", // unique within its family
+	"source": "engine", // kebab-case service name
+	"traceId": "…", // optional
+	"correlationId": "…", // optional
+	"data": {},
 }
 ```
 
@@ -120,10 +146,10 @@ Build keys with `kvKeyFor.*`; the same "never concatenate at a call site" rule a
 
 ## Where value domains live
 
-| Domain                                                                                          | Owner                     |
-| ------------------------------------------------------------------------------------------------ | ------------------------- |
-| leg side, direction, hangup side, SIP transport, DTMF source, bridge mode, recording kind, agent status | **this package** (enums)  |
-| hangup **cause** (66 names), destination type, disposition                                      | `@optimiq-voice/cdr-db`   |
+| Domain                                                                                                  | Owner                    |
+| ------------------------------------------------------------------------------------------------------- | ------------------------ |
+| leg side, direction, hangup side, SIP transport, DTMF source, bridge mode, recording kind, agent status | **this package** (enums) |
+| hangup **cause** (66 names), destination type, disposition                                              | `@optimiq-voice/cdr-db`  |
 
 `packages/events` must not depend on a database package — the whole point of the backbone is that
 `apps/sipd` and `apps/mediad` (Go) and every TS service share one contract without dragging Drizzle
@@ -143,12 +169,12 @@ When `packages/telephony` lands (plan §3.3) it becomes the shared home for all 
 
 ```ts
 import {
-  ensureStreams,
-  ensureKvBuckets,
-  makeCallEvent,
-  validateEvent,
-  subjectFilterFor,
-  CALLS_STREAM,
+	ensureStreams,
+	ensureKvBuckets,
+	makeCallEvent,
+	validateEvent,
+	subjectFilterFor,
+	CALLS_STREAM,
 } from "@optimiq-voice/events";
 
 // bootstrap (idempotent, safe on every boot)
@@ -158,17 +184,17 @@ await ensureKvBuckets(jsm);
 
 // publish — the subject is derived, never typed by hand
 const event = makeCallEvent("channel.hangup", {
-  orgId,
-  callId,
-  source: "engine",
-  data: { legId, cause: "NORMAL_CLEARING", causeCode: 16, side: "caller" },
+	orgId,
+	callId,
+	source: "engine",
+	data: { legId, cause: "NORMAL_CLEARING", causeCode: 16, side: "caller" },
 });
 await jsm.jetstream().publish(event.subject, encode(JSON.stringify(event)), { msgID: event.id });
 
 // consume — resolve the schema from the delivered subject
 const parsed = validateEvent(msg.subject, JSON.parse(decode(msg.data)));
 if (parsed.type === "channel.hangup") {
-  // parsed.data is narrowed to the hangup payload
+	// parsed.data is narrowed to the hangup payload
 }
 ```
 

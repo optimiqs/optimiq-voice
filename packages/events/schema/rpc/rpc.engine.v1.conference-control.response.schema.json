@@ -1,0 +1,68 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"type": "object",
+	"properties": {
+		"ok": {
+			"type": "boolean"
+		},
+		"action": {
+			"type": "string",
+			"enum": ["mute", "unmute", "deaf", "undeaf", "kick", "volume", "lock", "unlock"]
+		},
+		"instanceId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128
+		},
+		"memberCount": {
+			"default": 0,
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 9007199254740991
+		},
+		"locked": {
+			"type": "boolean"
+		},
+		"memberRef": {
+			"type": "string",
+			"maxLength": 128
+		},
+		"muted": {
+			"type": "boolean"
+		},
+		"deafened": {
+			"type": "boolean"
+		},
+		"moderator": {
+			"type": "boolean"
+		},
+		"talkGainPercent": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 400
+		},
+		"listenGainPercent": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 400
+		},
+		"reason": {
+			"type": "string",
+			"enum": [
+				"bad-request",
+				"unknown-conference",
+				"unknown-member",
+				"not-servable",
+				"media-refused",
+				"shutting-down",
+				"internal"
+			]
+		},
+		"error": {
+			"type": "string",
+			"maxLength": 512
+		}
+	},
+	"required": ["ok", "action", "instanceId", "memberCount"],
+	"additionalProperties": false
+}

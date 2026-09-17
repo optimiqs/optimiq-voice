@@ -1,8 +1,9 @@
-import { Inject, Injectable } from "@nestjs/common";
+import { Inject, Injectable, Optional } from "@nestjs/common";
 import { requireActiveOrganizationId } from "@optimiq-voice/auth";
+import { purgedRecordingSoftDeleteQuery } from "@optimiq-voice/cdr-db";
 import { getLogger } from "@optimiq-voice/logging";
 import { openMediaResponse } from "../../media/media-response";
-import { ObjectKeyOutsideRootError } from "../../storage";
+import { ObjectKeyOutsideRootError, objectContentType } from "../../storage";
 import { nextCursorFrom } from "../query/cdr-cursor";
 import { CdrCursorError } from "../query/cdr-cursor";
 import { MAX_RANGE_DAYS, rangeDays, resolveTimeRange } from "../query/cdr.dto";
@@ -17,12 +18,14 @@ import {
 	CdrSigningUnavailableException,
 } from "../shared/cdr.errors";
 import { CDR_DATABASE, CDR_ENV, CDR_RECORDING_STORE } from "../shared/cdr.tokens";
+import { RECORDING_ACCESS_AUDIT } from "./access-audit";
 import { mintRecordingToken, recordingMediaPath, verifyRecordingToken } from "./recording-token";
 import type { MediaResponse } from "../../media/media-response";
 import type { ObjectStore } from "../../storage";
 import type { RecordingListQuery } from "../query/cdr.dto";
 import type { RecordingListRow } from "../query/cdr.repository";
 import type { CdrEnv } from "../shared/cdr-env";
+import type { RecordingAccessAudit, RecordingAccessActor } from "./access-audit";
 import type { AppSession } from "@optimiq-voice/auth";
 import type { CdrDatabaseClient } from "@optimiq-voice/cdr-db";
 
@@ -95,7 +98,54 @@ export class RecordingsService {
 		@Inject(CDR_ENV) private readonly env: CdrEnv,
 		@Inject(CDR_DATABASE) private readonly database: CdrDatabaseClient,
 		@Inject(CDR_RECORDING_STORE) private readonly store: ObjectStore,
+		/**
+		 * The access ledger, implemented on the PBX side and therefore OPTIONAL on exactly the terms
+		 * `purge-audit.ts` sets out for its sibling: a deployment without the PBX area has no
+		 * `audit_log` to write, and recording playback must keep working regardless.
+		 *
+		 * The consequence is stated plainly rather than hidden: with the port absent, reads are not
+		 * audited. That is a deployment shape (CDR without PBX) rather than a failure, and the
+		 * alternative — refusing to serve media because a ledger in another database is unreachable
+		 * — would turn an audit outage into a customer-facing one.
+		 */
+		@Optional()
+		@Inject(RECORDING_ACCESS_AUDIT)
+		private readonly accessAudit?: RecordingAccessAudit,
 	) {}
+
+	/**
+	 * Appends one access row, and never fails the read for it.
+	 *
+	 * The listen has already been authorised and is about to happen (or has just happened), and it
+	 * is not undone by a ledger that would not take the row — so the honest failure mode is a read
+	 * that occurred and was not recorded, logged loudly here. The mirror — refusing a listen
+	 * because `pbx-db` is down — trades a gap in the ledger for an outage in the product, which is
+	 * the same trade `recording-retention-sweeper.service.ts` refuses for its purge rows.
+	 */
+	private async audit(
+		organizationId: string,
+		recordingId: string,
+		event: "download-url" | "play",
+		actor: RecordingAccessActor,
+		detail: Record<string, unknown>,
+	): Promise<void> {
+		if (this.accessAudit === undefined) {
+			return;
+		}
+		try {
+			await this.accessAudit.recordAccess(organizationId, {
+				recordingId,
+				event,
+				actor,
+				detail,
+			});
+		} catch (error) {
+			logger.error(
+				{ organizationId, recordingId, event, err: String(error) },
+				"a recording access could not be recorded in the audit ledger",
+			);
+		}
+	}
 
 	private organizationId(session: AppSession): string {
 		return requireActiveOrganizationId(session);
@@ -174,6 +224,26 @@ export class RecordingsService {
 		const expiresAt = Math.floor(Date.now() / 1000) + ttl;
 		const token = mintRecordingToken({ r: row.id, o: organizationId, e: expiresAt }, secret);
 
+		// The authorisation, recorded at the moment it is granted rather than when it is used — see
+		// `access-audit.ts` for why the mint and the fetch are two rows and not one.
+		await this.audit(
+			organizationId,
+			row.id,
+			"download-url",
+			{
+				kind: "user",
+				userId: session.user.id,
+				ref: null,
+				ipAddress: session.session.ipAddress ?? null,
+				userAgent: session.session.userAgent ?? null,
+			},
+			{
+				objectKey: row.objectKey,
+				expiresAt: new Date(expiresAt * 1000).toISOString(),
+				expiresInSeconds: ttl,
+			},
+		);
+
 		return {
 			data: {
 				url: recordingMediaPath(token),
@@ -181,6 +251,70 @@ export class RecordingsService {
 				expiresInSeconds: ttl,
 			},
 		};
+	}
+
+	/**
+	 * Deletes one recording on request: the object goes, the row becomes a tombstone.
+	 *
+	 * ## Why this exists now
+	 *
+	 * `recordings.delete` has been in the permission registry since it was written and there has
+	 * never been a `@Delete` on this controller — a grant an administrator could hand out believing
+	 * it did something, guarding nothing. This is the endpoint it always described.
+	 *
+	 * ## Objects first, row second — the sweep's ordering, and for the sweep's reason
+	 *
+	 * `recording-retention-sweeper.service.ts` argues it at length and the argument does not change
+	 * because a person pressed a button instead of a timer firing: a row tombstoned before its
+	 * object is gone is a recording this API refuses to play while the audio is still in the bucket
+	 * — deleted for the customer and retained for a subpoena, which is the worst of both. A store
+	 * that refuses the delete therefore fails the request and leaves the recording playable, so the
+	 * caller can try again rather than being told something happened that did not.
+	 *
+	 * ## A tombstone, not a `DELETE FROM`
+	 *
+	 * The row survives with `deleted_at` set, exactly as the retention sweep leaves it, and the
+	 * tombstone purge collects it after `DEFAULT_RECORDING_TOMBSTONE_MONTHS`. That is not
+	 * squeamishness about deletion: `call_legs.recording_key` points at this object, and a CDR row
+	 * whose recording reference resolves to nothing at all cannot tell a reader whether the
+	 * recording was deleted or never made. The tombstone is what makes the 410 — "it existed, it is
+	 * gone" — expressible, and `recordings.service.ts` and `cdr.repository.ts` already read it that
+	 * way everywhere else.
+	 *
+	 * Deleting a recording that is already a tombstone is a 410 rather than a 204. It is not
+	 * idempotence being refused — nothing changes either way — it is the endpoint declining to
+	 * report that it deleted something it did not.
+	 */
+	async delete(
+		session: AppSession,
+		id: string,
+	): Promise<{ readonly data: { readonly id: string } }> {
+		const organizationId = this.organizationId(session);
+		const row = await this.database.withTenantScope(
+			organizationId,
+			async (transaction) => await getRecording(transaction, id),
+		);
+		if (row === undefined) {
+			throw new CdrNotFoundException("recording", id);
+		}
+		if (row.deletedAt !== null) {
+			throw new CdrMediaGoneException();
+		}
+
+		// Idempotent on all three drivers — an object that is already gone is the state we wanted —
+		// so a retry after a partial failure costs nothing. A real transport failure propagates and
+		// the row stays untouched, which is the point of doing this first.
+		await this.store.delete(row.objectKey);
+
+		await this.database.withTenantScope(organizationId, async (transaction) => {
+			await transaction.execute(purgedRecordingSoftDeleteQuery(new Date(), [row.id]));
+		});
+
+		logger.info(
+			{ organizationId, recordingId: row.id, actorId: session.user.id },
+			"a recording was deleted on request",
+		);
+		return { data: { id: row.id } };
 	}
 
 	/**
@@ -193,6 +327,7 @@ export class RecordingsService {
 	async openSignedMedia(
 		token: string,
 		rangeHeader?: string | undefined,
+		client?: { readonly ipAddress?: string | undefined; readonly userAgent?: string | undefined },
 	): Promise<ResolvedRecordingMedia> {
 		const secret = this.env.CDR_RECORDING_URL_SECRET;
 		if (secret === undefined) {
@@ -240,24 +375,35 @@ export class RecordingsService {
 			throw new CdrMediaGoneException();
 		}
 
+		// Recorded once the read is certain to be served and not before: every refusal above answers
+		// a request that never reached any audio, and a ledger row for each of them would drown the
+		// listens — the events this table exists to hold — in noise a WAF already logs.
+		await this.audit(
+			payload.o,
+			row.id,
+			"play",
+			{
+				kind: "token",
+				userId: null,
+				// The token's own subject. No person is named, because none is known — `access-audit.ts`
+				// argues why attributing this to the minter would be a fabrication.
+				ref: `recording-token:${payload.r}`,
+				ipAddress: client?.ipAddress ?? null,
+				userAgent: client?.userAgent ?? null,
+			},
+			{
+				objectKey: row.objectKey,
+				sizeBytes: stat.sizeBytes,
+				ranged: rangeHeader !== undefined && rangeHeader.length > 0,
+			},
+		);
+
 		return await openMediaResponse(this.store, row.objectKey, stat.sizeBytes, {
-			contentType: contentTypeFor(row.objectKey),
+			contentType: objectContentType(row.objectKey),
 			fileName: downloadFileName(row),
 			rangeHeader,
 		});
 	}
-}
-
-/** Content type from the object key's extension. WAV is what the engine writes today. */
-function contentTypeFor(objectKey: string): string {
-	const lower = objectKey.toLowerCase();
-	if (lower.endsWith(".mp3")) {
-		return "audio/mpeg";
-	}
-	if (lower.endsWith(".ogg") || lower.endsWith(".opus")) {
-		return "audio/ogg";
-	}
-	return "audio/wav";
 }
 
 /**

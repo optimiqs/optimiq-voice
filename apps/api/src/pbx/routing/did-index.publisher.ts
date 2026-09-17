@@ -13,6 +13,18 @@ import type { RoutingArtifact } from "@optimiq-voice/routing";
 const logger = getLogger("api.pbx");
 
 /**
+ * Reads many keys with a bounded number of requests in flight.
+ *
+ * The reconcile has to look at every key in the bucket, and doing that with `await` inside the loop
+ * made it n SEQUENTIAL broker round trips rather than a scan — minutes of wall clock at a hundred
+ * thousand keys, in a fire-and-forget continuation holding a connection. The real fix is the
+ * per-organization reverse key the class header proposes, which removes the whole-key-space walk;
+ * this bounds the cost of the walk that is still here without letting an unbounded fan-out loose on
+ * the connection.
+ */
+const READ_CONCURRENCY = 64;
+
+/**
  * The `did-index` KV half of the NATS backbone: **which tenant does this DID belong to?**
  *
  * ## The problem it exists to solve
@@ -161,7 +173,7 @@ export class DidIndexPublisher implements OnModuleInit, OnApplicationShutdown {
 	): Promise<DidIndexSyncResult> {
 		const bucket = this.bucket;
 		if (bucket === undefined) {
-			return { published: 0, deleted: 0, conflicts: [], skipped: true };
+			return { published: 0, deleted: 0, conflicts: [], failed: 0, skipped: true };
 		}
 
 		const wanted = new Map<string, DidIndexEntry>();
@@ -184,6 +196,7 @@ export class DidIndexPublisher implements OnModuleInit, OnApplicationShutdown {
 		}
 
 		const conflicts: DidIndexConflict[] = [];
+		let failed = 0;
 		let published = 0;
 		let deleted = 0;
 
@@ -219,29 +232,43 @@ export class DidIndexPublisher implements OnModuleInit, OnApplicationShutdown {
 				published += 1;
 			} catch (error) {
 				this.failed += 1;
+				failed += 1;
 				logger.error({ key, organizationId, error }, "failed to write a did-index entry");
 			}
 		}
 
+		const candidates: string[] = [];
 		for await (const key of await bucket.keys()) {
-			if (wanted.has(key)) {
-				continue;
+			if (!wanted.has(key)) {
+				candidates.push(key);
 			}
-			const existing = await this.readEntry(bucket, key);
-			if (existing === undefined || existing.organizationId !== organizationId) {
-				continue;
-			}
-			try {
-				await bucket.delete(key);
-				this.removed += 1;
-				deleted += 1;
-			} catch (error) {
-				this.failed += 1;
-				logger.error({ key, organizationId, error }, "failed to delete a did-index entry");
+		}
+		for (let start = 0; start < candidates.length; start += READ_CONCURRENCY) {
+			const batch = candidates.slice(start, start + READ_CONCURRENCY);
+			const entries = await Promise.all(
+				batch.map(async (key) => await this.readEntry(bucket, key)),
+			);
+			for (const [index, existing] of entries.entries()) {
+				const key = batch[index];
+				if (key === undefined || existing === undefined) {
+					continue;
+				}
+				if (existing.organizationId !== organizationId) {
+					continue;
+				}
+				try {
+					await bucket.delete(key);
+					this.removed += 1;
+					deleted += 1;
+				} catch (error) {
+					this.failed += 1;
+					failed += 1;
+					logger.error({ key, organizationId, error }, "failed to delete a did-index entry");
+				}
 			}
 		}
 
-		return { published, deleted, conflicts, skipped: false };
+		return { published, deleted, conflicts, failed, skipped: false };
 	}
 
 	/** Reads one DID's owner. Used by the resolve responder's diagnostics and by verification. */
@@ -265,10 +292,21 @@ export class DidIndexPublisher implements OnModuleInit, OnApplicationShutdown {
 			return [];
 		}
 		const all: StoredDidIndexEntry[] = [];
+		// Drain the key listing before reading: awaiting a get inside the `keys()` iteration
+		// suspends its ordered consumer, which then ends the listing early and silently.
+		const keys: string[] = [];
 		for await (const key of await bucket.keys()) {
-			const entry = await this.readEntry(bucket, key);
-			if (entry !== undefined) {
-				all.push(entry);
+			keys.push(key);
+		}
+		for (let start = 0; start < keys.length; start += READ_CONCURRENCY) {
+			const batch = keys.slice(start, start + READ_CONCURRENCY);
+			const entries = await Promise.all(
+				batch.map(async (key) => await this.readEntry(bucket, key)),
+			);
+			for (const entry of entries) {
+				if (entry !== undefined) {
+					all.push(entry);
+				}
 			}
 		}
 		return all;
@@ -313,6 +351,11 @@ export interface DidIndexSyncResult {
 	readonly published: number;
 	readonly deleted: number;
 	readonly conflicts: readonly DidIndexConflict[];
+	/**
+	 * KV writes and deletes that threw. Non-zero means the reconcile is incomplete, so the caller
+	 * must leave the outbox obligation owed and let the sweeper republish.
+	 */
+	readonly failed: number;
 	/** True when there is no broker and nothing was attempted. */
 	readonly skipped: boolean;
 }

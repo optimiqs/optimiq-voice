@@ -7,6 +7,7 @@ export {
 	organizationRoleIds,
 } from "./access-control";
 export {
+	assertSsoProviderOrganization,
 	type Auth,
 	type AuthApi,
 	type AuthCookieOptions,
@@ -20,9 +21,14 @@ export {
 	DEFAULT_SESSION_COOKIE_CACHE_SECONDS,
 	DEFAULT_SESSION_EXPIRES_IN_SECONDS,
 	DEFAULT_SESSION_UPDATE_AGE_SECONDS,
+	emailMatchesDomain,
 	ORGANIZATION_MEMBERSHIP_ROLES,
+	type OrganizationCreatedEvent,
 	type OrganizationMembershipRole,
+	resolveSsoProviderOrganizationId,
 	SESSION_COOKIE_CACHE_VERSION,
+	type SsoProviderConfig,
+	SsoProviderConfigError,
 } from "./auth";
 export {
 	CALL_TOKEN_AUDIENCE,
@@ -50,6 +56,7 @@ export {
 	type PermissionGroup,
 	type PermissionScope,
 	PERMISSIONS,
+	RETIRED_PERMISSIONS,
 	SYSTEM_ROLE_IDS,
 	SYSTEM_ROLE_TEMPLATES,
 	type SystemRoleId,
@@ -81,6 +88,7 @@ export {
 	jwks,
 	member,
 	organization,
+	rateLimit,
 	session,
 	twoFactor,
 	user,

@@ -9,17 +9,25 @@ import {
 	InboundRoutesPanel,
 	OutboundRoutesPanel,
 	TimeConditionsPanel,
+	TranslationRulesetsPanel,
 } from "./routing-panels";
 import { RoutingToolsPanel } from "./routing-tools-panel";
 
 /**
- * Routing: five views of one subject.
+ * Routing: six views of one subject.
  *
- * Inbound routes, outbound routes, time conditions and feature codes are all gated by `routes.*`
- * and all answer the same question — how does a call get from where it arrives to where it should
- * go. Four sidebar entries would be four ways to say "routing", and four `PAGE_PERMISSIONS`
- * entries that all have to say the same thing. One page, with the section in the URL, keeps every
- * view linkable without any of that.
+ * Inbound routes, outbound routes, time conditions, number translations and feature codes are all
+ * gated by `routes.*` (or, for two of them, by a permission this page's `PAGE_PERMISSIONS` entry
+ * already names) and all answer the same question — how does a call get from where it arrives to
+ * where it should go. Five sidebar entries would be five ways to say "routing", and five
+ * `PAGE_PERMISSIONS` entries that all have to say the same thing. One page, with the section in the
+ * URL, keeps every view linkable without any of that.
+ *
+ * Translations joined rather than going to the Dial plan page, and the permission is what decided
+ * it: a ruleset rides `routes.*`, so filing it beside the aliases and streams under `dial-plan.*`
+ * would have hidden it from the people who own the routes that carry it. Call flows went the other
+ * way, to a route of their own, because `call-flows.toggle` is held by somebody who owns no part of
+ * this page.
  *
  * The tab lives in `?tab=` rather than in component state for the same reason the list search
  * does: a support conversation is "look at the outbound route" and that has to be a link.
@@ -28,6 +36,7 @@ const TAB_LABELS: Readonly<Record<RoutingTab, string>> = {
 	inbound: "Inbound",
 	outbound: "Outbound",
 	"time-conditions": "Time conditions",
+	translations: "Number translations",
 	"feature-codes": "Feature codes",
 	tools: "Compile & simulate",
 };
@@ -63,6 +72,9 @@ export function RoutingScreen() {
 				</TabsPanel>
 				<TabsPanel value="time-conditions">
 					<TimeConditionsPanel />
+				</TabsPanel>
+				<TabsPanel value="translations">
+					<TranslationRulesetsPanel />
 				</TabsPanel>
 				<TabsPanel value="feature-codes">
 					<FeatureCodesPanel />

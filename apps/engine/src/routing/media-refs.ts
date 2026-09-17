@@ -55,12 +55,27 @@ export interface MediaRefSettings {
 	 * falls back. See the header for why there is no HTTP alternative.
 	 */
 	readonly objectMediaRoot: string;
+	/**
+	 * The compiled artifact's `prompts` table: prompt row id → domain `MediaRef`, normally
+	 * `object://<objectKey>`.
+	 *
+	 * A plan node names a tenant's prompt by ROW id, but the audio was uploaded under a DIFFERENT
+	 * id, so `promptPrefix + promptId` names a file that has never existed on any deployment —
+	 * `mediad` answers `no such prompt` and the caller hears nothing. The table is the only thing
+	 * that knows the two ids apart, and it comes from the artifact because it is per-organization
+	 * and the engine holds no database handle.
+	 *
+	 * Empty is the pre-table state (an old artifact, or the platform's own sound set), and a MISS
+	 * falls back to the prefix — which is still right for a bare stem like `unavailable`.
+	 */
+	readonly prompts: Readonly<Record<string, string>>;
 }
 
 export const DEFAULT_MEDIA_REF_SETTINGS: MediaRefSettings = {
 	promptPrefix: "sound:",
 	fallbackMedia: "sound:unavailable",
 	objectMediaRoot: "",
+	prompts: {},
 };
 
 /** Media URI schemes Asterisk understands directly; anything already in one is passed through. */
@@ -84,7 +99,7 @@ export function resolveMediaRef(
 	}
 	const promptId = node.promptId?.trim();
 	if (promptId !== undefined && promptId !== "") {
-		return `${settings.promptPrefix}${promptId}`;
+		return promptMedia(promptId, settings);
 	}
 	return undefined;
 }
@@ -96,6 +111,80 @@ export function resolveMediaRefOr(
 ): string {
 	return resolveMediaRef(node, settings) ?? settings.fallbackMedia;
 }
+
+/**
+ * What a media server can be asked to do with one `MediaRef`.
+ *
+ * The typed half of {@link translateMediaRef}, added because one caller needs the REASON and not
+ * just the absence. `StreamPlanNode` compiles a mandatory `fallbackNodeId` precisely so that a
+ * source no driver can open produces a routed call rather than silence — and the note the walker
+ * leaves on that fallback is the only place an operator will ever learn WHY the stream did not
+ * play. "`translateMediaRef` returned undefined" is not that sentence; "no media server this
+ * platform ships can open an http(s) source" is.
+ */
+export type MediaRefResolution =
+	| { readonly kind: "playable"; readonly media: string }
+	| { readonly kind: "unplayable"; readonly reason: string };
+
+/**
+ * One `MediaRef` in the media server's vocabulary, or a refusal that says why.
+ *
+ * ## Remote sources, and why neither driver takes one
+ *
+ * This was checked rather than assumed, because the obvious hope is that ARI passes an `https://`
+ * URI through to Asterisk. It does — `AriMediaAdapter.play` puts whatever it is handed straight into
+ * `POST /channels/{id}/play` — but Asterisk's media vocabulary is `sound:`, `recording:`, `number:`,
+ * `digits:`, `characters:` and `tone:`, so the request comes back a 4xx and the caller hears the
+ * silence between issuing a verb and having it fail. Passing it through would move the failure from
+ * a place that can take a fallback branch to a place that cannot.
+ *
+ * `mediad` refuses by name and says so on the wire: `apps/mediad/internal/audio/library.go` resolves
+ * `sound:`, `tone:` and `moh:` out of a mounted directory and answers `ErrUnsupportedScheme` for
+ * anything else, deliberately — a fetch-and-stage rung would put a download on the call path.
+ *
+ * So the honest answer for both drivers is the same refusal, and the remote-fetch rung is still the
+ * seam this file's header describes. What changed is that the gap now has a NAME the walker can read
+ * out into a note.
+ */
+export function resolveMediaRefOrExplain(
+	ref: string,
+	settings: MediaRefSettings = DEFAULT_MEDIA_REF_SETTINGS,
+): MediaRefResolution {
+	const media = translateMediaRef(ref, settings);
+	if (media !== undefined) {
+		return { kind: "playable", media };
+	}
+	const trimmed = ref.trim();
+	if (trimmed === "") {
+		return { kind: "unplayable", reason: "the media reference is empty" };
+	}
+	if (REMOTE_SCHEMES.some((scheme) => trimmed.startsWith(scheme))) {
+		return {
+			kind: "unplayable",
+			reason:
+				"no media server this platform ships can open a remote source: Asterisk's media vocabulary " +
+				"has no http(s) scheme, and mediad plays only what is mounted. See media-refs.ts.",
+		};
+	}
+	if (trimmed.startsWith("tts://")) {
+		return { kind: "unplayable", reason: "there is no text-to-speech renderer on this platform" };
+	}
+	if (trimmed.startsWith("object://")) {
+		return {
+			kind: "unplayable",
+			reason:
+				"the object store is not mounted for the media server (set ENGINE_MEDIA_OBJECT_ROOT), or " +
+				"the key escapes it",
+		};
+	}
+	return {
+		kind: "unplayable",
+		reason: `"${trimmed}" is not a media reference this release renders`,
+	};
+}
+
+/** The schemes that name audio somewhere else on the network. Neither driver can open one. */
+const REMOTE_SCHEMES = ["http://", "https://", "stream://"] as const;
 
 /** One `MediaRef` in the media server's vocabulary, or `undefined` when it has no equivalent. */
 export function translateMediaRef(
@@ -113,7 +202,7 @@ export function translateMediaRef(
 		return trimmed;
 	}
 	if (trimmed.startsWith("prompt://")) {
-		return `${settings.promptPrefix}${trimmed.slice("prompt://".length)}`;
+		return promptMedia(trimmed.slice("prompt://".length), settings);
 	}
 	if (trimmed.startsWith("tone://")) {
 		return `tone:${trimmed.slice("tone://".length)}`;
@@ -127,9 +216,30 @@ export function translateMediaRef(
 	if (trimmed.startsWith("object://")) {
 		return objectMedia(trimmed.slice("object://".length), settings);
 	}
-	// `stream://`, `tts://`, `https://` — real sources with no direct ARI equivalent. See the
-	// header: reporting the gap beats playing silence.
+	// `stream://`, `tts://`, `http(s)://` — real sources with no direct ARI equivalent. See the
+	// header: reporting the gap beats playing silence, and {@link resolveMediaRefOrExplain} is what
+	// turns the gap into a sentence an operator can act on.
 	return undefined;
+}
+
+/**
+ * One prompt id in the media server's vocabulary.
+ *
+ * The artifact's table first, because a tenant's prompt is a ROW id and only the table knows which
+ * object holds its audio; the deployment-wide prefix second, because a bare stem (`unavailable`,
+ * `digits/7`) is not a row at all and never appears in the table. A table entry that cannot be
+ * rendered — an `object://` key with no mount — falls through to the prefix rather than to nothing,
+ * which keeps the refusal (and its reason) identical to what every release before the table did.
+ */
+function promptMedia(promptId: string, settings: MediaRefSettings): string {
+	const ref = settings.prompts[promptId];
+	if (ref !== undefined) {
+		const media = translateMediaRef(ref, settings);
+		if (media !== undefined) {
+			return media;
+		}
+	}
+	return `${settings.promptPrefix}${promptId}`;
 }
 
 /**

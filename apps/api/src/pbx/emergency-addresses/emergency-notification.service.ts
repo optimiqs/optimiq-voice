@@ -1,14 +1,25 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { getLogger } from "@optimiq-voice/logging";
-import { emergencyAddress, eq, extension } from "@optimiq-voice/pbx-db";
+import {
+	and,
+	asc,
+	device,
+	deviceLine,
+	emergencyAddress,
+	eq,
+	extension,
+} from "@optimiq-voice/pbx-db";
+import { MailTemplateService } from "../../auth/mail-templates/mail-template.service";
 import {
 	DEFAULT_MAIL_APP_NAME,
 	emergencyDialedMail,
 	formatDispatchableLocation,
 	Mailer,
 } from "../../mail";
+import { applyMailOverride } from "../../mail/mail-template-resolution";
 import { OrgSettingsService } from "../org-settings/org-settings.service";
 import { PBX_DATABASE } from "../shared/pbx.tokens";
+import type { MailComposition } from "../../auth/mail-templates/mail-template.service";
 import type { PbxDatabaseClient } from "@optimiq-voice/pbx-db";
 
 const logger = getLogger("api.pbx");
@@ -26,6 +37,8 @@ export interface EmergencyDialedNotice {
 	readonly number: string;
 	readonly callerNumber?: string | undefined;
 	readonly callerName?: string | undefined;
+	/** The handset the call was placed from, when the SIP edge named one. See `readContext`. */
+	readonly deviceId?: string | undefined;
 	readonly elin?: string | undefined;
 	readonly emergencyAddressId?: string | undefined;
 	readonly trunkName?: string | undefined;
@@ -89,6 +102,7 @@ export class EmergencyNotificationService {
 		@Inject(PBX_DATABASE) private readonly database: PbxDatabaseClient,
 		@Inject(Mailer) private readonly mailer: Mailer,
 		@Inject(OrgSettingsService) private readonly settings: OrgSettingsService,
+		@Inject(MailTemplateService) private readonly templates: MailTemplateService,
 	) {}
 
 	get stats(): { readonly sent: number; readonly skipped: number; readonly failed: number } {
@@ -139,22 +153,31 @@ export class EmergencyNotificationService {
 		}
 
 		const context = await this.readContext(organizationId, notice);
-		const rendered = emergencyDialedMail({
-			appName: DEFAULT_MAIL_APP_NAME,
-			...(policy.fromName === undefined ? {} : { fromName: policy.fromName }),
-			dialed: notice.dialed,
-			number: notice.number,
-			...(notice.callerNumber === undefined ? {} : { callerNumber: notice.callerNumber }),
-			...(notice.callerName === undefined ? {} : { callerName: notice.callerName }),
-			...(context.callerExtension === undefined
-				? {}
-				: { callerExtension: context.callerExtension }),
-			...(notice.elin === undefined ? {} : { elin: notice.elin }),
-			...(context.location === undefined ? {} : { location: context.location }),
-			...(context.locationUnknown ? { locationUnknown: true } : {}),
-			...(notice.trunkName === undefined ? {} : { trunkName: notice.trunkName }),
-			dialedAt: notice.dialedAt,
-		});
+		// The mail-template cascade, the same wire the voicemail consumer uses: the org's (or its
+		// reseller's) branding product name feeds the code template as its `appName`, and the resolved
+		// subject/intro override is applied. Keyed by `emergency-dialed` and the organization id.
+		const composition = await this.compose(organizationId);
+		const rendered = applyMailOverride(
+			emergencyDialedMail({
+				appName: composition.productName,
+				...(policy.fromName === undefined ? {} : { fromName: policy.fromName }),
+				dialed: notice.dialed,
+				number: notice.number,
+				...(notice.callerNumber === undefined ? {} : { callerNumber: notice.callerNumber }),
+				...(notice.callerName === undefined ? {} : { callerName: notice.callerName }),
+				...(context.callerExtension === undefined
+					? {}
+					: { callerExtension: context.callerExtension }),
+				...(notice.elin === undefined ? {} : { elin: notice.elin }),
+				...(context.location === undefined ? {} : { location: context.location }),
+				...(context.locationUnknown ? { locationUnknown: true } : {}),
+				...(context.locationDevice === undefined ? {} : { locationDevice: context.locationDevice }),
+				...(context.locationValidated === false ? { locationValidated: false } : {}),
+				...(notice.trunkName === undefined ? {} : { trunkName: notice.trunkName }),
+				dialedAt: notice.dialedAt,
+			}),
+			composition.override,
+		);
 
 		const delivered: string[] = [];
 		const failed: string[] = [];
@@ -194,6 +217,26 @@ export class EmergencyNotificationService {
 	}
 
 	/**
+	 * The branding product name and resolved template override for this organization's Kari's Law mail.
+	 *
+	 * Best-effort, like the send itself: this notification is a life-safety obligation and a
+	 * template-cascade read that fails must never suppress it, so a failure falls back to the code
+	 * default (`DEFAULT_MAIL_APP_NAME`, no override) — the message this consumer sent before the
+	 * cascade was wired. Language is `en`; the override table keys on `(org, template, language)`.
+	 */
+	private async compose(organizationId: string): Promise<MailComposition> {
+		try {
+			return await this.templates.resolveComposition(organizationId, "emergency-dialed", "en");
+		} catch (error) {
+			logger.warn(
+				{ organizationId, err: error },
+				"could not resolve the emergency mail template; sending with the default branding",
+			);
+			return { productName: DEFAULT_MAIL_APP_NAME, override: null };
+		}
+	}
+
+	/**
 	 * The two facts the event carries by REFERENCE, resolved inside one tenant scope so RLS filters.
 	 *
 	 * The dispatchable location is looked up by the `emergency_address.id` the event names — the
@@ -212,12 +255,12 @@ export class EmergencyNotificationService {
 	): Promise<{
 		readonly location: string | undefined;
 		readonly locationUnknown: boolean;
+		readonly locationDevice: string | undefined;
+		readonly locationValidated: boolean | undefined;
 		readonly callerExtension: string | undefined;
 	}> {
 		return await this.database.withTenantScope(organizationId, async (transaction) => {
-			let location: string | undefined;
-			let locationUnknown = false;
-			if (notice.emergencyAddressId !== undefined) {
+			const readAddress = async (addressId: string): Promise<AddressRow | undefined> => {
 				const rows = await transaction
 					.select({
 						label: emergencyAddress.label,
@@ -228,25 +271,38 @@ export class EmergencyNotificationService {
 						administrativeArea: emergencyAddress.administrativeArea,
 						postalCode: emergencyAddress.postalCode,
 						country: emergencyAddress.country,
+						validated: emergencyAddress.validated,
 					})
 					.from(emergencyAddress)
-					.where(eq(emergencyAddress.id, notice.emergencyAddressId))
+					.where(eq(emergencyAddress.id, addressId))
 					.limit(1);
-				const address = rows[0];
+				return rows[0];
+			};
+
+			let location: string | undefined;
+			let locationUnknown = false;
+			let locationValidated: boolean | undefined;
+			/** Kept, not just its formatted form: a device detail has to be inserted INTO it. */
+			let numberAddress: AddressRow | undefined;
+			if (notice.emergencyAddressId !== undefined) {
+				const address = await readAddress(notice.emergencyAddressId);
 				if (address === undefined) {
 					locationUnknown = true;
 				} else {
+					numberAddress = address;
 					const formatted = formatDispatchableLocation(address);
 					location = formatted.length === 0 ? undefined : formatted;
 					locationUnknown = location === undefined;
+					locationValidated = address.validated === true;
 				}
 			}
 
 			let callerExtension: string | undefined;
+			let callerExtensionId: string | undefined;
 			const number = notice.callerNumber?.trim();
 			if (number !== undefined && number.length > 0) {
 				const rows = await transaction
-					.select({ number: extension.number, label: extension.label })
+					.select({ id: extension.id, number: extension.number, label: extension.label })
 					.from(extension)
 					.where(eq(extension.number, number))
 					.limit(1);
@@ -254,10 +310,127 @@ export class EmergencyNotificationService {
 				if (found !== undefined) {
 					callerExtension =
 						found.label.trim().length === 0 ? found.number : `${found.number} (${found.label})`;
+					callerExtensionId = found.id;
 				}
 			}
 
-			return { location, locationUnknown, callerExtension };
+			/**
+			 * The per-handset location, and why it OVERRIDES the number's.
+			 *
+			 * The event names an `emergency_address` reached through the DID, which is the right
+			 * granularity for an ELIN and the wrong one for a dispatch: the audit's finding was exactly
+			 * that two desks on one extension share one DID and therefore shared one address. A device
+			 * that carries its own address is a statement somebody made about THIS handset, so it wins;
+			 * a device that carries none changes nothing and the number-level answer stands.
+			 *
+			 * Resolved from the EVENT when it named a device, and only inferred from the extension when
+			 * it did not. `call.emergency.dialed.deviceId` is what the digest credential resolved to at
+			 * the SIP edge — the registration that actually placed the call — so when it is present
+			 * there is no inference left to make and no ambiguity to state. When it is absent (a trunk
+			 * leg, an API-originated call, an edge that predates the field) the walk back through
+			 * `callerNumber → extension → device_line → device` stands, and the ambiguity it cannot
+			 * resolve is stated in the message rather than hidden: when several handsets on the
+			 * extension each claim a location, the notice names the one it used AND says the others
+			 * disagree, so a front desk knows to check both desks instead of trusting a coin flip.
+			 */
+			const deviceColumns = {
+				label: device.label,
+				macAddress: device.macAddress,
+				emergencyAddressId: device.emergencyAddressId,
+				emergencyLocationDetail: device.emergencyLocationDetail,
+			};
+			let locationDevice: string | undefined;
+			let chosen: DeviceRow | undefined;
+			/** How many handsets could have been the one. One when the edge told us; see above. */
+			let located = 0;
+			if (notice.deviceId !== undefined) {
+				const rows = await transaction
+					.select(deviceColumns)
+					.from(device)
+					.where(eq(device.id, notice.deviceId))
+					.limit(1);
+				chosen = rows[0];
+				located = chosen === undefined ? 0 : 1;
+			}
+			// The fallback, and only the fallback: an id that resolved to nothing is a deleted device,
+			// which is still better answered by the extension's handsets than by silence.
+			if (chosen === undefined && callerExtensionId !== undefined) {
+				const deviceRows = await transaction
+					.select(deviceColumns)
+					.from(deviceLine)
+					.innerJoin(device, eq(device.id, deviceLine.deviceId))
+					.where(and(eq(deviceLine.extensionId, callerExtensionId), eq(deviceLine.enabled, true)))
+					.orderBy(asc(device.macAddress));
+				const candidates = deviceRows.filter(
+					(row) => row.emergencyAddressId !== null || row.emergencyLocationDetail !== null,
+				);
+				chosen = candidates[0];
+				located = candidates.length;
+			}
+			if (chosen !== undefined) {
+				const address =
+					chosen.emergencyAddressId === null
+						? undefined
+						: await readAddress(chosen.emergencyAddressId);
+				// A device that names only a DETAIL refines whatever the number already resolved —
+				// "same building, desk by the window" — rather than replacing it with a bare fragment
+				// nobody could drive to. Re-formatted from the address ROW rather than appended to the
+				// formatted string, so the desk lands beside the floor it refines instead of after the
+				// country code.
+				const base = address ?? numberAddress;
+				const formatted =
+					base === undefined
+						? ""
+						: formatDispatchableLocation(base, chosen.emergencyLocationDetail);
+				if (formatted.length > 0) {
+					location = formatted;
+					locationUnknown = false;
+					if (address !== undefined) {
+						locationValidated = address.validated === true;
+					}
+					locationDevice = describeDevice(chosen.label, chosen.macAddress, located);
+				}
+			}
+
+			return { location, locationUnknown, locationDevice, locationValidated, callerExtension };
 		});
 	}
+}
+
+/** The device columns the location resolution reads, however the device was reached. */
+interface DeviceRow {
+	readonly label: string | null;
+	readonly macAddress: string;
+	readonly emergencyAddressId: string | null;
+	readonly emergencyLocationDetail: string | null;
+}
+
+/** The address columns the notice formats. Named so `readAddress` has a shape, not a bag. */
+interface AddressRow {
+	readonly label: string;
+	readonly streetLine1: string;
+	readonly streetLine2: string | null;
+	readonly locationDetail: string | null;
+	readonly locality: string;
+	readonly administrativeArea: string;
+	readonly postalCode: string;
+	readonly country: string;
+	readonly validated: boolean;
+}
+
+/**
+ * How a handset is named to a front desk, and the ambiguity it admits.
+ *
+ * The label first because that is what somebody wrote on the phone; the MAC when there is none,
+ * because an unlabelled phone is still findable by the sticker on its base. `located` is how many
+ * handsets on this extension each claim a location: more than one means the inference picked a
+ * desk and the others disagree, and saying so is the difference between sending somebody to the
+ * right desk and sending them to a desk.
+ */
+function describeDevice(label: string | null, macAddress: string, located: number): string {
+	const name = label?.trim().length ? label.trim() : macAddress;
+	return located <= 1
+		? name
+		: `${name} — ${located - 1} other handset${located === 2 ? "" : "s"} on this extension ` +
+				"registers a different location; check both";
 }

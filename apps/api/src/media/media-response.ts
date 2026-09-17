@@ -33,6 +33,15 @@ import type { Readable } from "node:stream";
  * reads to decide whether the playhead is draggable at all, and it must be present on the FIRST
  * response, which is the one with no `Range` header on it. The three routes previously answered
  * `accept-ranges: none`, which was honest about what they did and is why seeking never worked.
+ *
+ * ## Sniffing is refused here, not at the routes
+ *
+ * `x-content-type-options: nosniff` and a `default-src 'none'; sandbox` CSP ride on every response
+ * this function builds. They started as `@Header` decorators on the branding-logo route, which is
+ * the one that can serve an attacker-supplied SVG — but every route through here streams bytes a
+ * tenant uploaded, and the store does not know what they are. Setting them at the one place all six
+ * routes pass through is what makes the seventh route safe by default; the branding controller's
+ * decorators now merely restate them.
  */
 
 /** Everything a media controller needs to answer one request. */
@@ -81,9 +90,13 @@ export async function openMediaResponse(
 	const disposition = options.disposition ?? "inline";
 	const base: Record<string, string> = {
 		"content-type": options.contentType,
-		"content-disposition": `${disposition}; filename="${options.fileName}"`,
+		"content-disposition": `${disposition}; filename="${quotedFileName(options.fileName)}"`,
 		// The promise. See the header: present on every response, including the one with no range.
 		"accept-ranges": "bytes",
+		// See the header's sniffing note. Set here rather than per route, so a new streaming route
+		// cannot be the one that forgets them.
+		"x-content-type-options": "nosniff",
+		"content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
 	};
 
 	const decision = decideRange(options.rangeHeader, sizeBytes);
@@ -115,4 +128,20 @@ export async function openMediaResponse(
 		headers: { ...base, "content-length": String(sizeBytes) },
 		sizeBytes,
 	};
+}
+
+/**
+ * A file name safe to interpolate into `content-disposition`'s quoted-string.
+ *
+ * The header is `attachment; filename="…"`, and nothing here escaped `"` or `\`, so a name carrying
+ * either truncated or reshaped the header — and a `;` injected a parameter. Every caller in this
+ * area passes a derived name (dates, kinds, hex), but the PBX media-library routes share this
+ * helper and are the ones that pass a display name a user typed.
+ *
+ * Replaced rather than percent-encoded: RFC 6266's `filename` is an ASCII fallback by design, and a
+ * mangled character in a download name is a better outcome than a header a proxy re-parses.
+ */
+function quotedFileName(fileName: string): string {
+	// oxlint-disable-next-line no-control-regex -- the control characters are exactly what is removed
+	return fileName.replaceAll(/["\\;\u0000-\u001F\u007F]/gu, "_");
 }
